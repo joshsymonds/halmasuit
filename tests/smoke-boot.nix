@@ -34,6 +34,25 @@ pkgs.testers.runNixOSTest {
   # inside the same evaluation triggers infinite recursion).
   node.specialArgs = { inputs = testInputs; };
 
+  # In INTERACTIVE mode (`just test-vm-interactive smoke-boot` or
+  # `just test-vm-drive smoke-boot`), swap to virtio-vga-gl + GL display so
+  # niri's smithay TTY backend has a real GBM allocator and actually paints.
+  # Headless CI keeps the simpler virtio-gpu-pci because the alternative
+  # config conflicts with the framework's no-display headless mode and we
+  # don't need rendering for PID-tracking flash detection.
+  interactive.nodes.machine = { ... }: {
+    # APPEND, do not mkForce: the framework adds -kernel/-initrd/-append
+    # to qemu.options via mkIf cfg.directBoot.enable, and mkForce wipes
+    # those out (the VM then has no bootable device). QEMU is fine with
+    # multiple -device args; the second virtio-vga-gl coexists alongside
+    # the base virtio-gpu-pci, and -display gtk,gl=on overrides any
+    # earlier default display flag.
+    virtualisation.qemu.options = [
+      "-device virtio-vga-gl"
+      "-display gtk,gl=on"
+    ];
+  };
+
   nodes.machine =
     { config, lib, pkgs, ... }:
     {
