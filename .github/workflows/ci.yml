@@ -24,15 +24,20 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
+            substituters = https://cache.nixos.org https://joshsymonds.cachix.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= joshsymonds.cachix.org-1:DajO7Bjk/Q8eQVZQZC/AWOzdUst2TGp8fHS/B1pua2c=
 
-      # NOTE: Replace `halmasuit` with the actual cachix cache name once it's
-      # created. The CACHIX_AUTH_TOKEN secret must be set in the repo's
-      # GitHub Actions secrets for cache writes to work.
+      # joshsymonds is a public cache shared across all my flakes — niri/DMS/
+      # nixpkgs derivations from gnomon's `update` runs land here and CI
+      # benefits without any auth. The authToken is only needed if CI itself
+      # should *push* builds back into the cache; we skip that for v1 and
+      # let gnomon be the sole writer.
       - uses: cachix/cachix-action@v15
         with:
-          name: halmasuit
-          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
-        continue-on-error: true   # cache misses must not fail the build.
+          name: joshsymonds
+          # authToken left unset — read-only access works without a token
+          # because the cache is public.
+        continue-on-error: true
 
       - name: nix flake check
         run: nix flake check -L --print-build-logs
