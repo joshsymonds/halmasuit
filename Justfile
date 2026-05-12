@@ -27,11 +27,56 @@ fmt:
 test:
     cargo nextest run --workspace --all-features --no-fail-fast --no-tests=pass
 
-# NixOS VM tests (frame-capture pipeline against the current desktop stack).
-# Stub in v1 — the seamless-boot test lands in a follow-up task.
+# NixOS VM tests (headless, CI-style). Runs every check exposed by the flake.
 test-vm:
-    @echo "v1 test infrastructure not yet implemented — see Task #10 epic."
-    @exit 0
+    nix flake check -L --print-build-logs
+
+# Same VM test, but interactive: opens a QEMU window so you can watch the
+# guest boot, and drops you into a Python REPL inside the test driver.
+# Useful for `machine.screenshot("name")`, `machine.send_chars(...)`, and
+# poking at the VM state by hand.
+#
+# Usage: just test-vm-interactive smoke-boot
+test-vm-interactive name:
+    nix run .#checks.x86_64-linux.{{name}}.driverInteractive
+
+# Drive a VM test interactively from elsewhere: the QEMU window opens (so a
+# human can watch), and commands are sent by appending to a file. Useful for
+# agent-driven debugging where the agent runs commands and the human observes.
+#
+# After running, two paths are printed:
+#   /tmp/halmasuit-drive-cmds  — append Python commands here, one per line
+#   /tmp/halmasuit-drive.log   — driver stdout/stderr accumulates here
+#
+# Send commands:  echo 'start_all()' >> /tmp/halmasuit-drive-cmds
+#                 echo 'machine.screenshot("checkpoint")' >> /tmp/halmasuit-drive-cmds
+# Watch output:   tail -f /tmp/halmasuit-drive.log
+# Stop:           just test-vm-drive-stop
+#
+# Usage: just test-vm-drive smoke-boot
+test-vm-drive name:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CMDS=/tmp/halmasuit-drive-cmds
+    LOG=/tmp/halmasuit-drive.log
+    rm -f "$CMDS" "$LOG"
+    touch "$CMDS"
+    nohup setsid bash -c "exec tail -f $CMDS | nix run .#checks.x86_64-linux.{{name}}.driverInteractive > $LOG 2>&1" > /dev/null 2>&1 &
+    disown
+    echo "Driver spawned. QEMU window opens when start_all() runs."
+    echo
+    echo "  Send commands:  echo 'COMMAND' >> $CMDS"
+    echo "  Watch output:   tail -f $LOG"
+    echo "  Stop:           just test-vm-drive-stop"
+
+# Stop a test-vm-drive session and reap the VM.
+test-vm-drive-stop:
+    @echo "machine.shutdown()" >> /tmp/halmasuit-drive-cmds 2>/dev/null || true
+    @sleep 1
+    @pkill -f "nixos-test-driver.*driverInteractive" 2>/dev/null || true
+    @pkill -f "qemu-system-x86_64.*machine-test" 2>/dev/null || true
+    @pkill -f "tail -f /tmp/halmasuit-drive-cmds" 2>/dev/null || true
+    @echo "stopped"
 
 # RustSec advisory check only (subset of `cargo deny check`).
 audit:
