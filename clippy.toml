@@ -1,0 +1,7 @@
+# clippy configuration. Most lint behaviour is set in workspace Cargo.toml
+# under [workspace.lints.clippy]. This file is for per-lint tuning thresholds
+# (e.g. cognitive-complexity-threshold) that don't fit the level-only model.
+#
+# Empty for now. Tune as real code lands.
+
+msrv = "1.95"

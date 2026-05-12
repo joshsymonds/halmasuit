@@ -1,0 +1,18 @@
+[package]
+name        = "halmasuit-cli"
+description = "Command-line client for the halmasuit compositor (the `halmasuit msg` binary)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[[bin]]
+name = "halmasuit-msg"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]

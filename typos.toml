@@ -1,0 +1,16 @@
+# typos configuration. Run via `typos` (in nix devshell).
+# https://github.com/crate-ci/typos
+
+[default]
+extend-ignore-identifiers-re = []
+
+[default.extend-words]
+# Project-specific allow list grows here when typos misfires.
+halmasuit = "halmasuit"
+
+[files]
+extend-exclude = [
+    "target/",
+    "result*",
+    "*.lock",
+]

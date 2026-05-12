@@ -1,0 +1,27 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Nix
+/result
+/result-*
+
+# direnv
+/.direnv
+/.envrc.local
+
+# Per-repo cargo/rustup state from the dev shell.
+/.cargo-home
+/.rustup-home
+
+# Editor
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Cargo
+Cargo.lock.bak

@@ -1,0 +1,37 @@
+# cargo-deny configuration. Run via `cargo deny check` (or `just lint`).
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+version             = 2
+yanked              = "deny"
+ignore              = []  # RustSec advisory IDs to ignore (with written justification).
+
+[licenses]
+version    = 2
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",  # file-level copyleft is acceptable for halmasuit; flag if a problem emerges.
+    "CC0-1.0",
+]
+
+[bans]
+multiple-versions = "warn"   # workspace will accumulate duplicates; tighten later.
+wildcards         = "deny"   # no version = "*" in dependency specs.
+deny              = []       # explicit per-crate bans (none yet).
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "warn"
+allow-git        = []
