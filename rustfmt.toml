@@ -1,8 +1,10 @@
 edition                  = "2024"
-imports_granularity      = "Crate"
-group_imports            = "StdExternalCrate"
 reorder_imports          = true
 use_field_init_shorthand = true
 use_try_shorthand        = true
 newline_style            = "Unix"
-unstable_features        = true
+# Note: imports_granularity, group_imports, and unstable_features were
+# previously set here but require nightly rustfmt. Dropping them keeps
+# `cargo fmt` on stable, which avoids the rustup-fetch tax on every fresh
+# CI runner. Re-add when these stabilize, or revisit if grouped imports
+# become important for readability.

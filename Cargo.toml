@@ -33,7 +33,7 @@ similar_names           = "allow"
 must_use_candidate      = "allow"
 missing_errors_doc      = "allow"
 missing_panics_doc      = "allow"
-multiple_crate_versions = "allow"  # workspace will accumulate these; cargo-deny handles real duplicates.
+multiple_crate_versions = "allow"  # currently permitted; deny.toml has bans.multiple-versions = "warn" (non-failing). Tighten both when real deps land.
 cargo_common_metadata   = "allow"  # not publishing to crates.io; metadata fields like keywords/categories aren't relevant.
 doc_markdown            = "allow"  # we'll backtick-discipline as real APIs land; placeholder docs are too noisy.
 

@@ -17,9 +17,13 @@ jobs:
     name: nix flake check
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      # Actions pinned to commit SHAs (not mutable tags) to bound
+      # supply-chain blast radius. Refresh by replacing the SHA and
+      # noting the corresponding upstream version in the comment.
 
-      - uses: cachix/install-nix-action@v30
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5    # v4
+
+      - uses: cachix/install-nix-action@08dcb3a5e62fa31e2da3d490afc4176ef55ecd72    # v30
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -29,15 +33,25 @@ jobs:
 
       # joshsymonds is a public cache shared across all my flakes — niri/DMS/
       # nixpkgs derivations from gnomon's `update` runs land here and CI
-      # benefits without any auth. The authToken is only needed if CI itself
-      # should *push* builds back into the cache; we skip that for v1 and
-      # let gnomon be the sole writer.
-      - uses: cachix/cachix-action@v15
+      # benefits without any auth. We never push from CI, so no token.
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc    # v15
         with:
           name: joshsymonds
-          # authToken left unset — read-only access works without a token
-          # because the cache is public.
         continue-on-error: true
+
+      # Cache Rust toolchain + cargo registry + build artifacts. Currently
+      # mostly empty (v1 workspace has zero deps), but cheap to wire in now
+      # so future v2 builds don't start from scratch on every CI run.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830    # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Lint + unit gate (must pass)
         run: nix develop --command just check
@@ -67,14 +81,15 @@ jobs:
               echo "::error::flash-test step produced no result"; exit 1 ;;
           esac
 
-      - name: Upload artifacts on failure
+      # Only the v1 flash-detection log is useful as a CI artifact today
+      # (smoke-boot passes; failures there mean the framework broke, not
+      # the system under test). Once v2 lands and we have visual frame
+      # captures, expand this list.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02    # v4
         if: failure()
-        uses: actions/upload-artifact@v4
         with:
-          name: nix-build-artifacts
+          name: vm-test-artifacts
           path: |
-            result*
-            target/
             /tmp/flash.log
           if-no-files-found: ignore
           retention-days: 7

@@ -58,22 +58,10 @@ pkgs.testers.runNixOSTest {
     {
       imports = [
         "${nix-config}/modules/desktop/dms-niri.nix"
+        ./lib/test-user.nix
       ];
 
       desktop.dms-niri.enable = true;
-
-      # Greeter expects a real user to be able to log in. Password "test"
-      # so the test driver can later send credentials in follow-up tasks.
-      users.users.test = {
-        isNormalUser = true;
-        password = "test";
-        uid = 1000;
-        extraGroups = [ "wheel" "video" "input" ];
-      };
-
-      # Make sudo passwordless for the test user — the test framework
-      # uses sudo to inspect process state inside the VM.
-      security.sudo.wheelNeedsPassword = false;
 
       # VM hardware shape. virtio-gpu-pci gives niri a DRM device to find,
       # but vanilla virtio-gpu has no GBM allocator and niri logs "no

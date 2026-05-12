@@ -38,17 +38,25 @@ let
   # JSON over a Unix socket. https://man.sr.ht/~kennylevinsen/greetd/protocol.md
   testGreetdAuth = pkgs.writeScript "test-greetd-auth.py" ''
     #!${pkgs.python3}/bin/python3
-    import json, os, socket, struct, sys, time
+    import json, os, pathlib, socket, struct, sys, time
 
     sock_path = os.environ.get("GREETD_SOCK")
     if not sock_path:
         print("GREETD_SOCK not set in greeter env", file=sys.stderr)
         sys.exit(1)
 
-    # Give the test driver a window to snapshot greeter-side process
-    # state (niri PID, /sys/kernel/debug/dri/0/clients) before we drive
-    # the transition.
-    time.sleep(6)
+    # Sentinel-file handshake with the test driver instead of a fixed
+    # `time.sleep()`. The test driver waits for /tmp/greeter-ready,
+    # snapshots greeter-side process state, then touches /tmp/proceed
+    # to release us. State-based, not time-based — matches the brief's
+    # anti-pattern rule.
+    pathlib.Path("/tmp/greeter-ready").touch()
+    deadline = time.monotonic() + 60.0
+    while not pathlib.Path("/tmp/proceed").exists():
+        if time.monotonic() > deadline:
+            print("greeter-ready signaled but /tmp/proceed never appeared", file=sys.stderr)
+            sys.exit(1)
+        time.sleep(0.1)
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(sock_path)
@@ -107,8 +115,11 @@ let
   '';
 
   # niri config for the greeter side. Spawns our auth driver as a
-  # child, then quits when it returns. (greetd will tear us down at
-  # start_session before we reach the quit, which is the point.)
+  # child, then quits when the driver returns. greetd does NOT tear
+  # down the greeter on start_session — per greetd-ipc(7) the session
+  # starts only after the greeter process terminates voluntarily. The
+  # chained `niri msg action quit` is what causes that termination.
+  # Delete it and the test deadlocks.
   testGreeterNiriConfig = pkgs.writeText "test-greeter-niri.kdl" ''
     hotkey-overlay {
         skip-at-startup
@@ -127,7 +138,7 @@ let
   # then execs niri with our config. Mirrors dms-greeter's shape.
   niriPkg = nix-config.inputs.niri-flake.packages.${system}.niri-unstable;
   testGreeter = pkgs.writeShellScript "test-greeter" ''
-    set -e
+    set -euo pipefail
     export PATH=${pkgs.lib.makeBinPath [ niriPkg pkgs.python3 pkgs.coreutils ]}:$PATH
     exec ${niriPkg}/bin/niri -c ${testGreeterNiriConfig}
   '';
@@ -149,6 +160,7 @@ pkgs.testers.runNixOSTest {
     {
       imports = [
         "${nix-config}/modules/desktop/dms-niri.nix"
+        ./lib/test-user.nix
       ];
 
       desktop.dms-niri = {
@@ -167,15 +179,6 @@ pkgs.testers.runNixOSTest {
         };
       };
 
-      users.users.test = {
-        isNormalUser = true;
-        password = "test";
-        uid = 1000;
-        extraGroups = [ "wheel" "video" "input" ];
-      };
-
-      security.sudo.wheelNeedsPassword = false;
-
       virtualisation = {
         memorySize = 2048;
         cores = 2;
@@ -193,10 +196,13 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("graphical.target")
     machine.succeed("systemctl is-active greetd")
 
-    # Wait for the greeter-side niri (running as user "greeter"). Our
-    # test greeter sleeps 6s before driving auth, so we have a comfortable
-    # window to snapshot state.
+    # Wait for the greeter-side niri (running as user "greeter") AND the
+    # test greeter's Python driver to signal it has fully started and is
+    # holding for the test to capture state. State-based handshake instead
+    # of a fixed sleep — see /tmp/greeter-ready in test-greetd-auth.py.
     machine.wait_until_succeeds("pgrep -u greeter -x niri", timeout = 30)
+    machine.wait_until_succeeds("test -f /tmp/greeter-ready", timeout = 30)
+
     greeter_pid = machine.succeed("pgrep -u greeter -x niri").strip()
     greeter_uid = machine.succeed(f"stat -c %u /proc/{greeter_pid}").strip()
 
@@ -208,11 +214,13 @@ pkgs.testers.runNixOSTest {
     print(f"GREETER SIDE: niri pid={greeter_pid} uid={greeter_uid}")
     print(f"DRM clients pre-auth:\n{drm_pre}")
 
-    # ── Phase 2: wait for the user session ──────────────────────────────
-    # The test-greeter's Python script (running inside the greeter's niri)
-    # connects to greetd's socket after 6s and drives auth automatically.
-    # When start_session lands, greetd kills the greeter tree and execs
-    # niri for user "test" (uid 1000). 90s timeout covers a cold cache.
+    # ── Phase 2: release the greeter and wait for user session ──────────
+    # Drop the proceed sentinel; the greeter's Python driver is polling
+    # for it and will then drive greetd auth. When start_session lands,
+    # greetd waits for the greeter to exit (the chained `niri msg action
+    # quit` does that), then execs niri for user "test". 90s timeout
+    # covers a cold cache.
+    machine.succeed("touch /tmp/proceed")
     machine.wait_until_succeeds("pgrep -u test -x niri", timeout = 90)
 
     session_pid = machine.succeed("pgrep -u test -x niri").strip()

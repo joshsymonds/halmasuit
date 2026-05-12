@@ -4,13 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
-    # nix-config provides the dms-niri module — the same module gnomon uses to
-    # bring up greetd + DankGreeter + niri + DMS. We import the module's file
-    # path directly and supply the inputs it expects via _module.args.inputs.
-    #
-    # `git+file://` (not `path:`) per the user's memory rule on local flake
-    # inputs. Switch to `github:joshsymonds/nix-config` once pushed.
-    nix-config.url = "git+file:///home/joshsymonds/nix-config";
+    # nix-config provides the dms-niri module — the same module gnomon uses
+    # to bring up greetd + DankGreeter + niri + DMS. We import the module's
+    # file path directly and supply the inputs it expects via specialArgs.
+    nix-config.url = "github:joshsymonds/nix-config";
   };
 
   outputs =
@@ -77,14 +74,21 @@
           '';
         });
 
-      # NixOS VM tests. `nix flake check` exercises everything here.
-      checks = forEachSystem (system: {
+      # NixOS VM tests run on Linux only. Limited to x86_64-linux because
+      # nixpkgs.testers.runNixOSTest requires a build host matching the test
+      # architecture; emitting aarch64-linux checks from an x86_64 evaluator
+      # would either invoke qemu-aarch64 user-mode emulation (multi-minute
+      # slowdown) or fail outright. Add aarch64-linux here when we have a
+      # native runner for it.
+      checks.x86_64-linux = {
         smoke-boot = import ./tests/smoke-boot.nix {
-          inherit system nixpkgs nix-config;
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
         };
         login-flash = import ./tests/login-flash.nix {
-          inherit system nixpkgs nix-config;
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
         };
-      });
+      };
     };
 }

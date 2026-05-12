@@ -12,7 +12,7 @@ check: lint test
 
 # Lint everything (format + clippy + dep policy + spelling + dead deps).
 lint:
-    cargo +nightly fmt --check
+    cargo fmt --check
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo deny check
     cargo machete
@@ -20,7 +20,7 @@ lint:
 
 # Auto-format Rust sources.
 fmt:
-    cargo +nightly fmt
+    cargo fmt
 
 # Run unit + integration tests via nextest. Zero tests is fine while the
 # workspace is still scaffolding; nextest is strict about this by default.
