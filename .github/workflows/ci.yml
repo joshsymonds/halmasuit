@@ -39,11 +39,33 @@ jobs:
           # because the cache is public.
         continue-on-error: true
 
-      - name: nix flake check
-        run: nix flake check -L --print-build-logs
-
-      - name: just check
+      - name: Lint + unit gate (must pass)
         run: nix develop --command just check
+
+      - name: Smoke test (must pass)
+        run: nix build .#checks.x86_64-linux.smoke-boot -L --print-build-logs --no-link
+
+      - name: Flash detection (expected RED until halmasuit v2)
+        id: flash-test
+        continue-on-error: true
+        run: |
+          if nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link 2>&1 | tee /tmp/flash.log; then
+            echo "result=unexpected-pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=expected-fail" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Interpret flash result
+        run: |
+          case "${{ steps.flash-test.outputs.result }}" in
+            expected-fail)
+              echo "::notice::v1 baseline OK — flash detected as expected. v2 (halmasuit) will make this go green." ;;
+            unexpected-pass)
+              echo "::error::login-flash unexpectedly PASSED. Either the flash is gone (great, advance to v2!) or the test is broken (audit before celebrating)."
+              exit 1 ;;
+            *)
+              echo "::error::flash-test step produced no result"; exit 1 ;;
+          esac
 
       - name: Upload artifacts on failure
         if: failure()
@@ -53,5 +75,6 @@ jobs:
           path: |
             result*
             target/
+            /tmp/flash.log
           if-no-files-found: ignore
           retention-days: 7

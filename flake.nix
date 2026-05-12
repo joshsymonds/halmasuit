@@ -82,6 +82,9 @@
         smoke-boot = import ./tests/smoke-boot.nix {
           inherit system nixpkgs nix-config;
         };
+        login-flash = import ./tests/login-flash.nix {
+          inherit system nixpkgs nix-config;
+        };
       });
     };
 }

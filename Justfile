@@ -27,9 +27,26 @@ fmt:
 test:
     cargo nextest run --workspace --all-features --no-fail-fast --no-tests=pass
 
-# NixOS VM tests (headless, CI-style). Runs every check exposed by the flake.
+# NixOS VM tests (headless, CI-style). smoke-boot must pass; login-flash is
+# expected to FAIL until halmasuit v2 (the failure is the v1 baseline
+# measurement of the greetd→niri flash). An unexpected pass on login-flash
+# means either v2 just landed (advance!) or the test broke.
 test-vm:
-    nix flake check -L --print-build-logs
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "── smoke-boot (must pass) ──"
+    nix build .#checks.x86_64-linux.smoke-boot -L --print-build-logs --no-link
+    echo
+    echo "── login-flash (expected RED until v2) ──"
+    if nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link; then
+        echo
+        echo "ERROR: login-flash unexpectedly PASSED. Either the flash is gone (advance to v2!)"
+        echo "       or the test is broken (audit before celebrating)."
+        exit 1
+    else
+        echo
+        echo "OK: login-flash FAILED as expected — v1 baseline holds (greetd→niri restart is the flash)."
+    fi
 
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.
