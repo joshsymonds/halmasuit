@@ -31,7 +31,17 @@ tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "fmt", "env-filter"] }
 serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
-# Smithay's event loop. halmasuit's spine reuses this from main() onward.
+# Per-test tempdirs for integration tests that spawn binaries needing
+# XDG_RUNTIME_DIR or similar isolation.
+tempfile           = "3"
+# Smithay — Rust Wayland compositor toolkit. Pinned to niri's current
+# commit (matching their Cargo.toml workspace dep). default-features
+# disabled so each consumer crate picks only what it needs.
+smithay            = { version = "0.7", git = "https://github.com/Smithay/smithay.git", rev = "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef", default-features = false }
+# Calloop is pinned at the same 0.14.x line smithay uses; we pull it in
+# directly (in addition to smithay's reexport) only to opt into the
+# `signals` feature, which smithay itself doesn't enable. Cargo unifies
+# to a single version with merged features.
 calloop            = { version = "0.14", features = ["signals"] }
 # POSIX bindings. drm-master-probe has its own entry (different feature set);
 # this entry is for v2 production crates that need signal/kill/etc.

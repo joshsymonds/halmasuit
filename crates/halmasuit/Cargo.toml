@@ -13,9 +13,17 @@ workspace = true
 
 [dependencies]
 halmasuit-introspect = { path = "../halmasuit-introspect", version = "0.1" }
+tracing.workspace            = true
 tracing-subscriber.workspace = true
+# smithay carries Wayland-server protocol state. `wayland_frontend` is
+# the minimum feature for the Wayland-server protocol surface.
+smithay = { workspace = true, features = ["wayland_frontend"] }
+# calloop comes in two ways: (1) via smithay's reexport for general
+# event-loop use, (2) directly here for the `signals` feature smithay
+# doesn't enable. Cargo unifies to one version with merged features.
 calloop.workspace            = true
 
 [dev-dependencies]
 nix        = { workspace = true, features = ["signal"] }
 serde_json.workspace = true
+tempfile.workspace   = true

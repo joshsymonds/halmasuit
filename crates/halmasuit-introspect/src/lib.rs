@@ -67,14 +67,17 @@ pub enum Event {
 
 /// Compositor phases.
 ///
-/// Initially only [`Phase::Init`] is implemented; further variants
-/// (`WaylandReady`, `Greeter`, `Session`, `Locked`, `Shutdown`) land
+/// Further variants (`Greeter`, `Session`, `Locked`, `Shutdown`) land
 /// alongside the code that enters them.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     /// Initial phase: process has started, no subsystems initialized yet.
     Init,
+    /// Wayland socket is bound and accepting client connections. No
+    /// protocol globals are advertised yet — clients see an empty global
+    /// list. Globals are added as their consuming code lands.
+    WaylandReady,
 }
 
 /// Reason a clean shutdown was initiated.
@@ -142,6 +145,15 @@ mod tests {
         let v = round_trip(&Event::PhaseEntered { phase: Phase::Init });
         assert_eq!(v["event"], "phase_entered");
         assert_eq!(v["phase"], "init");
+    }
+
+    #[test]
+    fn event_phase_entered_wayland_ready_serializes() {
+        let v = round_trip(&Event::PhaseEntered {
+            phase: Phase::WaylandReady,
+        });
+        assert_eq!(v["event"], "phase_entered");
+        assert_eq!(v["phase"], "wayland_ready");
     }
 
     #[test]

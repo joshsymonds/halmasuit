@@ -68,6 +68,13 @@ in
         # there. stdout stays silent for now.
         StandardOutput = "null";
         StandardError  = "journal";
+        # RuntimeDirectory creates /run/halmasuit/ with the unit's UID
+        # (currently root; future `compositor` user inherits ownership
+        # automatically when User= is set). The Wayland socket lives at
+        # /run/halmasuit/wayland-0 — smithay's ListeningSocketSource
+        # places the socket at $XDG_RUNTIME_DIR/<name>.
+        RuntimeDirectory     = "halmasuit";
+        RuntimeDirectoryMode = "0755";
         # Hardening minimums. Looser than the eventual `compositor` user
         # posture but already restricts the obvious abuse paths. Each
         # directive below is free for Phase A's userspace-only work; some
@@ -92,6 +99,10 @@ in
 
       environment = {
         RUST_LOG = cfg.logLevel;
+        # Point smithay's ListeningSocketSource at the unit's
+        # RuntimeDirectory. /run/halmasuit/wayland-0 is the production
+        # socket path documented in ARCHITECTURE.md.
+        XDG_RUNTIME_DIR = "/run/halmasuit";
       };
     };
   };

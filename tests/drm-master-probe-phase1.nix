@@ -28,7 +28,10 @@ let
     pname   = "drm-master-probe";
     version = "0.1.0";
     src     = ../.;
-    cargoLock.lockFile = ../Cargo.lock;
+    cargoLock = {
+      lockFile = ../Cargo.lock;
+      allowBuiltinFetchGit = true;
+    };
     cargoBuildFlags    = [ "-p" "drm-master-probe" ];
     doCheck = false;
   };

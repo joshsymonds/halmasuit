@@ -86,6 +86,15 @@
               git
             ];
 
+            # Native libraries smithay links against. smithay's
+            # `wayland_frontend` minimum pulls in libxkbcommon for keymap
+            # handling; later features (`backend_libinput`, `backend_drm`,
+            # `renderer_gl`) will add libinput, libgbm, libegl, libdrm.
+            buildInputs = with pkgs; [
+              libxkbcommon
+              wayland
+            ];
+
             shellHook = ''
               export CARGO_HOME="$PWD/.cargo-home"
               export RUSTUP_HOME="$PWD/.rustup-home"
@@ -111,8 +120,21 @@
             pname   = "halmasuit";
             version = "0.1.0";
             src     = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
+            # smithay is pinned to a git rev. allowBuiltinFetchGit lets
+            # nixpkgs's rustPlatform clone the rev at build time via
+            # builtins.fetchGit rather than requiring a pre-computed
+            # outputHashes entry. Acceptable for a project that already
+            # uses a git smithay pin throughout.
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
             cargoBuildFlags    = [ "-p" "halmasuit" ];
+            # smithay needs libxkbcommon (keymap handling, even in the
+            # wayland-server-only feature set) and libwayland (for the
+            # protocol scanner / pkg-config probing).
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [ pkgs.libxkbcommon pkgs.wayland ];
             # Integration tests spawn the binary and send POSIX signals; the
             # Nix sandbox doesn't permit that cleanly. `just check` is the
             # canonical gate; the NixOS VM test (next task) is the deployment-side gate.
@@ -132,7 +154,10 @@
             pname   = "halmasuit-spawn";
             version = "0.1.0";
             src     = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
             cargoBuildFlags    = [ "-p" "halmasuit-spawn" ];
             doCheck = false; # VM test is the deployment-side gate
             meta = {
@@ -153,7 +178,10 @@
             pname   = "drm-master-probe";
             version = "0.1.0";
             src     = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
             cargoBuildFlags    = [ "-p" "drm-master-probe" ];
             doCheck = false; # NixOS VM test is the actual test
             meta = {

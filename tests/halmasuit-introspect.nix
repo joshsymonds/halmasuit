@@ -98,6 +98,13 @@ pkgs.testers.runNixOSTest {
     def find(events, event_name):
         return next((inner for (_, inner) in events if inner.get("event") == event_name), None)
 
+    def find_phase(events, phase):
+        return next(
+            (inner for (_, inner) in events
+             if inner.get("event") == "phase_entered" and inner.get("phase") == phase),
+            None,
+        )
+
     events = captured_events()
     assert events, (
         "no halmasuit::event-targeted records captured. "
@@ -114,12 +121,33 @@ pkgs.testers.runNixOSTest {
         f"started.version must match Cargo.toml, got: {started}"
     )
 
-    # Assertion 2: PhaseEntered with phase = init.
-    phase_entered = find(events, "phase_entered")
-    assert phase_entered is not None, f"no phase_entered event captured. Events: {events}"
-    assert phase_entered.get("phase") == "init", (
-        f"phase_entered.phase must be 'init' in Phase A, got: {phase_entered}"
+    # Assertion 2a: PhaseEntered for Phase::Init.
+    init_phase = find_phase(events, "init")
+    assert init_phase is not None, (
+        f"no phase_entered{{phase=init}} event captured. Events: {events}"
     )
+
+    # Assertion 2b: PhaseEntered for Phase::WaylandReady — the Wayland
+    # socket is bound and accepting connections.
+    machine.wait_until_succeeds(
+        "journalctl -u halmasuit | grep -qF 'wayland_ready'",
+        timeout=30,
+    )
+    events = captured_events()
+    wayland_ready = find_phase(events, "wayland_ready")
+    assert wayland_ready is not None, (
+        f"no phase_entered{{phase=wayland_ready}} event captured. Events: {events}"
+    )
+
+    # Assertion 2c: the Wayland socket file exists on disk at
+    # /run/halmasuit/wayland-0 (RuntimeDirectory + XDG_RUNTIME_DIR in
+    # the NixOS module).
+    rc, out = machine.execute("test -S /run/halmasuit/wayland-0")
+    if rc != 0:
+        listing = machine.execute("ls -la /run/halmasuit/ 2>&1")[1]
+        raise AssertionError(
+            f"/run/halmasuit/wayland-0 is not a socket. /run/halmasuit listing:\n{listing}"
+        )
 
     # Assertion 3: SIGTERM via systemctl stop produces Shutdown with
     # reason = signal_term, and the unit transitions to inactive (not failed).
