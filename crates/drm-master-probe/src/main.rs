@@ -34,8 +34,9 @@
 
 #![deny(unsafe_code)]
 
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::path::Path;
+use std::ffi::CString;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -102,6 +103,170 @@ fn set_argv0_marker() {
         let argv0_ptr: *mut std::os::raw::c_char = __progname_full;
         *argv0_ptr = b'@'.cast_signed();
     }
+}
+
+/// Phase 3: clear `FD_CLOEXEC` on the given fd so it survives `execve(2)`.
+/// By default, the `drm` crate opens `/dev/dri/card0` with `O_CLOEXEC`,
+/// which closes the fd at exec. We need the DRM master fd to outlive the
+/// exec, so we clear the close-on-exec flag explicitly before the call.
+#[expect(
+    unsafe_code,
+    reason = "fcntl(F_SETFD, 0) needs libc; no safe wrapper preserves all-flags-cleared semantics"
+)]
+fn clear_cloexec(fd: RawFd) -> Result<()> {
+    // SAFETY: fcntl(F_SETFD, 0) on a valid fd unconditionally clears the
+    // close-on-exec flag. No memory or aliasing concerns; the kernel
+    // mutates only its own fd-flags table.
+    let r = unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error()).context("fcntl(F_SETFD, 0) clear CLOEXEC");
+    }
+    Ok(())
+}
+
+/// Phase 3: re-exec into the rootfs-resident binary path while preserving
+/// the DRM master fd. Never returns on success (the process image is
+/// replaced); returns an error only if the execve itself failed.
+///
+/// The post-exec process picks up the inherited fd via `PROBE_DRM_FD` env
+/// var and reconstructs its Card from it.
+fn exec_to_rootfs_path(state: &ActiveModeset) -> Result<()> {
+    let fd = state.card.0.as_raw_fd();
+
+    // Crucial — clear CLOEXEC so the fd survives the exec.
+    clear_cloexec(fd).context("clear CLOEXEC on DRM master fd")?;
+
+    // Compute the rootfs path: own /proc/self/exe path, prefixed with
+    // /sysroot. NixOS guarantees the same /nix/store path is reachable
+    // at /sysroot/nix/store/... while sysroot is mounted pre-pivot.
+    // NixOS's initramfs view of the rootfs nix store: the read-only
+    // layer is mounted at /sysroot/nix/.ro-store, the writable layer at
+    // /sysroot/nix/.rw-store. The overlay /sysroot/nix/store is created
+    // by rootfs systemd POST-pivot; in initramfs the path we want is
+    // /sysroot/nix/.ro-store/<hash>/... rather than
+    // /sysroot/nix/store/<hash>/...
+    let own_exe = std::fs::read_link("/proc/self/exe").context("read /proc/self/exe")?;
+    let rel_to_store = own_exe
+        .strip_prefix("/nix/store")
+        .context("/proc/self/exe must be under /nix/store")?;
+    let rootfs_path: PathBuf = Path::new("/sysroot/nix/.ro-store").join(rel_to_store);
+
+    eprintln!(
+        "drm-master-probe: pre-exec target={} fd={fd}",
+        rootfs_path.display()
+    );
+
+    if !rootfs_path.exists() {
+        anyhow::bail!(
+            "rootfs exec target does not exist: {} (rootfs read-only store may not be mounted yet)",
+            rootfs_path.display()
+        );
+    }
+
+    // Build argv: just pass our own. Argv[0] is preserved (which means
+    // any @argv[0] mark from set_argv0_marker would be preserved — but
+    // Phase 3 always runs with SurviveFinalKillSignal=yes, not @argv[0]).
+    let argv: Vec<CString> = std::env::args()
+        .map(|s| CString::new(s).expect("argv contains no NUL"))
+        .collect();
+
+    // Build envp: pass through current env, but set PROBE_EXEC_PASS=post
+    // and PROBE_DRM_FD=<fd>. Remove PROBE_EXEC_AT_INIT so the post-exec
+    // process doesn't try to exec again (would recurse).
+    let mut envp: Vec<CString> = std::env::vars()
+        .filter(|(k, _)| k != "PROBE_EXEC_AT_INIT" && k != "PROBE_EXEC_PASS" && k != "PROBE_DRM_FD")
+        .map(|(k, v)| CString::new(format!("{k}={v}")).expect("env contains no NUL"))
+        .collect();
+    envp.push(CString::new("PROBE_EXEC_PASS=post").expect("literal contains no NUL"));
+    envp.push(
+        CString::new(format!("PROBE_DRM_FD={fd}")).expect("integer encoding contains no NUL"),
+    );
+
+    let path_cstr = CString::new(
+        rootfs_path
+            .to_str()
+            .context("rootfs path is utf-8")?
+            .as_bytes(),
+    )?;
+
+    // execve never returns on success — the process image is replaced.
+    nix::unistd::execve(&path_cstr, &argv, &envp).context("execve to rootfs path")?;
+    unreachable!("execve returned without error but the process image was supposed to be replaced");
+}
+
+/// Phase 3: reconstruct the `ActiveModeset` from an fd inherited across
+/// `execve(2)`. We open the existing fd (passed via `PROBE_DRM_FD`), wrap
+/// it as a Card, verify mastery by calling SET_MASTER (idempotent on an
+/// fd that already holds it), and re-derive the CRTC / framebuffer /
+/// connector handles by re-enumerating kernel state.
+#[expect(
+    unsafe_code,
+    reason = "File::from_raw_fd is necessarily unsafe — we trust PROBE_DRM_FD from our own pre-exec branch"
+)]
+fn reconstruct_drm_state_post_exec() -> Result<ActiveModeset> {
+    let fd_num: i32 = std::env::var("PROBE_DRM_FD")
+        .context("post-exec: PROBE_DRM_FD missing from env")?
+        .parse()
+        .context("post-exec: PROBE_DRM_FD must be integer")?;
+
+    // SAFETY: PROBE_DRM_FD was set by our own pre-exec branch immediately
+    // before execve, naming a fd that the kernel preserved across exec
+    // because we cleared FD_CLOEXEC. The fd refers to /dev/dri/card0 and
+    // is not aliased anywhere else (the pre-exec process is gone — its
+    // memory was replaced by ours).
+    let file = unsafe { std::fs::File::from_raw_fd(fd_num) };
+    let card = Card(file);
+    eprintln!("drm-master-probe: post-exec inherited_fd={fd_num}");
+
+    // Verify mastery survived the exec. SET_MASTER on an fd that already
+    // holds master is a no-op success; on an fd that does NOT hold master
+    // it returns EACCES (master held elsewhere) or succeeds (we acquire
+    // master). In our scenario only the first case is correct — the
+    // pre-exec process had master on this fd, and the kernel preserved
+    // it across the process-image swap.
+    card.acquire_master_lock()
+        .context("post-exec: SET_MASTER (mastery should be inherited from pre-exec)")?;
+    eprintln!("drm-master-probe: post-exec SET_MASTER ok — mastery survived exec");
+
+    // Re-enumerate to rebuild the State struct. Handles are kernel-side
+    // IDs; they survive any process-level operation that doesn't release
+    // them, so the kernel's record of "this CRTC has this FB attached at
+    // this mode" is intact.
+    let res = card
+        .resource_handles()
+        .context("post-exec: resource_handles")?;
+    let Some(con) = res
+        .connectors()
+        .iter()
+        .filter_map(|&h| card.get_connector(h, true).ok())
+        .find(|info| info.state() == connector::State::Connected)
+    else {
+        anyhow::bail!("post-exec: no connected connector");
+    };
+    let Some(&mode) = con.modes().first() else {
+        anyhow::bail!("post-exec: connector has no modes");
+    };
+    let &crtc_handle = res.crtcs().first().context("post-exec: no CRTCs")?;
+
+    // GETCRTC returns the FB currently bound to this CRTC. That's the
+    // dumb-buffer-as-framebuffer we created pre-exec, and it should still
+    // be on the primary plane post-exec.
+    let crtc_info = card.get_crtc(crtc_handle).context("post-exec: get_crtc")?;
+    let fb_handle = crtc_info
+        .framebuffer()
+        .context("post-exec: CRTC has no framebuffer bound — scanout was lost")?;
+    let connector_handle = con.handle();
+    eprintln!(
+        "drm-master-probe: post-exec rediscovered crtc={crtc_handle:?} fb={fb_handle:?} conn={connector_handle:?}"
+    );
+
+    Ok(ActiveModeset {
+        card,
+        crtc_handle,
+        fb_handle,
+        connector_handle,
+        mode,
+    })
 }
 
 /// Phase 1 diagnostic: fd to /run/drm-master-probe-events.log, written
@@ -348,24 +513,52 @@ fn run_rootfs_direct_phase() -> Result<()> {
     reason = "the probe is intended to hold DRM master forever and only exit via SIGTERM"
 )]
 fn run_initramfs_phase() -> Result<()> {
+    // Mode selection. Signals reset to default across execve(2), so
+    // setup_phase1_diagnostics must run in both pre-exec and post-exec
+    // branches.
+    let post_exec = std::env::var("PROBE_EXEC_PASS").as_deref() == Ok("post");
+    let exec_at_init = std::env::var("PROBE_EXEC_AT_INIT").is_ok();
     // Phase 2 opt-out: if PROBE_SKIP_ARGV0_MARK is set, skip the
     // __progname_full write and rely on the unit's
     // SurviveFinalKillSignal=yes directive to keep the process alive
     // across systemd-shutdown's killall during switch_root.
     let skip_argv0 = std::env::var("PROBE_SKIP_ARGV0_MARK").is_ok();
-    let mechanism = if skip_argv0 {
-        "survivefinalkillsignal"
-    } else {
-        set_argv0_marker();
-        "argv0"
+
+    // argv[0] mutation: only meaningful pre-exec. After execve, argv has
+    // been replaced by the kernel from the call site; the @ mark from
+    // before exec is irrelevant on the new image. Phase 3 always pairs
+    // exec with SurviveFinalKillSignal=yes for survival, so skipping
+    // the mark in both pre-exec and post-exec is correct.
+    let mechanism = match (post_exec, exec_at_init, skip_argv0) {
+        (true, _, _) => "exec-post",
+        (false, true, _) => "exec-pre",
+        (false, false, true) => "survivefinalkillsignal",
+        (false, false, false) => {
+            set_argv0_marker();
+            "argv0"
+        }
     };
+
     setup_phase1_diagnostics()?;
     let pid = std::process::id();
     eprintln!("drm-master-probe: phase=initramfs pid={pid} mechanism={mechanism}");
     log_cgroup("phase=initramfs start");
     log_cmdline("phase=initramfs start");
 
-    let state = setup_drm_and_paint()?;
+    let state = if post_exec {
+        reconstruct_drm_state_post_exec()?
+    } else {
+        setup_drm_and_paint()?
+    };
+
+    // Phase 3 pre-exec: immediately after taking master + painting,
+    // re-exec to the rootfs binary path with the DRM fd inherited.
+    // exec_to_rootfs_path never returns on success.
+    if exec_at_init {
+        eprintln!("drm-master-probe: phase=pre-exec triggering execve");
+        exec_to_rootfs_path(&state)?;
+        unreachable!("execve must not return on success");
+    }
 
     let start = Instant::now();
     let initrd_release = Path::new("/etc/initrd-release");

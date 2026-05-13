@@ -78,6 +78,15 @@ test-drm-probe-phase1:
 test-drm-probe-phase2:
     nix build .#checks.x86_64-linux.drm-master-probe-phase2 -L --print-build-logs --no-link
 
+# Phase 3 research probe: test whether halmasuit-in-initramfs can execve
+# into the rootfs-resident binary path across switch_root while preserving
+# its DRM master fd. Composes with Phase 2 (SurviveFinalKillSignal=yes for
+# survival). Phase 3 passing means exec is a viable mechanism for v2's
+# clean sd_notify handoff to rootfs systemd; failing means we stay with
+# the orphan-unit-with-SIGTERM-ignore-handler pattern.
+test-drm-probe-phase3:
+    nix build .#checks.x86_64-linux.drm-master-probe-phase3 -L --print-build-logs --no-link
+
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.
 # Useful for `machine.screenshot("name")`, `machine.send_chars(...)`, and

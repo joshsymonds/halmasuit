@@ -212,6 +212,10 @@
           system = "x86_64-linux";
           inherit nixpkgs;
         };
+        drm-master-probe-phase3 = import ./tests/drm-master-probe-phase3.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+        };
       };
     };
 }
