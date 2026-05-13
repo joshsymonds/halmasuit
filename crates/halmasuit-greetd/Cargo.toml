@@ -16,10 +16,9 @@ workspace = true
 # permissive-licensed; serde drives the JSON shape that matches the
 # upstream greetd protocol spec.
 serde.workspace      = true
+# Codec runtime: encode/decode messages on the greetd socket.
+serde_json.workspace = true
 thiserror.workspace  = true
 
 [dev-dependencies]
 proptest.workspace   = true
-# Round-trip the wire format against canonical JSON in tests, pinning
-# the shape to the protocol spec.
-serde_json.workspace = true

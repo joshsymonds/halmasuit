@@ -355,6 +355,101 @@ fn translate_pam_step(state: &mut SessionState, step: PamStep, username: String)
     }
 }
 
+// ── Wire codec ──────────────────────────────────────────────────────────
+//
+// greetd's wire format (per the spec at man.sr.ht):
+//
+//     [4-byte native-endian unsigned length][JSON body of that length]
+//
+// "Native endian" is the spec's choice; on Linux x86_64 / aarch64
+// that's little-endian in practice. Cross-architecture connections
+// aren't expected (greeter and daemon both run on the same host).
+//
+// These functions are pure — no I/O. The socket loop layer (next
+// task) reads bytes from a Unix socket, buffers them, and calls
+// `try_decode` in a loop until it returns `None` (not enough bytes
+// yet). On the write side it calls `encode` and hands the bytes to
+// the socket.
+
+/// Maximum permitted message body size (1 MiB). Rejected before we
+/// allocate a body buffer — defends against a malicious peer pushing
+/// a 4 GiB length prefix.
+pub const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
+
+const LENGTH_PREFIX_SIZE: usize = std::mem::size_of::<u32>();
+
+/// Errors from the wire codec. Framing or JSON, never I/O.
+#[derive(Debug, Error)]
+pub enum CodecError {
+    /// The length prefix exceeded [`MAX_MESSAGE_SIZE`]. Rejected
+    /// before any allocation.
+    #[error("message length {0} exceeds MAX_MESSAGE_SIZE ({1})")]
+    OversizedMessage(u32, u32),
+
+    /// The body wasn't valid JSON, didn't deserialize to the expected
+    /// type, or the encode side couldn't serialize the message.
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+/// Encode a `Request` or `Response` to wire bytes. The result is a
+/// `Vec<u8>` of `[length_prefix:4][json_body:N]`.
+///
+/// # Errors
+///
+/// [`CodecError::Json`] if `serde_json::to_vec` fails (shouldn't
+/// happen for our types; included for completeness).
+pub fn encode<M: serde::Serialize>(msg: &M) -> Result<Vec<u8>, CodecError> {
+    let body = serde_json::to_vec(msg)?;
+    let len = u32::try_from(body.len()).map_err(|_| {
+        // Vec<u8> longer than u32::MAX is implausible but guard
+        // anyway so we never silently truncate the prefix.
+        CodecError::OversizedMessage(u32::MAX, MAX_MESSAGE_SIZE)
+    })?;
+    if len > MAX_MESSAGE_SIZE {
+        return Err(CodecError::OversizedMessage(len, MAX_MESSAGE_SIZE));
+    }
+    let mut out = Vec::with_capacity(LENGTH_PREFIX_SIZE + body.len());
+    out.extend_from_slice(&len.to_ne_bytes());
+    out.extend(body);
+    Ok(out)
+}
+
+/// Attempt to decode one message from the front of `buf`.
+///
+/// Returns:
+/// - `Ok(Some((msg, consumed)))` — successfully parsed; the caller
+///   should advance its read buffer by `consumed` bytes.
+/// - `Ok(None)` — `buf` doesn't yet contain a complete message; the
+///   caller should read more bytes and retry.
+/// - `Err(_)` — framing error (oversized prefix) or JSON error. The
+///   connection should generally be closed at this point.
+///
+/// # Errors
+///
+/// See [`CodecError`].
+pub fn try_decode<T: serde::de::DeserializeOwned>(
+    buf: &[u8],
+) -> Result<Option<(T, usize)>, CodecError> {
+    if buf.len() < LENGTH_PREFIX_SIZE {
+        return Ok(None);
+    }
+    let mut len_bytes = [0u8; LENGTH_PREFIX_SIZE];
+    len_bytes.copy_from_slice(&buf[..LENGTH_PREFIX_SIZE]);
+    let len = u32::from_ne_bytes(len_bytes);
+    if len > MAX_MESSAGE_SIZE {
+        return Err(CodecError::OversizedMessage(len, MAX_MESSAGE_SIZE));
+    }
+    let len = len as usize;
+    let needed = LENGTH_PREFIX_SIZE + len;
+    if buf.len() < needed {
+        return Ok(None);
+    }
+    let body = &buf[LENGTH_PREFIX_SIZE..needed];
+    let msg: T = serde_json::from_slice(body)?;
+    Ok(Some((msg, needed)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,6 +850,123 @@ mod tests {
         }
     }
 
+    // ── codec ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn codec_roundtrip_each_request_variant() {
+        for req in [
+            Request::CreateSession {
+                username: "alice".into(),
+            },
+            Request::PostAuthMessageResponse {
+                response: Some("hunter2".into()),
+            },
+            Request::PostAuthMessageResponse { response: None },
+            Request::StartSession {
+                cmd: vec!["niri".into()],
+                env: vec!["XDG_SESSION_TYPE=wayland".into()],
+            },
+            Request::CancelSession,
+        ] {
+            let bytes = encode(&req).expect("encode");
+            let (decoded, consumed): (Request, usize) =
+                try_decode(&bytes).expect("decode").expect("complete");
+            assert_eq!(decoded, req);
+            assert_eq!(consumed, bytes.len());
+        }
+    }
+
+    #[test]
+    fn codec_roundtrip_each_response_variant() {
+        for resp in [
+            Response::Success,
+            Response::Error {
+                error_type: ErrorType::AuthError,
+                description: "bad password".into(),
+            },
+            Response::AuthMessage {
+                auth_message_type: AuthMessageType::Secret,
+                auth_message: "password:".into(),
+            },
+        ] {
+            let bytes = encode(&resp).expect("encode");
+            let (decoded, consumed): (Response, usize) =
+                try_decode(&bytes).expect("decode").expect("complete");
+            assert_eq!(decoded, resp);
+            assert_eq!(consumed, bytes.len());
+        }
+    }
+
+    #[test]
+    fn codec_decode_returns_none_for_short_prefix() {
+        let r: Result<Option<(Request, usize)>, CodecError> = try_decode(&[0u8, 0, 0]);
+        assert!(matches!(r, Ok(None)));
+    }
+
+    #[test]
+    fn codec_decode_returns_none_for_partial_body() {
+        let bytes = encode(&Request::CreateSession {
+            username: "alice".into(),
+        })
+        .unwrap();
+        // Truncate one byte off the body so length prefix says N but only N-1 bytes follow.
+        let truncated = &bytes[..bytes.len() - 1];
+        let r: Result<Option<(Request, usize)>, CodecError> = try_decode(truncated);
+        assert!(matches!(r, Ok(None)), "got: {r:?}");
+    }
+
+    #[test]
+    fn codec_decode_consumes_one_message_at_a_time() {
+        let a = encode(&Request::CreateSession {
+            username: "alice".into(),
+        })
+        .unwrap();
+        let b = encode(&Request::CancelSession).unwrap();
+        let mut combined = Vec::new();
+        combined.extend(&a);
+        combined.extend(&b);
+
+        let (first, consumed): (Request, usize) = try_decode(&combined).unwrap().unwrap();
+        assert_eq!(
+            first,
+            Request::CreateSession {
+                username: "alice".into()
+            }
+        );
+        assert_eq!(consumed, a.len());
+
+        let (second, consumed2): (Request, usize) =
+            try_decode(&combined[consumed..]).unwrap().unwrap();
+        assert_eq!(second, Request::CancelSession);
+        assert_eq!(consumed2, b.len());
+    }
+
+    #[test]
+    fn codec_decode_rejects_oversized_prefix() {
+        let oversized: u32 = MAX_MESSAGE_SIZE + 1;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&oversized.to_ne_bytes());
+        let r: Result<Option<(Request, usize)>, CodecError> = try_decode(&buf);
+        match r {
+            Err(CodecError::OversizedMessage(got, max)) => {
+                assert_eq!(got, oversized);
+                assert_eq!(max, MAX_MESSAGE_SIZE);
+            }
+            other => panic!("expected OversizedMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codec_decode_rejects_invalid_json() {
+        // 5 bytes of body: `xxxxx` — not JSON.
+        let len: u32 = 5;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&len.to_ne_bytes());
+        buf.extend_from_slice(b"xxxxx");
+        let r: Result<Option<(Request, usize)>, CodecError> = try_decode(&buf);
+        assert!(matches!(r, Err(CodecError::Json(_))), "got: {r:?}");
+    }
+
     // ── property tests ──────────────────────────────────────────────────
 
     fn arb_request() -> impl Strategy<Value = Request> {
@@ -852,6 +1064,17 @@ mod tests {
             let json = serde_json::to_string(&req).unwrap();
             let parsed: Request = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(parsed, req);
+        }
+
+        /// Codec round-trip: encode → try_decode is identity, and the
+        /// consumed-byte count matches the encoded length exactly.
+        #[test]
+        fn codec_request_roundtrip(req in arb_request()) {
+            let bytes = encode(&req).unwrap();
+            let (decoded, consumed): (Request, usize) =
+                try_decode(&bytes).unwrap().unwrap();
+            prop_assert_eq!(decoded, req);
+            prop_assert_eq!(consumed, bytes.len());
         }
     }
 }
