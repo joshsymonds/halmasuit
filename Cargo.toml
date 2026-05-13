@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/halmasuit",
     "crates/halmasuit-protocols",
+    "crates/halmasuit-introspect",
     "crates/halmasuit-greetd",
     "crates/halmasuit-ipc",
     "crates/halmasuit-cli",
@@ -22,7 +23,10 @@ repository    = "https://github.com/joshsymonds/halmasuit"
 authors       = ["Josh Symonds <veraticus@gmail.com>"]
 
 [workspace.dependencies]
-# Populated as crates land. v1 is scaffolding.
+# Shared across crates that emit or consume introspection events.
+tracing    = "0.1"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
