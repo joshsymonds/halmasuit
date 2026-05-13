@@ -2,12 +2,18 @@
 name        = "drm-master-probe"
 description = "Research probe: validate userspace DRM master persistence from rootfs boot to multi-user.target. Phase 0 of halmasuit v2 de-risking. Not production code; halmasuit-kms is the v2 home for DRM ownership."
 
-version.workspace      = true
-edition.workspace      = true
-rust-version.workspace = true
-license.workspace      = true
-repository.workspace   = true
-authors.workspace      = true
+version.workspace = true
+edition.workspace = true
+# rust-version intentionally NOT inherited from the workspace (1.95). The
+# probe is research scaffolding built via nixpkgs's pinned rustc, which is
+# currently 1.94.1 on nixpkgs-unstable. The binary uses no >1.81 features
+# (the highest is `#[expect]`); the looser MSRV is a probe-specific
+# relaxation, not a workspace-wide concession. Production crates
+# (halmasuit-*) keep the 1.95 minimum.
+rust-version       = "1.85"
+license.workspace  = true
+repository.workspace = true
+authors.workspace  = true
 
 [lints]
 workspace = true

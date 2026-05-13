@@ -72,6 +72,24 @@
             mkdir -p $out
             echo "halmasuit v1: test infrastructure only" > $out/README
           '';
+
+          # Phase 0 research probe: validates userspace DRM master
+          # persistence from rootfs boot through multi-user.target.
+          # Built as a Nix package so the NixOS VM test can install it.
+          # Not production code — halmasuit-kms is the v2 home for DRM
+          # ownership.
+          drm-master-probe = pkgs.rustPlatform.buildRustPackage {
+            pname   = "drm-master-probe";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags    = [ "-p" "drm-master-probe" ];
+            doCheck = false; # NixOS VM test is the actual test
+            meta = {
+              description = "Phase 0 research probe — DRM master persistence (halmasuit v2 de-risking)";
+              license     = pkgs.lib.licenses.asl20;
+            };
+          };
         });
 
       # NixOS VM tests run on Linux only. Limited to x86_64-linux because
@@ -88,6 +106,10 @@
         login-flash = import ./tests/login-flash.nix {
           system = "x86_64-linux";
           inherit nixpkgs nix-config;
+        };
+        drm-master-probe = import ./tests/drm-master-probe.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
         };
       };
     };

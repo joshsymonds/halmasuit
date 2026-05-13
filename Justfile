@@ -48,6 +48,12 @@ test-vm:
         echo "OK: login-flash FAILED as expected — v1 baseline holds (greetd→niri restart is the flash)."
     fi
 
+# Phase 0 research probe: validate userspace DRM master persistence from
+# rootfs boot through multi-user.target. Headless gate; for visual
+# verification of the painted red frame, use `just test-vm-drive drm-master-probe`.
+test-drm-probe:
+    nix build .#checks.x86_64-linux.drm-master-probe -L --print-build-logs --no-link
+
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.
 # Useful for `machine.screenshot("name")`, `machine.send_chars(...)`, and
