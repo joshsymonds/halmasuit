@@ -24,9 +24,15 @@ authors       = ["Josh Symonds <veraticus@gmail.com>"]
 
 [workspace.dependencies]
 # Shared across crates that emit or consume introspection events.
-tracing    = "0.1"
-serde      = { version = "1", features = ["derive"] }
-serde_json = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "fmt", "env-filter"] }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+# Smithay's event loop. halmasuit's spine reuses this from main() onward.
+calloop            = { version = "0.14", features = ["signals"] }
+# POSIX bindings. drm-master-probe has its own entry (different feature set);
+# this entry is for v2 production crates that need signal/kill/etc.
+nix                = "0.30"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

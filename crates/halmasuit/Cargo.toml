@@ -12,3 +12,10 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
+halmasuit-introspect = { path = "../halmasuit-introspect", version = "0.1" }
+tracing-subscriber.workspace = true
+calloop.workspace            = true
+
+[dev-dependencies]
+nix        = { workspace = true, features = ["signal"] }
+serde_json.workspace = true
