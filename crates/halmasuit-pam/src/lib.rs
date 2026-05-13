@@ -26,9 +26,9 @@
 
 use libc::{c_int, c_void};
 use pam_sys::{
-    PAM_BUF_ERR, PAM_CONV_ERR, PAM_ERROR_MSG, PAM_PROMPT_ECHO_OFF, PAM_PROMPT_ECHO_ON, PAM_SUCCESS,
-    PAM_TEXT_INFO, pam_conv, pam_end, pam_handle_t, pam_message, pam_response, pam_set_item,
-    pam_start,
+    PAM_BUF_ERR, PAM_CONV_ERR, PAM_ERROR_MSG, PAM_PROMPT_ECHO_OFF, PAM_PROMPT_ECHO_ON, PAM_RUSER,
+    PAM_SUCCESS, PAM_TEXT_INFO, PAM_TTY, PAM_USER, pam_acct_mgmt, pam_authenticate, pam_conv,
+    pam_end, pam_get_item, pam_handle_t, pam_message, pam_response, pam_set_item, pam_start,
 };
 use std::ffi::{CStr, CString, NulError};
 use std::panic;
@@ -118,26 +118,34 @@ pub fn conv_pair() -> (ConvBridge, ConvDriver) {
     )
 }
 
-/// Pure-Rust core of the conv: send each prompt over the bridge, then
-/// collect N responses (in order). Empty string fallback if the
-/// driver side has hung up — the conv callback turns that into an
-/// empty `pam_response`, which PAM treats as "user provided no
-/// answer."
+/// Pure-Rust core of the conv: for each prompt, send it on the
+/// challenge channel and immediately wait for its response. The
+/// interleaved send/recv (vs. batch-send-then-batch-recv) is
+/// load-bearing: the future PamSession driver returns one challenge
+/// at a time and only sends a response after the state machine
+/// processes it. A batched bridge would deadlock the moment
+/// `num_msg > 1` because PAM would block sending prompt 2 while the
+/// driver tried to send response 1.
+///
+/// Empty-string fallback if the driver side has hung up — PAM treats
+/// an empty `pam_response` as "user provided no answer."
 fn process_prompts(prompts: Vec<PromptChallenge>, bridge: &ConvBridge) -> Vec<Zeroizing<String>> {
     let n = prompts.len();
+    let mut responses = Vec::with_capacity(n);
     for p in prompts {
         if bridge.challenge_tx.send(p).is_err() {
-            return (0..n).map(|_| Zeroizing::new(String::new())).collect();
+            while responses.len() < n {
+                responses.push(Zeroizing::new(String::new()));
+            }
+            return responses;
         }
+        let r = bridge
+            .response_rx
+            .recv()
+            .unwrap_or_else(|_| Zeroizing::new(String::new()));
+        responses.push(r);
     }
-    (0..n)
-        .map(|_| {
-            bridge
-                .response_rx
-                .recv()
-                .unwrap_or_else(|_| Zeroizing::new(String::new()))
-        })
-        .collect()
+    responses
 }
 
 // ── Error type ──────────────────────────────────────────────────────────
@@ -151,6 +159,17 @@ pub enum PamError {
     /// `pam_set_item` returned a non-success status.
     #[error("pam_set_item failed: status {0}")]
     SetItem(c_int),
+    /// `pam_authenticate` returned a non-success status. `PAM_AUTH_ERR`
+    /// is the common case (bad password / denied).
+    #[error("pam_authenticate failed: status {0}")]
+    Authenticate(c_int),
+    /// `pam_acct_mgmt` returned a non-success status.
+    #[error("pam_acct_mgmt failed: status {0}")]
+    AcctMgmt(c_int),
+    /// `pam_get_item(PAM_USER)` returned a non-success status or
+    /// produced a non-UTF-8 value.
+    #[error("pam_get_item(PAM_USER) failed: status {0}")]
+    GetUser(c_int),
     /// An argument contained an interior NUL byte and can't be passed
     /// to libpam as a C string.
     #[error("argument contained NUL byte")]
@@ -162,7 +181,11 @@ impl PamError {
     #[must_use]
     pub const fn status(&self) -> Option<c_int> {
         match self {
-            Self::Start(s) | Self::SetItem(s) => Some(*s),
+            Self::Start(s)
+            | Self::SetItem(s)
+            | Self::Authenticate(s)
+            | Self::AcctMgmt(s)
+            | Self::GetUser(s) => Some(*s),
             Self::Nul(_) => None,
         }
     }
@@ -407,6 +430,105 @@ impl Pam {
             Err(PamError::SetItem(status))
         }
     }
+
+    /// Set `PAM_TTY`. PAM modules use this to scope rate limits and
+    /// audit-log entries.
+    ///
+    /// # Errors
+    /// As for [`Self::set_item_str`].
+    pub fn set_tty(&mut self, value: &str) -> Result<(), PamError> {
+        self.set_item_str(PAM_TTY, value)
+    }
+
+    /// Set `PAM_RUSER`. The "requesting user" — for a system compositor,
+    /// typically the `compositor` or `greeter` system user, NOT the
+    /// user being authenticated.
+    ///
+    /// # Errors
+    /// As for [`Self::set_item_str`].
+    pub fn set_ruser(&mut self, value: &str) -> Result<(), PamError> {
+        self.set_item_str(PAM_RUSER, value)
+    }
+
+    /// Run the PAM authentication stack. Blocks until PAM either
+    /// succeeds, fails, or runs the conv callback to exhaustion. The
+    /// resulting status is stored so `pam_end` on drop sees the right
+    /// value.
+    ///
+    /// # Errors
+    /// [`PamError::Authenticate`] on any non-success status. `PAM_AUTH_ERR`
+    /// (bad credentials) is the common case.
+    pub fn authenticate(&mut self) -> Result<(), PamError> {
+        #[expect(
+            unsafe_code,
+            reason = "FFI: pam_authenticate blocks on this thread and \
+                      drives our bridge_conv callback. Handle is owned \
+                      by self; flags=0 is the standard invocation."
+        )]
+        let status = unsafe { pam_authenticate(self.handle, 0) };
+        self.last_status = status;
+        if status == PAM_SUCCESS as c_int {
+            Ok(())
+        } else {
+            Err(PamError::Authenticate(status))
+        }
+    }
+
+    /// Run the PAM account-management stack. Catches "account expired",
+    /// "must change password", "account disabled" — conditions PAM
+    /// considers separately from authentication.
+    ///
+    /// # Errors
+    /// [`PamError::AcctMgmt`] on any non-success status. `PAM_NEW_AUTHTOK_REQD`
+    /// is the "must change password" case; the caller decides whether to
+    /// surface that distinctly.
+    pub fn acct_mgmt(&mut self) -> Result<(), PamError> {
+        #[expect(
+            unsafe_code,
+            reason = "FFI: pam_acct_mgmt. Handle owned by self; flags=0."
+        )]
+        let status = unsafe { pam_acct_mgmt(self.handle, 0) };
+        self.last_status = status;
+        if status == PAM_SUCCESS as c_int {
+            Ok(())
+        } else {
+            Err(PamError::AcctMgmt(status))
+        }
+    }
+
+    /// Read back `PAM_USER`. The username PAM has settled on — may
+    /// differ from the username passed to [`Self::start`] if a module
+    /// rewrote it (e.g. via `pam_username`).
+    ///
+    /// # Errors
+    /// [`PamError::GetUser`] if pam_get_item returns non-success, the
+    /// item pointer is null, or the value isn't valid UTF-8.
+    pub fn get_user(&mut self) -> Result<String, PamError> {
+        let mut raw: *const c_void = ptr::null();
+        #[expect(
+            unsafe_code,
+            reason = "FFI: pam_get_item. Handle owned by self; raw is a \
+                      valid out-pointer; the returned pointer (if any) \
+                      is libpam-owned and valid until pam_end."
+        )]
+        let status = unsafe { pam_get_item(self.handle, PAM_USER, &raw mut raw) };
+        if status != PAM_SUCCESS as c_int {
+            return Err(PamError::GetUser(status));
+        }
+        if raw.is_null() {
+            return Err(PamError::GetUser(PAM_CONV_ERR as c_int));
+        }
+        // SAFETY: PAM_USER's item, when present, is a NUL-terminated
+        // C string owned by libpam.
+        #[expect(
+            unsafe_code,
+            reason = "libpam-owned NUL-terminated C string for PAM_USER."
+        )]
+        let cstr = unsafe { CStr::from_ptr(raw.cast::<libc::c_char>()) };
+        cstr.to_str()
+            .map(str::to_owned)
+            .map_err(|_| PamError::GetUser(PAM_CONV_ERR as c_int))
+    }
 }
 
 impl Drop for Pam {
@@ -427,7 +549,6 @@ impl Drop for Pam {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pam_sys::PAM_RUSER;
     use std::thread;
 
     // ── handle lifecycle (carried over from the previous task) ──────────
@@ -443,8 +564,7 @@ mod tests {
     fn set_ruser_succeeds() {
         let (bridge, _driver) = conv_pair();
         let mut pam = Pam::start("other", "nobody", bridge).unwrap();
-        pam.set_item_str(PAM_RUSER as c_int, "alice")
-            .expect("set PAM_RUSER");
+        pam.set_item_str(PAM_RUSER, "alice").expect("set PAM_RUSER");
     }
 
     #[test]
@@ -465,8 +585,37 @@ mod tests {
     fn nul_byte_in_set_item_value_is_rejected() {
         let (bridge, _driver) = conv_pair();
         let mut pam = Pam::start("other", "nobody", bridge).unwrap();
-        let r = pam.set_item_str(PAM_RUSER as c_int, "ali\0ce");
+        let r = pam.set_item_str(PAM_RUSER, "ali\0ce");
         assert!(matches!(r, Err(PamError::Nul(_))));
+    }
+
+    // ── authenticate / acct_mgmt / get_user ─────────────────────────────
+
+    #[test]
+    fn authenticate_against_other_service_fails() {
+        // /etc/pam.d/other uses pam_deny.so on every conformant Linux
+        // PAM stack — pam_authenticate returns PAM_AUTH_ERR (or similar
+        // non-success) immediately without invoking conv.
+        let (bridge, _driver) = conv_pair();
+        let mut pam = Pam::start("other", "nobody", bridge).unwrap();
+        let r = pam.authenticate();
+        assert!(matches!(r, Err(PamError::Authenticate(_))), "got: {r:?}");
+    }
+
+    #[test]
+    fn get_user_round_trips_start_username() {
+        let (bridge, _driver) = conv_pair();
+        let mut pam = Pam::start("other", "alice", bridge).unwrap();
+        let user = pam.get_user().expect("get_user");
+        assert_eq!(user, "alice");
+    }
+
+    #[test]
+    fn set_tty_and_set_ruser_succeed() {
+        let (bridge, _driver) = conv_pair();
+        let mut pam = Pam::start("other", "alice", bridge).unwrap();
+        pam.set_tty("/dev/tty1").expect("set_tty");
+        pam.set_ruser("compositor").expect("set_ruser");
     }
 
     // ── process_prompts (the safe core) ─────────────────────────────────
@@ -475,14 +624,15 @@ mod tests {
     fn process_prompts_forwards_in_order() {
         let (bridge, driver) = conv_pair();
         let responder = thread::spawn(move || {
+            // Interleaved: recv, send, recv, send. Matches the
+            // interleaved process_prompts implementation.
             let mut got: Vec<PromptChallenge> = Vec::new();
-            for _ in 0..2 {
-                got.push(driver.challenge_rx.recv().unwrap());
-            }
+            got.push(driver.challenge_rx.recv().unwrap());
             driver
                 .response_tx
                 .send(Zeroizing::new("alice".into()))
                 .unwrap();
+            got.push(driver.challenge_rx.recv().unwrap());
             driver
                 .response_tx
                 .send(Zeroizing::new("hunter2".into()))
@@ -640,6 +790,10 @@ mod tests {
 
     #[test]
     fn bridge_conv_round_trips_multiple_prompts() {
+        // Interleaved recv/send — mirrors how the PamSession driver
+        // will consume one challenge at a time. A batched responder
+        // (recv all, then send all) would deadlock against the
+        // interleaved process_prompts.
         let got = call_bridge_conv(
             &[
                 (PAM_PROMPT_ECHO_ON, "login:"),
@@ -647,11 +801,11 @@ mod tests {
             ],
             |driver| {
                 let _ = driver.challenge_rx.recv().unwrap();
-                let _ = driver.challenge_rx.recv().unwrap();
                 driver
                     .response_tx
                     .send(Zeroizing::new("alice".into()))
                     .unwrap();
+                let _ = driver.challenge_rx.recv().unwrap();
                 driver
                     .response_tx
                     .send(Zeroizing::new("hunter2".into()))
