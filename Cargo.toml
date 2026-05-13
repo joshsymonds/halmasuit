@@ -8,6 +8,7 @@ members = [
     "crates/halmasuit-cli",
     "crates/halmasuit-spawn",
     "crates/halmasuit-test",
+    "crates/drm-master-probe",
     "xtask",
 ]
 

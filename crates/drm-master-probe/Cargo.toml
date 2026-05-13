@@ -1,0 +1,17 @@
+[package]
+name        = "drm-master-probe"
+description = "Research probe: validate userspace DRM master persistence from rootfs boot to multi-user.target. Phase 0 of halmasuit v2 de-risking. Not production code; halmasuit-kms is the v2 home for DRM ownership."
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+drm    = "0.15"
