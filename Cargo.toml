@@ -5,6 +5,7 @@ members = [
     "crates/halmasuit-protocols",
     "crates/halmasuit-introspect",
     "crates/halmasuit-greetd",
+    "crates/halmasuit-pam",
     "crates/halmasuit-ipc",
     "crates/halmasuit-cli",
     "crates/halmasuit-spawn",
@@ -34,6 +35,12 @@ authors       = ["Josh Symonds <veraticus@gmail.com>"]
 # `thiserror` for error enums that benefit from Display derives. Used
 # by halmasuit-greetd's StateMachineError.
 thiserror          = "2"
+# PAM FFI for halmasuit-pam. Direct thin FFI (no wrapper crate) per
+# ARCHITECTURE.md "Open decisions" row 1 — wrappers flatten PAM's
+# message-style enum that our AuthMessageType already mirrors.
+pam-sys            = "1.0.0-alpha5"
+# C types and constants for the halmasuit-pam FFI surface.
+libc               = "0.2"
 # Shared across crates that emit or consume introspection events.
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "fmt", "env-filter"] }

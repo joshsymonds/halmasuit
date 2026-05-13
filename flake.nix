@@ -90,15 +90,29 @@
             # `wayland_frontend` minimum pulls in libxkbcommon for keymap
             # handling; later features (`backend_libinput`, `backend_drm`,
             # `renderer_gl`) will add libinput, libgbm, libegl, libdrm.
+            # libpam is for halmasuit-pam's FFI (pam-sys links against
+            # libpam.so.0 via `links = "pam"` in its Cargo.toml).
             buildInputs = with pkgs; [
               libxkbcommon
               wayland
+              pam
             ];
+
+            # bindgen (used transitively by pam-sys at build time) needs
+            # libclang.so available; LIBCLANG_PATH points it at the right
+            # one. Without this, `cargo build` panics inside clang-sys's
+            # build script when it can't find libclang.
+            nativeBuildInputs = [ pkgs.llvmPackages.libclang ];
 
             shellHook = ''
               export CARGO_HOME="$PWD/.cargo-home"
               export RUSTUP_HOME="$PWD/.rustup-home"
               export PATH="$CARGO_HOME/bin:$PATH"
+              export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+              # bindgen invokes clang directly, bypassing NIX_CFLAGS_COMPILE.
+              # Point it at PAM + glibc headers so pam-sys's build.rs
+              # finds <security/pam_appl.h> and its transitive <unistd.h>.
+              export BINDGEN_EXTRA_CLANG_ARGS="-I${pkgs.pam}/include -I${pkgs.glibc.dev}/include"
               mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
             '';
           };

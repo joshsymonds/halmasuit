@@ -1,0 +1,23 @@
+[package]
+name        = "halmasuit-pam"
+description = "PAM FFI for halmasuit. All libpam unsafe is quarantined here so halmasuit-greetd can stay #![forbid(unsafe_code)]."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Direct FFI to libpam.so.0 — no wrapper crate. Picked over `pam` /
+# `pam-client` per ARCHITECTURE.md "Open decisions" row 1: the
+# wrappers flatten PAM's message-style enum into named conversation
+# methods, losing the variant our AuthMessageType mirrors, and
+# `pam-client` is MPL-2.0 which conflicts with the workspace's
+# permissive posture.
+pam-sys.workspace   = true
+libc.workspace      = true
+thiserror.workspace = true
