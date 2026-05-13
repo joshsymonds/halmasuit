@@ -33,22 +33,25 @@
 // 1. Validate argv shape (parse_argv).
 // 2. Confirm current EUID == 0 (geteuid).
 // 3. Enforce UID floor (enforce_uid_floor; >= 1000).
-// 4. Sanitize envp via allowlist (sanitize_env).
-// 5. setresgid(target_gid, target_gid, target_gid).
-// 6. initgroups(target_user, target_gid).
-// 7. setresuid(target_uid, target_uid, target_uid).
-// 8. prctl(PR_SET_NO_NEW_PRIVS).
-// 9. execve(command[0], command, sanitized_envp) — never returns on success.
+// 4. Cross-check argv user vs /etc/passwd (validate_pwent). Refuses any
+//    username whose pwent uid/gid does not match the argv uid/gid —
+//    closes the supplementary-group escalation vector.
+// 5. Sanitize envp via allowlist (sanitize_env).
+// 6. setresgid(target_gid, target_gid, target_gid).
+// 7. initgroups(target_user, target_gid).
+// 8. setresuid(target_uid, target_uid, target_uid).
+// 9. prctl(PR_SET_NO_NEW_PRIVS).
+// 10. execve(command[0], command, sanitized_envp) — never returns on success.
 //
 // No allocations and no user-controlled-state syscalls between privilege
-// drop and execve. Steps 5–9 are straight-line.
+// drop and execve. Steps 6–10 are straight-line.
 
 #![forbid(unsafe_code)]
 
 use std::ffi::CString;
 use std::process::ExitCode;
 
-use halmasuit_spawn::{enforce_uid_floor, parse_argv, sanitize_env};
+use halmasuit_spawn::{enforce_uid_floor, parse_argv, sanitize_env, validate_pwent};
 use nix::sys::prctl;
 use nix::unistd::{Gid, Uid, execve, geteuid, initgroups, setresgid, setresuid};
 
@@ -64,6 +67,15 @@ fn main() -> ExitCode {
 
     if let Err(e) = enforce_uid_floor(parsed.target_uid, parsed.target_gid) {
         return die(&format!("UID floor: {e}"), 1);
+    }
+
+    // Pwent cross-check: refuse any (uid, gid, user) triple where the
+    // username's /etc/passwd entry doesn't match the argv-supplied uid
+    // and gid. Closes the supplementary-group escalation vector that
+    // would otherwise let an attacker pass `1000 1000 root --` and
+    // inherit root's group memberships via initgroups(3).
+    if let Err(e) = validate_pwent(&parsed) {
+        return die(&format!("pwent: {e}"), 1);
     }
 
     let env = sanitize_env(std::env::vars_os());

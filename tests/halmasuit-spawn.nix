@@ -101,6 +101,38 @@ pkgs.testers.runNixOSTest {
         f"gid refusal must mention the floor; got: {out!r}"
     )
 
+    # Assertion 3b: SUPPLEMENTARY-GROUP ESCALATION ATTACK refused.
+    #
+    # `halmasuit-spawn 1000 1000 root -- id -G` passes the UID floor (uid+gid
+    # both >= 1000) but uses `root` as the username argument to initgroups(3).
+    # Without pwent validation, initgroups would add the process to every
+    # group containing `root` in /etc/group — typically `wheel` (gid 1) and
+    # `disk` (gid 6) on NixOS, both of which are functionally root-equivalent
+    # via sudo / raw disk access. This bypasses the UID floor's stated purpose
+    # for the supplementary-group dimension (per ARCHITECTURE.md threat model
+    # row 11). The helper MUST cross-check argv's uid/gid against the named
+    # user's pwent and refuse a mismatch.
+    rc, out = machine.execute(
+        f"sudo -u test {WRAPPER} 1000 1000 root -- {ID} -G 2>&1"
+    )
+    assert rc != 0, (
+        f"username/uid impersonation must be refused; got rc={rc} out={out!r}"
+    )
+    assert "pwent" in out.lower() or "mismatch" in out.lower() or "/etc/passwd" in out, (
+        f"refusal must explain the pwent/uid mismatch; got: {out!r}"
+    )
+
+    # Assertion 3c: unknown username refused.
+    rc, out = machine.execute(
+        f"sudo -u test {WRAPPER} 1000 1000 nonexistent_xyz_abc -- {ID} -u 2>&1"
+    )
+    assert rc != 0, (
+        f"unknown username must be refused; got rc={rc} out={out!r}"
+    )
+    assert "unknown user" in out.lower() or "pwent" in out.lower(), (
+        f"refusal must indicate unknown user; got: {out!r}"
+    )
+
     # Assertion 4: env allowlist strips LD_PRELOAD. Invoke with
     # LD_PRELOAD set (it'd be ignored by the kernel for the setuid call
     # anyway due to AT_SECURE, but we also sanitize it explicitly).

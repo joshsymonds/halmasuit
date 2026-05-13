@@ -11,6 +11,8 @@
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStringExt;
 
+use nix::unistd::User;
+
 /// Minimum acceptable target UID/GID.
 ///
 /// Refusing anything below this is the load-bearing security property
@@ -55,6 +57,14 @@ pub enum SpawnError {
     /// A path/argument string contained an interior NUL byte and so cannot
     /// be passed to `execve` via a `CString`.
     InvalidString,
+    /// `target_user` resolves to a pwent inconsistent with the argv
+    /// `target_uid` / `target_gid`, doesn't resolve at all, or the NSS
+    /// lookup failed. The string carries the operator-facing reason.
+    ///
+    /// This is the load-bearing check that prevents supplementary-group
+    /// escalation via an attacker-chosen username (per ARCHITECTURE.md
+    /// threat model row 11, extended to the supplementary-group dimension).
+    Pwent(String),
 }
 
 impl std::fmt::Display for SpawnError {
@@ -63,6 +73,7 @@ impl std::fmt::Display for SpawnError {
             Self::Argv(s) => f.write_str(s),
             Self::UidFloor(v) => write!(f, "uid/gid {v} is below UID_MIN ({UID_MIN})"),
             Self::InvalidString => f.write_str("argument contained NUL byte"),
+            Self::Pwent(s) => f.write_str(s),
         }
     }
 }
@@ -118,6 +129,55 @@ pub const fn enforce_uid_floor(uid: u32, gid: u32) -> Result<(), SpawnError> {
     } else {
         Ok(())
     }
+}
+
+/// Cross-check the argv `target_user`'s `/etc/passwd` entry against the
+/// argv `target_uid` and `target_gid`.
+///
+/// This is the load-bearing defense against supplementary-group escalation.
+/// `initgroups(3)` consumes the username and adds the process to EVERY
+/// group containing that user in `/etc/group`, with no GID floor. Without
+/// this check, an attacker who reached `halmasuit-spawn` could pass
+/// `1000 1000 root` and inherit root's supplementary groups (typically
+/// `wheel` / `disk` / `docker` on NixOS) — all functionally root-equivalent.
+///
+/// Fail-closed: NSS errors, unknown users, and uid/gid mismatches all
+/// refuse.
+pub fn validate_pwent(parsed: &ParsedArgs) -> Result<(), SpawnError> {
+    // `target_user` is stored as a CString (for the eventual initgroups
+    // call); `User::from_name` wants &str. Convert; reject if not UTF-8.
+    let name = parsed
+        .target_user
+        .to_str()
+        .map_err(|_| SpawnError::Pwent("username is not valid UTF-8".to_owned()))?;
+    let user = match User::from_name(name) {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return Err(SpawnError::Pwent(format!("unknown user: {name:?}")));
+        }
+        Err(e) => {
+            return Err(SpawnError::Pwent(format!(
+                "NSS lookup failed for {name:?}: {e}"
+            )));
+        }
+    };
+    let pwent_uid = user.uid.as_raw();
+    let pwent_gid = user.gid.as_raw();
+    if pwent_uid != parsed.target_uid {
+        return Err(SpawnError::Pwent(format!(
+            "username {name:?} has uid={pwent_uid} in /etc/passwd \
+             but argv says target_uid={}",
+            parsed.target_uid
+        )));
+    }
+    if pwent_gid != parsed.target_gid {
+        return Err(SpawnError::Pwent(format!(
+            "username {name:?} has gid={pwent_gid} in /etc/passwd \
+             but argv says target_gid={}",
+            parsed.target_gid
+        )));
+    }
+    Ok(())
 }
 
 /// Filter an env map through the allowlist + `LC_*` prefix.
@@ -316,6 +376,68 @@ mod tests {
         fn floor_accepts_every_user_uid(uid in UID_MIN..u32::MAX, gid in UID_MIN..u32::MAX) {
             prop_assert_eq!(enforce_uid_floor(uid, gid), Ok(()));
         }
+    }
+
+    // ── validate_pwent ────────────────────────────────────────────────
+    //
+    // These tests hit real /etc/passwd via NSS. They depend on conventional
+    // entries (root has uid 0) which are stable across Linux distros.
+
+    fn parsed_with(uid: u32, gid: u32, user: &str) -> ParsedArgs {
+        parse_argv(argv(&[
+            "halmasuit-spawn",
+            &uid.to_string(),
+            &gid.to_string(),
+            user,
+            "--",
+            "/usr/bin/id",
+        ]))
+        .expect("test argv should parse")
+    }
+
+    #[test]
+    fn pwent_refuses_username_when_uid_does_not_match() {
+        // root has uid 0, but argv says 1000 — the impersonation attack
+        // gambit:review caught. Must refuse.
+        let parsed = parsed_with(1000, 1000, "root");
+        let err = validate_pwent(&parsed).unwrap_err();
+        match err {
+            SpawnError::Pwent(s) => {
+                assert!(
+                    s.contains("uid") && s.contains("target_uid"),
+                    "refusal must explain the uid mismatch, got: {s}"
+                );
+            }
+            other => panic!("expected SpawnError::Pwent, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pwent_refuses_unknown_user() {
+        let parsed = parsed_with(1000, 1000, "nonexistent_xyz_abc_99887766");
+        let err = validate_pwent(&parsed).unwrap_err();
+        match err {
+            SpawnError::Pwent(s) => {
+                assert!(
+                    s.contains("unknown user"),
+                    "refusal must indicate unknown user, got: {s}"
+                );
+            }
+            other => panic!("expected SpawnError::Pwent, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pwent_accepts_when_uid_gid_match() {
+        // Look up root's actual entry and validate against its real
+        // uid/gid (both 0 on every Linux). Despite enforce_uid_floor
+        // refusing this combination, validate_pwent itself only
+        // validates the pwent consistency — the call sites compose.
+        let parsed = parsed_with(0, 0, "root");
+        // Note: validate_pwent does NOT enforce the UID floor — that's
+        // the caller's responsibility (and main.rs calls enforce_uid_floor
+        // first). validate_pwent should succeed here because pwent matches.
+        assert_eq!(validate_pwent(&parsed), Ok(()));
     }
 
     // ── sanitize_env ──────────────────────────────────────────────────
