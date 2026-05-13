@@ -39,26 +39,36 @@ unavoidable consequence of that process split.
 
 Halmasuit's design deletes the split. The same `halmasuit` binary that
 paints the splash during initramfs survives `switch_root` via systemd's
-`@argv[0]` storage-daemon convention: the process renames its `argv[0]`
-to start with `@`, which excludes it from systemd-shutdown's killall at
-the `pivot_root` boundary (see
-[systemd ROOT_STORAGE_DAEMONS](https://systemd.io/ROOT_STORAGE_DAEMONS/)).
-Same PID, same memory mapping, same DRM master file descriptor on both
-sides of the boundary; no `execve` or FD-passing dance is needed. The
-process continues painting through systemd target traversal, brings up
-its Wayland server when the system reaches a ready state, hosts the
-greeter as a `wl_client`, swaps to niri after PAM success, and persists
-until power-off. DRM master is held continuously from initramfs through
+`SurviveFinalKillSignal=yes` unit directive (systemd v255+, declared in
+the `[Unit]` section), which excludes the process from
+`systemd-shutdown`'s killall at the `pivot_root` boundary. Same PID,
+same memory mapping, same DRM master file descriptor on both sides of
+the boundary; no FD-passing dance is needed. The process continues
+painting through systemd target traversal, brings up its Wayland server
+when the system reaches a ready state, hosts the greeter as a
+`wl_client`, swaps to niri after PAM success, and persists until
+power-off. DRM master is held continuously from initramfs through
 shutdown. The CRTC is modeset exactly once — or twice if `simpledrm`
 migrates to a real KMS driver mid-boot. Every visible transition is
 internal: either a buffer swap on the primary plane, or a `wl_client`
 swap inside halmasuit's own scenegraph. Nothing visible to the user
 crosses a process boundary.
 
+The legacy `@argv[0]` storage-daemon convention (write `@` into
+`argv[0][0]` via glibc's `__progname_full` data symbol per
+[systemd ROOT_STORAGE_DAEMONS](https://systemd.io/ROOT_STORAGE_DAEMONS/))
+also works and is retained as a documented fallback. It's NOT
+production halmasuit's primary path because the upstream documentation
+is explicit: the convention applies "to storage technology only, not to
+daemons with any other (non-storage related) purposes." halmasuit is
+non-storage, and recent systemd regressions in the convention's
+implementation make it brittle to depend on long-term.
+
 This mechanism has been **empirically validated end-to-end** — see
-[`RESEARCH.md`](RESEARCH.md) for the `drm-master-probe` Phase 0 + Phase 1
-artifacts. The probes are runnable: `just test-drm-probe` and
-`just test-drm-probe-phase1` re-establish ground truth in seconds.
+[`RESEARCH.md`](RESEARCH.md) for the `drm-master-probe` Phase 0, 1, 2,
+and 3 artifacts. The probes are runnable: `just test-drm-probe`,
+`just test-drm-probe-phase1`, `just test-drm-probe-phase2`,
+`just test-drm-probe-phase3` re-establish ground truth in seconds.
 
 This is what nothing else in the wlroots/smithay ecosystem ships. Plymouth,
 gdm-wayland, SDDM-wayland — every one of them dies and restarts the display
@@ -87,42 +97,66 @@ shutdown splash. **Halmasuit hosts UI; it does not implement UI.**
 
 ### Related work and validation
 
-Two existing projects prove this architectural class works in shipping
-production form. Both are useful references for halmasuit; neither is
-quite the same shape:
+**`lomiri-system-compositor`** (Canonical / UBports — Ubuntu Touch,
+PinePhone — in production since 2013, ~13 years and counting) is the
+*one* shipping example of halmasuit's exact architecture: one
+long-lived userspace process owning the GPU continuously, hosting the
+greeter and the user shell as nested clients, never releasing the seat
+between them. Source:
+[gitlab.com/ubports/core/lomiri-system-compositor](https://gitlab.com/ubports/core/lomiri-system-compositor).
+Built on Mir.
 
-- **Mir / Lomiri** (Canonical / UBports — Ubuntu Touch, PinePhone, in
-  production since 2013). A long-lived display server hosting the
-  lockscreen, greeter, and user shell as nested clients. The closest
-  architectural relative to halmasuit. Different ecosystem (Mir is C++,
-  uses its own protocols rather than vanilla Wayland), different target
-  (mobile/convergent rather than desktop), but the *shape* — one
-  display owner across the entire user-visible lifetime — is exactly
-  what halmasuit borrows.
-- **Gamescope** (Valve, [github.com/ValveSoftware/gamescope](https://github.com/ValveSoftware/gamescope),
-  MIT). The compositor running inside SteamOS on the Steam Deck. Thin
-  wlroots-based Wayland compositor that hosts one foreground client
-  (Steam Big Picture, or a game) and direct-scans-out when possible.
-  Structurally very close to what halmasuit *is* during the `SESSION`
-  phase. Notable distinction: gamescope is **not a system compositor**
-  on Steam Deck. The actual SteamOS boot chain is Plymouth (initramfs +
-  through `graphical.target`) → SDDM (system display manager, autologin
-  configured via `/etc/sddm.conf.d/zz-steamos-autologin.conf`) → user
-  session → `gamescope-session-plus@.service` (a **user** systemd unit
-  under `graphical-session.target`) → gamescope → Steam. Three
-  display-owning userspace processes (Plymouth, SDDM, gamescope) with
-  process boundaries between each. Valve has masked the visual flashes
-  via a tuned Plymouth theme matching Steam aesthetics, hidden SDDM
-  (zero-timeout autologin), and fast boot timings — but they have not
-  eliminated the process boundaries. Halmasuit's structural premise is
-  "delete the boundaries, don't mask them."
+halmasuit is a **Rust + smithay + vanilla-Wayland port of USC's
+architectural ideas**, not a divergence from them. Reading the USC
+source end-to-end is the highest-leverage technical artifact for
+de-risking halmasuit v2 — the lifecycle, privilege model, and
+greeter→session swap mechanism encode 13 years of hard-won lessons.
 
-Neither project is a substrate halmasuit builds on — Mir is the wrong
-ecosystem, gamescope is the wrong use case (gaming I/O, HDR pipelines,
-FSR upscaling — none of which overlap with greeter/PAM/boot work) and
-the wrong language for this project's security posture. But both
-demonstrate that "thin display server hosting one foreground client" is
-a sound architecture at production scale.
+USC isn't a substrate halmasuit builds on, for reasons specific and
+mostly language-secondary:
+
+- **Tight coupling to the Lomiri (Unity8) shell.** USC's non-skeleton
+  code exists to host Lomiri's specific UI components. Hosting a
+  greetd-compatible greeter + niri instead means modifying code that
+  isn't designed for that.
+- **LightDM lifecycle.** USC is spawned by LightDM at greeter-time and
+  doesn't span boot → shutdown. Adopting USC means re-adopting the
+  display-manager layer halmasuit exists to delete.
+- **Mir protocols, not vanilla Wayland.** Niri is a vanilla-Wayland
+  compositor. Mir 2.x has a Wayland frontend but its surface is
+  incomplete (Lomiri itself is still on Mir 1.x with limited Wayland
+  support).
+- **Mobile / convergent target.** Touch input, rotation, mobile-shell
+  assumptions are baked in.
+- **License** (GPL-3+) and **NixOS packaging burden** (Mir's transitive
+  dependency graph isn't packaged for NixOS) are real but secondary.
+- **Language posture.** halmasuit leans hard on Rust's memory-safety
+  guarantees — `#![forbid(unsafe_code)]` on production crates, a
+  ≤80-line audit-grade setuid helper. C++ in skilled hands is fine,
+  but the project's broader posture is consistently Rust-first.
+
+Forking USC would mean tearing out everything in that bullet list —
+leaving an architectural skeleton of a few hundred lines. The
+substantive choice was always **language + toolkit** (Rust + smithay
+vs. C++ + Mir), not fork-vs-build. Both involve writing halmasuit
+fresh; we picked the Rust ecosystem on the merits.
+
+**`gamescope`** (Valve, [github.com/ValveSoftware/gamescope](https://github.com/ValveSoftware/gamescope),
+MIT) is structurally close to what halmasuit *is* during the `SESSION`
+phase — a thin wlroots-based Wayland compositor hosting one foreground
+client (Steam Big Picture, or a game) and direct-scans-out when possible.
+Notable distinction: gamescope is **not a system compositor** on Steam
+Deck. The actual SteamOS boot chain is Plymouth (initramfs + through
+`graphical.target`) → SDDM (system display manager, autologin
+configured via `/etc/sddm.conf.d/zz-steamos-autologin.conf`) → user
+session → `gamescope-session-plus@.service` (a **user** systemd unit
+under `graphical-session.target`) → gamescope → Steam. Three
+display-owning userspace processes (Plymouth, SDDM, gamescope) with
+process boundaries between each. Valve has masked the visual flashes
+via a tuned Plymouth theme matching Steam aesthetics, hidden SDDM
+(zero-timeout autologin), and fast boot timings — but they have not
+eliminated the process boundaries. Halmasuit's structural premise is
+"delete the boundaries, don't mask them."
 
 ---
 
@@ -192,23 +226,38 @@ SHUTDOWN_SPLASH        halmasuit-splash              (none — awaits poweroff)
 Transitions:
 
 - **`INITRAMFS_SPLASH → ROOTFS_SPLASH`**: triggered by systemd's
-  `initrd-switch-root.target`. halmasuit relies on the `@argv[0]`
-  storage-daemon convention (writes `'@'` to `argv[0][0]` via glibc's
-  `__progname_full` data symbol) to exclude itself from systemd-shutdown's
-  killall at the `pivot_root` boundary. Same PID, same memory mapping,
-  same DRM master fd on both sides — no `execve`, no FD passing. The unit
-  itself uses `DefaultDependencies = false` + `IgnoreOnIsolate = true` so
-  it isn't stopped when `initrd-switch-root.target` is isolated. Once
-  rootfs is mounted, halmasuit drops privileges from root to the
-  `compositor` system user via `setresuid` (DRM master is per-fd; mastery
-  survives the privilege drop), and resumes painting the same surface.
-  The user sees no visible change. **Note:** rootfs systemd discovers the
-  orphan unit (its name lives only in the now-dead initramfs systemd) and
-  sends `SIGTERM` ~1s post-`switch_root`; halmasuit must either
-  `sd_notify` to register with rootfs systemd as a tracked unit, install
-  a graceful SIGTERM handler, or detach from systemd's process tracking.
-  See [`RESEARCH.md`](RESEARCH.md) drm-master-probe Phase 1 for the
-  empirical evidence behind every claim in this paragraph.
+  `initrd-switch-root.target`. halmasuit's initramfs unit declares
+  `SurviveFinalKillSignal=yes` (systemd v255+, in the `[Unit]` section
+  — NOT `[Service]`, which systemd silently rejects), excluding the
+  process from `systemd-shutdown`'s killall at the `pivot_root`
+  boundary. Same PID, same memory mapping, same DRM master fd on both
+  sides — no FD passing. The unit also uses `DefaultDependencies = false`
+  + `IgnoreOnIsolate = true` so PID 1 doesn't *stop* the unit when
+  `initrd-switch-root.target` is isolated (separate concern from the
+  killall — these prevent systemd's normal stop sequence, the killall
+  is `systemd-shutdown`'s process-level cleanup). Once rootfs is
+  mounted, halmasuit drops privileges from root to the `compositor`
+  system user via `setresuid` (DRM master is per-fd; mastery survives
+  the privilege drop), and resumes painting the same surface. The user
+  sees no visible change. **Optional v3 layer:** an `execve` into the
+  rootfs-resident binary path before the killall (Phase 3 probe
+  validates this) gives the post-pivot process a canonical rootfs
+  `/proc/<pid>/exe` and sets up for clean `sd_notify` registration
+  with rootfs systemd — sidestepping the orphan-unit-`SIGTERM`-reaper
+  problem. v2 Phase A ships without the exec layer; the orphan
+  `SIGTERM` is handled via a graceful handler. **Note:** rootfs
+  systemd discovers the orphan unit (its name lives only in the
+  now-dead initramfs systemd) and sends `SIGTERM` ~1s
+  post-`switch_root`; halmasuit must either `sd_notify` to register
+  with rootfs systemd as a tracked unit (requires the v3 exec layer),
+  install a graceful SIGTERM handler, or detach from systemd's process
+  tracking. **Fallback mechanism:** for systems running systemd <
+  v255, the `@argv[0]` storage-daemon convention also works (Phase 1
+  probe validates this), though upstream documents the convention as
+  "storage technology only" — production halmasuit prefers the
+  supported `SurviveFinalKillSignal=yes` directive. See
+  [`RESEARCH.md`](RESEARCH.md) for empirical evidence (Phases 0, 1, 2,
+  and 3).
 - **`ROOTFS_SPLASH → GREETER`**: triggered by halmasuit reaching an
   internal-ready state (D-Bus session bus available, `XDG_RUNTIME_DIR`
   populated for the greeter user, halmasuit-greetd socket bound).
@@ -1134,16 +1183,18 @@ These are explicit "we know this needs deciding, just not yet":
    when we start writing the auth code.
 2. **smithay revision** (v2). Pin to whatever niri or cosmic-comp is on
    when v2 begins. Update on a deliberate cadence; not bleeding-edge.
-3. ~~**`switch_root` re-exec mechanism** (v2).~~ **RESOLVED via empirical
-   validation in [`RESEARCH.md`](RESEARCH.md) drm-master-probe Phase 1:**
-   neither `execve` re-exec nor `SCM_RIGHTS` fd-passing is required. The
-   `@argv[0]` storage-daemon convention from
-   [systemd ROOT_STORAGE_DAEMONS](https://systemd.io/ROOT_STORAGE_DAEMONS/)
-   keeps the same process and DRM master fd across the boundary. v2
-   halmasuit takes this approach. Remaining engineering concern (NOT
-   architectural): rootfs systemd sends `SIGTERM` to the orphan unit
-   ~1s post-`switch_root`, so v2 must `sd_notify` to register with
-   rootfs systemd, handle SIGTERM gracefully, or detach explicitly.
+3. ~~**`switch_root` re-exec mechanism** (v2).~~ **RESOLVED via
+   empirical validation in [`RESEARCH.md`](RESEARCH.md) Phases 1, 2,
+   and 3:** production halmasuit uses `SurviveFinalKillSignal=yes`
+   (systemd v255+, Phase 2) — the upstream-supported general-purpose
+   replacement for the storage-only `@argv[0]` convention. Same PID
+   and DRM master fd preserved across the boundary; no FD-passing
+   needed. Phase 3 validated that an additional `execve` layer for
+   clean rootfs-systemd handoff is feasible if v3 wants it. v2 Phase A
+   ships with just `SurviveFinalKillSignal=yes`; the orphan-unit
+   `SIGTERM` from rootfs systemd ~1s post-pivot is handled via a
+   graceful SIGTERM handler. `@argv[0]` (Phase 1) remains a documented
+   fallback for systemd-v254-and-older deployments.
 4. **Exact Wayland protocol surface** for v2 (vs additions in v3+). The
    v2 list above is the minimum; we may add `wp_drm_lease_v1` or
    `linux-explicit-synchronization-v1` if useful.
