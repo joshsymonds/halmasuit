@@ -25,6 +25,38 @@ This is the user's stated working preference: "broadly working, then
 individual components until beautiful." The order is a preference, not
 a contract. The scope below is the contract.
 
+## Build order
+
+One ordering constraint inside the otherwise-flexible "broadly working"
+phase: **the structured-event sink lands first, before any compositor
+logic.** From `main()` line 1, halmasuit emits NDJSON state events to
+stderr through `tracing` + `tracing-subscriber`. journald captures them
+across both initramfs and rootfs; humans and agents tail with
+`journalctl -u halmasuit -f -o json`.
+
+This is how you see what the spine is doing while you build it. Headless
+VM tests assert structure (PID continuity, DRM-master holding) but
+`virtio-gpu-pci` paints nothing, and the project is designed to be
+developed on any KVM-capable Linux host without a local display (per
+[`ARCHITECTURE.md`](ARCHITECTURE.md): "v2 must build and pass tests on
+any KVM-capable Linux system, not just gnomon"). Structured event logs
+are the agent- and SSH-friendly substitute for a monitor. Instrumenting
+after the spine is built wastes the observability exactly when it's
+most useful.
+
+The live snapshot surface — `/run/halmasuit/introspect.sock` and
+`org.halmasuit.Debug.Introspect.Snapshot()` over D-Bus — lands later,
+once the rootfs phase has somewhere stable for `/run/halmasuit/`.
+Initramfs gets the event stream only; nobody is querying initramfs
+interactively anyway.
+
+Both surfaces are query-only by construction. No `set_*` or `inject_*`
+methods, ever. Kept on a separate D-Bus interface from
+`org.halmasuit.Compositor1` so control-plane scope can't leak into
+observability scope. PAM message text is redacted before emission so
+the feed can't become a passphrase side-channel; socket mode 0600,
+owned by `compositor`.
+
 ## In scope
 
 | Component | Minimum bar for v2 |
@@ -37,6 +69,7 @@ a contract. The scope below is the contract.
 | `halmasuit-fsck` | systemd-fsckd progress. Happy path: progress display. No repair-decision Y/N flow yet. |
 | `halmasuit-emergency` | `emergency.target` adapter. Happy path: graphical PAM-as-root prompt, exec a terminal. No recovery-menu UX. |
 | `halmasuit-kms`, `halmasuit-protocols`, `halmasuit-ipc`, `halmasuit-cli` | Backing crates per ARCHITECTURE.md workspace layout. |
+| Introspection surface | NDJSON events to stderr/journald from `main()` line 1 via `tracing` + `tracing-subscriber`. Live snapshot via `/run/halmasuit/introspect.sock` and `org.halmasuit.Debug.Introspect.Snapshot()` once rootfs is reached. Socket mode 0600, owned by `compositor`. PAM message text redacted before emission. Query-only; separate D-Bus interface from `org.halmasuit.Compositor1`. Lands first in build order (see "Build order" above). |
 | `sd_notify` / SIGTERM handling | drm-master-probe Phase 1 identified that rootfs systemd sends SIGTERM to the orphan unit ~1s post-`switch_root`. halmasuit must either `sd_notify` to be tracked as a rootfs unit, install a graceful SIGTERM handler, or detach explicitly. (Empirical finding in RESEARCH.md.) |
 | NixOS module | `services.halmasuit.enable = true;` replaces **both** Plymouth and greetd. Wires initramfs + rootfs systemd units, setuid bit on `halmasuit-spawn`, PAM service file `halmasuit`, `compositor` and `greeter` system users, polkit policies. Includes `boot.initrd.kernelModules` for the target hardware's GPU driver. |
 | DankGreeter launcher patch | ~20 lines in DMS to skip the nested-niri spawn when `WAYLAND_DISPLAY` is set by halmasuit. |
@@ -66,6 +99,7 @@ deliberately defers to the epic:
 - **smithay revision pin.** Pin to whatever niri or cosmic-comp is currently on. Decide at v2 start.
 - **`halmasuit-luks` prompt rendering form.** Replace splash with prompt vs. overlay prompt via subsurface composition. Decide when the adapter is implemented.
 - **`org.halmasuit.Compositor1` D-Bus surface.** Method list depends on what desktop-environment integration actually needs.
+- **`org.halmasuit.Debug.Introspect` surface shape.** Single `Snapshot()` method vs. signal-based event stream over D-Bus vs. both. Exact NDJSON schema (surface roles, geometry units, phase enum). Redaction policy for `pam_message` content. Decide as the auth code and first introspection consumer land — the stderr/tracing half lands earlier and is schema-flexible by virtue of being unstructured `tracing` events at first.
 - **OCR in `full-boot-flash` test.** May defer text-leak detection to a later test if tesseract bindings prove fiddly.
 - **Build order within "broadly working."** User preference is the thin-spine approach. Open question: start with `halmasuit-spawn` (small, security-critical, standalone) before the spine, or start directly with the spine and add `halmasuit-spawn` as the first integration dep? Brainstorm decides.
 
