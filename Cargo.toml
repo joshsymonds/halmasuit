@@ -41,6 +41,10 @@ thiserror          = "2"
 pam-sys            = "1.0.0-alpha5"
 # C types and constants for the halmasuit-pam FFI surface.
 libc               = "0.2"
+# Zero-on-drop for password buffers handed back to PAM. Used by the
+# conv-callback bridge to wipe response strings after libc::strdup
+# copies them into PAM-owned memory.
+zeroize            = "1"
 # Shared across crates that emit or consume introspection events.
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "fmt", "env-filter"] }

@@ -2,25 +2,145 @@
 //!
 //! All `unsafe` related to libpam lives in this crate so
 //! halmasuit-greetd can stay `#![forbid(unsafe_code)]`. The public
-//! surface is the [`Pam`] struct (RAII handle around `pam_handle_t`)
-//! and [`PamError`].
+//! surface is:
 //!
-//! This crate exposes only what halmasuit-greetd's state machine
-//! needs to drive PAM forward: handle lifecycle + `pam_set_item`. The
-//! conversation callback bridge that connects the state machine's
-//! step-by-step model to PAM's blocking `pam_authenticate` lands in
-//! a follow-up task.
+//! - [`Pam`] — RAII handle around `pam_handle_t`.
+//! - [`conv_pair`] — builds a paired [`ConvBridge`] (kept inside `Pam`,
+//!   the conv callback dereferences this) and [`ConvDriver`] (the
+//!   outside-the-thread driver that delivers responses and receives
+//!   prompts). The driver is what the upcoming `PamSession` impl
+//!   talks to.
+//!
+//! The conv callback ([`bridge_conv`]) marshals each
+//! `pam_message` → [`PromptChallenge`] over the channel, waits for a
+//! [`Zeroizing<String>`] response, then `libc::calloc`s a
+//! `pam_response` array and `libc::strdup`s each response into it for
+//! PAM to free. All panicable paths are wrapped in `catch_unwind`
+//! because panicking across an `extern "C"` boundary is UB.
+//!
+//! What's NOT here yet: the worker-thread driver that runs
+//! `pam_authenticate` blocking and exposes the trait
+//! `halmasuit_greetd::PamSession`. That's the next task.
 
 #![deny(unsafe_code)]
 
 use libc::{c_int, c_void};
 use pam_sys::{
-    PAM_CONV_ERR, PAM_SUCCESS, pam_conv, pam_end, pam_handle_t, pam_message, pam_response,
-    pam_set_item, pam_start,
+    PAM_BUF_ERR, PAM_CONV_ERR, PAM_ERROR_MSG, PAM_PROMPT_ECHO_OFF, PAM_PROMPT_ECHO_ON, PAM_SUCCESS,
+    PAM_TEXT_INFO, pam_conv, pam_end, pam_handle_t, pam_message, pam_response, pam_set_item,
+    pam_start,
 };
-use std::ffi::{CString, NulError};
+use std::ffi::{CStr, CString, NulError};
+use std::panic;
 use std::ptr;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use thiserror::Error;
+use zeroize::Zeroizing;
+
+// ── PAM message types ───────────────────────────────────────────────────
+
+/// The four message styles PAM's conv callback delivers, narrowed
+/// from `pam_message::msg_style` (a raw `c_uint` in the bindings).
+///
+/// Maps 1:1 to `halmasuit_greetd::AuthMessageType`; the translation
+/// happens in the `PamSession` impl (next task) rather than here so
+/// `halmasuit-pam` doesn't yet depend on `halmasuit-greetd`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PamMessageStyle {
+    /// `PAM_PROMPT_ECHO_ON` — visible input (e.g. username).
+    PromptEchoOn,
+    /// `PAM_PROMPT_ECHO_OFF` — hidden input (password).
+    PromptEchoOff,
+    /// `PAM_ERROR_MSG` — error banner, no response expected.
+    ErrorMsg,
+    /// `PAM_TEXT_INFO` — informational banner, no response expected.
+    TextInfo,
+}
+
+impl PamMessageStyle {
+    /// Narrow a raw `msg_style` value from libpam. Both
+    /// `pam_message::msg_style` and the PAM_PROMPT_*/PAM_*_MSG/INFO
+    /// constants are `c_int` in the generated bindings, so the match
+    /// works directly.
+    #[must_use]
+    pub const fn from_raw(raw: c_int) -> Option<Self> {
+        match raw {
+            PAM_PROMPT_ECHO_ON => Some(Self::PromptEchoOn),
+            PAM_PROMPT_ECHO_OFF => Some(Self::PromptEchoOff),
+            PAM_ERROR_MSG => Some(Self::ErrorMsg),
+            PAM_TEXT_INFO => Some(Self::TextInfo),
+            _ => None,
+        }
+    }
+}
+
+/// One challenge from PAM to the greeter — the marshalled form of a
+/// single `pam_message`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptChallenge {
+    pub style: PamMessageStyle,
+    pub message: String,
+}
+
+// ── Conv-bridge channels ────────────────────────────────────────────────
+
+/// PAM-side half of the conv channel pair. Owned by [`Pam`]; the
+/// `bridge_conv` callback dereferences `pam_conv::appdata_ptr` (a
+/// pointer to this) to push challenges and pull responses.
+pub struct ConvBridge {
+    challenge_tx: SyncSender<PromptChallenge>,
+    response_rx: Receiver<Zeroizing<String>>,
+}
+
+/// Outside-the-thread half. The (future) `PamSession` impl receives
+/// challenges on `challenge_rx` and sends responses on `response_tx`.
+pub struct ConvDriver {
+    pub challenge_rx: Receiver<PromptChallenge>,
+    pub response_tx: SyncSender<Zeroizing<String>>,
+}
+
+/// Build a paired bridge + driver. Each channel is rendezvous
+/// (capacity 0) so the conv callback and the driver synchronize
+/// step-by-step.
+#[must_use]
+pub fn conv_pair() -> (ConvBridge, ConvDriver) {
+    let (challenge_tx, challenge_rx) = sync_channel(0);
+    let (response_tx, response_rx) = sync_channel(0);
+    (
+        ConvBridge {
+            challenge_tx,
+            response_rx,
+        },
+        ConvDriver {
+            challenge_rx,
+            response_tx,
+        },
+    )
+}
+
+/// Pure-Rust core of the conv: send each prompt over the bridge, then
+/// collect N responses (in order). Empty string fallback if the
+/// driver side has hung up — the conv callback turns that into an
+/// empty `pam_response`, which PAM treats as "user provided no
+/// answer."
+fn process_prompts(prompts: Vec<PromptChallenge>, bridge: &ConvBridge) -> Vec<Zeroizing<String>> {
+    let n = prompts.len();
+    for p in prompts {
+        if bridge.challenge_tx.send(p).is_err() {
+            return (0..n).map(|_| Zeroizing::new(String::new())).collect();
+        }
+    }
+    (0..n)
+        .map(|_| {
+            bridge
+                .response_rx
+                .recv()
+                .unwrap_or_else(|_| Zeroizing::new(String::new()))
+        })
+        .collect()
+}
+
+// ── Error type ──────────────────────────────────────────────────────────
 
 /// Errors from PAM FFI.
 #[derive(Debug, Error)]
@@ -48,70 +168,201 @@ impl PamError {
     }
 }
 
+// ── Conv callback (the unsafe core) ─────────────────────────────────────
+
+#[expect(
+    unsafe_code,
+    reason = "extern \"C\" PAM conv callback. The callback is invoked \
+              by libpam on the same thread that called pam_authenticate. \
+              All panicable paths run inside catch_unwind because \
+              unwinding across an extern \"C\" boundary is UB. Pointer \
+              safety arguments documented per unsafe block below."
+)]
+unsafe extern "C" fn bridge_conv(
+    num_msg: c_int,
+    msg: *mut *const pam_message,
+    resp: *mut *mut pam_response,
+    appdata_ptr: *mut c_void,
+) -> c_int {
+    let result = panic::catch_unwind(|| {
+        if num_msg <= 0 || msg.is_null() || resp.is_null() || appdata_ptr.is_null() {
+            return PAM_CONV_ERR as c_int;
+        }
+        // num_msg > 0 by the guard above; cast is non-negative.
+        let n = usize::try_from(num_msg).unwrap_or(0);
+
+        // SAFETY: appdata_ptr came from a Box<ConvBridge> we stored in
+        // pam_conv::appdata_ptr (see Pam::start). The Box outlives the
+        // Pam (and therefore the conv callback) because it's held by a
+        // field that drops after pam_end.
+        #[expect(
+            unsafe_code,
+            reason = "appdata_ptr was stashed by Pam::start from a Box \
+                      that is kept alive in the Pam struct."
+        )]
+        let bridge: &ConvBridge = unsafe { &*(appdata_ptr.cast::<ConvBridge>()) };
+
+        // Marshal: C array of *const pam_message → Vec<PromptChallenge>.
+        let mut prompts = Vec::with_capacity(n);
+        for i in 0..n {
+            // SAFETY: msg is a libpam-provided C array of num_msg
+            // non-null pam_message pointers (guaranteed by the
+            // protocol; we still null-check for defense).
+            #[expect(
+                unsafe_code,
+                reason = "indexing libpam-provided pam_message array; \
+                          bounds checked by the loop, contents checked \
+                          for null below."
+            )]
+            let m_ptr = unsafe { *msg.add(i) };
+            if m_ptr.is_null() {
+                return PAM_CONV_ERR as c_int;
+            }
+            // SAFETY: m_ptr is non-null and points at a libpam-allocated
+            // pam_message that's valid for the duration of this conv call.
+            #[expect(
+                unsafe_code,
+                reason = "libpam guarantees pam_message lives until the \
+                          conv callback returns."
+            )]
+            let m = unsafe { &*m_ptr };
+            let Some(style) = PamMessageStyle::from_raw(m.msg_style) else {
+                return PAM_CONV_ERR as c_int;
+            };
+            let text = if m.msg.is_null() {
+                String::new()
+            } else {
+                // SAFETY: m.msg is a NUL-terminated C string owned by
+                // libpam, valid for the conv call.
+                #[expect(unsafe_code, reason = "libpam-provided NUL-terminated C string.")]
+                let cstr = unsafe { CStr::from_ptr(m.msg) };
+                cstr.to_string_lossy().into_owned()
+            };
+            prompts.push(PromptChallenge {
+                style,
+                message: text,
+            });
+        }
+
+        // Drive the channels.
+        let responses = process_prompts(prompts, bridge);
+
+        // Marshal: Vec<Zeroizing<String>> → libc::calloc'd
+        // pam_response array. PAM frees both the array and each
+        // .resp via free(); we must use the matching libc allocator.
+        let resp_size = std::mem::size_of::<pam_response>();
+        // SAFETY: libc::calloc returns null on OOM or a valid block of
+        // n * resp_size zeroed bytes otherwise.
+        #[expect(
+            unsafe_code,
+            reason = "C allocator paired with libpam's free() (which \
+                      libpam invokes on .resp and on the array itself)."
+        )]
+        let resp_array = unsafe { libc::calloc(n, resp_size) }.cast::<pam_response>();
+        if resp_array.is_null() {
+            return PAM_BUF_ERR as c_int;
+        }
+
+        for (i, r) in responses.into_iter().enumerate() {
+            // Strip any interior NUL silently — libpam can't carry NUL
+            // bytes in resp anyway. The greeter shouldn't have sent NULs
+            // through the wire either; this is defensive.
+            let bytes: Vec<u8> = r.as_bytes().iter().copied().filter(|b| *b != 0).collect();
+            // r (Zeroizing<String>) drops here, wiping the original buffer.
+            drop(r);
+            // SAFETY: bytes has no interior NULs (filter above), so
+            // CString::from_vec_unchecked is sound.
+            #[expect(unsafe_code, reason = "interior-NUL filtered above.")]
+            let cstr = unsafe { CString::from_vec_unchecked(bytes) };
+            // SAFETY: cstr.as_ptr() is a valid NUL-terminated C string
+            // for the duration of this call; libc::strdup copies it.
+            #[expect(unsafe_code, reason = "strdup copies; cstr lifetime covers the call.")]
+            let dup = unsafe { libc::strdup(cstr.as_ptr()) };
+            if dup.is_null() {
+                // OOM partway through; free what we allocated already.
+                // SAFETY: resp_array and prior .resp pointers all came
+                // from libc allocators paired with libc::free.
+                #[expect(unsafe_code, reason = "rolling back libc allocations on OOM.")]
+                unsafe {
+                    for j in 0..i {
+                        let prev = (*resp_array.add(j)).resp;
+                        if !prev.is_null() {
+                            libc::free(prev.cast::<c_void>());
+                        }
+                    }
+                    libc::free(resp_array.cast::<c_void>());
+                }
+                return PAM_BUF_ERR as c_int;
+            }
+            // SAFETY: resp_array[i] is in-bounds (i < n) and points at
+            // zeroed pam_response storage.
+            #[expect(unsafe_code, reason = "writing to in-bounds pam_response slot.")]
+            unsafe {
+                (*resp_array.add(i)).resp = dup;
+                (*resp_array.add(i)).resp_retcode = 0;
+            }
+        }
+
+        // SAFETY: resp is the libpam-provided output pointer, valid for
+        // the duration of this conv call.
+        #[expect(unsafe_code, reason = "writing to libpam-provided out-pointer.")]
+        unsafe {
+            *resp = resp_array;
+        }
+        PAM_SUCCESS as c_int
+    });
+    result.unwrap_or(PAM_CONV_ERR as c_int)
+}
+
+// ── RAII PAM handle ─────────────────────────────────────────────────────
+
 /// RAII handle for an in-flight PAM transaction.
 ///
 /// Constructed by [`Pam::start`]. The transaction is closed via
 /// `pam_end` on drop. `Pam` is `!Send` (inherited from the raw
 /// `pam_handle_t` pointer); a worker-thread pattern that uses this
 /// must construct the `Pam` on the worker thread itself.
-///
-/// This struct does NOT yet carry a real conversation callback —
-/// the conv field is a stub that returns `PAM_CONV_ERR` for every
-/// message. Real conversation handling lands in the follow-up
-/// "conv callback bridge" task.
 pub struct Pam {
     handle: *mut pam_handle_t,
     // The pam_conv struct must outlive the handle: pam_start stores
-    // a pointer to it (does not copy). Keep it pinned via Box so its
-    // address is stable, and rely on Drop order (drop() runs first;
-    // declared-field destructors run after) to ensure pam_end has
-    // already released libpam's reference before _conv drops.
+    // a pointer to it (does not copy). Keep it pinned via Box.
     _conv: Box<pam_conv>,
+    // The ConvBridge holds the channel ends the conv callback uses.
+    // Boxed for a stable address; the conv's appdata_ptr aliases this.
+    _bridge: Box<ConvBridge>,
     last_status: c_int,
 }
 
-#[expect(
-    unsafe_code,
-    reason = "extern \"C\" PAM conv callback. Stub returns PAM_CONV_ERR \
-              for every prompt; the real bridge to channels lands in \
-              the next task. Safety: takes raw pointers but reads no \
-              memory through them and writes nothing."
-)]
-const unsafe extern "C" fn stub_conv(
-    _num_msg: c_int,
-    _msg: *mut *const pam_message,
-    _resp: *mut *mut pam_response,
-    _appdata_ptr: *mut c_void,
-) -> c_int {
-    PAM_CONV_ERR as c_int
-}
-
 impl Pam {
-    /// Open a PAM transaction for `service_name` as `username`.
+    /// Open a PAM transaction for `service_name` as `username`, wiring
+    /// the given `bridge` into the conv callback.
     ///
     /// `service_name` selects which `/etc/pam.d/<name>` file PAM
     /// consults. `username` is the user being authenticated.
     ///
     /// # Errors
     ///
-    /// Returns [`PamError::Nul`] if either argument contains an
-    /// interior NUL byte, or [`PamError::Start`] if libpam returns a
-    /// non-success status.
-    pub fn start(service_name: &str, username: &str) -> Result<Self, PamError> {
+    /// [`PamError::Nul`] for interior NUL in either string argument,
+    /// [`PamError::Start`] for a non-success libpam status.
+    pub fn start(service_name: &str, username: &str, bridge: ConvBridge) -> Result<Self, PamError> {
         let service = CString::new(service_name)?;
         let user = CString::new(username)?;
+
+        let mut boxed_bridge = Box::new(bridge);
+        let appdata_ptr: *mut c_void =
+            std::ptr::from_mut::<ConvBridge>(boxed_bridge.as_mut()).cast::<c_void>();
+
         let conv = Box::new(pam_conv {
-            conv: Some(stub_conv),
-            appdata_ptr: ptr::null_mut(),
+            conv: Some(bridge_conv),
+            appdata_ptr,
         });
         let mut handle: *mut pam_handle_t = ptr::null_mut();
         #[expect(
             unsafe_code,
-            reason = "FFI: pam_start signature. service/user are valid \
-                      NUL-terminated C strings owned by CStrings that \
-                      live until this block returns. conv's address is \
-                      stable for the lifetime of self (Box). handle is \
-                      a valid out-pointer."
+            reason = "FFI: pam_start. service/user are NUL-terminated \
+                      C strings owned by CStrings live for the call. \
+                      conv's address is stable for self's lifetime \
+                      (Box). handle is a valid out-pointer."
         )]
         let status = unsafe {
             pam_start(
@@ -125,6 +376,7 @@ impl Pam {
             Ok(Self {
                 handle,
                 _conv: conv,
+                _bridge: boxed_bridge,
                 last_status: status,
             })
         } else {
@@ -145,8 +397,7 @@ impl Pam {
         let cstr = CString::new(value)?;
         #[expect(
             unsafe_code,
-            reason = "FFI: pam_set_item copies the C string before \
-                      returning, so cstr need only live for the call."
+            reason = "FFI: pam_set_item copies; cstr lifetime covers call."
         )]
         let status =
             unsafe { pam_set_item(self.handle, item_type, cstr.as_ptr().cast::<c_void>()) };
@@ -162,9 +413,8 @@ impl Drop for Pam {
     fn drop(&mut self) {
         #[expect(
             unsafe_code,
-            reason = "FFI: pam_end releases libpam-owned state for this \
-                      transaction. self.handle was set by a successful \
-                      pam_start in Pam::start and is not aliased."
+            reason = "FFI: pam_end releases libpam-owned state. handle \
+                      was set by a successful pam_start; not aliased."
         )]
         unsafe {
             pam_end(self.handle, self.last_status);
@@ -172,45 +422,312 @@ impl Drop for Pam {
     }
 }
 
+// ── Tests ───────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pam_sys::PAM_RUSER;
+    use std::thread;
 
-    /// `other` is the fallback PAM service that every conformant Linux
-    /// PAM stack ships with (`/etc/pam.d/other`). pam_start succeeds
-    /// against it regardless of whether the user exists — the failure
-    /// point is later, at pam_authenticate, which this task doesn't
-    /// touch.
+    // ── handle lifecycle (carried over from the previous task) ──────────
+
     #[test]
     fn start_against_other_service_succeeds() {
-        let pam = Pam::start("other", "nobody").expect("pam_start for 'other'");
+        let (bridge, _driver) = conv_pair();
+        let pam = Pam::start("other", "nobody", bridge).expect("pam_start for 'other'");
         drop(pam);
     }
 
     #[test]
     fn set_ruser_succeeds() {
-        let mut pam = Pam::start("other", "nobody").unwrap();
+        let (bridge, _driver) = conv_pair();
+        let mut pam = Pam::start("other", "nobody", bridge).unwrap();
         pam.set_item_str(PAM_RUSER as c_int, "alice")
             .expect("set PAM_RUSER");
     }
 
     #[test]
     fn nul_byte_in_service_name_is_rejected() {
-        let r = Pam::start("other\0bad", "nobody");
+        let (bridge, _driver) = conv_pair();
+        let r = Pam::start("other\0bad", "nobody", bridge);
         assert!(matches!(r, Err(PamError::Nul(_))));
     }
 
     #[test]
     fn nul_byte_in_username_is_rejected() {
-        let r = Pam::start("other", "no\0body");
+        let (bridge, _driver) = conv_pair();
+        let r = Pam::start("other", "no\0body", bridge);
         assert!(matches!(r, Err(PamError::Nul(_))));
     }
 
     #[test]
     fn nul_byte_in_set_item_value_is_rejected() {
-        let mut pam = Pam::start("other", "nobody").unwrap();
+        let (bridge, _driver) = conv_pair();
+        let mut pam = Pam::start("other", "nobody", bridge).unwrap();
         let r = pam.set_item_str(PAM_RUSER as c_int, "ali\0ce");
         assert!(matches!(r, Err(PamError::Nul(_))));
+    }
+
+    // ── process_prompts (the safe core) ─────────────────────────────────
+
+    #[test]
+    fn process_prompts_forwards_in_order() {
+        let (bridge, driver) = conv_pair();
+        let responder = thread::spawn(move || {
+            let mut got: Vec<PromptChallenge> = Vec::new();
+            for _ in 0..2 {
+                got.push(driver.challenge_rx.recv().unwrap());
+            }
+            driver
+                .response_tx
+                .send(Zeroizing::new("alice".into()))
+                .unwrap();
+            driver
+                .response_tx
+                .send(Zeroizing::new("hunter2".into()))
+                .unwrap();
+            got
+        });
+
+        let prompts = vec![
+            PromptChallenge {
+                style: PamMessageStyle::PromptEchoOn,
+                message: "login:".into(),
+            },
+            PromptChallenge {
+                style: PamMessageStyle::PromptEchoOff,
+                message: "password:".into(),
+            },
+        ];
+        let responses = process_prompts(prompts.clone(), &bridge);
+        let got = responder.join().unwrap();
+
+        assert_eq!(got, prompts);
+        assert_eq!(responses.len(), 2);
+        assert_eq!(&**responses[0], "alice");
+        assert_eq!(&**responses[1], "hunter2");
+    }
+
+    #[test]
+    fn process_prompts_returns_empty_strings_when_driver_dropped() {
+        let (bridge, driver) = conv_pair();
+        drop(driver);
+        let prompts = vec![PromptChallenge {
+            style: PamMessageStyle::PromptEchoOff,
+            message: "password:".into(),
+        }];
+        let responses = process_prompts(prompts, &bridge);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(&**responses[0], "");
+    }
+
+    // ── PamMessageStyle ─────────────────────────────────────────────────
+
+    #[test]
+    fn pam_message_style_from_raw_covers_all_variants() {
+        assert_eq!(
+            PamMessageStyle::from_raw(PAM_PROMPT_ECHO_ON),
+            Some(PamMessageStyle::PromptEchoOn)
+        );
+        assert_eq!(
+            PamMessageStyle::from_raw(PAM_PROMPT_ECHO_OFF),
+            Some(PamMessageStyle::PromptEchoOff)
+        );
+        assert_eq!(
+            PamMessageStyle::from_raw(PAM_ERROR_MSG),
+            Some(PamMessageStyle::ErrorMsg)
+        );
+        assert_eq!(
+            PamMessageStyle::from_raw(PAM_TEXT_INFO),
+            Some(PamMessageStyle::TextInfo)
+        );
+        assert_eq!(PamMessageStyle::from_raw(9999), None);
+    }
+
+    // ── bridge_conv via synthetic C input ───────────────────────────────
+    //
+    // Calls the extern "C" callback directly with a hand-crafted
+    // pam_message array. Verifies that the strdup'd response array
+    // carries the right strings, then frees with libc::free in the
+    // shape PAM would.
+
+    fn call_bridge_conv(
+        prompts: &[(c_int, &str)],
+        responder: impl FnOnce(&ConvDriver) + Send + 'static,
+    ) -> Vec<String> {
+        let (bridge, driver) = conv_pair();
+        let mut boxed_bridge = Box::new(bridge);
+
+        let handle = thread::spawn(move || responder(&driver));
+
+        // Build pam_message structs + a C array of pointers to them.
+        let cstrings: Vec<CString> = prompts
+            .iter()
+            .map(|(_, m)| CString::new(*m).unwrap())
+            .collect();
+        let messages: Vec<pam_message> = prompts
+            .iter()
+            .zip(&cstrings)
+            .map(|((style, _), cs)| pam_message {
+                msg_style: *style,
+                msg: cs.as_ptr().cast_mut(),
+            })
+            .collect();
+        let mut msg_ptrs: Vec<*const pam_message> =
+            messages.iter().map(std::ptr::from_ref).collect();
+        // Suppress unused_mut: msg_ptrs is borrowed as *mut below.
+        let _ = &mut msg_ptrs;
+
+        let mut resp_out: *mut pam_response = ptr::null_mut();
+        let appdata: *mut c_void =
+            std::ptr::from_mut::<ConvBridge>(boxed_bridge.as_mut()).cast::<c_void>();
+
+        let num_msg = c_int::try_from(prompts.len()).expect("prompts.len() fits in c_int");
+        let status = {
+            #[expect(
+                unsafe_code,
+                reason = "test harness: invoke the extern \"C\" callback \
+                          directly to exercise its FFI path."
+            )]
+            unsafe {
+                bridge_conv(num_msg, msg_ptrs.as_mut_ptr(), &raw mut resp_out, appdata)
+            }
+        };
+        assert_eq!(status, PAM_SUCCESS as c_int, "bridge_conv non-success");
+
+        // Read back the response array, then free it the way libpam would.
+        let mut got = Vec::with_capacity(prompts.len());
+        #[expect(
+            unsafe_code,
+            reason = "reading and then freeing the libc::calloc'd resp \
+                      array that bridge_conv returned; same allocator \
+                      pair that PAM would use."
+        )]
+        unsafe {
+            for i in 0..prompts.len() {
+                let r_ptr = (*resp_out.add(i)).resp;
+                let s = if r_ptr.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(r_ptr).to_string_lossy().into_owned()
+                };
+                got.push(s);
+                if !r_ptr.is_null() {
+                    libc::free(r_ptr.cast::<c_void>());
+                }
+            }
+            libc::free(resp_out.cast::<c_void>());
+        }
+
+        handle.join().unwrap();
+        got
+    }
+
+    #[test]
+    fn bridge_conv_round_trips_single_prompt() {
+        let got = call_bridge_conv(&[(PAM_PROMPT_ECHO_OFF, "password:")], |driver| {
+            let c = driver.challenge_rx.recv().unwrap();
+            assert_eq!(c.style, PamMessageStyle::PromptEchoOff);
+            assert_eq!(c.message, "password:");
+            driver
+                .response_tx
+                .send(Zeroizing::new("hunter2".into()))
+                .unwrap();
+        });
+        assert_eq!(got, vec!["hunter2".to_string()]);
+    }
+
+    #[test]
+    fn bridge_conv_round_trips_multiple_prompts() {
+        let got = call_bridge_conv(
+            &[
+                (PAM_PROMPT_ECHO_ON, "login:"),
+                (PAM_PROMPT_ECHO_OFF, "password:"),
+            ],
+            |driver| {
+                let _ = driver.challenge_rx.recv().unwrap();
+                let _ = driver.challenge_rx.recv().unwrap();
+                driver
+                    .response_tx
+                    .send(Zeroizing::new("alice".into()))
+                    .unwrap();
+                driver
+                    .response_tx
+                    .send(Zeroizing::new("hunter2".into()))
+                    .unwrap();
+            },
+        );
+        assert_eq!(got, vec!["alice".to_string(), "hunter2".to_string()]);
+    }
+
+    #[test]
+    fn bridge_conv_strips_interior_nuls_from_response() {
+        let got = call_bridge_conv(&[(PAM_PROMPT_ECHO_OFF, "p:")], |driver| {
+            let _ = driver.challenge_rx.recv().unwrap();
+            driver
+                .response_tx
+                .send(Zeroizing::new("hu\0nter".into()))
+                .unwrap();
+        });
+        assert_eq!(got, vec!["hunter".to_string()]);
+    }
+
+    // ── bridge_conv error paths ─────────────────────────────────────────
+
+    #[test]
+    fn bridge_conv_rejects_null_appdata() {
+        let mut resp_out: *mut pam_response = ptr::null_mut();
+        let status = {
+            #[expect(unsafe_code, reason = "test the null-appdata refusal path")]
+            unsafe {
+                bridge_conv(1, ptr::null_mut(), &raw mut resp_out, ptr::null_mut())
+            }
+        };
+        assert_eq!(status, PAM_CONV_ERR as c_int);
+    }
+
+    #[test]
+    fn bridge_conv_rejects_negative_num_msg() {
+        let (bridge, _driver) = conv_pair();
+        let mut boxed_bridge = Box::new(bridge);
+        let appdata: *mut c_void =
+            std::ptr::from_mut::<ConvBridge>(boxed_bridge.as_mut()).cast::<c_void>();
+        let mut resp_out: *mut pam_response = ptr::null_mut();
+        let status = {
+            #[expect(unsafe_code, reason = "test the num_msg<=0 refusal path")]
+            unsafe {
+                bridge_conv(-1, ptr::null_mut(), &raw mut resp_out, appdata)
+            }
+        };
+        assert_eq!(status, PAM_CONV_ERR as c_int);
+    }
+
+    #[test]
+    fn bridge_conv_rejects_unknown_msg_style() {
+        let (bridge, _driver) = conv_pair();
+        let mut boxed_bridge = Box::new(bridge);
+        let appdata: *mut c_void =
+            std::ptr::from_mut::<ConvBridge>(boxed_bridge.as_mut()).cast::<c_void>();
+
+        let cs = CString::new("?:").unwrap();
+        let message = pam_message {
+            msg_style: 9999,
+            msg: cs.as_ptr().cast_mut(),
+        };
+        let msg_ptr: *const pam_message = &raw const message;
+        let mut resp_out: *mut pam_response = ptr::null_mut();
+        let status = {
+            #[expect(unsafe_code, reason = "test the unknown-msg-style refusal path")]
+            unsafe {
+                bridge_conv(
+                    1,
+                    std::ptr::from_ref::<*const pam_message>(&msg_ptr).cast_mut(),
+                    &raw mut resp_out,
+                    appdata,
+                )
+            }
+        };
+        assert_eq!(status, PAM_CONV_ERR as c_int);
     }
 }
