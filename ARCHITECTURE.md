@@ -38,17 +38,27 @@ DRM-master release/acquire across that boundary. The flash is the direct,
 unavoidable consequence of that process split.
 
 Halmasuit's design deletes the split. The same `halmasuit` binary that
-paints the splash during initramfs survives `switch_root` (via a controlled
-re-exec from the rootfs path, preserving the DRM master fd through
-`SCM_RIGHTS` or argv-FD inheritance), continues painting through systemd
-target traversal, brings up its Wayland server when the system reaches a
-ready state, hosts the greeter as a `wl_client`, swaps to niri after PAM
-success, and persists until power-off. DRM master is held continuously from
-initramfs through shutdown. The CRTC is modeset exactly once — or twice if
-`simpledrm` migrates to a real KMS driver mid-boot. Every visible transition
-is internal: either a buffer swap on the primary plane, or a `wl_client`
-swap inside halmasuit's own scenegraph. Nothing visible to the user crosses
-a process boundary.
+paints the splash during initramfs survives `switch_root` via systemd's
+`@argv[0]` storage-daemon convention: the process renames its `argv[0]`
+to start with `@`, which excludes it from systemd-shutdown's killall at
+the `pivot_root` boundary (see
+[systemd ROOT_STORAGE_DAEMONS](https://systemd.io/ROOT_STORAGE_DAEMONS/)).
+Same PID, same memory mapping, same DRM master file descriptor on both
+sides of the boundary; no `execve` or FD-passing dance is needed. The
+process continues painting through systemd target traversal, brings up
+its Wayland server when the system reaches a ready state, hosts the
+greeter as a `wl_client`, swaps to niri after PAM success, and persists
+until power-off. DRM master is held continuously from initramfs through
+shutdown. The CRTC is modeset exactly once — or twice if `simpledrm`
+migrates to a real KMS driver mid-boot. Every visible transition is
+internal: either a buffer swap on the primary plane, or a `wl_client`
+swap inside halmasuit's own scenegraph. Nothing visible to the user
+crosses a process boundary.
+
+This mechanism has been **empirically validated end-to-end** — see
+[`RESEARCH.md`](RESEARCH.md) for the `drm-master-probe` Phase 0 + Phase 1
+artifacts. The probes are runnable: `just test-drm-probe` and
+`just test-drm-probe-phase1` re-establish ground truth in seconds.
 
 This is what nothing else in the wlroots/smithay ecosystem ships. Plymouth,
 gdm-wayland, SDDM-wayland — every one of them dies and restarts the display
@@ -182,14 +192,23 @@ SHUTDOWN_SPLASH        halmasuit-splash              (none — awaits poweroff)
 Transitions:
 
 - **`INITRAMFS_SPLASH → ROOTFS_SPLASH`**: triggered by systemd's
-  `initrd-switch-root.target`. halmasuit re-execs itself from the rootfs
-  binary path (reachable because the rootfs is already mounted before
-  `switch_root`), preserving the DRM master fd and the wayland-socket fd
-  across the exec via non-CLOEXEC inheritance. The new image re-attaches
-  to those fds, drops privileges from root to the `compositor` system user
-  (via `setresuid` — the DRM master ioctl was checked at SET_MASTER time;
-  retaining mastery survives the privilege drop), and resumes painting the
-  same surface. The user sees no visible change.
+  `initrd-switch-root.target`. halmasuit relies on the `@argv[0]`
+  storage-daemon convention (writes `'@'` to `argv[0][0]` via glibc's
+  `__progname_full` data symbol) to exclude itself from systemd-shutdown's
+  killall at the `pivot_root` boundary. Same PID, same memory mapping,
+  same DRM master fd on both sides — no `execve`, no FD passing. The unit
+  itself uses `DefaultDependencies = false` + `IgnoreOnIsolate = true` so
+  it isn't stopped when `initrd-switch-root.target` is isolated. Once
+  rootfs is mounted, halmasuit drops privileges from root to the
+  `compositor` system user via `setresuid` (DRM master is per-fd; mastery
+  survives the privilege drop), and resumes painting the same surface.
+  The user sees no visible change. **Note:** rootfs systemd discovers the
+  orphan unit (its name lives only in the now-dead initramfs systemd) and
+  sends `SIGTERM` ~1s post-`switch_root`; halmasuit must either
+  `sd_notify` to register with rootfs systemd as a tracked unit, install
+  a graceful SIGTERM handler, or detach from systemd's process tracking.
+  See [`RESEARCH.md`](RESEARCH.md) drm-master-probe Phase 1 for the
+  empirical evidence behind every claim in this paragraph.
 - **`ROOTFS_SPLASH → GREETER`**: triggered by halmasuit reaching an
   internal-ready state (D-Bus session bus available, `XDG_RUNTIME_DIR`
   populated for the greeter user, halmasuit-greetd socket bound).
@@ -491,8 +510,13 @@ privileges. Anything that fits inside those constraints is in scope.
 
 ## Process model and UID handoff
 
-- **halmasuit** runs as `compositor` (system user, no shell, no login).
-  Owns DRM master via logind, holds the Wayland/greetd/IPC sockets.
+- **halmasuit** runs as `compositor` (system user, no shell, no login)
+  post-`switch_root`; as root in initramfs (before the userdb exists).
+  Owns DRM master directly — `DRM_IOCTL_SET_MASTER` against
+  `/dev/dri/card0`, not via logind brokerage. The probe in
+  [`RESEARCH.md`](RESEARCH.md) confirms the kernel allows continuous
+  master holding without logind involvement, and logind raises no
+  contention when it boots up later. Holds the Wayland/greetd/IPC sockets.
 - **Greeter process** runs as `greeter` (system user, no shell, no login,
   no FS access beyond its own cache dir). Same posture as greetd's
   greeter user. Sees keystrokes (Wayland input) including typed
@@ -677,7 +701,7 @@ Attackers, in order of likelihood:
 | 5 | TOCTOU during privilege drop in `halmasuit-spawn` | UID/GID passed as integers via argv. No path lookups in the helper. Privilege-drop syscalls execute in lockstep with no intervening user-controlled-state syscalls. Standard sudo hardening. |
 | 6 | Bug in `halmasuit-spawn` itself → privilege escalation | Helper is microscopic (~80 lines), `#![forbid(unsafe_code)]`, statically linked, no env propagation except allowlist, no file I/O except `XDG_RUNTIME_DIR` open. Audited on every change. |
 | 7 | Credential material lingers in halmasuit memory after auth | `zeroize` crate clears PAM challenge/response buffers immediately after auth completes. Only authenticated UID is retained. |
-| 8 | DRM master takeover by another process | logind enforces single-master-per-seat. Halmasuit registers as seat master via logind D-Bus; logind rejects competing requests. |
+| 8 | DRM master takeover by another process | The kernel enforces single-master-per-DRM-node: once halmasuit calls `DRM_IOCTL_SET_MASTER`, any other process's `SET_MASTER` returns `EACCES` until halmasuit closes the fd or calls `DROP_MASTER`. logind, if it tries to broker the device for another caller post-boot, will be denied the same way. Halmasuit takes master directly (no logind brokerage) — confirmed by [`RESEARCH.md`](RESEARCH.md). |
 | 9 | D-Bus method abuse — random user calls `RestartInnerWM` | polkit rules shipped with the NixOS module. Privileged methods require `wheel` group or interactive authentication. |
 | 10 | Lock-screen bypass | Lock screen is an `ext-session-lock-v1` client. Halmasuit refuses to release the lock until the client demonstrates a successful PAM round-trip. Same flow as greeter, in-session. |
 | 11 | Compromised halmasuit invokes `halmasuit-spawn` with `target_uid=0` (or any system UID) to escalate to root | **UID floor**: spawn refuses any `target_uid < UID_MIN` (typically 1000); same for `target_gid`. A compromised compositor can still invoke spawn for legitimate session UIDs but cannot reach root or other system users. Worst case bounded to session-as-currently-logged-in-user. **This is the load-bearing security property of the privilege split** — without it, the split is theater. |
@@ -1107,14 +1131,16 @@ These are explicit "we know this needs deciding, just not yet":
    when we start writing the auth code.
 2. **smithay revision** (v2). Pin to whatever niri or cosmic-comp is on
    when v2 begins. Update on a deliberate cadence; not bleeding-edge.
-3. **`switch_root` re-exec mechanism** (v2). Two viable approaches:
-   (a) `execve` from rootfs path with non-CLOEXEC fd inheritance — same
-   PID, same process, simplest; or (b) fork+exec the rootfs binary as a
-   child, pass fds via `SCM_RIGHTS`, exit the initramfs parent —
-   Plymouth's approach, slightly more involved. (a) is cleaner if
-   systemd cooperates with our unit lifecycle across the target switch;
-   (b) is the proven fallback. Decision belongs to whoever wires the
-   NixOS module's `boot.initrd.systemd.services.halmasuit` unit.
+3. ~~**`switch_root` re-exec mechanism** (v2).~~ **RESOLVED via empirical
+   validation in [`RESEARCH.md`](RESEARCH.md) drm-master-probe Phase 1:**
+   neither `execve` re-exec nor `SCM_RIGHTS` fd-passing is required. The
+   `@argv[0]` storage-daemon convention from
+   [systemd ROOT_STORAGE_DAEMONS](https://systemd.io/ROOT_STORAGE_DAEMONS/)
+   keeps the same process and DRM master fd across the boundary. v2
+   halmasuit takes this approach. Remaining engineering concern (NOT
+   architectural): rootfs systemd sends `SIGTERM` to the orphan unit
+   ~1s post-`switch_root`, so v2 must `sd_notify` to register with
+   rootfs systemd, handle SIGTERM gracefully, or detach explicitly.
 4. **Exact Wayland protocol surface** for v2 (vs additions in v3+). The
    v2 list above is the minimum; we may add `wp_drm_lease_v1` or
    `linux-explicit-synchronization-v1` if useful.

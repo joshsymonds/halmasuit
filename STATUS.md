@@ -67,6 +67,18 @@ just test-vm    # smoke-boot passes; login-flash fails as designed;
 
 ---
 
+## Validation archive
+
+The architectural premise — one halmasuit process owning DRM master from
+initramfs through to shutdown, surviving `switch_root` and `setresuid`
+— has been empirically validated end-to-end on the QEMU `virtio-gpu-pci`
+substrate. See [`RESEARCH.md`](RESEARCH.md) for the `drm-master-probe`
+artifact (Phase 0 + Phase 1) and what each phase proved. The probes are
+runnable; doubt is resolvable in seconds via `just test-drm-probe` and
+`just test-drm-probe-phase1`.
+
+---
+
 ## v2 — Next
 
 Implement the halmasuit compositor binary that makes `login-flash` go green

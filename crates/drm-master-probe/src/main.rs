@@ -1,5 +1,16 @@
 // drm-master-probe — research probe for halmasuit v2.
 //
+// This crate is the artifact described in RESEARCH.md at the repo root.
+// It is NOT production code: it is not gated by `just check`, it has
+// not been through formal review, and its assertions mirror the
+// architectural questions that motivated it rather than the contracts
+// halmasuit v2 production code (`halmasuit-*` crates) will need.
+//
+// The probe exists as a runnable proof, so when doubt about the
+// project's premise arises in the future, anyone — including
+// future-me — can run `just test-drm-probe` and `just test-drm-probe-phase1`
+// and re-establish ground truth in seconds.
+//
 // Phase 0 (rootfs-direct): if /etc/initrd-release is absent at startup,
 // the probe opens /dev/dri/card0, takes DRM master, paints solid red via
 // dumb buffer + SETCRTC, and heartbeats forever. Answers: can a userspace
@@ -16,8 +27,10 @@
 // process span the initramfs→rootfs boundary with DRM master and drop
 // privileges cleanly?
 //
-// This is research scaffolding. Production DRM ownership lives in
-// halmasuit-kms (v2). See ARCHITECTURE.md "The architectural commitment".
+// See RESEARCH.md for results, ARCHITECTURE.md "The architectural
+// commitment" for how the probe's findings feed v2's design. Production
+// DRM ownership lives in `halmasuit-kms` (v2), written from scratch
+// against the patterns this probe validated — not lifted from it.
 
 #![deny(unsafe_code)]
 
