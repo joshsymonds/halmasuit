@@ -23,6 +23,7 @@
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -88,6 +89,125 @@ fn set_argv0_marker() {
         let argv0_ptr: *mut std::os::raw::c_char = __progname_full;
         *argv0_ptr = b'@'.cast_signed();
     }
+}
+
+/// Phase 1 diagnostic: fd to /run/drm-master-probe-events.log, written
+/// to from signal handlers before the process dies. -1 means uninitialized;
+/// signal handler bails to default behavior in that case.
+static EVENT_LOG_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Async-signal-safe handler that records which signal arrived and
+/// **continues running** (does not exit). This lets us learn what
+/// arrives without dying from it; we want SIGTERM ignored so we can see
+/// what kills us next (e.g., a follow-up SIGKILL would still terminate).
+///
+/// SIGABRT specifically: Rust panic machinery uses abort(), which
+/// raises SIGABRT. We do NOT want to ignore SIGABRT in production code,
+/// but for this probe's diagnostic, returning lets us see whether the
+/// kill is signal-based or something else entirely.
+#[expect(
+    unsafe_code,
+    reason = "signal handlers must use async-signal-safe libc primitives only"
+)]
+extern "C" fn diagnostic_signal_handler(sig: libc::c_int) {
+    let fd = EVENT_LOG_FD.load(Ordering::Relaxed);
+    let msg: &[u8] = match sig {
+        libc::SIGTERM => b"SIGTERM (caught, ignored)\n",
+        libc::SIGHUP => b"SIGHUP (caught, ignored)\n",
+        libc::SIGPIPE => b"SIGPIPE (caught, ignored)\n",
+        libc::SIGINT => b"SIGINT (caught, ignored)\n",
+        libc::SIGABRT => b"SIGABRT (caught, ignored)\n",
+        libc::SIGQUIT => b"SIGQUIT (caught, ignored)\n",
+        _ => b"OTHER (caught, ignored)\n",
+    };
+    // SAFETY: write() is async-signal-safe per POSIX. Returning from the
+    // handler resumes the interrupted instruction; the signal is consumed.
+    unsafe {
+        if fd >= 0 {
+            libc::write(fd, msg.as_ptr().cast(), msg.len());
+        }
+    }
+}
+
+/// Phase 1 diagnostics:
+///   - dup2 stderr (fd 2) onto a file in /run so eprintln writes survive
+///     switch_root (journald-in-initrd dies, its stderr pipe breaks)
+///   - install signal handlers that log which signal killed us before
+///     exiting (caught signals only — SIGKILL can't be caught, but the
+///     absence of any logged signal IS itself a finding: probably a
+///     SIGKILL from cgroup.kill or similar)
+#[expect(
+    unsafe_code,
+    reason = "libc dup2 + signal for diagnostic setup; documented operations"
+)]
+fn setup_phase1_diagnostics() -> Result<()> {
+    use std::os::unix::io::IntoRawFd;
+
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/run/drm-master-probe.log")
+        .context("open /run/drm-master-probe.log")?;
+    let events = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/run/drm-master-probe-events.log")
+        .context("open /run/drm-master-probe-events.log")?;
+
+    // SAFETY: dup2 redirects fd 2 (stderr) onto our log file fd. After
+    // this, every eprintln write lands in /run/drm-master-probe.log,
+    // which persists across switch_root (it's tmpfs at /run).
+    unsafe {
+        libc::dup2(log.into_raw_fd(), 2);
+    }
+    EVENT_LOG_FD.store(events.into_raw_fd(), Ordering::Relaxed);
+
+    let signals: &[libc::c_int] = &[
+        libc::SIGTERM,
+        libc::SIGHUP,
+        libc::SIGPIPE,
+        libc::SIGINT,
+        libc::SIGABRT,
+        libc::SIGQUIT,
+    ];
+    // SAFETY: signal() installs a global signal handler. Legal for a
+    // single-threaded process (which ours is).
+    unsafe {
+        for &sig in signals {
+            libc::signal(
+                sig,
+                diagnostic_signal_handler as *const () as libc::sighandler_t,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Log /proc/self/cgroup contents — if the probe dies because of cgroup
+/// manipulation by rootfs systemd, we'll see the cgroup change in the
+/// log right before death.
+fn log_cgroup(label: &str) {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
+        .unwrap_or_else(|e| format!("(unreadable: {e})"));
+    eprintln!("drm-master-probe: cgroup at {label}: {}", cgroup.trim());
+}
+
+/// Log /proc/self/cmdline contents — verifies whether the argv[0]='@'
+/// mutation is still visible to the kernel (and thus to systemd's
+/// @-survival check). Note: cmdline is NUL-separated; we display
+/// substituting NUL with '|' for readability.
+fn log_cmdline(label: &str) {
+    let cmdline = std::fs::read("/proc/self/cmdline").map_or_else(
+        |e| format!("(unreadable: {e})"),
+        |bytes| {
+            let displayable: Vec<u8> = bytes
+                .iter()
+                .map(|&b| if b == 0 { b'|' } else { b })
+                .collect();
+            String::from_utf8_lossy(&displayable).into_owned()
+        },
+    );
+    eprintln!("drm-master-probe: cmdline at {label}: {cmdline}");
 }
 
 /// Phase 0's DRM pipeline: open device, take master, paint solid red,
@@ -216,8 +336,11 @@ fn run_rootfs_direct_phase() -> Result<()> {
 )]
 fn run_initramfs_phase() -> Result<()> {
     set_argv0_marker();
+    setup_phase1_diagnostics()?;
     let pid = std::process::id();
     eprintln!("drm-master-probe: phase=initramfs pid={pid} argv0_marker=@ set");
+    log_cgroup("phase=initramfs start");
+    log_cmdline("phase=initramfs start");
 
     let state = setup_drm_and_paint()?;
 
@@ -239,6 +362,21 @@ fn run_initramfs_phase() -> Result<()> {
             break;
         }
     }
+
+    log_cgroup("switch_root detected, pre-setresuid");
+    log_cmdline("switch_root detected, pre-setresuid");
+    // Empirical finding from this probe: rootfs systemd discovers our
+    // orphan unit ~1s post-switch_root and sends SIGTERM intending to
+    // reap it (the unit's name lives only in the initramfs systemd; the
+    // rootfs systemd's "Unit drm-master-probe.service not found" status
+    // means it tries to stop what it doesn't recognize). With the
+    // diagnostic SIGTERM handler in setup_phase1_diagnostics catching
+    // and ignoring it, we survive indefinitely. Rootfs systemd then
+    // sits in "stop-sigterm" wait. v2 production halmasuit would
+    // either sd_notify into rootfs systemd to be tracked as a unit,
+    // handle SIGTERM with graceful release, or detach explicitly —
+    // none of those is an architectural blocker; this is standard
+    // daemon engineering.
 
     // Phase 1b: switch_root has completed. Drop privileges.
     let from_uid = nix::unistd::Uid::current().as_raw();
@@ -273,14 +411,20 @@ fn run_initramfs_phase() -> Result<()> {
     eprintln!(
         "drm-master-probe: phase=post-switchroot setresuid({from_uid}→{target_uid}) ok, master still held"
     );
+    log_cgroup("phase=post-switchroot start");
 
     // Phase 1c: post-switchroot heartbeat. Same `start`, monotonic tick.
+    // Re-log cgroup state every 5 ticks so we can see if rootfs systemd
+    // manipulates our cgroup membership over time.
     loop {
         std::thread::sleep(Duration::from_millis(100));
         let elapsed = start.elapsed().as_secs();
         if elapsed > last_tick {
             last_tick = elapsed;
             eprintln!("drm-master-probe: tick t={elapsed}s phase=post-switchroot");
+            if elapsed.is_multiple_of(5) {
+                log_cgroup(&format!("phase=post-switchroot t={elapsed}s"));
+            }
         }
     }
 }

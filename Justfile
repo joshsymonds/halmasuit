@@ -54,6 +54,14 @@ test-vm:
 test-drm-probe:
     nix build .#checks.x86_64-linux.drm-master-probe -L --print-build-logs --no-link
 
+# Phase 1 research probe: validate userspace DRM master persistence across
+# the initramfs→rootfs switch_root boundary, with setresuid privilege drop.
+# Probe is started in initramfs via boot.initrd.systemd.services, survives
+# switch_root via systemd's @argv[0] convention, drops to UID 1000, asserts
+# master still held.
+test-drm-probe-phase1:
+    nix build .#checks.x86_64-linux.drm-master-probe-phase1 -L --print-build-logs --no-link
+
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.
 # Useful for `machine.screenshot("name")`, `machine.send_chars(...)`, and
