@@ -13,6 +13,9 @@ members = [
     "crates/drm-master-probe",
     "xtask",
 ]
+# cargo-fuzz subworkspace needs nightly rustc + libfuzzer-sys; isolated
+# from the main workspace which pins stable 1.95.
+exclude = ["crates/halmasuit-spawn/fuzz"]
 
 [workspace.package]
 version       = "0.1.0"

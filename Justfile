@@ -133,3 +133,15 @@ miri:
 # API stability check against the last published version.
 semver:
     cargo semver-checks check-release
+
+# Fuzz halmasuit-spawn's parse_argv for `seconds` seconds (default 10).
+# Requires `cargo install cargo-fuzz` + `rustup toolchain install nightly`
+# locally; not run in CI (cargo-fuzz needs nightly and is hostile to
+# sandboxes). The fuzz/ subworkspace is excluded from the main workspace,
+# so `just check` is unaffected.
+#
+# Mutation-verify by inserting `panic!("seed")` into parse_argv and
+# running for 30s — libfuzzer should crash within seconds.
+fuzz-spawn seconds="10":
+    cd crates/halmasuit-spawn/fuzz && \
+        cargo +nightly fuzz run parse_argv -- -max_total_time={{seconds}}

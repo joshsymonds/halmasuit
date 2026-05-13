@@ -1,0 +1,33 @@
+# cargo-fuzz harness for halmasuit-spawn.
+#
+# This is a SEPARATE workspace from the main halmasuit workspace —
+# cargo-fuzz convention plus the fact that libfuzzer-sys requires
+# nightly rustc, which the main workspace pins to stable 1.95.
+# The parent workspace `excludes` this directory in halmasuit/Cargo.toml.
+
+[package]
+name        = "halmasuit-spawn-fuzz"
+version     = "0.0.0"
+publish     = false
+edition     = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys       = "0.4"
+halmasuit-spawn     = { path = ".." }
+
+[[bin]]
+name  = "parse_argv"
+path  = "fuzz_targets/parse_argv.rs"
+test  = false
+doc   = false
+bench = false
+
+[workspace]
+members = []
+
+# Strip-down release profile for fast iteration during local fuzz runs.
+[profile.release]
+debug = 1
