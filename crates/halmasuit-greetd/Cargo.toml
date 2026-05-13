@@ -19,6 +19,10 @@ serde.workspace      = true
 # Codec runtime: encode/decode messages on the greetd socket.
 serde_json.workspace = true
 thiserror.workspace  = true
+# Unix socket peer-credential lookup (SO_PEERCRED via nix wrappers,
+# so this crate stays #![forbid(unsafe_code)]).
+nix                  = { workspace = true, features = ["socket", "user"] }
 
 [dev-dependencies]
 proptest.workspace   = true
+tempfile.workspace   = true

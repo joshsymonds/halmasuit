@@ -34,6 +34,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod server;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -238,10 +240,10 @@ impl SessionState {
                   explicitly. Collapsing arms with `|` would obscure \
                   which transitions are forbidden in which states."
     )]
-    pub fn handle<P: PamSession>(
+    pub fn handle(
         &mut self,
         request: Request,
-        pam: &mut P,
+        pam: &mut dyn PamSession,
     ) -> Result<Response, StateMachineError> {
         match (&*self, request) {
             // ── Idle ────────────────────────────────────────────────────
@@ -312,23 +314,32 @@ impl SessionState {
         }
     }
 
-    fn advance_pam<P: PamSession>(&mut self, username: String, pam: &mut P) -> Response {
+    fn advance_pam(&mut self, username: String, pam: &mut dyn PamSession) -> Response {
         *self = Self::Authenticating {
             username: username.clone(),
         };
         translate_pam_step(self, pam.step(None), username)
     }
 
-    fn advance_pam_with_response<P: PamSession>(
+    fn advance_pam_with_response(
         &mut self,
         response: Option<String>,
-        pam: &mut P,
+        pam: &mut dyn PamSession,
     ) -> Response {
         let Self::Authenticating { username } = self else {
             unreachable!("advance_pam_with_response called outside Authenticating");
         };
         let username = username.clone();
         translate_pam_step(self, pam.step(response), username)
+    }
+}
+
+/// Forwards `step` to the inner trait object so callers can pass a
+/// `Box<dyn PamSession + Send>` (or `&mut Box<...>`) where the state
+/// machine expects something that implements `PamSession`.
+impl PamSession for Box<dyn PamSession + Send> {
+    fn step(&mut self, response: Option<String>) -> PamStep {
+        (**self).step(response)
     }
 }
 
