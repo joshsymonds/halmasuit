@@ -69,6 +69,15 @@ test-drm-probe:
 test-drm-probe-phase1:
     nix build .#checks.x86_64-linux.drm-master-probe-phase1 -L --print-build-logs --no-link
 
+# Phase 2 research probe: test whether systemd's SurviveFinalKillSignal=yes
+# (v255+) is a viable replacement for the @argv[0] mechanism Phase 1 uses.
+# Same probe binary, PROBE_SKIP_ARGV0_MARK=1 env, SurviveFinalKillSignal=yes
+# on the unit. Phase 2 passing means we have a supported upgrade path off
+# the storage-only @argv[0] convention; failing means @argv[0] remains the
+# only mechanism and we accept its upstream-policy risk.
+test-drm-probe-phase2:
+    nix build .#checks.x86_64-linux.drm-master-probe-phase2 -L --print-build-logs --no-link
+
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.
 # Useful for `machine.screenshot("name")`, `machine.send_chars(...)`, and

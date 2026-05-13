@@ -348,10 +348,20 @@ fn run_rootfs_direct_phase() -> Result<()> {
     reason = "the probe is intended to hold DRM master forever and only exit via SIGTERM"
 )]
 fn run_initramfs_phase() -> Result<()> {
-    set_argv0_marker();
+    // Phase 2 opt-out: if PROBE_SKIP_ARGV0_MARK is set, skip the
+    // __progname_full write and rely on the unit's
+    // SurviveFinalKillSignal=yes directive to keep the process alive
+    // across systemd-shutdown's killall during switch_root.
+    let skip_argv0 = std::env::var("PROBE_SKIP_ARGV0_MARK").is_ok();
+    let mechanism = if skip_argv0 {
+        "survivefinalkillsignal"
+    } else {
+        set_argv0_marker();
+        "argv0"
+    };
     setup_phase1_diagnostics()?;
     let pid = std::process::id();
-    eprintln!("drm-master-probe: phase=initramfs pid={pid} argv0_marker=@ set");
+    eprintln!("drm-master-probe: phase=initramfs pid={pid} mechanism={mechanism}");
     log_cgroup("phase=initramfs start");
     log_cmdline("phase=initramfs start");
 
