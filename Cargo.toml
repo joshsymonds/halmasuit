@@ -33,6 +33,9 @@ calloop            = { version = "0.14", features = ["signals"] }
 # POSIX bindings. drm-master-probe has its own entry (different feature set);
 # this entry is for v2 production crates that need signal/kill/etc.
 nix                = "0.30"
+# Property-based testing. halmasuit-spawn argv parser + the future greetd
+# state machine both lean on it for boundary-condition coverage.
+proptest           = "1"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

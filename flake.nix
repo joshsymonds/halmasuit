@@ -129,6 +129,24 @@
             };
           };
 
+          # halmasuit-spawn — setuid-root privilege-drop helper. Shipped
+          # as a separate Nix package so the production NixOS module can
+          # wrap it with security.wrappers (setuid bit) and the VM test
+          # can install + invoke it as a real setuid binary.
+          halmasuit-spawn = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-spawn";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags    = [ "-p" "halmasuit-spawn" ];
+            doCheck = false; # VM test is the deployment-side gate
+            meta = {
+              description = "halmasuit setuid-root privilege-drop helper";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-spawn";
+            };
+          };
+
           # Phase 0 research probe: validates userspace DRM master
           # persistence from rootfs boot through multi-user.target.
           # Built as a Nix package so the NixOS VM test can install it.
@@ -181,6 +199,11 @@
           system    = "x86_64-linux";
           inherit nixpkgs;
           halmasuit = self.packages.x86_64-linux.halmasuit;
+        };
+        halmasuit-spawn = import ./tests/halmasuit-spawn.nix {
+          system          = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit-spawn = self.packages.x86_64-linux.halmasuit-spawn;
         };
         drm-master-probe = import ./tests/drm-master-probe.nix {
           system = "x86_64-linux";

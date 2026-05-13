@@ -41,6 +41,9 @@ test-vm:
     echo "── halmasuit-introspect (must pass) ──"
     nix build .#checks.x86_64-linux.halmasuit-introspect -L --print-build-logs --no-link
     echo
+    echo "── halmasuit-spawn (must pass) ──"
+    nix build .#checks.x86_64-linux.halmasuit-spawn -L --print-build-logs --no-link
+    echo
     echo "── login-flash (expected RED until v2) ──"
     if nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link; then
         echo
