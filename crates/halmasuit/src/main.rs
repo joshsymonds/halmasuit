@@ -1,25 +1,34 @@
 // halmasuit — Linux system compositor.
 //
 // v2 Phase A spine. This binary lives from `multi-user.target` to shutdown
-// and will host greeter + session as nested wl_clients. Today (smithay
-// scaffolding + foundational globals) it brings up smithay's Wayland-
-// server event loop, binds a Wayland socket, and advertises the
-// foundational protocol globals `wl_compositor` + `wl_subcompositor` +
-// `xdg_wm_base`. Connecting clients can create surfaces and top-levels;
-// nothing renders yet (no wl_output / no scanout backend). Additional
-// globals (`wl_seat`, `wl_output`, `wl_shm`, `linux-dmabuf-v1`, …) land
-// in subsequent tasks. See ARCHITECTURE.md.
+// and will host greeter + session as nested wl_clients. Today it brings
+// up smithay's Wayland-server event loop, binds a Wayland socket, and
+// advertises foundational protocol globals: `wl_compositor`,
+// `wl_subcompositor`, `xdg_wm_base`, `wl_seat`, `wl_output`. Connecting
+// clients can create surfaces, top-levels, and discover inputs/outputs.
+// Nothing renders yet (no scanout backend); the advertised output is
+// a synthesized 1920×1080@60Hz placeholder until DRM lands. Additional
+// globals (`wl_shm`, `linux-dmabuf-v1`, …) land in subsequent tasks.
+// See ARCHITECTURE.md.
 
 use std::io;
 use std::sync::Arc;
 
-use calloop::EventLoop;
+use std::time::Duration;
+
+use calloop::generic::Generic;
 use calloop::signals::{Signal, Signals};
+// calloop's `Mode` and smithay's `output::Mode` collide; rename calloop's
+// to keep the smithay one as `Mode` (used more often).
+use calloop::{EventLoop, Interest, Mode as CalloopMode, PostAction};
 use halmasuit_introspect::{Event, Phase, ShutdownReason, emit};
+use smithay::input::{Seat, SeatHandler, SeatState};
+use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
 use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
+use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
@@ -34,6 +43,18 @@ struct HalmasuitState {
     display_handle: DisplayHandle,
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
+    seat_state: SeatState<Self>,
+    // `_seat` is retained so the seat global stays registered for the
+    // lifetime of the compositor; capabilities are added when real
+    // input devices come online in a future task.
+    _seat: Seat<Self>,
+    // OutputManagerState exists to keep the xdg_output_manager global
+    // alive; nothing reads the field directly (delegate_output! handles
+    // dispatch via the type), hence the leading underscore.
+    _output_manager_state: OutputManagerState,
+    // `_output` keeps the synthesized output alive; real outputs come
+    // with the DRM backend.
+    _output: Output,
 }
 
 /// Per-client metadata. smithay's `CompositorHandler` requires us to
@@ -109,8 +130,51 @@ impl XdgShellHandler for HalmasuitState {
     }
 }
 
+impl SeatHandler for HalmasuitState {
+    type KeyboardFocus = WlSurface;
+    type PointerFocus = WlSurface;
+    type TouchFocus = WlSurface;
+
+    fn seat_state(&mut self) -> &mut SeatState<Self> {
+        &mut self.seat_state
+    }
+
+    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&Self::KeyboardFocus>) {
+        // Focus tracking lands when there are multiple foreground
+        // clients to switch between. Phase A hosts at most one
+        // wl_client at a time.
+    }
+}
+
+impl OutputHandler for HalmasuitState {}
+
+/// calloop callback for the wayland Display source. The Display is
+/// owned by calloop's `Generic` wrapper (`NoIoDrop`); accessing the
+/// inner value requires an unsafe call to `get_mut`.
+#[expect(
+    unsafe_code,
+    reason = "calloop's NoIoDrop<Display>::get_mut is unsafe to prevent accidentally dropping the wrapped fd; the callback never drops display"
+)]
+fn dispatch_display(
+    _: calloop::Readiness,
+    display: &mut calloop::generic::NoIoDrop<Display<HalmasuitState>>,
+    state: &mut HalmasuitState,
+) -> Result<PostAction, io::Error> {
+    // SAFETY: we never drop the display from this callback; calloop
+    // owns the fd for the lifetime of the source.
+    unsafe {
+        display
+            .get_mut()
+            .dispatch_clients(state)
+            .map_err(io::Error::other)?;
+    }
+    Ok(PostAction::Continue)
+}
+
 smithay::delegate_compositor!(HalmasuitState);
 smithay::delegate_xdg_shell!(HalmasuitState);
+smithay::delegate_seat!(HalmasuitState);
+smithay::delegate_output!(HalmasuitState);
 
 fn main() -> io::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -130,6 +194,33 @@ fn main() -> io::Result<()> {
     let display_handle = display.handle();
     let compositor_state = CompositorState::new::<HalmasuitState>(&display_handle);
     let xdg_shell_state = XdgShellState::new::<HalmasuitState>(&display_handle);
+
+    let mut seat_state = SeatState::new();
+    let seat = seat_state.new_wl_seat(&display_handle, "seat0".to_owned());
+
+    let output_manager_state =
+        OutputManagerState::new_with_xdg_output::<HalmasuitState>(&display_handle);
+    // Synthesized placeholder output. Geometry is invented; the
+    // advertisement exists so clients can discover an output and
+    // proceed past their wl_registry phase. Real geometry lands when
+    // the DRM backend wires actual modes (subsequent task).
+    let output_mode = Mode {
+        size: (1920, 1080).into(),
+        refresh: 60_000, // 60 Hz, in mHz per the wl_output spec
+    };
+    let output = Output::new(
+        "output-0".to_owned(),
+        PhysicalProperties {
+            size: (480, 270).into(), // mm; ~96 DPI assumption
+            subpixel: Subpixel::Unknown,
+            make: "halmasuit".to_owned(),
+            model: "synthesized-1080p".to_owned(),
+            serial_number: String::new(),
+        },
+    );
+    output.create_global::<HalmasuitState>(&display_handle);
+    output.change_current_state(Some(output_mode), None, None, Some((0, 0).into()));
+    output.set_preferred(output_mode);
 
     let mut event_loop: EventLoop<HalmasuitState> =
         EventLoop::try_new().map_err(io::Error::other)?;
@@ -178,21 +269,40 @@ fn main() -> io::Result<()> {
         phase: Phase::WaylandReady,
     });
 
+    // Wrap the Display as a calloop Generic source so client fd
+    // activity (new requests on connected clients) wakes the event
+    // loop. Without this, dispatch_clients only runs when something
+    // else fires the loop, and connected clients hang. (smithay's
+    // anvil example uses the same pattern.)
+    loop_handle
+        .insert_source(
+            Generic::new(display, Interest::READ, CalloopMode::Level),
+            dispatch_display,
+        )
+        .map_err(io::Error::other)?;
+
     let mut state = HalmasuitState {
         running: true,
         display_handle,
         compositor_state,
         xdg_shell_state,
+        seat_state,
+        _seat: seat,
+        _output_manager_state: output_manager_state,
+        _output: output,
     };
 
-    let mut display = display;
+    // Main loop: wait briefly for any source to fire, then flush any
+    // pending outgoing events to clients. flush_clients lives on the
+    // DisplayHandle (cloned earlier) since Display itself is now owned
+    // by the calloop source above.
     while state.running {
-        display
-            .dispatch_clients(&mut state)
-            .map_err(io::Error::other)?;
-        display.flush_clients().map_err(io::Error::other)?;
         event_loop
-            .dispatch(None, &mut state)
+            .dispatch(Some(Duration::from_millis(16)), &mut state)
+            .map_err(io::Error::other)?;
+        state
+            .display_handle
+            .flush_clients()
             .map_err(io::Error::other)?;
     }
 

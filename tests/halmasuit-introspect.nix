@@ -161,14 +161,11 @@ pkgs.testers.runNixOSTest {
         "XDG_RUNTIME_DIR=/run/halmasuit WAYLAND_DISPLAY=wayland-0 "
         "timeout 5 wayland-info 2>&1"
     )
-    if "wl_compositor" not in info:
-        raise AssertionError(
-            f"wl_compositor global not advertised; wayland-info output:\n{info}"
-        )
-    if "xdg_wm_base" not in info:
-        raise AssertionError(
-            f"xdg_wm_base global not advertised; wayland-info output:\n{info}"
-        )
+    for required in ("wl_compositor", "xdg_wm_base", "wl_seat", "wl_output"):
+        if required not in info:
+            raise AssertionError(
+                f"{required} global not advertised; wayland-info output:\n{info}"
+            )
 
     # Assertion 3: SIGTERM via systemctl stop produces Shutdown with
     # reason = signal_term, and the unit transitions to inactive (not failed).
