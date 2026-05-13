@@ -1186,9 +1186,24 @@ Things we will not do regardless of pressure:
 
 These are explicit "we know this needs deciding, just not yet":
 
-1. **PAM bindings** (v2). `pam-client` and `pam-sys` are stale (2022 and
-   2023 respectively). Decide between fork, write-thin-FFI, or use-as-is
-   when we start writing the auth code.
+1. ~~**PAM bindings** (v2).~~ **RESOLVED: use `pam-sys` 1.0.0-alpha5
+   directly, no wrapper crate.** Dual MIT-OR-Apache (matches workspace
+   posture); the `1.0.0-alpha` label is misleading — it has shipped
+   alphas for 4 years and the FFI surface is ~70 lines of Rust over
+   a stable C ABI. Higher-level wrappers (`pam-client`, `pam`) flatten
+   the conversation-message style enum and hide the `pam_conv` pointer
+   we need to wire to a channel; `pam-client` is also MPL-2.0 which is
+   the same license-posture problem we just paid to avoid. greetd
+   itself uses `pam-sys` directly, validating the path. Implementation
+   pattern (per upstream greetd `src/pam/session.rs`): worker thread
+   per PAM session, two `mpsc::sync_channel`s (challenge-out,
+   response-in). `pam_authenticate` blocks on the conv callback;
+   `PamSession::step` is the channel-driven adapter that bridges the
+   blocking C call to our state machine's round-by-round model.
+   Pitfalls noted for the implementation task: `catch_unwind` inside
+   the `extern "C"` conv (panic-across-FFI is UB), `zeroize` response
+   buffers on the conv thread after `strdup`, set `PAM_RUSER`/`PAM_TTY`
+   before `authenticate`, handle `PAM_NEW_AUTHTOK_REQD` distinctly.
 2. **smithay revision** (v2). Pin to whatever niri or cosmic-comp is on
    when v2 begins. Update on a deliberate cadence; not bleeding-edge.
 3. ~~**`switch_root` re-exec mechanism** (v2).~~ **RESOLVED via
