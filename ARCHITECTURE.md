@@ -88,6 +88,18 @@ as a server. Every existing Wayland greeter that greetd already speaks to
 (DankGreeter, regreet, tuigreet, gtkgreet, agreety) connects to halmasuit
 unchanged. From the greeter's perspective, halmasuit IS greetd.
 
+Wire types and the JSON codec come from upstream — `halmasuit-greetd`
+depends on the published [`greetd_ipc`](https://crates.io/crates/greetd_ipc)
+crate maintained alongside greetd itself. What we own is the daemon-side
+logic: the state machine, PAM glue, and the integration points that swap
+halmasuit's foreground Wayland client when auth succeeds. We do not
+re-derive the protocol from the spec text — reusing greetd's own types
+means we track protocol additions automatically and inherit no drift
+bugs. Reusing greetd-the-daemon itself as a library is not feasible: its
+privilege model (run as root, `execve` the user session) is incompatible
+with halmasuit's (run as `compositor` user, never exec, delegate UID
+switching to `halmasuit-spawn`).
+
 Flow:
 
 1. halmasuit launches the configured greeter binary with environment:
@@ -134,6 +146,8 @@ unmodified.
 The privilege-drop sequence inside `halmasuit-spawn`:
 
 ```
+assert target_uid >= UID_MIN (typically 1000)
+assert target_gid >= UID_MIN
 setresgid(target_gid, target_gid, target_gid)
 setgroups(target_supplementary_groups)
 setresuid(target_uid, target_uid, target_uid)
@@ -143,6 +157,15 @@ execve(cmd, sanitized_argv, sanitized_envp)
 
 No intervening syscalls touch user-controlled state between privilege
 drop and exec.
+
+The UID-floor refusal is what makes the privilege split *not* security
+theater. A compromised halmasuit can invoke `halmasuit-spawn` — that is
+in the threat model and not preventable. What the floor prevents is
+using spawn to escalate to root or any other system user. With the floor
+in place, the worst-case outcome of full code execution in halmasuit is
+"spawn arbitrary commands as the currently-logged-in user," not "system
+compromise" — reboot to recovery and the persistent damage is in
+`$HOME`, not in `/`. Removing the floor turns the split into theater.
 
 ---
 
@@ -294,14 +317,36 @@ Attackers, in order of likelihood:
 | 8 | DRM master takeover by another process | logind enforces single-master-per-seat. Halmasuit registers as seat master via logind D-Bus; logind rejects competing requests. |
 | 9 | D-Bus method abuse — random user calls `RestartInnerWM` | polkit rules shipped with the NixOS module. Privileged methods require `wheel` group or interactive authentication. |
 | 10 | Lock-screen bypass | Lock screen is an `ext-session-lock-v1` client. Halmasuit refuses to release the lock until the client demonstrates a successful PAM round-trip. Same flow as greeter, in-session. |
+| 11 | Compromised halmasuit invokes `halmasuit-spawn` with `target_uid=0` (or any system UID) to escalate to root | **UID floor**: spawn refuses any `target_uid < UID_MIN` (typically 1000); same for `target_gid`. A compromised compositor can still invoke spawn for legitimate session UIDs but cannot reach root or other system users. Worst case bounded to session-as-currently-logged-in-user. **This is the load-bearing security property of the privilege split** — without it, the split is theater. |
 
 ### Posture vs current greetd
 
-Halmasuit is **roughly equivalent** to greetd's existing security
-posture, with one new component (`halmasuit-spawn`) that is the
-highest-priority code to audit and keep small. The compositor running as
-a non-root `compositor` user means a halmasuit compromise gets the
-attacker `compositor`-level access, not user files or root.
+Halmasuit's posture is **strictly better** than greetd's. greetd-the-daemon
+runs as **root** — full compromise of greetd is full compromise of the
+system, with no privilege boundary to fall back on. halmasuit factors
+that privilege into one ~80-line setuid helper (`halmasuit-spawn`) and
+leaves the compositor itself unprivileged. Concretely:
+
+- **Bug-class delta.** Most exploitable bugs (info leaks, OOB reads,
+  partial heap overwrites, Wayland state-machine errors, smithay surface
+  bugs) become non-fatal when the process has no privileges to escalate.
+  In a root greetd or root halmasuit, the same bug class is a
+  kernel-attack primitive — root can `ptrace` arbitrary processes, write
+  `/proc/*/mem`, open `/dev/mem`, `init_module`, etc.
+- **Full-RCE bound.** Even on full code-execution in halmasuit, the UID
+  floor in `halmasuit-spawn` (row 11 above) caps the blast radius at the
+  currently-logged-in user. greetd has no equivalent cap because it *is*
+  root.
+- **Audit ratio.** The privileged surface goes from "all of greetd plus
+  its deps" to ~80 lines of `#![forbid(unsafe_code)]`, statically-linked
+  Rust. That fits on a whiteboard and is reviewable by eye on every
+  commit.
+
+The pattern is standard split-privilege design, the same one OpenSSH
+uses (privileged `sshd` + unprivileged per-connection child) and the
+same one Windows uses (privileged `winlogon`/`lsass` + DWM running as a
+virtual service account, not SYSTEM). The privilege isn't hidden — it's
+**factored**.
 
 `halmasuit-spawn`, the Wayland socket peer-credential check, and the
 greetd state machine are the three things that must have fuzz tests and

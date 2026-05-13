@@ -15,17 +15,33 @@
 // - --: required separator.
 // - <command> [args...]: the program to exec after privilege drop.
 //
+// ## Refusal rules (load-bearing security property)
+//
+// halmasuit-spawn refuses to set target_uid below UID_MIN (typically
+// 1000; read from /etc/login.defs at build time or hardcoded as a
+// conservative default). The same floor applies to target_gid.
+//
+// This is what makes the privilege split *not* theater. A compromised
+// halmasuit can invoke this helper — that is in the threat model and is
+// not preventable. What the UID floor prevents is using the helper to
+// escalate to root or to any other system user. With the floor in
+// place, the worst-case outcome of full RCE in halmasuit is "spawn
+// arbitrary commands as the currently-logged-in user." Without it, the
+// split is theater. Do not remove this check.
+//
 // ## Sequence (v2)
 //
 // 1. Validate argv shape (exactly the schema above; reject otherwise).
 // 2. Confirm current EUID == 0 (we should be setuid-root; abort if not).
-// 3. Sanitize envp: drop everything except an explicit allowlist
+// 3. Enforce UID floor: target_uid >= UID_MIN && target_gid >= UID_MIN;
+//    abort with a precise diagnostic otherwise.
+// 4. Sanitize envp: drop everything except an explicit allowlist
 //    (XDG_RUNTIME_DIR, PATH, LANG, LC_*, HOME, USER, LOGNAME, SHELL).
-// 4. setresgid(target_gid, target_gid, target_gid).
-// 5. initgroups(target_user) — or setgroups(target_supplementary_groups).
-// 6. setresuid(target_uid, target_uid, target_uid).
-// 7. prctl(PR_SET_NO_NEW_PRIVS).
-// 8. execve(command, sanitized_argv, sanitized_envp).
+// 5. setresgid(target_gid, target_gid, target_gid).
+// 6. initgroups(target_user) — or setgroups(target_supplementary_groups).
+// 7. setresuid(target_uid, target_uid, target_uid).
+// 8. prctl(PR_SET_NO_NEW_PRIVS).
+// 9. execve(command, sanitized_argv, sanitized_envp).
 //
 // No intervening syscalls touch user-controlled state between drop and exec.
 
