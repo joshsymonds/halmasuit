@@ -21,3 +21,6 @@ workspace = true
 [dependencies]
 anyhow = "1"
 drm    = "0.15"
+# Phase 1: setresuid for the privilege-drop step post-switch_root. The
+# `user` feature gates nix::unistd::{Uid, setresuid}.
+nix    = { version = "0.30", features = ["user"] }
