@@ -20,7 +20,7 @@ use nix::unistd::Pid;
 
 const TIMEOUT_EVENT: Duration = Duration::from_secs(3);
 const TIMEOUT_EXIT: Duration = Duration::from_secs(5);
-const EXIT_POLL: Duration = Duration::from_millis(50);
+const EXIT_POLL: Duration = Duration::from_millis(10);
 
 /// Spawn the halmasuit binary with stderr piped, and a background thread
 /// shuttling stderr lines into a channel. Returns the child handle plus the

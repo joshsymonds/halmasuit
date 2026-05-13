@@ -17,4 +17,4 @@ serde.workspace      = true
 serde_json.workspace = true
 
 [dev-dependencies]
-tracing-subscriber = { version = "0.3", features = ["json", "fmt"] }
+tracing-subscriber.workspace = true

@@ -62,13 +62,25 @@ pkgs.testers.runNixOSTest {
     machine.start()
     machine.wait_for_unit("multi-user.target")
 
-    # Assertion 1: happy path. test user (uid 1000) invokes the setuid
+    # Assertion 1a: happy path. test user (uid 1000) invokes the setuid
     # wrapper with target_uid=1000, command=`id -u`. The helper should
     # drop privs and execve id. id prints the (now-real) uid.
     out = machine.succeed(
         f"sudo -u test {WRAPPER} 1000 1000 test -- {ID} -u"
     ).strip()
     assert out == "1000", f"happy path: id -u must print 1000, got {out!r}"
+
+    # Assertion 1b: supplementary groups land too. `id -G` prints every
+    # group the process belongs to. The primary 1000 must be present;
+    # extras come from initgroups()'s NSS lookup over /etc/group.
+    # If initgroups silently regresses or is removed, this assertion
+    # catches it.
+    groups = machine.succeed(
+        f"sudo -u test {WRAPPER} 1000 1000 test -- {ID} -G"
+    ).strip().split()
+    assert "1000" in groups, (
+        f"happy path: id -G must include primary gid 1000, got {groups!r}"
+    )
 
     # Assertion 2: UID floor refuses target_uid = 0. The refusal message
     # goes to stderr; redirect it so machine.execute() captures it.

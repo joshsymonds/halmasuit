@@ -101,13 +101,8 @@
           rustPlatform = rustPlatformFor pkgs;
         in
         {
-          # v1 placeholder. v2's compositor binary builds via `nix build .#halmasuit`
-          # below; this default stays a README so `nix build` without an attribute
-          # still does something harmless.
-          default = pkgs.runCommand "halmasuit-placeholder" { } ''
-            mkdir -p $out
-            echo "halmasuit v1: test infrastructure only" > $out/README
-          '';
+          # `nix build` with no attribute builds the compositor.
+          default = self.packages.${system}.halmasuit;
 
           # halmasuit compositor binary. Built with the rust-toolchain.toml-pinned
           # toolchain via rust-overlay so the workspace's 1.95 MSRV is satisfied

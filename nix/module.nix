@@ -32,13 +32,17 @@ in
     };
 
     logLevel = lib.mkOption {
-      type        = lib.types.str;
+      type        = lib.types.enum [ "error" "warn" "info" "debug" ];
       default     = "info";
-      example     = "debug,halmasuit::event=info";
       description = ''
         Value passed as `RUST_LOG`. halmasuit consumes this via
         `tracing-subscriber::EnvFilter`; the default keeps event-stream
         output at INFO, which is what the introspection sink emits at.
+
+        `trace` is deliberately not exposed: halmasuit-introspect's redaction
+        contract is enforced at construction time, not at filter time, and a
+        `trace` filter could surface unredacted PAM challenge text from the
+        future `halmasuit-greetd` path before that contract is in place.
       '';
     };
   };
@@ -65,11 +69,25 @@ in
         StandardOutput = "null";
         StandardError  = "journal";
         # Hardening minimums. Looser than the eventual `compositor` user
-        # posture but already restricts the obvious abuse paths.
-        NoNewPrivileges = true;
-        ProtectSystem   = "strict";
-        ProtectHome     = true;
-        PrivateTmp      = true;
+        # posture but already restricts the obvious abuse paths. Each
+        # directive below is free for Phase A's userspace-only work; some
+        # (notably MemoryDenyWriteExecute, RestrictNamespaces) will need
+        # auditable relaxations when DRM/Wayland/smithay's GL backend land.
+        NoNewPrivileges        = true;
+        ProtectSystem          = "strict";
+        ProtectHome            = true;
+        PrivateTmp             = true;
+        ProtectKernelTunables  = true;
+        ProtectKernelModules   = true;
+        ProtectKernelLogs      = true;
+        ProtectControlGroups   = true;
+        RestrictNamespaces     = true;
+        RestrictRealtime       = true;
+        RestrictSUIDSGID       = true;
+        LockPersonality        = true;
+        MemoryDenyWriteExecute = true;
+        SystemCallArchitectures = "native";
+        SystemCallFilter       = [ "@system-service" ];
       };
 
       environment = {

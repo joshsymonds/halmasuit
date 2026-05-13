@@ -48,14 +48,14 @@
 use std::ffi::CString;
 use std::process::ExitCode;
 
-use halmasuit_spawn::{SpawnError, enforce_uid_floor, parse_argv, sanitize_env};
+use halmasuit_spawn::{enforce_uid_floor, parse_argv, sanitize_env};
 use nix::sys::prctl;
 use nix::unistd::{Gid, Uid, execve, geteuid, initgroups, setresgid, setresuid};
 
 fn main() -> ExitCode {
     let parsed = match parse_argv(std::env::args_os()) {
         Ok(p) => p,
-        Err(e) => return die(&format!("argv: {}", describe(&e)), 64),
+        Err(e) => return die(&format!("argv: {e}"), 64),
     };
 
     if !geteuid().is_root() {
@@ -63,15 +63,22 @@ fn main() -> ExitCode {
     }
 
     if let Err(e) = enforce_uid_floor(parsed.target_uid, parsed.target_gid) {
-        return die(&format!("UID floor: {}", describe(&e)), 1);
+        return die(&format!("UID floor: {e}"), 1);
     }
 
     let env = sanitize_env(std::env::vars_os());
     let target_uid = Uid::from_raw(parsed.target_uid);
     let target_gid = Gid::from_raw(parsed.target_gid);
 
-    // ── Privilege drop. Straight-line; no syscalls touch user-controlled
-    //    state between here and execve. ─────────────────────────────────
+    // Build the execve ref-vectors BEFORE privilege drop so the privileged
+    // window between setresgid and execve contains zero allocations (matches
+    // the spec comment in the header block; audit-grade clarity).
+    let argv: Vec<&CString> = parsed.command.iter().collect();
+    let env_refs: Vec<&CString> = env.iter().collect();
+    let path = &parsed.command[0];
+
+    // ── Privilege drop. Straight-line; no allocations and no syscalls
+    //    touch user-controlled state between here and execve. ──────────
     if let Err(e) = setresgid(target_gid, target_gid, target_gid) {
         return die(&format!("setresgid: {e}"), 1);
     }
@@ -85,24 +92,9 @@ fn main() -> ExitCode {
         return die(&format!("PR_SET_NO_NEW_PRIVS: {e}"), 1);
     }
 
-    let argv: Vec<&CString> = parsed.command.iter().collect();
-    let env_refs: Vec<&CString> = env.iter().collect();
-    let path = &parsed.command[0];
-
     match execve(path, &argv, &env_refs) {
         Ok(_) => unreachable!("execve returns Infallible on success"),
         Err(e) => die(&format!("execve: {e}"), 127),
-    }
-}
-
-fn describe(e: &SpawnError) -> String {
-    match e {
-        SpawnError::Argv(s) => (*s).to_owned(),
-        SpawnError::UidFloor(v) => format!(
-            "uid/gid {v} is below UID_MIN ({})",
-            halmasuit_spawn::UID_MIN
-        ),
-        SpawnError::InvalidString => "argument contained NUL byte".to_owned(),
     }
 }
 
