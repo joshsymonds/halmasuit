@@ -29,7 +29,7 @@ pkgs.testers.runNixOSTest {
   name = "halmasuit-introspect";
 
   nodes.machine =
-    { ... }:
+    { pkgs, ... }:
     {
       imports = [ ../nix/module.nix ];
 
@@ -37,6 +37,10 @@ pkgs.testers.runNixOSTest {
         enable  = true;
         package = halmasuit;
       };
+
+      # `wayland-info` lets the testScript query halmasuit's advertised
+      # globals over the wire — the canonical client-side check.
+      environment.systemPackages = [ pkgs.wayland-utils ];
 
       # Phase A doesn't touch graphics, DRM, or input yet — keep the VM
       # minimal. Subsequent tasks will need virtio-gpu-pci etc.
@@ -147,6 +151,23 @@ pkgs.testers.runNixOSTest {
         listing = machine.execute("ls -la /run/halmasuit/ 2>&1")[1]
         raise AssertionError(
             f"/run/halmasuit/wayland-0 is not a socket. /run/halmasuit listing:\n{listing}"
+        )
+
+    # Assertion 2d: a real Wayland client (wayland-info from
+    # pkgs.wayland-utils) can connect and discover the advertised
+    # globals. wl_compositor + xdg_wm_base are this task's deliverables;
+    # we look for both literal interface names in the output.
+    info = machine.succeed(
+        "XDG_RUNTIME_DIR=/run/halmasuit WAYLAND_DISPLAY=wayland-0 "
+        "timeout 5 wayland-info 2>&1"
+    )
+    if "wl_compositor" not in info:
+        raise AssertionError(
+            f"wl_compositor global not advertised; wayland-info output:\n{info}"
+        )
+    if "xdg_wm_base" not in info:
+        raise AssertionError(
+            f"xdg_wm_base global not advertised; wayland-info output:\n{info}"
         )
 
     # Assertion 3: SIGTERM via systemctl stop produces Shutdown with
