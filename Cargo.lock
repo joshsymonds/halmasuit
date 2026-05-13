@@ -343,6 +343,12 @@ version = "0.1.0"
 [[package]]
 name = "halmasuit-greetd"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "halmasuit-introspect"

@@ -21,11 +21,19 @@ exclude = ["crates/halmasuit-spawn/fuzz"]
 version       = "0.1.0"
 edition       = "2024"
 rust-version  = "1.95"
-license       = "Apache-2.0"
+# Dual-licensed per Rust ecosystem convention. The decision to re-derive
+# the greetd protocol locally (rather than depend on upstream `greetd_ipc`,
+# which is GPL-3.0-only) keeps halmasuit's binary distributable under
+# permissive terms. See halmasuit-greetd/src/lib.rs for the protocol-
+# source citation and the clean-room reimplementation rationale.
+license       = "MIT OR Apache-2.0"
 repository    = "https://github.com/joshsymonds/halmasuit"
 authors       = ["Josh Symonds <veraticus@gmail.com>"]
 
 [workspace.dependencies]
+# `thiserror` for error enums that benefit from Display derives. Used
+# by halmasuit-greetd's StateMachineError.
+thiserror          = "2"
 # Shared across crates that emit or consume introspection events.
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "fmt", "env-filter"] }
