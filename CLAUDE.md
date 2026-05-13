@@ -87,14 +87,21 @@ Do not relax them without explicit user direction:
 
 These are the easy traps to fall into when adding real deps:
 
-- **`halmasuit-greetd` is built on upstream `greetd_ipc`.** Wire types
-  and JSON codec come from the published crate maintained alongside
-  greetd itself. What we own is the daemon-side state machine + PAM
-  glue + compositor integration. Do not re-derive the protocol from
-  spec text — that's how drift bugs are born. Reusing greetd-the-daemon
-  as a library is not feasible (incompatible privilege model: greetd
-  runs as root and `execve`s; halmasuit is unprivileged and never
-  execs).
+- **`halmasuit-greetd` owns its wire types locally.** The upstream
+  `greetd_ipc` crate is GPL-3.0-only; linking it would force
+  halmasuit's binary to GPL, conflicting with the workspace's dual
+  MIT-OR-Apache posture (which matches the Rust-Wayland infrastructure
+  tier: smithay, wlroots, Weston). The wire types in
+  `crates/halmasuit-greetd/src/lib.rs` are a clean-room
+  reimplementation derived from the public protocol spec at
+  <https://man.sr.ht/~kennylevinsen/greetd/protocol.md>, NOT from
+  `greetd_ipc`'s source. Drift mitigation is the
+  `wire_format_*` canonical-payload roundtrip tests in that crate —
+  they pin the JSON shape against payloads from the spec, so if
+  upstream ever changes the format we notice. Reusing
+  greetd-the-daemon as a library is also not feasible (incompatible
+  privilege model: greetd runs as root and `execve`s; halmasuit is
+  unprivileged and never execs).
 - **smithay** — pin to a `git` revision matching niri's or
   cosmic-comp's current pin, never crates.io 0.7.0 (June 2024,
   pre-DnD-refactor, pre-`delegate_dispatch2!`). Standard

@@ -24,4 +24,10 @@ just test-vm         # NixOS VM tests (stub until v1 lands)
 
 ## License
 
-Apache-2.0
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. This matches the Rust-Wayland infrastructure tier
+(smithay, wlroots, Weston).

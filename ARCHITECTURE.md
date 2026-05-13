@@ -421,17 +421,24 @@ the user interacts. The backend stays where it lives.
 The greeter is the most important wrap point and the one v2 implements
 first. Detailed flow:
 
-Wire types and the JSON codec come from upstream — `halmasuit-greetd`
-depends on the published [`greetd_ipc`](https://crates.io/crates/greetd_ipc)
-crate maintained alongside greetd itself. What we own is the daemon-side
-logic: the state machine, PAM glue, and the integration points that swap
-halmasuit's foreground `wl_client` when auth succeeds. We do not
-re-derive the protocol from the spec text — reusing greetd's own types
-means we track protocol additions automatically and inherit no drift
-bugs. Reusing greetd-the-daemon itself as a library is not feasible: its
-privilege model (run as root, `execve` the user session) is incompatible
-with halmasuit's (run as `compositor` user, never exec, delegate UID
-switching to `halmasuit-spawn`).
+Wire types and the JSON codec are owned locally in `halmasuit-greetd`.
+The upstream [`greetd_ipc`](https://crates.io/crates/greetd_ipc) crate
+is GPL-3.0-only; linking it would force halmasuit's binary to GPL,
+conflicting with the workspace's dual MIT-OR-Apache posture (which
+matches the Rust-Wayland infrastructure tier: smithay, wlroots,
+Weston). The types in `halmasuit-greetd` are a clean-room
+reimplementation from the public protocol spec at
+<https://man.sr.ht/~kennylevinsen/greetd/protocol.md>. Drift mitigation
+is a suite of canonical-payload roundtrip tests that pin the JSON
+shape against payloads from that spec — if upstream changes the
+format, the tests break and we notice. What halmasuit-greetd owns
+beyond the wire types is the daemon-side logic: the state machine,
+PAM glue, and the integration points that swap halmasuit's foreground
+`wl_client` when auth succeeds. Reusing greetd-the-daemon itself as
+a library is also not feasible: its privilege model (run as root,
+`execve` the user session) is incompatible with halmasuit's (run as
+`compositor` user, never exec, delegate UID switching to
+`halmasuit-spawn`).
 
 Flow:
 
@@ -864,7 +871,8 @@ halmasuit/
 ├── clippy.toml
 ├── ARCHITECTURE.md             # this file
 ├── README.md
-├── LICENSE                     # Apache-2.0
+├── LICENSE-APACHE              # Apache-2.0 (one half of dual license)
+├── LICENSE-MIT                 # MIT (other half; user picks at consumption)
 ├── .github/
 │   └── workflows/
 │       └── ci.yml              # nix flake check on ubuntu-24.04 + cachix
