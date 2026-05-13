@@ -4,12 +4,13 @@
 // and will host greeter + session as nested wl_clients. Today it brings
 // up smithay's Wayland-server event loop, binds a Wayland socket, and
 // advertises foundational protocol globals: `wl_compositor`,
-// `wl_subcompositor`, `xdg_wm_base`, `wl_seat`, `wl_output`. Connecting
-// clients can create surfaces, top-levels, and discover inputs/outputs.
-// Nothing renders yet (no scanout backend); the advertised output is
-// a synthesized 1920×1080@60Hz placeholder until DRM lands. Additional
-// globals (`wl_shm`, `linux-dmabuf-v1`, …) land in subsequent tasks.
-// See ARCHITECTURE.md.
+// `wl_subcompositor`, `xdg_wm_base`, `wl_seat`, `wl_output`, `wl_shm`.
+// Connecting clients can create surfaces, top-levels, software buffers,
+// and discover inputs/outputs. Nothing renders yet (no scanout backend);
+// the advertised output is a synthesized 1920×1080@60Hz placeholder
+// until DRM lands. Additional globals (`linux-dmabuf-v1`,
+// `presentation-time`, `ext-session-lock-v1`, …) land in subsequent
+// tasks. See ARCHITECTURE.md.
 
 use std::io;
 use std::sync::Arc;
@@ -27,11 +28,13 @@ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
+use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
+use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::wayland::socket::ListeningSocketSource;
 use tracing_subscriber::EnvFilter;
 
@@ -55,6 +58,7 @@ struct HalmasuitState {
     // `_output` keeps the synthesized output alive; real outputs come
     // with the DRM backend.
     _output: Output,
+    shm_state: ShmState,
 }
 
 /// Per-client metadata. smithay's `CompositorHandler` requires us to
@@ -148,6 +152,22 @@ impl SeatHandler for HalmasuitState {
 
 impl OutputHandler for HalmasuitState {}
 
+impl ShmHandler for HalmasuitState {
+    fn shm_state(&self) -> &ShmState {
+        &self.shm_state
+    }
+}
+
+impl BufferHandler for HalmasuitState {
+    fn buffer_destroyed(
+        &mut self,
+        _buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
+    ) {
+        // No buffer-tracking state yet; the renderer task will hook
+        // into this to evict any cached GPU resources for the buffer.
+    }
+}
+
 /// calloop callback for the wayland Display source. The Display is
 /// owned by calloop's `Generic` wrapper (`NoIoDrop`); accessing the
 /// inner value requires an unsafe call to `get_mut`.
@@ -175,6 +195,7 @@ smithay::delegate_compositor!(HalmasuitState);
 smithay::delegate_xdg_shell!(HalmasuitState);
 smithay::delegate_seat!(HalmasuitState);
 smithay::delegate_output!(HalmasuitState);
+smithay::delegate_shm!(HalmasuitState);
 
 fn main() -> io::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -221,6 +242,11 @@ fn main() -> io::Result<()> {
     output.create_global::<HalmasuitState>(&display_handle);
     output.change_current_state(Some(output_mode), None, None, Some((0, 0).into()));
     output.set_preferred(output_mode);
+
+    // wl_shm. Empty formats iter requests just ARGB8888 + XRGB8888,
+    // which the spec mandates always be advertised. Additional formats
+    // come with the renderer task.
+    let shm_state = ShmState::new::<HalmasuitState>(&display_handle, std::iter::empty());
 
     let mut event_loop: EventLoop<HalmasuitState> =
         EventLoop::try_new().map_err(io::Error::other)?;
@@ -290,6 +316,7 @@ fn main() -> io::Result<()> {
         _seat: seat,
         _output_manager_state: output_manager_state,
         _output: output,
+        shm_state,
     };
 
     // Main loop: wait briefly for any source to fire, then flush any

@@ -161,7 +161,7 @@ pkgs.testers.runNixOSTest {
         "XDG_RUNTIME_DIR=/run/halmasuit WAYLAND_DISPLAY=wayland-0 "
         "timeout 5 wayland-info 2>&1"
     )
-    for required in ("wl_compositor", "xdg_wm_base", "wl_seat", "wl_output"):
+    for required in ("wl_compositor", "xdg_wm_base", "wl_seat", "wl_output", "wl_shm"):
         if required not in info:
             raise AssertionError(
                 f"{required} global not advertised; wayland-info output:\n{info}"
