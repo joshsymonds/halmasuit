@@ -8,23 +8,56 @@
     # to bring up greetd + DankGreeter + niri + DMS. We import the module's
     # file path directly and supply the inputs it expects via specialArgs.
     nix-config.url = "github:joshsymonds/nix-config";
+
+    # rust-toolchain.toml is the single source of truth for halmasuit's
+    # toolchain. rust-overlay reads it so Nix builds compile with the same
+    # rustc that rustup uses locally. Without this, nixpkgs's rustc lags
+    # the workspace's pinned channel (today: nixpkgs ships 1.94.1, we want
+    # 1.95 for edition 2024 + recent stable features).
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
     { self
     , nixpkgs
     , nix-config
+    , rust-overlay
     }:
     let
       forEachSystem = nixpkgs.lib.genAttrs [
         "x86_64-linux"
         "aarch64-linux"
       ];
+
+      # Construct pkgs with the rust-overlay applied so `pkgs.rust-bin` is
+      # available everywhere we build Rust artifacts. Use this in place of
+      # `nixpkgs.legacyPackages.${system}` whenever a Rust build is involved.
+      pkgsFor = system: import nixpkgs {
+        inherit system;
+        overlays = [ rust-overlay.overlays.default ];
+      };
+
+      # Toolchain derived from rust-toolchain.toml. Single source of truth
+      # shared with rustup.
+      rustToolchainFor = pkgs:
+        pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+
+      # rustPlatform with the pinned toolchain. Use this for halmasuit and
+      # any other v2 production crate that needs the 1.95 minimum.
+      rustPlatformFor = pkgs:
+        let toolchain = rustToolchainFor pkgs; in
+        pkgs.makeRustPlatform {
+          cargo = toolchain;
+          rustc = toolchain;
+        };
     in
     {
       devShells = forEachSystem (system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = pkgsFor system;
         in
         {
           default = pkgs.mkShell {
@@ -64,21 +97,46 @@
 
       packages = forEachSystem (system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs         = pkgsFor system;
+          rustPlatform = rustPlatformFor pkgs;
         in
         {
-          # v1 placeholder. The compositor binary builds in v2.
+          # v1 placeholder. v2's compositor binary builds via `nix build .#halmasuit`
+          # below; this default stays a README so `nix build` without an attribute
+          # still does something harmless.
           default = pkgs.runCommand "halmasuit-placeholder" { } ''
             mkdir -p $out
             echo "halmasuit v1: test infrastructure only" > $out/README
           '';
 
+          # halmasuit compositor binary. Built with the rust-toolchain.toml-pinned
+          # toolchain via rust-overlay so the workspace's 1.95 MSRV is satisfied
+          # regardless of which rustc nixpkgs currently ships.
+          halmasuit = rustPlatform.buildRustPackage {
+            pname   = "halmasuit";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags    = [ "-p" "halmasuit" ];
+            # Integration tests spawn the binary and send POSIX signals; the
+            # Nix sandbox doesn't permit that cleanly. `just check` is the
+            # canonical gate; the NixOS VM test (next task) is the deployment-side gate.
+            doCheck = false;
+            meta = {
+              description = "halmasuit Linux system compositor (v2 Phase A spine)";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit";
+            };
+          };
+
           # Phase 0 research probe: validates userspace DRM master
           # persistence from rootfs boot through multi-user.target.
           # Built as a Nix package so the NixOS VM test can install it.
           # Not production code — halmasuit-kms is the v2 home for DRM
-          # ownership.
-          drm-master-probe = pkgs.rustPlatform.buildRustPackage {
+          # ownership. Builds under the same pinned toolchain as halmasuit;
+          # the probe's Cargo.toml MSRV (1.87) is a code-level claim, not
+          # a build requirement.
+          drm-master-probe = rustPlatform.buildRustPackage {
             pname   = "drm-master-probe";
             version = "0.1.0";
             src     = ./.;
@@ -91,6 +149,18 @@
             };
           };
         });
+
+      # NixOS modules halmasuit exports. Consumers (a user's nix-config, the
+      # gnomon host config, VM tests) import these.
+      nixosModules.halmasuit = ./nix/module.nix;
+
+      # Overlay exposing halmasuit-related packages under their bare names so
+      # the NixOS module's default = pkgs.halmasuit resolves. Consumers apply
+      # this once (`nixpkgs.overlays = [ halmasuit.overlays.default ];`) and
+      # then services.halmasuit.enable = true works without further wiring.
+      overlays.default = final: _prev: {
+        halmasuit = self.packages.${final.stdenv.hostPlatform.system}.halmasuit;
+      };
 
       # NixOS VM tests run on Linux only. Limited to x86_64-linux because
       # nixpkgs.testers.runNixOSTest requires a build host matching the test
