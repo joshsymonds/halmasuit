@@ -997,11 +997,10 @@ Scope:
   handoff through to `SESSION` phase, asserts no all-black frame and no
   DSSIM jump above threshold across any transition.
 
-Deferred to later milestones in v2's design:
-
-- `halmasuit-fsck` and `halmasuit-emergency` adapters (nice to have,
-  but only matter when fsck triggers or the system is in trouble; can
-  ship after the main v2 binary lands).
+Scope refinements live in [`PLAN.md`](PLAN.md). All adapters
+(`halmasuit-luks`, `halmasuit-fsck`, `halmasuit-emergency`) are in scope
+for v2 at happy-path quality; edge-case UX (LUKS retry, fsck repair
+prompts, emergency recovery menu) is Phase B polish.
 
 Done condition:
 
@@ -1082,11 +1081,15 @@ These exist so the scope cannot creep without an explicit decision.
   *True* client preservation is explicitly not on the roadmap (it would
   require forking niri into a non-compositor policy daemon).
 - **NOT in v2:** multi-seat, HDR, VRR pass-through.
-- **NOT in v2:** `halmasuit-fsck` and `halmasuit-emergency` adapters.
-  They use the same adapter pattern as `halmasuit-luks` and can be
-  added incrementally after the main v2 binary lands; the wire
-  contracts they target are well-defined and don't require halmasuit
-  internal changes.
+- **NOT in v2:** the animated / shader-driven `halmasuit-splash`. v2 ships
+  a static logo so "the system didn't brick" is visually obvious. The
+  Vulkan/wgpu "Visual identity" section's full ambition is a Phase B
+  polish pass once the static path works.
+- **NOT in v2 (happy path only):** advanced UX in the adapter crates —
+  LUKS retry / advanced options, fsck repair-decision Y/N flow,
+  emergency recovery menu. The adapters themselves (`halmasuit-luks`,
+  `halmasuit-fsck`, `halmasuit-emergency`) ARE in scope at happy-path
+  quality per [`PLAN.md`](PLAN.md).
 - **NOT in v2:** OpenTelemetry export. Adding `tracing-opentelemetry`
   later is a one-line subscriber change; not needed until we have spans
   worth exporting.

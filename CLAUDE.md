@@ -12,7 +12,9 @@ Eliminates the visible black flash that exists today between greeter and
 session on every greetd-based Linux desktop.
 
 Read **`ARCHITECTURE.md`** for the design, threat model, and roadmap.
-Read **`STATUS.md`** for what ships today and what v2 needs to do.
+Read **`PLAN.md`** for v2's implementation scope and "in / out" decisions.
+Read **`RESEARCH.md`** for the empirically validated architectural
+foundations (drm-master-probe Phase 0 + Phase 1).
 
 The terms `v1`, `v2`, `v3`, `v4`, `v5+` in this repo always refer to the
 roadmap milestones in `ARCHITECTURE.md`, not crate versions.
@@ -137,7 +139,8 @@ inversion in place.
 
 ## Where to look
 
-- `STATUS.md` — current milestone state.
+- `PLAN.md` — v2 implementation plan: what's in scope, what's deferred.
+- `RESEARCH.md` — empirically validated architectural foundations.
 - `ARCHITECTURE.md` — full design, threat model, roadmap.
 - `Justfile` — every command, local and CI.
 - `tests/login-flash.nix` — the canonical v1 deliverable; reading it
