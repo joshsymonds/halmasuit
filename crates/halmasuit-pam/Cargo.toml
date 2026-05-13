@@ -22,3 +22,8 @@ pam-sys.workspace   = true
 libc.workspace      = true
 thiserror.workspace = true
 zeroize.workspace   = true
+# The trait we implement (PamSession). halmasuit-pam is the production
+# impl; halmasuit-greetd stays unsafe-free and consumes the trait.
+halmasuit-greetd    = { path = "../halmasuit-greetd", version = "0.1" }
+# pwent lookup (User::from_name) to resolve uid/gid after PAM completes.
+nix                 = { workspace = true, features = ["user"] }

@@ -544,6 +544,211 @@ impl Drop for Pam {
     }
 }
 
+// ── PamThread: worker-thread driver implementing PamSession ─────────────
+//
+// PAM's C API is blocking: pam_authenticate runs the entire conv
+// conversation on the calling thread before returning. The state
+// machine in halmasuit-greetd needs a step-by-step interface
+// (PamSession::step). PamThread bridges the two: it spawns a worker
+// thread that calls pam_authenticate, while the outside thread
+// invokes step() and pumps responses + receives challenges via the
+// conv-channel pair built by `conv_pair`.
+
+use halmasuit_greetd::{AuthMessageType, PamSession, PamStep};
+use std::thread::JoinHandle;
+
+/// Terminal outcome of the PAM conversation, computed by the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PamOutcome {
+    Success { uid: u32, gid: u32 },
+    Failure { reason: String },
+}
+
+/// PAM session driven by a worker thread.
+///
+/// Construct with [`PamThread::new`] (cheap — no thread yet). The
+/// worker spawns on the first [`PamSession::step`] call, owns a `Pam`
+/// (which is `!Send`), and runs `pam_authenticate` → `pam_acct_mgmt`
+/// → `get_user` → pwent lookup. The outside thread drives the
+/// conversation by sending responses and reading challenges through
+/// the channels in `ThreadState::Running`.
+///
+/// Drop is safe at any time: dropping `PamThread` closes the
+/// driver-side channels, which causes the conv callback to terminate
+/// the conversation (empty responses, then pam_authenticate fails),
+/// the worker drops its `Pam` (releasing libpam state via `pam_end`),
+/// and tries to send the outcome (which fails silently — receiver is
+/// gone). The worker handle is detached.
+pub struct PamThread {
+    config: PamThreadConfig,
+    state: ThreadState,
+}
+
+#[derive(Debug, Clone)]
+struct PamThreadConfig {
+    service: String,
+    username: String,
+    ruser: Option<String>,
+    tty: Option<String>,
+}
+
+enum ThreadState {
+    NotStarted,
+    Running {
+        challenge_rx: Receiver<PromptChallenge>,
+        response_tx: SyncSender<Zeroizing<String>>,
+        outcome_rx: Receiver<PamOutcome>,
+        // Detached; JoinHandle held only so the type stays Send and
+        // for clarity. We don't .join() on drop — the worker exits
+        // on its own once the bridge channels close.
+        _worker: JoinHandle<()>,
+    },
+    Done,
+}
+
+impl PamThread {
+    /// Build a new PamThread for `service_name` as `username`. No
+    /// worker thread is spawned yet.
+    #[must_use]
+    pub fn new(service_name: &str, username: &str) -> Self {
+        Self {
+            config: PamThreadConfig {
+                service: service_name.into(),
+                username: username.into(),
+                ruser: None,
+                tty: None,
+            },
+            state: ThreadState::NotStarted,
+        }
+    }
+
+    /// Set `PAM_RUSER` (the requesting user) for the upcoming PAM
+    /// transaction. No-op if step() has already started the worker.
+    pub fn set_ruser(&mut self, value: &str) -> &mut Self {
+        self.config.ruser = Some(value.into());
+        self
+    }
+
+    /// Set `PAM_TTY` for the upcoming PAM transaction. No-op if step()
+    /// has already started the worker.
+    pub fn set_tty(&mut self, value: &str) -> &mut Self {
+        self.config.tty = Some(value.into());
+        self
+    }
+
+    fn spawn(&mut self) {
+        let (bridge, driver) = conv_pair();
+        let (outcome_tx, outcome_rx) = sync_channel(1);
+        let config = self.config.clone();
+        let worker = std::thread::spawn(move || run_pam(&config, bridge, &outcome_tx));
+        self.state = ThreadState::Running {
+            challenge_rx: driver.challenge_rx,
+            response_tx: driver.response_tx,
+            outcome_rx,
+            _worker: worker,
+        };
+    }
+
+    /// After a successful send-or-spawn, block on the next challenge
+    /// or terminal outcome.
+    fn recv_next(&mut self) -> PamStep {
+        let ThreadState::Running {
+            challenge_rx,
+            outcome_rx,
+            ..
+        } = &self.state
+        else {
+            unreachable!("recv_next called outside ThreadState::Running");
+        };
+        if let Ok(c) = challenge_rx.recv() {
+            return PamStep::Challenge {
+                kind: translate_style(c.style),
+                prompt: c.message,
+            };
+        }
+        // Worker dropped Pam → challenge channel closed. The outcome
+        // is in the (1-slot buffered) outcome channel by construction:
+        // the worker drops Pam THEN sends the outcome.
+        let outcome = outcome_rx.recv().unwrap_or_else(|_| PamOutcome::Failure {
+            reason: "worker exited without an outcome".into(),
+        });
+        self.state = ThreadState::Done;
+        match outcome {
+            PamOutcome::Success { uid, gid } => PamStep::Success { uid, gid },
+            PamOutcome::Failure { reason } => PamStep::Failure { reason },
+        }
+    }
+}
+
+impl PamSession for PamThread {
+    fn step(&mut self, response: Option<String>) -> PamStep {
+        match &self.state {
+            ThreadState::NotStarted => {
+                // First call: spawn the worker. Per the trait contract
+                // the first response is None (no challenge has been
+                // delivered yet), so we just spawn and wait for the
+                // first challenge or terminal outcome.
+                self.spawn();
+            }
+            ThreadState::Running { response_tx, .. } => {
+                // Forward the response (or empty if None) through the
+                // bridge. Send may fail if the worker has already
+                // finished — that just means recv_next will see the
+                // channel closed and read the outcome.
+                let r = Zeroizing::new(response.unwrap_or_default());
+                let _ = response_tx.send(r);
+            }
+            ThreadState::Done => {
+                return PamStep::Failure {
+                    reason: "PamSession::step called after PAM completion".into(),
+                };
+            }
+        }
+        self.recv_next()
+    }
+}
+
+const fn translate_style(s: PamMessageStyle) -> AuthMessageType {
+    match s {
+        PamMessageStyle::PromptEchoOn => AuthMessageType::Visible,
+        PamMessageStyle::PromptEchoOff => AuthMessageType::Secret,
+        PamMessageStyle::ErrorMsg => AuthMessageType::Error,
+        PamMessageStyle::TextInfo => AuthMessageType::Info,
+    }
+}
+
+fn run_pam(config: &PamThreadConfig, bridge: ConvBridge, outcome_tx: &SyncSender<PamOutcome>) {
+    // try_pam owns the Pam (and bridge). On scope exit (Ok or Err),
+    // Pam drops → pam_end closes libpam state and the bridge's
+    // challenge_tx drops → the driver-side challenge_rx returns Err.
+    // ONLY THEN do we send the outcome on the 1-slot buffered
+    // outcome channel. This ordering guarantees the driver reads
+    // "channel closed" before reading the terminal outcome.
+    let outcome = match try_pam(config, bridge) {
+        Ok((uid, gid)) => PamOutcome::Success { uid, gid },
+        Err(reason) => PamOutcome::Failure { reason },
+    };
+    let _ = outcome_tx.send(outcome);
+}
+
+fn try_pam(config: &PamThreadConfig, bridge: ConvBridge) -> Result<(u32, u32), String> {
+    let mut pam =
+        Pam::start(&config.service, &config.username, bridge).map_err(|e| e.to_string())?;
+    if let Some(ruser) = &config.ruser {
+        pam.set_ruser(ruser).map_err(|e| e.to_string())?;
+    }
+    if let Some(tty) = &config.tty {
+        pam.set_tty(tty).map_err(|e| e.to_string())?;
+    }
+    pam.authenticate().map_err(|e| e.to_string())?;
+    pam.acct_mgmt().map_err(|e| e.to_string())?;
+    let resolved = pam.get_user().map_err(|e| e.to_string())?;
+    let pw = nix::unistd::User::from_name(&resolved)
+        .map_err(|e| format!("pwent lookup failed for {resolved}: {e}"))?
+        .ok_or_else(|| format!("no pwent for {resolved}"))?;
+    Ok((pw.uid.as_raw(), pw.gid.as_raw()))
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -616,6 +821,61 @@ mod tests {
         let mut pam = Pam::start("other", "alice", bridge).unwrap();
         pam.set_tty("/dev/tty1").expect("set_tty");
         pam.set_ruser("compositor").expect("set_ruser");
+    }
+
+    // ── PamThread + PamSession impl ─────────────────────────────────────
+
+    #[test]
+    fn pam_thread_against_other_service_yields_failure() {
+        use halmasuit_greetd::PamSession as _;
+        // pam_deny.so denies pam_authenticate immediately without ever
+        // invoking the conv callback — so the worker finishes before
+        // delivering any challenge, and the very first step() returns
+        // Failure.
+        let mut pt = PamThread::new("other", "nobody");
+        let step = pt.step(None);
+        match step {
+            PamStep::Failure { reason } => {
+                assert!(!reason.is_empty(), "Failure reason should not be empty");
+                assert!(
+                    reason.contains("pam_authenticate") || reason.contains("authenticate"),
+                    "Failure reason should mention the failing call: {reason}",
+                );
+            }
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pam_thread_set_builders_compose() {
+        // Just verifies the builder methods chain cleanly — the actual
+        // RUSER/TTY values get exercised by the VM test (which is the
+        // real gate, since unit tests can't write /etc/pam.d/).
+        let mut pt = PamThread::new("other", "nobody");
+        pt.set_ruser("compositor").set_tty("/dev/tty1");
+    }
+
+    #[test]
+    fn pam_thread_step_after_failure_returns_failure() {
+        use halmasuit_greetd::PamSession as _;
+        let mut pt = PamThread::new("other", "nobody");
+        let _ = pt.step(None);
+        // After completion, further step() calls fall into the Done arm.
+        let second = pt.step(Some("anything".into()));
+        match second {
+            PamStep::Failure { reason } => {
+                assert!(reason.contains("after PAM completion"), "got: {reason}");
+            }
+            other => panic!("expected Failure on Done arm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pam_thread_is_send() {
+        // Compile-time assertion: PamThread must be Send so the state
+        // machine driver (running on the calloop thread) can own it.
+        fn assert_send<T: Send>() {}
+        assert_send::<PamThread>();
     }
 
     // ── process_prompts (the safe core) ─────────────────────────────────
