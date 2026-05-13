@@ -27,15 +27,19 @@ fmt:
 test:
     cargo nextest run --workspace --all-features --no-fail-fast --no-tests=pass
 
-# NixOS VM tests (headless, CI-style). smoke-boot must pass; login-flash is
-# expected to FAIL until halmasuit v2 (the failure is the v1 baseline
-# measurement of the greetd→niri flash). An unexpected pass on login-flash
-# means either v2 just landed (advance!) or the test broke.
+# NixOS VM tests (headless, CI-style). smoke-boot + halmasuit-introspect
+# must pass; login-flash is expected to FAIL until halmasuit v2 (the failure
+# is the v1 baseline measurement of the greetd→niri flash). An unexpected
+# pass on login-flash means either v2 just landed (advance!) or the test
+# broke.
 test-vm:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "── smoke-boot (must pass) ──"
     nix build .#checks.x86_64-linux.smoke-boot -L --print-build-logs --no-link
+    echo
+    echo "── halmasuit-introspect (must pass) ──"
+    nix build .#checks.x86_64-linux.halmasuit-introspect -L --print-build-logs --no-link
     echo
     echo "── login-flash (expected RED until v2) ──"
     if nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link; then

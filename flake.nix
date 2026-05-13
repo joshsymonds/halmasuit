@@ -177,6 +177,11 @@
           system = "x86_64-linux";
           inherit nixpkgs nix-config;
         };
+        halmasuit-introspect = import ./tests/halmasuit-introspect.nix {
+          system    = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit = self.packages.x86_64-linux.halmasuit;
+        };
         drm-master-probe = import ./tests/drm-master-probe.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
