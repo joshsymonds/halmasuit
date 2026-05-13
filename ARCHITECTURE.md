@@ -15,12 +15,104 @@ continuous visual presentation from graphical-target up, with the same
 process owning the display across the greeter→session boundary so there is
 no black frame, no compositor restart, no visible discontinuity.
 
-The full ambition is BIOS → kernel → initramfs → greeter → desktop visual
+The ambition is BIOS → kernel → initramfs → greeter → desktop visual
 continuity, the way macOS goes from Apple logo to login window to desktop
-without a single flash. That requires moving halmasuit into the initramfs
-and surviving `switch_root`, which is real engineering work parked for a
-later milestone. The first milestone is the much smaller and still-novel
-problem of making the **greeter → session** transition seamless.
+without a single flash. v1 has shipped the test infrastructure that
+measures one boundary of this (`tests/login-flash.nix`, the greeter→session
+flash). v2 is the implementation that delivers the *whole* visual
+continuity — **one halmasuit process from initramfs through to shutdown**,
+with no userspace owner of the display ever exiting and restarting after
+the kernel hands off.
+
+---
+
+## The architectural commitment
+
+**One halmasuit process, started in the initramfs, never exits until shutdown.**
+
+The entire boot flash exists because of one upstream choice everywhere on
+Linux: Plymouth dies at `graphical.target`, then a display manager
+(greetd / GDM / SDDM / etc.) starts from scratch. Two userspace owners of
+the display, with a hard process boundary between them, and a kernel-level
+DRM-master release/acquire across that boundary. The flash is the direct,
+unavoidable consequence of that process split.
+
+Halmasuit's design deletes the split. The same `halmasuit` binary that
+paints the splash during initramfs survives `switch_root` (via a controlled
+re-exec from the rootfs path, preserving the DRM master fd through
+`SCM_RIGHTS` or argv-FD inheritance), continues painting through systemd
+target traversal, brings up its Wayland server when the system reaches a
+ready state, hosts the greeter as a `wl_client`, swaps to niri after PAM
+success, and persists until power-off. DRM master is held continuously from
+initramfs through shutdown. The CRTC is modeset exactly once — or twice if
+`simpledrm` migrates to a real KMS driver mid-boot. Every visible transition
+is internal: either a buffer swap on the primary plane, or a `wl_client`
+swap inside halmasuit's own scenegraph. Nothing visible to the user crosses
+a process boundary.
+
+This is what nothing else in the wlroots/smithay ecosystem ships. Plymouth,
+gdm-wayland, SDDM-wayland — every one of them dies and restarts the display
+owner at least once during boot. Halmasuit is the architecture that doesn't.
+
+The Mir / Lomiri stack (Ubuntu Touch, PinePhone — in production since 2013)
+demonstrates the model works: one long-lived display server hosting the
+lockscreen, greeter, and user shell as nested clients. Halmasuit ports that
+model into the wlroots/smithay world and into desktop Linux's boot pipeline.
+
+### What halmasuit *itself* implements
+
+Halmasuit is intentionally thin. It owns three things only:
+
+1. **The display surface.** DRM master, KMS modeset, the primary plane.
+2. **A Wayland server hosting one foreground `wl_client` at a time.** No
+   inner window management, no shell, no taskbar, no anything else a
+   normal compositor does — those live in niri.
+3. **Phase transitions.** Internal state machine that swaps which
+   `wl_client` is foreground, and the orchestration (PAM, halmasuit-spawn,
+   logind D-Bus calls) needed to make that swap happen.
+
+Everything else is a `wl_client` of halmasuit, including the splash, the
+greeter, the lock screen, the user session, the LUKS prompt, and the
+shutdown splash. **Halmasuit hosts UI; it does not implement UI.**
+
+### Related work and validation
+
+Two existing projects prove this architectural class works in shipping
+production form. Both are useful references for halmasuit; neither is
+quite the same shape:
+
+- **Mir / Lomiri** (Canonical / UBports — Ubuntu Touch, PinePhone, in
+  production since 2013). A long-lived display server hosting the
+  lockscreen, greeter, and user shell as nested clients. The closest
+  architectural relative to halmasuit. Different ecosystem (Mir is C++,
+  uses its own protocols rather than vanilla Wayland), different target
+  (mobile/convergent rather than desktop), but the *shape* — one
+  display owner across the entire user-visible lifetime — is exactly
+  what halmasuit borrows.
+- **Gamescope** (Valve, [github.com/ValveSoftware/gamescope](https://github.com/ValveSoftware/gamescope),
+  MIT). The compositor running inside SteamOS on the Steam Deck. Thin
+  wlroots-based Wayland compositor that hosts one foreground client
+  (Steam Big Picture, or a game) and direct-scans-out when possible.
+  Structurally very close to what halmasuit *is* during the `SESSION`
+  phase. Notable distinction: gamescope is **not a system compositor**
+  on Steam Deck. The actual SteamOS boot chain is Plymouth (initramfs +
+  through `graphical.target`) → SDDM (system display manager, autologin
+  configured via `/etc/sddm.conf.d/zz-steamos-autologin.conf`) → user
+  session → `gamescope-session-plus@.service` (a **user** systemd unit
+  under `graphical-session.target`) → gamescope → Steam. Three
+  display-owning userspace processes (Plymouth, SDDM, gamescope) with
+  process boundaries between each. Valve has masked the visual flashes
+  via a tuned Plymouth theme matching Steam aesthetics, hidden SDDM
+  (zero-timeout autologin), and fast boot timings — but they have not
+  eliminated the process boundaries. Halmasuit's structural premise is
+  "delete the boundaries, don't mask them."
+
+Neither project is a substrate halmasuit builds on — Mir is the wrong
+ecosystem, gamescope is the wrong use case (gaming I/O, HDR pipelines,
+FSR upscaling — none of which overlap with greeter/PAM/boot work) and
+the wrong language for this project's security posture. But both
+demonstrate that "thin display server hosting one foreground client" is
+a sound architecture at production scale.
 
 ---
 
@@ -52,47 +144,220 @@ form.
 
 ---
 
-## High-level architecture
+## Boot timeline and phases
+
+The halmasuit process traverses internal phases over the lifetime of the
+machine. Each phase transition is a state change inside the running
+process — *not* a process restart.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  systemd (PID 1)                                                │
-│   └─ halmasuit.service                                          │
-│      └─ halmasuit (as 'compositor' user, holds DRM master)      │
-│         ├─ Wayland server   /run/halmasuit/wayland-0            │
-│         ├─ greetd-compat    /run/halmasuit/greetd.sock          │
-│         ├─ control IPC      /run/halmasuit/control.sock         │
-│         ├─ D-Bus consumer   → logind (TakeDevice, sleep events) │
-│         ├─ D-Bus server     → org.halmasuit.Compositor1         │
-│         └─ child lifecycle:                                     │
-│             ├─ PHASE greeter   → DankGreeter / regreet / …      │
-│             │                    (as 'greeter' user, Wayland)   │
-│             ├─ PHASE session   → niri (as authenticated user)   │
-│             │                    └─ DMS, terminals, browser, …  │
-│             └─ PHASE locked    → ext-session-lock-v1 client     │
-└─────────────────────────────────────────────────────────────────┘
+Phase                  Foreground wl_client          Adapters active
+─────────────────────────────────────────────────────────────────────────
+INITRAMFS_SPLASH       halmasuit-splash              halmasuit-luks (if
+                                                      cryptsetup needs a
+                                                      passphrase),
+                                                      halmasuit-fsck (if
+                                                      fsck needs interaction)
+
+ROOTFS_SPLASH          halmasuit-splash              (none — just waiting
+                       (re-attached post-              for system readiness)
+                        re-exec; same surface
+                        on screen as before)
+
+GREETER                DankGreeter / regreet / …     halmasuit-greetd
+                       (as 'greeter' user)            (in-process)
+
+SESSION                niri                          (none — niri owns
+                       (as authenticated user          everything in-session
+                        via halmasuit-spawn)           via its own protocols)
+
+LOCKED                 ext-session-lock-v1 client    (lock client itself
+                       (swaylock / hyprlock / …)      drives re-auth via PAM
+                                                      brokered by halmasuit)
+
+SHUTDOWN_SPLASH        halmasuit-splash              (none — awaits poweroff)
+                       (different scene)
 ```
 
-Halmasuit replaces greetd entirely. The compositor itself is a system
-service running as a dedicated `compositor` system user. It owns DRM
-master via logind from the moment graphical.target is reached, and never
-exits until shutdown.
+Transitions:
+
+- **`INITRAMFS_SPLASH → ROOTFS_SPLASH`**: triggered by systemd's
+  `initrd-switch-root.target`. halmasuit re-execs itself from the rootfs
+  binary path (reachable because the rootfs is already mounted before
+  `switch_root`), preserving the DRM master fd and the wayland-socket fd
+  across the exec via non-CLOEXEC inheritance. The new image re-attaches
+  to those fds, drops privileges from root to the `compositor` system user
+  (via `setresuid` — the DRM master ioctl was checked at SET_MASTER time;
+  retaining mastery survives the privilege drop), and resumes painting the
+  same surface. The user sees no visible change.
+- **`ROOTFS_SPLASH → GREETER`**: triggered by halmasuit reaching an
+  internal-ready state (D-Bus session bus available, `XDG_RUNTIME_DIR`
+  populated for the greeter user, halmasuit-greetd socket bound).
+  halmasuit-greetd spawns the configured greeter as a `wl_client` running
+  as the `greeter` user. As the greeter's first surface commit arrives,
+  halmasuit crossfades from the splash buffer to the greeter surface (~250
+  ms alpha blend).
+- **`GREETER → SESSION`**: triggered by PAM success inside halmasuit-greetd.
+  halmasuit kills the greeter `wl_client`, invokes `halmasuit-spawn` to
+  exec niri as the authenticated user, and composites niri's surface in
+  the greeter's place. No DRM activity; halmasuit's mastery is unchanged.
+- **`SESSION ↔ LOCKED`**: triggered by `loginctl lock-session` (D-Bus
+  signal halmasuit subscribes to), by an explicit `halmasuit msg lock`,
+  or by an idle timeout the session configures. halmasuit spawns the
+  configured `ext-session-lock-v1` client, makes it foreground; niri keeps
+  running in the background but is hidden. On successful re-auth, lock
+  client exits and niri returns to foreground.
+- **`SESSION → SHUTDOWN_SPLASH`**: triggered by `PrepareForShutdown` signal
+  from logind. halmasuit asks niri to exit; once niri has, halmasuit hosts
+  halmasuit-splash again with a "shutting down" scene and awaits the
+  logind-driven power-off.
+
+Two invariants hold across every transition:
+
+1. **DRM master is never released.** Held continuously from
+   `INITRAMFS_SPLASH` to the final frame of `SHUTDOWN_SPLASH`. logind
+   exists for *session management* (PAM session → `user@.service`,
+   `XDG_RUNTIME_DIR` setup, polkit context) but is **not in the DRM
+   brokerage path** for halmasuit's seat. logind starts up after halmasuit
+   has already become master; nothing else asks logind for the device, so
+   no contention arises.
+2. **The CRTC is modeset at most twice over the entire boot** — once when
+   halmasuit takes DRM in initramfs, optionally once more during the
+   `simpledrm` → real-KMS migration when the GPU driver loads. After
+   that, every visual change is a buffer swap on the primary plane.
+   Atomic flips guarantee no black frame.
+
+The login-flash test from v1 measures one specific transition
+(`GREETER → SESSION`) by asserting PID continuity of the niri-rendering
+process. v2 will add a sibling test that asserts frame continuity for the
+whole boot pipeline — frames captured from kernel handoff through to
+`SESSION` phase, asserting no all-black frame and no DSSIM jump above
+threshold across any transition.
 
 ---
 
-## The greeter integration
+## High-level architecture
 
-The most important architectural decision: **halmasuit speaks greetd's
-wire protocol** ([reference](https://man.sr.ht/~kennylevinsen/greetd/protocol.md))
-as a server. Every existing Wayland greeter that greetd already speaks to
-(DankGreeter, regreet, tuigreet, gtkgreet, agreety) connects to halmasuit
-unchanged. From the greeter's perspective, halmasuit IS greetd.
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ INITRAMFS                                                            │
+│   systemd (in initramfs, PID 1)                                       │
+│    └─ halmasuit.service                                              │
+│       └─ halmasuit (as root — no userdb yet in initramfs)            │
+│          • opens /dev/dri/card0, becomes DRM master directly         │
+│          • Wayland server   /run/halmasuit/wayland-0                 │
+│          • foreground wl_client: halmasuit-splash                    │
+│          • adapter listening: halmasuit-luks (systemd password agent)│
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              │  initrd-switch-root.target
+                              │  → halmasuit re-execs from rootfs path
+                              │    (DRM fd + wl-socket fd inherited
+                              │     across exec; PID changes; mastery
+                              │     retained; setresuid → compositor)
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ ROOTFS                                                                │
+│   systemd (PID 1)                                                     │
+│    └─ halmasuit.service                                              │
+│       └─ halmasuit (as 'compositor' system user — DRM master         │
+│                    retained across re-exec)                          │
+│          • Wayland server   /run/halmasuit/wayland-0                 │
+│          • greetd-compat    /run/halmasuit/greetd.sock               │
+│          • control IPC      /run/halmasuit/control.sock              │
+│          • D-Bus consumer   → logind (PrepareForSleep,               │
+│                                       PrepareForShutdown,            │
+│                                       Lock signals)                  │
+│          • D-Bus server     → org.halmasuit.Compositor1              │
+│          • foreground wl_client over time:                            │
+│             ├─ PHASE rootfs-splash  halmasuit-splash                 │
+│             ├─ PHASE greeter        DankGreeter / regreet / …        │
+│             │                       (as 'greeter' user)              │
+│             ├─ PHASE session        niri                             │
+│             │                       (as authenticated user, exec'd  │
+│             │                        via halmasuit-spawn)            │
+│             ├─ PHASE locked         ext-session-lock-v1 client       │
+│             └─ PHASE shutdown       halmasuit-splash                  │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Halmasuit replaces **both Plymouth and greetd** with one binary that lives
+in both the initramfs and the rootfs and is the same process throughout.
+DRM master is taken directly (not via logind) in the initramfs, because
+logind does not exist yet. After `switch_root`, halmasuit re-execs itself,
+drops privileges from root to the `compositor` system user, and continues —
+the DRM master held by the file descriptor survives both the exec and the
+privilege drop. logind starts up later in the boot but is never asked for
+the device; logind's role for halmasuit's seat is reduced to session
+management only.
+
+---
+
+## Adapter principle: halmasuit owns the pixels, never the feature
+
+Halmasuit's job is to own the seat's display surface and host one
+foreground `wl_client` at a time. It is **not** halmasuit's job to
+implement the features that today prompt the user from a TTY or run as
+their own separate display owner. Each such feature already has a wire
+contract — a Unix socket protocol, a Wayland protocol, or a D-Bus
+interface — that some other binary or library on the system already
+speaks. Halmasuit **adopts that contract on the appropriate side** and
+the feature's UI plugs in as a `wl_client` (or, where the contract is
+naturally daemon-side, as an in-process adapter module). Halmasuit
+fulfils the wire contract of the program it is adopting; the program's
+logic and UI are unchanged or pluggable.
+
+This pattern is what keeps halmasuit thin. If LUKS prompts need to look
+nice during boot, the contract is "speak the systemd password-agent
+protocol," not "patch halmasuit." If a new lock screen wants to ship,
+it's an `ext-session-lock-v1` client, not a halmasuit fork. Halmasuit's
+surface stays bounded to the three things only it can do: own the
+display, host `wl_clients`, manage phase transitions.
+
+### Wrap points
+
+The table below enumerates every place in the Linux boot/login pipeline
+where userspace currently drops to a TTY, runs a competing display owner,
+or otherwise interrupts visual continuity — and the wire contract
+halmasuit (or a plug-in `wl_client`) adopts to absorb it.
+
+| Wrap point | Existing wire contract | Where halmasuit fits | Plug-in form |
+|---|---|---|---|
+| **Greeter** | greetd JSON-over-Unix-socket ([spec](https://man.sr.ht/~kennylevinsen/greetd/protocol.md)) | `halmasuit-greetd` crate (in-process server) | Any greetd-compatible greeter binary: DankGreeter, regreet, tuigreet, gtkgreet, agreety |
+| **LUKS / dm-verity / password prompts during boot** | systemd password-agent protocol ([spec](https://systemd.io/PASSWORD_AGENTS/)) — `/run/systemd/ask-password/ask.*` inotify + response sockets | `halmasuit-luks` is a `wl_client` running during `INITRAMFS_SPLASH`; registers as a password agent | Replaceable by any other `wl_client` that implements the agent protocol |
+| **fsck progress + repair prompts** | systemd-fsckd progress protocol over `/run/systemd/fsck.progress` | `halmasuit-fsck` is a `wl_client` that renders progress overlays + Y/N prompts | Replaceable by any other `wl_client` speaking the same socket |
+| **Lock screen** | Wayland `ext-session-lock-v1` (halmasuit exposes), plus `org.freedesktop.login1.Manager.Lock` D-Bus signal (halmasuit subscribes) | halmasuit hosts the lock client and brokers session activation around it | Any existing `ext-session-lock-v1` client: swaylock, hyprlock, gtklock, custom |
+| **Emergency / rescue UI** | `emergency.target` invokes a unit; today that unit is `sulogin` on a console | `halmasuit-emergency` is a `wl_client` that does PAM-as-root and execs a graphical terminal | Replaceable by any other `wl_client` registered for emergency.target |
+| **Fast user switching** | `org.freedesktop.login1.Manager.ActivateSession` D-Bus + multi-session logind support | halmasuit hosts multiple per-user `wl_client` session subtrees concurrently and swaps which is foreground | Switching UI itself is a session-level concern (lives in niri / DMS, not in halmasuit) |
+| **First-boot setup** | `systemd-firstboot` and related | Optional `halmasuit-firstboot` `wl_client`; low priority | Plug-in |
+| **Polkit authentication prompts mid-session** | `org.freedesktop.PolicyKit1.AuthenticationAgent` D-Bus | **Not a wrap point.** Polkit auth agents already work as ordinary `wl_client`s of niri during `SESSION` phase. Halmasuit needs no special integration. | — |
+
+The greeter wrap point is the only one where the adapter lives **inside**
+halmasuit's process — because the greetd state machine needs to drive
+halmasuit's foreground-client lifecycle (terminate greeter, exec niri)
+and call PAM in halmasuit's address space. Every other adapter lives in
+its own `wl_client` process.
+
+**What halmasuit does NOT reimplement:**
+- LUKS keyslot verification (`cryptsetup` / kernel dm-crypt do it)
+- fsck repair decisions (`e2fsck` / `xfs_repair` / etc. do them)
+- Polkit authorization logic (`polkitd` does it)
+- logind's session management (logind does it)
+- PAM authentication (PAM does it; halmasuit calls into libpam in-process for the greeter wrap; emergency and lock-screen adapters call PAM in their own process)
+
+Halmasuit absorbs only the *frontend* of each — the surface through which
+the user interacts. The backend stays where it lives.
+
+### The greeter as the canonical example
+
+The greeter is the most important wrap point and the one v2 implements
+first. Detailed flow:
 
 Wire types and the JSON codec come from upstream — `halmasuit-greetd`
 depends on the published [`greetd_ipc`](https://crates.io/crates/greetd_ipc)
 crate maintained alongside greetd itself. What we own is the daemon-side
 logic: the state machine, PAM glue, and the integration points that swap
-halmasuit's foreground Wayland client when auth succeeds. We do not
+halmasuit's foreground `wl_client` when auth succeeds. We do not
 re-derive the protocol from the spec text — reusing greetd's own types
 means we track protocol additions automatically and inherit no drift
 bugs. Reusing greetd-the-daemon itself as a library is not feasible: its
@@ -123,6 +388,104 @@ DMS patch needed: roughly twenty lines in the `dms-greeter` launcher
 script to skip its nested-niri spawn when `WAYLAND_DISPLAY` is already
 set by the parent. DankGreeter's QML and Quickshell content run
 unmodified.
+
+---
+
+## Visual identity
+
+`halmasuit-splash` is **not** "a logo on a background." It is a full
+GPU-accelerated `wl_client` running shader-driven rendering, starting in
+the initramfs and persisting across every phase where halmasuit hosts
+no other foreground client. It is the visible signature of the system
+from kernel handoff to user login, and from user logout back to
+power-off. This is the layer that makes a Linux desktop feel like
+intentional industrial design instead of an apology for booting.
+
+### Capability and cost
+
+The GPU is fully capable from the moment its KMS driver loads. amdgpu,
+i915, nouveau, and the rest expose Vulkan and OpenGL ES through Mesa
+at the kernel level. To use those capabilities inside the initramfs we
+ship:
+
+- Mesa, trimmed to the driver(s) for target hardware — ~80 MB compressed.
+- `vulkan-loader` + the Vulkan ICD for the target GPU — ~10 MB.
+- `wgpu` (or direct `ash`) statically linked into `halmasuit-splash`
+  — ~20 MB.
+
+~100 MB initramfs addition, decompressed once per boot. Trivially
+affordable on any 2026 system; Steam Deck's initramfs is larger and
+decompresses in ~100 ms on NVMe. The payoff is uniform, high-quality
+visual presentation across the *entire* boot/login/logout pipeline, not
+a tiny logo on a tiny window.
+
+### The killer move: one continuous animation across phases
+
+Because halmasuit is one long-lived process and the splash is one
+long-lived `wl_client`, the animation it renders can be *continuous*
+across every phase transition:
+
+```
+INITRAMFS_SPLASH → ROOTFS_SPLASH → GREETER → LOCKED ↔ SESSION → SHUTDOWN
+       │                │            │         │                  │
+       └────────────────┴────────────┴─────────┴──────────────────┘
+                same splash animation runs through all of this
+                (overlaid by greeter UI / niri / lock-screen
+                 client / shutdown text as appropriate)
+```
+
+The greeter doesn't appear *after* the splash; the greeter appears *in
+front of* the splash, which continues running underneath. The lock
+screen is the same — the splash backdrop is still alive behind the
+lock client. niri is the exception (full-screen opaque), but on
+logout the splash is already running and just becomes visible again.
+macOS cannot do this because their compositor doesn't live across the
+greeter→session boundary. ours does. it would be malpractice not to
+use it.
+
+### Aesthetic rules
+
+These constrain the form, not the ambition.
+
+- **Intentional, not frantic.** No fast cuts, no aggressive motion. The
+  user is waiting for the system; the splash conveys "the system is
+  composed and proceeding," not "look at me, I'm a screensaver."
+- **Calm enough to be a backdrop, rich enough to be the foreground.**
+  When the splash is alone (initramfs phase), it carries the entire
+  visual moment. When the greeter is on top, it has to recede without
+  going inert. Both modes have to work.
+- **Distinctly Linux.** Not a stolen Apple aesthetic. The opportunity is
+  to express what is actually distinct about Linux — programmability,
+  configurability, demoscene roots, the freedom to do something nobody
+  else's OS will. macOS won't ship a procedurally generated identity
+  the user can theme because Apple controls the aesthetic. We can.
+- **Theme-driven.** The user's nixos-config can parameterize the splash:
+  colors, intensity, motif, even custom shader injection at the
+  expert/advanced level. The system identity is *theirs*, not the
+  project's.
+- **No text during boot.** Whatever the splash renders, it does not
+  render words. Text is what fbcon does and what we are taking from
+  fbcon. The splash is purely visual.
+
+### Reference points
+
+- **Steam Deck boot animation** — animated, branded, fast, dignified.
+- **PS5 / Switch boot** — dynamic but never tiring across repeated viewings.
+- **The demoscene tradition** — Farbrausch's *fr-08: .the .product*,
+  Conspiracy's *Chaos Theory*, and the broader scene's proof that
+  extraordinary visuals fit in tiny binaries.
+- **Anti-reference:** Apple's iOS boot. Restrained, polished, deliberately
+  under-ambitious next to what halmasuit could be.
+
+### Implementation sketch (deferred to v2 implementation)
+
+What the splash actually *renders* is a design question separate from
+the architecture and lives in `halmasuit-splash`'s own design notes
+(TBD when the crate is implemented). The architecture's only constraint
+is that it be a `wl_client` that uses the standard Wayland buffer-
+sharing protocols (`linux-dmabuf-v1`) to submit GPU-rendered frames to
+halmasuit, at the display's native refresh rate, with no special
+privileges. Anything that fits inside those constraints is in scope.
 
 ---
 
@@ -319,6 +682,34 @@ Attackers, in order of likelihood:
 | 10 | Lock-screen bypass | Lock screen is an `ext-session-lock-v1` client. Halmasuit refuses to release the lock until the client demonstrates a successful PAM round-trip. Same flow as greeter, in-session. |
 | 11 | Compromised halmasuit invokes `halmasuit-spawn` with `target_uid=0` (or any system UID) to escalate to root | **UID floor**: spawn refuses any `target_uid < UID_MIN` (typically 1000); same for `target_gid`. A compromised compositor can still invoke spawn for legitimate session UIDs but cannot reach root or other system users. Worst case bounded to session-as-currently-logged-in-user. **This is the load-bearing security property of the privilege split** — without it, the split is theater. |
 
+### Initramfs phase: temporary root
+
+In `INITRAMFS_SPLASH`, halmasuit necessarily runs as root — the user
+database (`/etc/passwd`, NSS) does not exist yet in initramfs, so there
+is no `compositor` user to drop to. This is the same posture Plymouth
+has today during the same boot phase, and the same code is exposed to
+the same attack surface (an attacker capable of compromising halmasuit
+during the seconds-long initramfs window could escalate from root).
+
+What v2 does to keep this short:
+
+- The privilege drop to `compositor` happens **immediately** at the
+  re-exec across `switch_root`, not in some later "post-graphical-ready"
+  step. The non-privileged image of halmasuit is the long-lived one;
+  the privileged one lives only as long as the initramfs phase does
+  (typically 1–3 seconds on modern hardware).
+- The initramfs binary is the same crate as the rootfs binary, just
+  built with a `--features initramfs` flag that gates the small amount
+  of phase-specific code (direct DRM open, password-agent registration,
+  etc.). The vast majority of halmasuit's code is reachable in both
+  configurations; reducing the initramfs feature set does not
+  meaningfully shrink the attack surface there.
+- The systemd password-agent protocol (`halmasuit-luks`) is the highest-
+  risk surface during initramfs because it sees passphrases. It runs as
+  a separate `wl_client` process (not in halmasuit's address space) but
+  also as root in initramfs. After re-exec to rootfs the equivalent
+  prompts (lock-screen re-auth, polkit) are no longer privileged.
+
 ### Posture vs current greetd
 
 Halmasuit's posture is **strictly better** than greetd's. greetd-the-daemon
@@ -405,9 +796,14 @@ halmasuit/
 │   └── workflows/
 │       └── ci.yml              # nix flake check on ubuntu-24.04 + cachix
 ├── crates/
-│   ├── halmasuit/              # compositor binary (v2)
+│   ├── halmasuit/              # compositor binary (v2) — links every lib below
+│   ├── halmasuit-kms/          # DRM/KMS direct-scanout core, modeset, primary plane (v2)
 │   ├── halmasuit-protocols/    # Wayland XML + wayland-rs codegen (v2)
-│   ├── halmasuit-greetd/       # greetd wire-protocol server impl (v2)
+│   ├── halmasuit-greetd/       # greetd wire-protocol server, in-process state machine + PAM (v2)
+│   ├── halmasuit-splash/       # GPU-accelerated splash wl_client (Vulkan via wgpu/ash, shader-driven). Used during INITRAMFS / ROOTFS / LOCKED-backdrop / SHUTDOWN phases (v2). See "Visual identity" section. (v2)
+│   ├── halmasuit-luks/         # systemd password-agent wl_client adapter (v2)
+│   ├── halmasuit-fsck/         # systemd-fsckd progress wl_client adapter (v2)
+│   ├── halmasuit-emergency/    # emergency-shell wl_client adapter (v2)
 │   ├── halmasuit-ipc/          # JSON-RPC control plane types (v2)
 │   ├── halmasuit-cli/          # halmasuit msg CLI (v2)
 │   ├── halmasuit-spawn/        # setuid privilege-drop helper (v2)
@@ -535,20 +931,60 @@ placeholders in the workspace, ready to be filled in v2.
 This is TDD applied to systems work: build the measurement instrument
 before the thing it measures.
 
-### v2 — Halmasuit compositor that passes the v1 test
+### v2 — One process from initramfs to session
 
-- smithay-based compositor binary.
-- greetd protocol server (the `halmasuit-greetd` crate).
-- PAM integration (decision on bindings made here).
-- `halmasuit-spawn` setuid helper.
-- NixOS module that replaces greetd: `services.halmasuit.enable = true;`.
+v2 fuses what earlier drafts of this document split into v2 (greetd
+replacement) and v4 (initramfs integration). They are one milestone
+because splitting them is what causes the boot flash — shipping a v2
+that exists only after `graphical.target` would be a worse Plymouth and
+solve nothing of the project's stated mission.
+
+Scope:
+
+- `halmasuit-kms`: DRM/KMS direct-scanout core. Open device, become
+  master, atomic modeset, manage primary plane. Handle the simpledrm →
+  real-KMS driver migration (snapshot framebuffer pixels, modeset on new
+  device, paint snapshot, release old). Reference: Plymouth's
+  `ply-renderer-drm.c`.
+- `halmasuit` binary that runs in **both** initramfs and rootfs. Comes
+  up early in initramfs, takes DRM master, brings up Wayland server,
+  hosts `halmasuit-splash` as foreground `wl_client`. Re-execs itself
+  across `switch_root` from the rootfs binary path, preserving DRM
+  master fd and Wayland-socket fd across the exec, and drops privileges
+  from root to `compositor` system user post-exec.
+- `halmasuit-splash`: logo + background `wl_client`. Same crate used in
+  `INITRAMFS_SPLASH`, `ROOTFS_SPLASH`, and `SHUTDOWN_SPLASH` phases.
+- `halmasuit-luks`: systemd password-agent adapter `wl_client`.
+  Required for any encrypted-rootfs system to boot through halmasuit
+  without dropping to a TTY prompt.
+- `halmasuit-greetd`: greetd wire-protocol server, PAM in-process,
+  state machine.
+- `halmasuit-spawn`: setuid privilege-drop helper. ~80 lines,
+  `#![forbid(unsafe_code)]`.
+- D-Bus integration (logind subscriptions + `org.halmasuit.Compositor1`
+  server). After re-exec to rootfs only; not in initramfs.
+- NixOS module that wires halmasuit into both initramfs
+  (`boot.initrd.systemd.services.halmasuit`) and rootfs
+  (`systemd.services.halmasuit`); replaces both Plymouth and greetd;
+  installs `halmasuit-spawn` setuid; installs PAM service file `halmasuit`;
+  configures `compositor` and `greeter` system users.
 - DankGreeter launcher patch (~20 lines).
-- Inner-niri lifecycle.
-- D-Bus integration (logind + `org.halmasuit.Compositor1`).
-- Ship to gnomon as the daily-driver greeter.
+- New VM test: `tests/full-boot-flash.nix` — frame-capture from kernel
+  handoff through to `SESSION` phase, asserts no all-black frame and no
+  DSSIM jump above threshold across any transition.
 
-When the v1 NixOS test starts passing against the halmasuit-enabled
-system, v2 is done.
+Deferred to later milestones in v2's design:
+
+- `halmasuit-fsck` and `halmasuit-emergency` adapters (nice to have,
+  but only matter when fsck triggers or the system is in trouble; can
+  ship after the main v2 binary lands).
+
+Done condition:
+
+- `tests/login-flash.nix` passes (greeter→session boundary).
+- `tests/full-boot-flash.nix` passes (whole-boot continuity).
+- gnomon boots with halmasuit and Plymouth + greetd both removed from
+  the system entirely.
 
 ### v3 — Direct-scanout optimization
 
@@ -559,42 +995,49 @@ system, v2 is done.
 - Atomic-modeset code in halmasuit to put niri's dmabuf directly on a
   CRTC plane when conditions allow.
 - Falls back to normal nested composition when an overlay is up
-  (recovery menu, lock screen).
+  (recovery menu, lock screen, fsck progress).
 
 Removes the GPU tax that v2 pays for nested rendering. Frame latency
 matches running niri natively.
 
-### v4 — Initramfs integration
+### v4 and beyond
 
-- Build halmasuit into the initramfs image.
-- Start halmasuit as one of the first userspace processes.
-- Handle the simpledrm → real KMS driver handover gracefully (hold last
-  frame across, atomic flip to new device).
-- Survive `switch_root` (binary in both initramfs and rootfs; re-exec
-  pattern à la Plymouth).
-- Continue running through systemd target traversal.
-- Reach `graphical.target` and accept the first greeter client.
-
-When done: BIOS firmware splash → halmasuit splash → greeter → session
-with zero visible discontinuities.
-
-### v5 and beyond
-
-- **Crash isolation with client preservation.** When niri crashes,
-  clients survive (currently they die). Requires the "good version" of
-  the architecture: halmasuit hosts the clients directly, niri provides
-  only window-management policy via a custom protocol. Significant
-  protocol work. May or may not be worth pursuing.
+- **Graceful crash recovery.** When niri (or whichever inner WM is
+  configured) crashes, halmasuit survives — its sole `wl_client` just
+  disconnected. Halmasuit swaps the foreground back to halmasuit-splash
+  rendering a "session ended" scene, then transitions to `GREETER`
+  phase for re-login. The apps that were running under niri are gone
+  (same as today), but the user experience is a clean recovery UI
+  rather than a black screen with leaked kernel text. Costs almost
+  nothing beyond what v2 builds.
 - **Fast user switching.** Two user sessions live concurrently;
-  foreground swaps without exit.
+  halmasuit hosts each user's niri as a separate `wl_client` subtree,
+  swaps which is foreground. The switching UI itself lives in niri/DMS,
+  not in halmasuit.
 - **HDR + VRR pass-through across nesting.** Requires plumbing color
-  management and presentation timing through the direct-scanout path.
-- **Multi-seat.** A single halmasuit process serving multiple seats.
-- **Recovery mode.** A graphical recovery UI accessible even when the
-  user session won't start. Halmasuit is already running; just paint a
-  different scene.
-- **Screen casting / remote display infrastructure.** Owned by the
-  long-lived compositor, stable across session changes.
+  management and presentation timing through the direct-scanout path
+  (v3 prerequisite).
+- **Multi-seat.** A single halmasuit process serving multiple physical
+  seats — each seat its own DRM device, own foreground `wl_client`
+  pipeline, shared codebase.
+- **Graphical recovery mode.** When the user session won't start at
+  all (broken niri config, missing binaries, failed `halmasuit-spawn`),
+  halmasuit paints a recovery menu — re-login as different user, drop
+  to `halmasuit-emergency` shell adapter, reboot. Halmasuit is already
+  running; recovery is just another phase.
+- **Screen casting / remote display.** Owned by halmasuit since it's
+  the long-lived display owner; stable across session changes.
+
+**Explicitly not pursuing:** *true* crash isolation with client
+preservation across niri restart. This would require apps to connect to
+halmasuit's Wayland socket directly (not niri's) and would reduce niri
+to a non-compositor policy daemon driven by a custom halmasuit protocol.
+That is a fork of niri maintained against upstream forever — same
+problem for hyprland, cosmic-comp, or any other inner WM. The cost is
+not justified by the gain, and the gain (apps surviving a niri restart)
+is small compared to the v2 win (no flashes anywhere visible during the
+normal boot/login/logout pipeline). Graceful crash *recovery* above gives
+us a clean failure UX without the protocol fork.
 
 ---
 
@@ -604,15 +1047,22 @@ These exist so the scope cannot creep without an explicit decision.
 
 - **NOT in v1:** any halmasuit compositor code. The compositor crates are
   empty placeholders. v1 is purely test infrastructure.
-- **NOT in v2:** initramfs integration. v2 ships as a normal display
-  manager replacement that starts at `graphical.target`.
 - **NOT in v2:** direct-scanout / single-composition optimization. v2
-  pays the double-composition GPU cost. Acceptable trade-off for
-  scope/risk; v3 fixes it.
-- **NOT in v2:** client preservation across inner-WM restart. v2
-  restarts niri cleanly and clients die. Same UX as a Hyprland/niri
-  crash today.
+  pays the double-composition GPU cost (halmasuit composites niri's
+  surface, niri composites its apps). Acceptable trade-off for
+  scope/risk; v3 fixes it via the `ext-halmasuit-host-v1` protocol.
+- **NOT in v2:** client preservation across niri restart. If niri
+  crashes, its apps die — same as a niri crash today on any system.
+  v4's "graceful crash recovery" gives a clean halmasuit-painted
+  recovery overlay, but the apps themselves are not preserved.
+  *True* client preservation is explicitly not on the roadmap (it would
+  require forking niri into a non-compositor policy daemon).
 - **NOT in v2:** multi-seat, HDR, VRR pass-through.
+- **NOT in v2:** `halmasuit-fsck` and `halmasuit-emergency` adapters.
+  They use the same adapter pattern as `halmasuit-luks` and can be
+  added incrementally after the main v2 binary lands; the wire
+  contracts they target are well-defined and don't require halmasuit
+  internal changes.
 - **NOT in v2:** OpenTelemetry export. Adding `tracing-opentelemetry`
   later is a one-line subscriber change; not needed until we have spans
   worth exporting.
@@ -657,12 +1107,27 @@ These are explicit "we know this needs deciding, just not yet":
    when we start writing the auth code.
 2. **smithay revision** (v2). Pin to whatever niri or cosmic-comp is on
    when v2 begins. Update on a deliberate cadence; not bleeding-edge.
-3. **Exact Wayland protocol surface** for v2 (vs additions in v3+). The
+3. **`switch_root` re-exec mechanism** (v2). Two viable approaches:
+   (a) `execve` from rootfs path with non-CLOEXEC fd inheritance — same
+   PID, same process, simplest; or (b) fork+exec the rootfs binary as a
+   child, pass fds via `SCM_RIGHTS`, exit the initramfs parent —
+   Plymouth's approach, slightly more involved. (a) is cleaner if
+   systemd cooperates with our unit lifecycle across the target switch;
+   (b) is the proven fallback. Decision belongs to whoever wires the
+   NixOS module's `boot.initrd.systemd.services.halmasuit` unit.
+4. **Exact Wayland protocol surface** for v2 (vs additions in v3+). The
    v2 list above is the minimum; we may add `wp_drm_lease_v1` or
    `linux-explicit-synchronization-v1` if useful.
-4. **OCR in v1 test pipeline.** May defer text-leak detection to v1.5
-   if tesseract bindings prove fiddly; v1 ships with black-frame and
-   DSSIM-jump detection only.
-5. **D-Bus surface details.** The method list above is a starting set;
+5. **OCR in test pipeline.** May defer text-leak detection to v1.5
+   if tesseract bindings prove fiddly; current tests ship with
+   black-frame and DSSIM-jump detection only.
+6. **D-Bus surface details.** The method list above is a starting set;
    final surface depends on what desktop-environment integration
    requires in practice.
+7. **`halmasuit-luks` UI form.** During `INITRAMFS_SPLASH` the screen
+   shows the splash; when cryptsetup needs a passphrase, do we
+   (a) replace the splash with `halmasuit-luks` as foreground, or
+   (b) overlay `halmasuit-luks`'s prompt on top of the still-rendered
+   splash via subsurface composition? (b) is more visually continuous
+   but more compositor complexity. Decision when the adapter is
+   implemented.
