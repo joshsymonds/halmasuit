@@ -81,29 +81,10 @@ pkgs.testers.runNixOSTest {
         group        = "halmasuit-greeter";
       };
 
-      # halmasuit's GLES renderer needs Mesa + EGL inside the guest;
-      # `hardware.graphics.enable` sets up /run/opengl-driver and
-      # installs Mesa's DRI drivers. `LIBGL_ALWAYS_SOFTWARE=1` then
-      # forces llvmpipe — deterministic CPU rendering, no host EGL
-      # backend required, no /dev/dri/renderD128 host pass-through
-      # required. Goldens stay stable until `nix flake update` shifts
-      # the Mesa pin.
-      #
-      # `LD_LIBRARY_PATH` is required because smithay uses libloading
-      # to dlopen `libEGL.so.1` at runtime; without /run/opengl-driver/lib
-      # on the search path the dlopen fails (NixOS's libglvnd lives
-      # there, not in /etc/ld.so.cache).
-      hardware.graphics.enable = true;
-      # libglvnd provides libEGL.so.1; Mesa provides the swrast DRI
-      # driver. Both surface at /run/opengl-driver/lib via NixOS's
-      # opengl-driver wrapper. Installing them in systemPackages
-      # ensures they make it into the closure; the env vars route
-      # halmasuit's runtime dlopens at them.
-      environment.systemPackages = [ pkgs.libglvnd pkgs.mesa ];
-      systemd.services.halmasuit.environment = {
-        LIBGL_ALWAYS_SOFTWARE = "1";
-        LD_LIBRARY_PATH       = "/run/opengl-driver/lib";
-      };
+      # hardware.graphics.enable + LIBGL_ALWAYS_SOFTWARE +
+      # LD_LIBRARY_PATH are now set by services.halmasuit.enable in
+      # nix/module.nix — every halmasuit deployment needs Mesa once
+      # the GLES renderer is in place, not just this visual gate.
 
       virtualisation = {
         memorySize = 1024;

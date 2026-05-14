@@ -186,6 +186,15 @@
             # Nix sandbox doesn't permit that cleanly. `just check` is the
             # canonical gate; the NixOS VM test (next task) is the deployment-side gate.
             doCheck = false;
+            # smithay dlopens libEGL.so.1 (and libGL.so.1) at runtime via
+            # `libloading`. Because nothing in halmasuit's link graph
+            # actually references those libs, Nix's linker drops them from
+            # RPATH despite libGL being in buildInputs. Add libGL's lib
+            # dir to RPATH explicitly with patchelf so the runtime dlopen
+            # succeeds without LD_LIBRARY_PATH propagation.
+            postFixup = ''
+              patchelf --add-rpath "${pkgs.libGL}/lib" $out/bin/halmasuit
+            '';
             meta = {
               description = "halmasuit Linux system compositor (v2 Phase A spine)";
               license     = pkgs.lib.licenses.asl20;

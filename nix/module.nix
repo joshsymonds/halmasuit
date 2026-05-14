@@ -185,6 +185,15 @@ in
       }
     ];
 
+    # halmasuit's renderer is GLES + DrmCompositor. That requires Mesa
+    # + libglvnd available at runtime: libEGL.so.1 is `dlopen`ed by
+    # smithay via libloading, and Mesa's DRI driver (loaded as
+    # `dri_gbm.so` from `/run/opengl-driver/lib/gbm/`) is the actual
+    # software-rendering backend when LIBGL_ALWAYS_SOFTWARE=1 or the
+    # only backend when virtio-gpu-pci is the VM substrate.
+    # `hardware.graphics.enable` is NixOS's canonical setup for both.
+    hardware.graphics.enable = true;
+
     # Default PAM service file — gives us unixAuth-backed pam_unix +
     # pam_env + pam_limits, which is what halmasuit-pam exercises in
     # the VM test and is the conventional starting stack for greeters.
@@ -295,6 +304,18 @@ in
         # declared above. halmasuit (deprivileged) execs this to
         # launch user sessions.
         HALMASUIT_SPAWN_BIN = "/run/wrappers/bin/halmasuit-spawn";
+        # Force Mesa to use llvmpipe (software rasterizer) until the
+        # epic's real-hardware shakedown subtask validates virgl /
+        # native GPU paths on gnomon. Deterministic, doesn't need
+        # virtio-gpu-gl or host EGL backend, and produces stable
+        # goldens.
+        LIBGL_ALWAYS_SOFTWARE = "1";
+        # NixOS routes runtime OpenGL through /run/opengl-driver/lib.
+        # halmasuit's binary has libglvnd's lib dir in RPATH (via the
+        # halmasuit derivation's postFixup) but Mesa's DRI driver
+        # (dri_gbm.so) still loads from the dlopen search path. The
+        # libglvnd dispatch also looks here for vendor JSON.
+        LD_LIBRARY_PATH = "/run/opengl-driver/lib";
       } // lib.optionalAttrs (cfg.greeterCommand != null) {
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.
