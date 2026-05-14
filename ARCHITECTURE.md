@@ -761,6 +761,7 @@ Attackers, in order of likelihood:
 | 9 | D-Bus method abuse — random user calls `RestartInnerWM` | polkit rules shipped with the NixOS module. Privileged methods require `wheel` group or interactive authentication. |
 | 10 | Lock-screen bypass | Lock screen is an `ext-session-lock-v1` client. Halmasuit refuses to release the lock until the client demonstrates a successful PAM round-trip. Same flow as greeter, in-session. |
 | 11 | Compromised halmasuit invokes `halmasuit-spawn` with `target_uid=0` (or any system UID) to escalate to root | **UID floor**: spawn refuses any `target_uid < UID_MIN` (typically 1000); same for `target_gid`. A compromised compositor can still invoke spawn for legitimate session UIDs but cannot reach root or other system users. Worst case bounded to session-as-currently-logged-in-user. **This is the load-bearing security property of the privilege split** — without it, the split is theater. |
+| 12 | Compromised halmasuit uses retained `CAP_KILL` to denial-of-service system services | halmasuit retains `CAP_KILL` in its effective set so it can SIGKILL the greeter on session start (the greeter runs under a different uid, and `kill(2)` requires either EUID match or `CAP_KILL`). `CAP_KILL` bypasses the EUID match check and lets the holder signal any process system-wide. A compromised compositor could SIGKILL `init`, `sshd`, or another user's session — a DoS primitive, not full RCE. Mitigations: `CAP_KILL` is the *only* capability halmasuit retains post-drop (`CapPrm=CapEff={CAP_KILL}`, `CapBnd={CAP_SETUID, CAP_SETGID}` for the spawn handoff, everything else cleared); the compositor cannot ptrace, write `/proc/*/mem`, load kernel modules, or open `/dev/mem`. The privilege split's primary defense is that halmasuit-the-process is unprivileged enough to bound a compromise to "DoS the system" rather than "own the system." |
 
 ### Initramfs phase: temporary root
 
@@ -796,7 +797,11 @@ Halmasuit's posture is **strictly better** than greetd's. greetd-the-daemon
 runs as **root** — full compromise of greetd is full compromise of the
 system, with no privilege boundary to fall back on. halmasuit factors
 that privilege into one ~80-line setuid helper (`halmasuit-spawn`) and
-leaves the compositor itself unprivileged. Concretely:
+runs the compositor itself with exactly one retained capability:
+`CAP_KILL` in the effective set (for the greeter-kill on session
+start; see threat model row 12 for the bounded blast radius). No
+DAC bypass, no `ptrace` of arbitrary processes, no `/dev/mem`, no
+`init_module`. Concretely:
 
 - **Bug-class delta.** Most exploitable bugs (info leaks, OOB reads,
   partial heap overwrites, Wayland state-machine errors, smithay surface

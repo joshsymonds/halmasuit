@@ -45,6 +45,24 @@
 //
 // No allocations and no user-controlled-state syscalls between privilege
 // drop and execve. Steps 6–10 are straight-line.
+//
+// ## Capabilities at execve-in
+//
+// halmasuit-spawn is invoked from the deprivileged halmasuit
+// compositor (uid 998) via a setuid-root wrapper. The kernel's
+// capability transition rule for setuid-root binaries with no file
+// caps gives this helper, at execve-in:
+//
+//   P'(permitted) = P(inheritable) | P(bounding) = ∅ | {CAP_SETUID, CAP_SETGID}
+//   P'(effective) = P'(permitted)                = {CAP_SETUID, CAP_SETGID}
+//
+// `CAP_SETUID` and `CAP_SETGID` are exactly what `setresuid` and
+// `setresgid`/`initgroups` (steps 6–8) require. Nothing else is in
+// the inherited set — the compositor's bounding set is restricted
+// to exactly these two caps so an accidental setuid-root execve
+// elsewhere wouldn't grant more. After step 8 the kernel clears
+// the effective set on the root → non-root uid transition, so by
+// execve time (step 10) the session sees no capabilities at all.
 
 #![forbid(unsafe_code)]
 
