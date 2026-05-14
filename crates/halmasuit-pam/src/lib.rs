@@ -287,20 +287,32 @@ unsafe extern "C" fn bridge_conv(
         }
 
         for (i, r) in responses.into_iter().enumerate() {
-            // Strip any interior NUL silently — libpam can't carry NUL
-            // bytes in resp anyway. The greeter shouldn't have sent NULs
-            // through the wire either; this is defensive.
-            let bytes: Vec<u8> = r.as_bytes().iter().copied().filter(|b| *b != 0).collect();
+            // Build a NUL-terminated buffer in a Zeroizing<Vec<u8>> so
+            // every intermediate copy of the password is wiped on drop.
+            // Going through CString would deallocate without zeroing
+            // (std::ffi::CString::Drop just frees), leaving credential
+            // residue accessible until the heap slot is reused.
+            // Interior NULs are stripped silently — libpam can't carry
+            // NUL bytes in resp anyway.
+            let mut bytes: Zeroizing<Vec<u8>> =
+                Zeroizing::new(r.as_bytes().iter().copied().filter(|b| *b != 0).collect());
             // r (Zeroizing<String>) drops here, wiping the original buffer.
             drop(r);
-            // SAFETY: bytes has no interior NULs (filter above), so
-            // CString::from_vec_unchecked is sound.
-            #[expect(unsafe_code, reason = "interior-NUL filtered above.")]
-            let cstr = unsafe { CString::from_vec_unchecked(bytes) };
-            // SAFETY: cstr.as_ptr() is a valid NUL-terminated C string
-            // for the duration of this call; libc::strdup copies it.
-            #[expect(unsafe_code, reason = "strdup copies; cstr lifetime covers the call.")]
-            let dup = unsafe { libc::strdup(cstr.as_ptr()) };
+            // Append the trailing NUL so the buffer is a valid C string
+            // for strdup. The buffer now contains exactly one NUL byte:
+            // the trailing one we just pushed.
+            bytes.push(0);
+            // SAFETY: bytes contains a single trailing NUL (we just
+            // pushed it; the filter above guarantees no interior NULs).
+            // libc::strdup copies into a new libpam-owned allocation;
+            // bytes (Zeroizing<Vec<u8>>) drops at the end of this
+            // iteration, wiping the source.
+            #[expect(
+                unsafe_code,
+                reason = "strdup copies a NUL-terminated Zeroizing<Vec<u8>>; \
+                          source wiped on drop at end of iteration."
+            )]
+            let dup = unsafe { libc::strdup(bytes.as_ptr().cast::<libc::c_char>()) };
             if dup.is_null() {
                 // OOM partway through; free what we allocated already.
                 // SAFETY: resp_array and prior .resp pointers all came
