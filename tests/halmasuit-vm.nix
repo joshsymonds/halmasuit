@@ -337,6 +337,44 @@ pkgs.testers.runNixOSTest {
             f"got {status_gid!r}"
         )
 
+        # Capability sets — the load-bearing architectural state of
+        # `drop_privileges`. Bit positions per `<linux/capability.h>`:
+        #   CAP_KILL   = 5 → 0x0000000000000020
+        #   CAP_SETGID = 6 → 0x0000000000000040
+        #   CAP_SETUID = 7 → 0x0000000000000080
+        # Post-drop halmasuit should hold exactly:
+        #   CapPrm/CapEff = {CAP_KILL}                   = 0x20
+        #   CapBnd        = {CAP_SETUID, CAP_SETGID}     = 0xc0
+        #   CapInh/CapAmb = ∅                            = 0x00
+        # CAP_KILL is intentionally NOT in bounding — bounding only
+        # constrains caps *gained* via execve/capset, not the
+        # current permitted set. Locking these strings in catches
+        # any drift in drop_privileges (cap added/removed silently,
+        # ordering bug that loses caps, etc.).
+        caps_raw = machine.succeed(
+            f"awk '/^Cap(Bnd|Eff|Inh|Prm|Amb):/' /proc/{pid}/status"
+        ).strip()
+        caps = dict(
+            line.split(":\t") for line in caps_raw.splitlines()
+        )
+        assert caps.get("CapPrm") == "0000000000000020", (
+            f"halmasuit CapPrm must be exactly {{CAP_KILL}}, got {caps.get('CapPrm')!r} "
+            f"(full /proc/{pid}/status caps: {caps_raw})"
+        )
+        assert caps.get("CapEff") == "0000000000000020", (
+            f"halmasuit CapEff must be exactly {{CAP_KILL}}, got {caps.get('CapEff')!r}"
+        )
+        assert caps.get("CapBnd") == "00000000000000c0", (
+            f"halmasuit CapBnd must be exactly {{CAP_SETUID, CAP_SETGID}}, "
+            f"got {caps.get('CapBnd')!r}"
+        )
+        assert caps.get("CapInh") == "0000000000000000", (
+            f"halmasuit CapInh must be empty, got {caps.get('CapInh')!r}"
+        )
+        assert caps.get("CapAmb") == "0000000000000000", (
+            f"halmasuit CapAmb must be empty, got {caps.get('CapAmb')!r}"
+        )
+
     # ──────────────────────────────────────────────────────────────────
     # Suite 2.7: Greeter child process exists and runs as greeter uid
     # ──────────────────────────────────────────────────────────────────

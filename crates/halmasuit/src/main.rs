@@ -877,8 +877,12 @@ fn reap_zombie_children() {
 ///      after its setuid-root execve. Per capabilities(7) for
 ///      set-user-ID-root binaries with no file caps:
 ///      `P'(permitted) = P(inheritable) | P(bounding)`. Keep
-///      `{CAP_KILL, CAP_SETUID, CAP_SETGID}` — the only caps
-///      halmasuit or any binary it deliberately execs need.
+///      `{CAP_SETUID, CAP_SETGID}` — exactly what halmasuit-spawn
+///      needs to `setresuid`/`setresgid` into the target user.
+///      `CAP_KILL` is NOT in bounding: halmasuit retains it via
+///      step 5's `capset`, and bounding only restricts caps
+///      *gained* via future execve/capset — not the runtime
+///      permitted set.
 ///      `PR_CAPBSET_DROP` requires `CAP_SETPCAP` in the *effective*
 ///      set, which is full at this point (we're still root, no
 ///      `setresuid` yet). Doing this drop AFTER `setresuid` would
@@ -922,11 +926,16 @@ fn drop_privileges(uid: u32) -> io::Result<()> {
     // syscall-cheaper because PR_CAPBSET_DROP doesn't need the
     // capset choreography otherwise required to re-raise
     // CAP_SETPCAP after setresuid clears effective.
-    let keep_in_bounding = [
-        Capability::CAP_KILL,
-        Capability::CAP_SETUID,
-        Capability::CAP_SETGID,
-    ];
+    //
+    // We keep ONLY `{CAP_SETUID, CAP_SETGID}` in bounding — exactly
+    // what `halmasuit-spawn`'s setuid-root execve needs to inherit
+    // via `P'(permitted) = P(inheritable) | P(bounding)`. Note that
+    // CAP_KILL is NOT kept here: bounding only constrains caps
+    // gained later (capset additions to inheritable, or grants
+    // during execve), it does NOT retroactively shrink halmasuit's
+    // own permitted/effective sets. halmasuit's runtime `CAP_KILL`
+    // survives via `KEEP_CAPS + capset` below regardless of bounding.
+    let keep_in_bounding = [Capability::CAP_SETUID, Capability::CAP_SETGID];
     for cap in caps::all() {
         if keep_in_bounding.contains(&cap) {
             continue;
