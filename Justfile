@@ -45,6 +45,43 @@ test-vm:
     echo
     echo "── login-flash ──"
     nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link
+    echo
+    echo "── visual-standin ──"
+    nix build .#checks.x86_64-linux.visual-standin -L --print-build-logs --no-link
+
+# Regenerate one or all visual-test goldens. Runs the named test
+# interactively (driverInteractive), with HALMASUIT_GOLDEN_REGEN=1 and
+# GOLDENS_DIR pointing at the source tree's tests/goldens so visual.py
+# writes the captured PNGs in-place instead of comparing.
+#
+# IMPORTANT: After regeneration, manually inspect each updated golden
+# before committing. A broken renderer that paints garbage will happily
+# overwrite a previously-good golden with garbage; the human in the
+# loop is the only check.
+#
+# Usage:
+#   just update-goldens                  # all visual tests
+#   just update-goldens visual-standin   # one named test
+update-goldens name="visual-standin":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Regenerating goldens for: {{name}}"
+    echo "Source-tree goldens dir:  $(pwd)/tests/goldens"
+    echo
+    echo "Press Ctrl-C now to cancel; otherwise the captured PNG will"
+    echo "OVERWRITE the existing golden. Inspect the result before committing."
+    echo
+    read -p "Continue? [y/N] " -n 1 -r REPLY
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        exit 1
+    fi
+    HALMASUIT_GOLDEN_REGEN=1 \
+    GOLDENS_DIR="$(pwd)/tests/goldens" \
+    nix run .#checks.x86_64-linux.{{name}}.driver
+    echo
+    echo "Done. New golden(s) in $(pwd)/tests/goldens — inspect, then commit."
 
 # Phase 0 research probe: validate userspace DRM master persistence from
 # rootfs boot through multi-user.target. Headless gate; for visual

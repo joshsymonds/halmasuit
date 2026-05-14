@@ -1,0 +1,22 @@
+[package]
+name        = "halmasuit-visual-test-standin"
+description = "Visual-test stand-in: opens DRM, paints a known 4-quadrant pattern via dumb buffer, holds until SIGTERM. Used by tests/visual-standin.nix to prove the headless-GL capture path works end-to-end before halmasuit's real renderer exists. Not production code; retired once halmasuit can paint itself."
+
+version.workspace        = true
+edition.workspace        = true
+license.workspace        = true
+repository.workspace     = true
+authors.workspace        = true
+
+# rust-version not inherited from the workspace (1.95). The standin is
+# test infrastructure built via nixpkgs's pinned rustc (mirrors
+# drm-master-probe's rationale). Highest stable feature used:
+# `let-else` (stable since 1.65). The looser MSRV is local to this crate.
+rust-version       = "1.87"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+drm    = "0.15"

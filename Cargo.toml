@@ -13,6 +13,10 @@ members = [
     "crates/halmasuit-vm-client",
     # Research probe — not v2 production. See RESEARCH.md.
     "crates/drm-master-probe",
+    # Visual-test stand-in — throwaway, retired once halmasuit's
+    # renderer can paint its own clear color. See
+    # tests/visual-standin.nix.
+    "crates/halmasuit-visual-test-standin",
     "xtask",
 ]
 # cargo-fuzz subworkspace needs nightly rustc + libfuzzer-sys; isolated

@@ -240,6 +240,57 @@
               license     = pkgs.lib.licenses.asl20;
             };
           };
+
+          # halmasuit-visual-test-standin — throwaway DRM dumb-buffer
+          # paint used by tests/visual-standin.nix to prove the
+          # headless-GL + golden capture pipeline works end-to-end
+          # before halmasuit's real renderer exists. Retired once the
+          # halmasuit renderer subtask lands.
+          halmasuit-visual-test-standin = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-visual-test-standin";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags    = [ "-p" "halmasuit-visual-test-standin" ];
+            doCheck = false; # NixOS VM test is the actual test
+            meta = {
+              description = "Visual-test stand-in for halmasuit (DRM dumb-buffer paint)";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-visual-test-standin";
+            };
+          };
+
+          # ssimulacra2_rs — pure-Rust port of the SSIMULACRA2
+          # perceptual image-diff metric. Used by visual VM tests as
+          # the golden-comparison engine. Chosen over the C++
+          # libjxl-tools ssimulacra2 (nixpkgs build is broken in our
+          # pin due to libhwy/gtest C++14 mismatch) and over Kornel's
+          # dssim (not in nixpkgs; would need its own custom
+          # derivation). buildNoDefaultFeatures = true skips the heavy
+          # video-decoder deps; we only compare PNGs.
+          #
+          # See PLAN.md / epic Task #1 Requirement #9 for the choice
+          # rationale.
+          ssimulacra2-cli = rustPlatform.buildRustPackage rec {
+            pname   = "ssimulacra2_rs";
+            version = "0.5.2";
+            src     = pkgs.fetchCrate {
+              inherit pname version;
+              hash = "sha256-p9NERnuLz1FLx/JBsWIEa6ZJg9zno2DIArn96igVBzQ=";
+            };
+            cargoHash = "sha256-c0rRiLYJSkLoOrOodnSvKWzCfEQz7Yxy2QKfPa5aVfw=";
+            buildNoDefaultFeatures = true;
+            doCheck = false;
+            meta = {
+              description = "Pure-Rust ssimulacra2 perceptual image-diff metric (CLI)";
+              homepage    = "https://github.com/rust-av/ssimulacra2_bin";
+              license     = pkgs.lib.licenses.bsd2;
+              mainProgram = "ssimulacra2_rs";
+            };
+          };
         });
 
       # NixOS modules halmasuit exports. Consumers (a user's nix-config, the
@@ -300,6 +351,12 @@
         drm-master-probe-phase3 = import ./tests/drm-master-probe-phase3.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
+        };
+        visual-standin = import ./tests/visual-standin.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit-visual-test-standin = self.packages.x86_64-linux.halmasuit-visual-test-standin;
+          ssimulacra2-cli               = self.packages.x86_64-linux.ssimulacra2-cli;
         };
       };
     };
