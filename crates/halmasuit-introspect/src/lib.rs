@@ -94,7 +94,10 @@ pub enum Event {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
-    /// Initial phase: process has started, no subsystems initialized yet.
+    /// Compositor initialization completed: smithay protocol state
+    /// constructed, Wayland and signal sources registered on the
+    /// event loop. Emitted immediately before `WaylandReady` under
+    /// the current ordering — the two are effectively adjacent.
     Init,
     /// Wayland socket is bound and accepting client connections. No
     /// protocol globals are advertised yet — clients see an empty global
@@ -191,6 +194,24 @@ mod tests {
         });
         assert_eq!(v["event"], "phase_entered");
         assert_eq!(v["phase"], "wayland_ready");
+    }
+
+    #[test]
+    fn event_phase_entered_drm_master_acquired_serializes() {
+        let v = round_trip(&Event::PhaseEntered {
+            phase: Phase::DrmMasterAcquired,
+        });
+        assert_eq!(v["event"], "phase_entered");
+        assert_eq!(v["phase"], "drm_master_acquired");
+    }
+
+    #[test]
+    fn event_phase_entered_deprivileged_serializes() {
+        let v = round_trip(&Event::PhaseEntered {
+            phase: Phase::Deprivileged,
+        });
+        assert_eq!(v["event"], "phase_entered");
+        assert_eq!(v["phase"], "deprivileged");
     }
 
     #[test]

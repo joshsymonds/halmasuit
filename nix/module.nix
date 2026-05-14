@@ -9,8 +9,7 @@
 # its sockets while still privileged, then in-process `setresuid`s to
 # the configured `compositorUid`. From that point on every halmasuit
 # code path runs unprivileged; the only setuid binary on the closure
-# is halmasuit-spawn (wrapped via `security.wrappers` when
-# `useSetuidWrapper = true`).
+# is halmasuit-spawn, wrapped via `security.wrappers` below.
 
 { config, lib, pkgs, ... }:
 
@@ -117,24 +116,6 @@ in
       '';
     };
 
-    useSetuidWrapper = lib.mkOption {
-      type        = lib.types.bool;
-      default     = true;
-      description = ''
-        When true, wraps `halmasuit-spawn` via `security.wrappers` with
-        the setuid bit so the deprivileged halmasuit process can still
-        execve it and get its uid elevated by the kernel at exec time.
-
-        Setting this to true forces `serviceConfig.NoNewPrivileges =
-        false` on the halmasuit unit: with `NoNewPrivileges = true` the
-        kernel ignores the setuid bit at exec time, defeating the whole
-        wrapper. The trade-off is documented next to the directive.
-
-        Set to false only when halmasuit itself runs as root for the
-        entire lifetime (dev / VM tests against an old shape).
-      '';
-    };
-
     pamService = lib.mkOption {
       type        = lib.types.str;
       default     = "halmasuit";
@@ -220,13 +201,11 @@ in
     # time via the setuid bit on this wrapper. The real binary lives
     # in the nix store; security.wrappers writes a tiny setuid shim
     # at /run/wrappers/bin/halmasuit-spawn that re-execs it.
-    security.wrappers = lib.mkIf cfg.useSetuidWrapper {
-      halmasuit-spawn = {
-        owner  = "root";
-        group  = "root";
-        setuid = true;
-        source = "${cfg.spawnPackage}/bin/halmasuit-spawn";
-      };
+    security.wrappers.halmasuit-spawn = {
+      owner  = "root";
+      group  = "root";
+      setuid = true;
+      source = "${cfg.spawnPackage}/bin/halmasuit-spawn";
     };
 
     systemd.services.halmasuit = {
@@ -267,33 +246,30 @@ in
         # documented escape: pam_unix tries `getspnam` first and
         # only falls back to the helper on EPERM.
         SupplementaryGroups    = [ "shadow" ];
-        # Hardening that does NOT imply NoNewPrivileges, so it's safe
-        # to apply regardless of whether the setuid wrapper is in use.
+        # Hardening posture. The privilege split (halmasuit deprivileges
+        # to compositorUid; halmasuit-spawn is the only setuid binary)
+        # is the primary defense. The directives below are
+        # defense-in-depth. We deliberately do NOT enable the systemd
+        # directives that implicitly set `NoNewPrivileges=yes`
+        # (MemoryDenyWriteExecute, RestrictNamespaces, RestrictRealtime,
+        # SystemCallFilter, LockPersonality, ProtectKernelTunables,
+        # ProtectKernelModules, RestrictSUIDSGID — see
+        # systemd.exec(5)'s context_has_seccomp/no_new_privileges).
+        # With NNP on, the kernel ignores the setuid bit on
+        # halmasuit-spawn at exec time, breaking the session-spawn
+        # handoff entirely. halmasuit-spawn itself is audit-grade
+        # (microscopic, fuzzed, UID_MIN floor) and the only setuid
+        # binary in the closure — that's what we're trusting instead.
         ProtectSystem          = "strict";
         ProtectHome            = true;
         PrivateTmp             = true;
         ProtectControlGroups   = true;
-      } // lib.optionalAttrs (!cfg.useSetuidWrapper) {
-        SystemCallArchitectures = "native";
-        # NNP-implying hardening. Each directive below implicitly sets
-        # `NoNewPrivileges=yes` per systemd.exec(5); with NNP on, the
-        # kernel ignores the setuid bit on exec'd children, which
-        # breaks the halmasuit-spawn wrapper handoff and pam_unix's
-        # unix_chkpwd fork (both rely on setuid escalation). When
-        # `useSetuidWrapper = true` we trade these directives for the
-        # privilege split — halmasuit-spawn is the only setuid binary
-        # on the closure and is itself audit-grade (microscopic,
-        # fuzzed, UID_MIN floor).
-        NoNewPrivileges        = true;
-        ProtectKernelTunables  = true;
-        ProtectKernelModules   = true;
+        # ProtectKernelLogs does NOT imply NNP when the unit starts
+        # privileged (it's CAP_SYS_ADMIN-gated in
+        # systemd.exec(5)::context_has_no_new_privileges) — safe to
+        # apply unconditionally. Blocks dmesg access from the
+        # compositor process.
         ProtectKernelLogs      = true;
-        RestrictNamespaces     = true;
-        RestrictRealtime       = true;
-        RestrictSUIDSGID       = true;
-        LockPersonality        = true;
-        MemoryDenyWriteExecute = true;
-        SystemCallFilter       = [ "@system-service" ];
       } // lib.optionalAttrs (cfg.greeterGroup != null) {
         # Process egid → inherited by Unix sockets bound under
         # RuntimeDirectory. Members of this group can connect through
@@ -315,18 +291,14 @@ in
         # Privilege-drop target. halmasuit reads this after binding
         # sockets and `setresuid`s to it in-process.
         HALMASUIT_COMPOSITOR_UID = toString cfg.compositorUid;
+        # Resolved path to halmasuit-spawn — the setuid wrapper
+        # declared above. halmasuit (deprivileged) execs this to
+        # launch user sessions.
+        HALMASUIT_SPAWN_BIN = "/run/wrappers/bin/halmasuit-spawn";
       } // lib.optionalAttrs (cfg.greeterCommand != null) {
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.
         HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
-      } // {
-        # Resolved path to halmasuit-spawn. With the setuid wrapper
-        # enabled, this points at /run/wrappers/bin/<name>; otherwise
-        # it's the raw store path.
-        HALMASUIT_SPAWN_BIN =
-          if cfg.useSetuidWrapper
-          then "/run/wrappers/bin/halmasuit-spawn"
-          else "${cfg.spawnPackage}/bin/halmasuit-spawn";
       };
     };
   };

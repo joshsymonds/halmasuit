@@ -61,10 +61,6 @@ pkgs.testers.runNixOSTest {
         greeterCommand = "${pkgs.writeShellScript "halmasuit-test-greeter" ''
           exec ${pkgs.coreutils}/bin/sleep infinity
         ''}";
-        # useSetuidWrapper left at default (true) — the wrapper is what
-        # lets the deprivileged halmasuit re-elevate halmasuit-spawn at
-        # exec time. Setting it false here would break suite 4's full-
-        # auth path (compositor user can't setresuid into alice).
         # pamService + installPamConfig left at defaults.
       };
 
@@ -226,23 +222,41 @@ pkgs.testers.runNixOSTest {
             f"greeter_spawned.pid must be positive int: {greeter}"
         )
 
-        # Phase ordering is load-bearing:
-        # - drm_master_acquired must precede wayland_ready (DRM master is
-        #   the first privileged op; smithay setup follows)
-        # - deprivileged must follow greetd_ready (sockets are bound while
-        #   still root, then setresuid)
+        # Phase ordering is load-bearing. Expected sequence:
+        # drm_master_acquired → init → wayland_ready → greetd_ready
+        # → deprivileged. Each step encodes an architectural invariant
+        # the binary must maintain.
         phase_order = [
             inner["phase"]
             for (_, inner) in events
             if inner.get("event") == "phase_entered"
         ]
-        dm_idx = phase_order.index("drm_master_acquired")
-        wr_idx = phase_order.index("wayland_ready")
-        gd_idx = phase_order.index("greetd_ready")
-        dp_idx = phase_order.index("deprivileged")
-        assert dm_idx < wr_idx, (
-            f"drm_master_acquired must precede wayland_ready, got: {phase_order}"
+        init_idx = phase_order.index("init")
+        dm_idx   = phase_order.index("drm_master_acquired")
+        wr_idx   = phase_order.index("wayland_ready")
+        gd_idx   = phase_order.index("greetd_ready")
+        dp_idx   = phase_order.index("deprivileged")
+        # DRM master is acquired before any other init does anything
+        # (it's the only privileged operation that must run while we
+        # still have root via execve, before smithay touches the fb).
+        assert dm_idx < init_idx, (
+            f"drm_master_acquired must precede init, got: {phase_order}"
         )
+        # Init marks "smithay state assembled" — must precede the
+        # Wayland socket being announced as ready for clients.
+        assert init_idx < wr_idx, (
+            f"init must precede wayland_ready, got: {phase_order}"
+        )
+        # Wayland socket exists before greetd's auth socket — a
+        # greeter needs both, and the order pins which one to wait
+        # for first when integrating.
+        assert wr_idx < gd_idx, (
+            f"wayland_ready must precede greetd_ready, got: {phase_order}"
+        )
+        # Privilege drop is strictly last among the init phases: all
+        # privileged operations (socket binds under /run/halmasuit,
+        # greeter fork-and-drop while still root) must complete
+        # before halmasuit setresuids itself.
         assert gd_idx < dp_idx, (
             f"deprivileged must follow greetd_ready, got: {phase_order}"
         )

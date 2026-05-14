@@ -48,6 +48,13 @@ use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::wayland::socket::ListeningSocketSource;
 use tracing_subscriber::EnvFilter;
 
+/// Maximum concurrent greetd connections halmasuit will accept. The
+/// SO_PEERCRED check authorises only the configured greeter uid, so
+/// the cap protects against a buggy or compromised greeter looping
+/// on connect(). A real greeter opens one connection at a time;
+/// reaching this cap is a runaway signal.
+const MAX_GREETD_CONNECTIONS: usize = 4;
+
 /// Compositor state passed to calloop callbacks. Holds the smithay
 /// per-protocol state structs and the greetd-connection map; each new
 /// protocol adds its `*State` here as it lands.
@@ -282,6 +289,21 @@ fn handle_listener_ready(
                         peer_uid = creds.uid,
                         expected = state.greeter_uid,
                         "rejected greeter connection from unauthorised uid",
+                    );
+                    drop(stream);
+                    continue;
+                }
+                // Connection cap. SO_PEERCRED already restricts to the
+                // configured greeter uid, but a buggy or compromised
+                // greeter could still open connections in a loop and
+                // exhaust calloop sources / map entries. The cap is
+                // generous: a real greeter opens one connection at a
+                // time. Reaching the cap signals a runaway.
+                if state.connections.len() >= MAX_GREETD_CONNECTIONS {
+                    tracing::warn!(
+                        cap = MAX_GREETD_CONNECTIONS,
+                        active = state.connections.len(),
+                        "greetd connection cap reached; dropping new connection",
                     );
                     drop(stream);
                     continue;
@@ -541,6 +563,18 @@ nix::ioctl_none!(drm_set_master, b'd', 0x1e);
 /// running without DRM master defeats the architecture.
 fn acquire_drm_master() -> io::Result<Option<std::fs::File>> {
     if std::env::var_os("HALMASUIT_SKIP_DRM_MASTER").is_some() {
+        // Fail-closed if running as root: production halmasuit always
+        // starts as root (the systemd unit has User= unset so it can
+        // bind sockets in /run/halmasuit and acquire DRM master). The
+        // SKIP bypass is for ad-hoc dev launches as a normal user.
+        // Honoring it under root would silently disarm the
+        // architecture's core requirement.
+        if nix::unistd::geteuid().is_root() {
+            return Err(io::Error::other(
+                "HALMASUIT_SKIP_DRM_MASTER is the dev/test bypass; refusing \
+                 to honor it under euid 0",
+            ));
+        }
         tracing::warn!(
             "HALMASUIT_SKIP_DRM_MASTER set — not acquiring DRM master. \
              This is the dev/test bypass; production deployments \
@@ -572,31 +606,28 @@ fn acquire_drm_master() -> io::Result<Option<std::fs::File>> {
 }
 
 /// Resolve compositor uid from env. `HALMASUIT_COMPOSITOR_UID` is
-/// the operator's contract: when set, halmasuit drops privileges to
-/// that uid after binding its sockets. When unset, no drop happens
-/// (useful for ad-hoc dev launches).
-fn compositor_uid_from_env() -> Option<u32> {
-    std::env::var("HALMASUIT_COMPOSITOR_UID").ok()?.parse().ok()
+/// the operator's contract: when set to a valid `u32`, halmasuit
+/// drops privileges to that uid after binding its sockets. `Ok(None)`
+/// means the operator deliberately left it unset (dev mode);
+/// `Err(_)` means the env var is present but malformed — which the
+/// caller treats as fatal rather than silently falling through to
+/// the "stay as current user" warning. The privilege drop is
+/// load-bearing per the architecture's threat model; an unparsable
+/// value must not be confused with "no value at all."
+fn compositor_uid_from_env() -> io::Result<Option<u32>> {
+    let Some(raw) = std::env::var_os("HALMASUIT_COMPOSITOR_UID") else {
+        return Ok(None);
+    };
+    let s = raw
+        .to_str()
+        .ok_or_else(|| io::Error::other("HALMASUIT_COMPOSITOR_UID is not valid UTF-8"))?;
+    s.parse::<u32>().map(Some).map_err(|e| {
+        io::Error::other(format!(
+            "HALMASUIT_COMPOSITOR_UID is not a valid u32 ({s:?}): {e}"
+        ))
+    })
 }
 
-/// Drop privileges to the configured compositor uid. The gid and
-/// supplementary group set were pinned at unit-startup via systemd
-/// `Group=` + `SupplementaryGroups=` in the NixOS module; this
-/// function pins the saved-set-gid against later resurrection and
-/// drops the uid. Supplementary groups (`shadow` in production, so
-/// halmasuit-pam can read /etc/shadow directly without forking
-/// unix_chkpwd) are intentionally NOT cleared — systemd already
-/// constrained them at startup, and clearing here would defeat that.
-///
-/// Order is load-bearing:
-///   1. `setresgid(egid, egid, egid)` — pin all three gid components
-///      to the current egid so we can't `setresgid(0,0,0)` later.
-///   2. `setresuid` — drop uid. Once euid is non-zero the gid can no
-///      longer change, so this is strictly last.
-///
-/// All three uid components (real, effective, saved) are set to the
-/// same value so the process cannot resurrect root via `seteuid(0)`
-/// later.
 /// Path of the greeter binary to exec at startup. Returns `None` when
 /// `HALMASUIT_GREETER_COMMAND` is unset (dev mode — halmasuit runs
 /// without a greeter). Production deployments always set it via
@@ -683,12 +714,46 @@ fn spawn_greeter(greeter_uid: u32, command: &Path) -> io::Result<Child> {
         .map_err(|e| io::Error::other(format!("spawn greeter {}: {e}", command.display())))
 }
 
+/// Drop privileges to the configured compositor uid. The gid and
+/// supplementary group set were pinned at unit-startup via systemd
+/// `Group=` + `SupplementaryGroups=` in the NixOS module; supplementary
+/// groups (`shadow` in production, so halmasuit-pam can read
+/// `/etc/shadow` directly without forking `unix_chkpwd`) are
+/// intentionally NOT cleared — systemd already constrained them at
+/// startup, and clearing here would defeat that.
+///
+/// Order is load-bearing:
+///   1. `setresgid(egid, egid, egid)` — pin all three gid components
+///      to the current egid. This is belt-and-suspenders; the
+///      `setresuid` below is what actually removes the ability to
+///      change gid (it drops CAP_SETGID with the uid transition to
+///      non-zero, after which `setresgid` calls return EPERM).
+///   2. `setresuid` — drop uid. Strictly last because it severs
+///      `CAP_SETGID`.
+///
+/// All three uid components (real, effective, saved) are set to the
+/// same value so the process cannot resurrect root via `seteuid(0)`
+/// later.
+/// Reap any zombie children with `waitpid(-1, WNOHANG)` in a loop.
+/// Called from the SIGCHLD handler: signal delivery is coalesced
+/// (multiple children dying between handler runs produce one signal),
+/// so a single SIGCHLD may correspond to multiple terminations. Loop
+/// until `waitpid` reports no more reapable children. Without this,
+/// dead halmasuit-spawn / greeter / session children accumulate as
+/// zombies and eventually exhaust the pid namespace.
+fn reap_zombie_children() {
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+    loop {
+        match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) | Err(_) => return,
+            Ok(status) => tracing::debug!(?status, "reaped child"),
+        }
+    }
+}
+
 fn drop_privileges(uid: u32) -> io::Result<()> {
     use nix::unistd::{Uid, getegid, setresgid, setresuid};
 
-    // Pin the gid (no-op for the active value; the load-bearing effect
-    // is forcing saved-set-gid == egid so future setresgid resurrection
-    // can't recover root's gid).
     let egid = getegid();
     setresgid(egid, egid, egid).map_err(|e| io::Error::other(format!("setresgid({egid}): {e}")))?;
 
@@ -866,17 +931,23 @@ fn main() -> io::Result<()> {
 
     // Signal source. Register BEFORE the first dispatch so a SIGTERM
     // racing startup is still caught.
-    let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT])?;
+    let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT, Signal::SIGCHLD])?;
     loop_handle
-        .insert_source(signals, |event, (), state: &mut HalmasuitState| {
-            let reason = match event.signal() {
-                Signal::SIGTERM => ShutdownReason::SignalTerm,
-                Signal::SIGINT => ShutdownReason::SignalInt,
-                _ => ShutdownReason::Internal,
-            };
-            emit(&Event::Shutdown { reason });
-            state.running = false;
-        })
+        .insert_source(
+            signals,
+            |event, (), state: &mut HalmasuitState| match event.signal() {
+                Signal::SIGCHLD => reap_zombie_children(),
+                sig => {
+                    let reason = match sig {
+                        Signal::SIGTERM => ShutdownReason::SignalTerm,
+                        Signal::SIGINT => ShutdownReason::SignalInt,
+                        _ => ShutdownReason::Internal,
+                    };
+                    emit(&Event::Shutdown { reason });
+                    state.running = false;
+                }
+            },
+        )
         .map_err(io::Error::other)?;
 
     emit(&Event::PhaseEntered { phase: Phase::Init });
@@ -957,25 +1028,39 @@ fn main() -> io::Result<()> {
         _greeter_child: greeter_child,
     };
 
-    // Privilege drop. Both Unix sockets and (in a future task) the
-    // DRM master FD are acquired above while we still have euid==0;
-    // everything from here onwards runs as the configured compositor
-    // system user. The setuid wrapper for halmasuit-spawn (set up by
-    // the NixOS module's `security.wrappers`) is what allows us to
-    // still execve halmasuit-spawn after this drop. When the operator
-    // hasn't set HALMASUIT_COMPOSITOR_UID, we log and continue — that
-    // mode is for ad-hoc dev launches outside the unit.
-    if let Some(uid) = compositor_uid_from_env() {
-        drop_privileges(uid)?;
-        emit(&Event::PhaseEntered {
-            phase: Phase::Deprivileged,
-        });
-    } else {
-        tracing::warn!(
-            "HALMASUIT_COMPOSITOR_UID unset; staying as current user. \
-             This is expected in dev launches; production deployments \
-             set it via services.halmasuit.compositorUid."
-        );
+    // Privilege drop. The DRM master FD and both Unix sockets are
+    // acquired above while we still have euid==0; everything from
+    // here onwards runs as the configured compositor system user.
+    // The setuid wrapper for halmasuit-spawn (set up by the NixOS
+    // module's `security.wrappers`) is what allows us to still
+    // execve halmasuit-spawn after this drop.
+    //
+    // Fail-closed when running as root with no compositor uid
+    // configured: a deploy that forgot to set HALMASUIT_COMPOSITOR_UID
+    // would otherwise run the entire compositor as root for its
+    // lifetime, silently inverting the architecture's whole point.
+    // Ad-hoc dev launches (non-root euid) keep the warn-and-continue
+    // shape so they can run without the env at all.
+    match compositor_uid_from_env()? {
+        Some(uid) => {
+            drop_privileges(uid)?;
+            emit(&Event::PhaseEntered {
+                phase: Phase::Deprivileged,
+            });
+        }
+        None if nix::unistd::geteuid().is_root() => {
+            return Err(io::Error::other(
+                "refusing to run as root without HALMASUIT_COMPOSITOR_UID; \
+                 set services.halmasuit.compositorUid in production",
+            ));
+        }
+        None => {
+            tracing::warn!(
+                "HALMASUIT_COMPOSITOR_UID unset; staying as current user. \
+                 This is expected in dev launches; production deployments \
+                 set it via services.halmasuit.compositorUid."
+            );
+        }
     }
 
     // Main loop: wait briefly for any source to fire, then flush any

@@ -35,9 +35,11 @@ calloop.workspace            = true
 # - `signal`: sigprocmask in the greeter pre_exec closure (the parent
 #   blocks SIGTERM/SIGINT for calloop's signalfd; the greeter child
 #   needs the default mask restored before execve)
-nix = { workspace = true, features = ["user", "ioctl", "signal"] }
+# - `process`: waitpid in the SIGCHLD reaper so dead greeter / session
+#   children don't accumulate as zombies
+nix = { workspace = true, features = ["user", "ioctl", "signal", "process"] }
 
 [dev-dependencies]
-nix        = { workspace = true, features = ["signal", "user", "ioctl"] }
+nix        = { workspace = true, features = ["signal", "user", "ioctl", "process"] }
 serde_json.workspace = true
 tempfile.workspace   = true
