@@ -31,13 +31,12 @@ smithay = { workspace = true, features = ["wayland_frontend"] }
 calloop.workspace            = true
 # nix features used by halmasuit:
 # - `user`: getuid, setresuid, setresgid for the privilege drop path
-# - `ioctl`: the `ioctl_none!` macro that generates the DRM_IOCTL_SET_MASTER wrapper
 # - `signal`: sigprocmask in the greeter pre_exec closure (the parent
 #   blocks SIGTERM/SIGINT for calloop's signalfd; the greeter child
 #   needs the default mask restored before execve)
 # - `process`: waitpid in the SIGCHLD reaper so dead greeter / session
 #   children don't accumulate as zombies
-nix = { workspace = true, features = ["user", "ioctl", "signal", "process"] }
+nix = { workspace = true, features = ["user", "signal", "process"] }
 # DRM-rs (v0.15) — typed wrappers around DRM master acquisition,
 # resource enumeration, dumb-buffer allocation, and SETCRTC. Used by
 # the `drm` submodule. Same pin as drm-master-probe and

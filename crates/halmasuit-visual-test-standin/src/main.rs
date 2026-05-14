@@ -165,3 +165,45 @@ fn main() -> Result<()> {
         eprintln!("standin: tick t={t}s");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Paint a small buffer and assert the cardinal-quadrant pixel
+    /// colors plus the center black square. Pure function, no DRM
+    /// required; catches endianness flips, quadrant-flip mistakes,
+    /// and `saturating_sub` regressions before the VM-test runs.
+    #[test]
+    fn paints_four_quadrants_with_centered_black_square() {
+        let width = 100usize;
+        let height = 100usize;
+        let mut buf = vec![0u8; width * height * 4];
+        paint_quadrants(&mut buf, width, height);
+
+        // Pixel `(x, y)` lives at offset `(y*width + x) * 4` and is
+        // four bytes in XRGB8888 little-endian: `[B, G, R, X]`.
+        let pixel = |x: usize, y: usize| -> [u8; 4] {
+            let o = (y * width + x) * 4;
+            [buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]
+        };
+
+        // Top-left red, top-right green, bottom-left blue, bottom-right white.
+        assert_eq!(pixel(5, 5), RED, "TL should be red");
+        assert_eq!(pixel(95, 5), GREEN, "TR should be green");
+        assert_eq!(pixel(5, 95), BLUE, "BL should be blue");
+        assert_eq!(pixel(95, 95), WHITE, "BR should be white");
+
+        // Center black-square: width.min(height) / 20 = 5 wide, centered.
+        // For width=height=100, the square spans approximately (47..53, 47..53).
+        assert_eq!(pixel(50, 50), BLACK, "center should be black");
+
+        // Just outside the center square — should be the BR quadrant color
+        // since (60, 60) is in the bottom-right quadrant past the square.
+        assert_eq!(
+            pixel(60, 60),
+            WHITE,
+            "outside center square (BR) should be white"
+        );
+    }
+}

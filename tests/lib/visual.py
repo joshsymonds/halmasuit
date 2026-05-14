@@ -46,6 +46,7 @@ line. We parse the float after `Score:`.
 """
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -129,11 +130,21 @@ def ssimulacra2_compare(expected: Path, actual: Path) -> float:
         )
     token = score_line.split(":", 1)[1].strip().split()[0]
     try:
-        return float(token)
+        score = float(token)
     except ValueError as exc:
         raise RuntimeError(
             f"could not parse ssimulacra2_rs score from {score_line!r}: {exc}"
         ) from exc
+    # NaN guard: `float('nan') < threshold` is False in Python, so a
+    # garbled CLI output that yields NaN would silently pass the
+    # `score < threshold` assertion in assert_matches_golden. Refuse
+    # non-finite scores explicitly so the failure mode is loud.
+    if not math.isfinite(score):
+        raise RuntimeError(
+            f"ssimulacra2_rs returned non-finite score {score!r} "
+            f"(parsed from {score_line!r})"
+        )
+    return score
 
 
 def assert_matches_golden(

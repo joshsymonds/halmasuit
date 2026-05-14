@@ -43,34 +43,63 @@ impl AsFd for Card {
 impl Device for Card {}
 impl ControlDevice for Card {}
 
-/// Bundle of state pinned for the process lifetime once halmasuit
-/// owns the scanout. Dropping this value:
+/// Encode `#RRGGBB` as XRGB8888 little-endian for filling a dumb
+/// buffer: byte order is `[B, G, R, X]`. The X byte is always zero
+/// (alpha is ignored in XRGB).
 ///
-/// 1. Drops `_dumb`, which destroys the kernel-side dumb buffer.
-/// 2. Drops `card`, which closes the DRM fd; the kernel releases
-///    master designation, the CRTC reverts to whatever the firmware
-///    handoff left, and the framebuffer handle is reaped automatically.
+/// `const fn` so it can build the brand-clear constant at compile
+/// time. Pinned by `xrgb_le_pins_byte_order` below — any change to
+/// the byte layout that breaks the visual goldens trips the unit
+/// test first.
+#[must_use]
+pub const fn xrgb_le(r: u8, g: u8, b: u8) -> [u8; 4] {
+    [b, g, r, 0]
+}
+
+/// Bundle of state pinned for the process lifetime once halmasuit
+/// owns the scanout.
+///
+/// **Happy-path drop order:**
+/// 1. `_dumb` drops first, destroying the kernel-side dumb buffer.
+/// 2. `card` drops last, closing the DRM fd; the kernel releases
+///    master designation and reaps any still-registered framebuffer
+///    handle automatically.
 ///
 /// We don't explicitly destroy the framebuffer / clear the CRTC: fd
 /// close + dumb-buffer destroy is sufficient cleanup and matches the
 /// pattern `drm-master-probe` uses successfully across SIGTERM.
+///
+/// **Error-path cleanup** (for callers of `scan_out_clear_color`): if
+/// `add_framebuffer` or `set_crtc` returns Err, the `ActiveScanout`
+/// is never constructed. Cleanup happens via locals dropping at
+/// function return: the `DumbBuffer` RAII-destroys, and the
+/// fresh `framebuffer::Handle` (if `add_framebuffer` succeeded but
+/// `set_crtc` failed) has no Drop impl but is reaped by the kernel
+/// when the `Card`'s fd closes at end of scope. As B.2 adds GBM /
+/// EGL allocations into this constructor, the implicit story will
+/// need to become an explicit builder or RAII guard.
+#[expect(
+    dead_code,
+    reason = "card + mode are part of the public seam B.2 reads; the underscore-prefixed fields are RAII-only and intentionally unread"
+)]
 pub struct ActiveScanout {
     /// DRM device file (master designation lives on this fd). Held
     /// for the process lifetime; the GLES + DrmCompositor subtask
     /// (B.2) will take a `&Card` from here to bind its GBM allocator
     /// against the same device.
-    pub _card: Card,
+    pub card: Card,
     /// Dumb buffer with the rendered pixels. RAII-destroys on drop.
-    pub _dumb: DumbBuffer,
-    /// Framebuffer handle wrapping `_dumb`.
-    pub _fb: framebuffer::Handle,
+    _dumb: DumbBuffer,
+    /// Framebuffer handle wrapping `_dumb`. No `Drop`; the kernel
+    /// reaps it when the `card` fd closes.
+    _fb: framebuffer::Handle,
     /// CRTC currently driven by `_fb`.
-    pub _crtc: crtc::Handle,
+    _crtc: crtc::Handle,
     /// Connector receiving scan-out from `_crtc`.
-    pub _connector: connector::Handle,
-    /// Mode in effect at SETCRTC time. The B.2 GLES subtask will read
+    _connector: connector::Handle,
+    /// Mode in effect at SETCRTC time. The B.2 GLES subtask reads
     /// this to size the GBM-backed framebuffer to the same dimensions.
-    pub _mode: Mode,
+    pub mode: Mode,
 }
 
 /// Open `path` for DRM access and acquire master via the drm-rs
@@ -90,7 +119,8 @@ pub fn open_and_set_master(path: &Path) -> io::Result<Card> {
 }
 
 /// Mode-set the first connected connector to scan out a solid-color
-/// dumb buffer. `color` is XRGB8888 little-endian (`[B, G, R, X]`).
+/// dumb buffer. `color` is XRGB8888 little-endian (`[B, G, R, X]`) —
+/// use [`xrgb_le`] to build the byte array from a logical `#RRGGBB`.
 ///
 /// Returns the `ActiveScanout` that must be retained for the process
 /// lifetime; dropping it tears down the scanout cleanly.
@@ -99,7 +129,9 @@ pub fn open_and_set_master(path: &Path) -> io::Result<Card> {
 ///
 /// Bubbles any DRM ioctl failure, plus explicit `io::Error::other`
 /// bails for the structurally-invalid environments (no connected
-/// connector, connector has no modes, no CRTCs available).
+/// connector, connector has no modes, no CRTCs available). Error
+/// returns clean up via the function-scope drop chain documented on
+/// [`ActiveScanout`].
 pub fn scan_out_clear_color(card: Card, color: [u8; 4]) -> io::Result<ActiveScanout> {
     let res = card
         .resource_handles()
@@ -145,12 +177,12 @@ pub fn scan_out_clear_color(card: Card, color: [u8; 4]) -> io::Result<ActiveScan
         .map_err(|e| io::Error::other(format!("set_crtc: {e}")))?;
 
     Ok(ActiveScanout {
-        _card: card,
+        card,
         _dumb: dumb,
         _fb: fb,
         _crtc: crtc_handle,
         _connector: connector,
-        _mode: mode,
+        mode,
     })
 }
 
@@ -158,16 +190,20 @@ pub fn scan_out_clear_color(card: Card, color: [u8; 4]) -> io::Result<ActiveScan
 mod tests {
     use super::*;
 
-    /// Smoke test: the `ActiveScanout` and `Card` types are `Sized`
-    /// and their public surfaces compile. Hardware-touching paths
-    /// require a real DRM device and are exercised by
-    /// `tests/visual-halmasuit-clear.nix`. This test exists so a
-    /// future refactor that breaks the public surface fails at the
-    /// unit level before VM tests are exercised.
+    /// Pin the `xrgb_le` byte ordering. The visual goldens depend on
+    /// `[B, G, R, X]` little-endian for XRGB8888; a refactor that
+    /// transposes channels would trip this before any VM test runs.
+    /// Pure-function unit test; no DRM device required.
     #[test]
-    fn types_have_known_sizes() {
-        fn assert_sized<T: Sized>() {}
-        assert_sized::<ActiveScanout>();
-        assert_sized::<Card>();
+    fn xrgb_le_pins_byte_order() {
+        // #0a0014 → red=0x0a, green=0x00, blue=0x14
+        // little-endian XRGB8888 → [B, G, R, X] = [0x14, 0x00, 0x0a, 0x00]
+        assert_eq!(xrgb_le(0x0A, 0x00, 0x14), [0x14, 0x00, 0x0A, 0x00]);
+
+        // Pure red, green, blue, white sanity cases.
+        assert_eq!(xrgb_le(0xFF, 0x00, 0x00), [0x00, 0x00, 0xFF, 0x00]);
+        assert_eq!(xrgb_le(0x00, 0xFF, 0x00), [0x00, 0xFF, 0x00, 0x00]);
+        assert_eq!(xrgb_le(0x00, 0x00, 0xFF), [0xFF, 0x00, 0x00, 0x00]);
+        assert_eq!(xrgb_le(0xFF, 0xFF, 0xFF), [0xFF, 0xFF, 0xFF, 0x00]);
     }
 }

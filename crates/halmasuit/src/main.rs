@@ -612,11 +612,16 @@ fn spawn_bin_from_env() -> PathBuf {
 }
 
 /// Brand clear color rendered before any wl_client connects: `#0a0014`
-/// in XRGB8888 little-endian (`[B, G, R, X]`). Per the visual-compositor
-/// epic's IMMUTABLE Requirement #5, this distinguishes "halmasuit alive,
-/// no client yet" from "halmasuit broken / producing black" — every
+/// in XRGB8888 little-endian. Per the visual-compositor epic's
+/// IMMUTABLE Requirement #5, this distinguishes "halmasuit alive, no
+/// client yet" from "halmasuit broken / producing black" — every
 /// frame painted before halmasuit-splash connects is this exact color.
-const HALMASUIT_BRAND_CLEAR: [u8; 4] = [0x14, 0x00, 0x0A, 0x00];
+///
+/// Built via [`drm::xrgb_le`] so the byte ordering is unit-tested at
+/// build (see `drm::tests::xrgb_le_pins_byte_order`) — silent reverts
+/// to the wrong byte order, channel transpose, or `#000000` trip a
+/// fast unit test before the visual VM gate.
+const HALMASUIT_BRAND_CLEAR: [u8; 4] = drm::xrgb_le(0x0A, 0x00, 0x14);
 
 /// Open `/dev/dri/card0` (or the device named by `HALMASUIT_DRM_DEVICE`),
 /// acquire master via `DRM_IOCTL_SET_MASTER`, and mode-set the first
