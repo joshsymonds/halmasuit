@@ -10,6 +10,9 @@
 /.direnv
 /.envrc.local
 
+# git worktrees
+/.worktrees
+
 # Per-repo cargo/rustup state from the dev shell.
 /.cargo-home
 /.rustup-home
