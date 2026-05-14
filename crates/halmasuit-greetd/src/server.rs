@@ -704,6 +704,48 @@ mod tests {
     }
 
     #[test]
+    fn listener_accept_authorized_drops_when_uid_does_not_match() {
+        // Negative-path companion to the test above. The VM gate's
+        // header in tests/halmasuit-vm.nix:18-20 defers wrong-UID
+        // rejection coverage here; this test fulfills that deferral.
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("greetd.sock");
+        let l = Listener::bind(&sock, 0o660).unwrap();
+        // Non-blocking listener so the loop in accept_authorized
+        // bubbles up `WouldBlock` instead of hanging once the queued
+        // client has been rejected.
+        l.set_nonblocking(true).unwrap();
+
+        let self_uid = nix::unistd::getuid().as_raw();
+        let disallowed = self_uid.wrapping_add(1);
+
+        let mut client = UnixStream::connect(&sock).expect("client connect");
+
+        // accept_authorized must drop the queued stream (peer uid
+        // doesn't match) and then propagate the next `accept`'s
+        // `WouldBlock` since no more clients are queued.
+        let result = l.accept_authorized(disallowed);
+        match &result {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("expected WouldBlock after rejection; got {other:?}"),
+        }
+
+        // The client must observe EOF — that's the visible evidence
+        // halmasuit-greetd actually closed the unauthorized stream
+        // (drop(stream) on the server side). A 2s read timeout
+        // prevents the test from hanging if the close didn't fire.
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut buf = [0u8; 1];
+        let n = client.read(&mut buf).expect("client read");
+        assert_eq!(
+            n, 0,
+            "client should observe EOF after server drops rejected stream"
+        );
+    }
+
+    #[test]
     fn connection_factory_built_once_per_accepted_create() {
         // First CreateSession in Idle → build called once.
         // Second CreateSession in Authenticating → DoubleCreate, no rebuild.

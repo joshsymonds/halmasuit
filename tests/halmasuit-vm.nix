@@ -14,10 +14,13 @@
 #   5. Clean shutdown via systemctl stop
 #
 # The greeter peer in suite 4 runs as a real non-root system user
-# (halmasuit-greeter, uid 999) so SO_PEERCRED authorization exercises the
-# production shape. The wrong-UID-rejection path itself is covered by
-# unit tests in halmasuit-greetd (accept_authorized + Listener::bind
-# mode validation).
+# (halmasuit-greeter, uid 999) so SO_PEERCRED authorization exercises
+# the production shape. The wrong-UID-rejection path itself is covered
+# by halmasuit-greetd unit tests:
+#   - listener_accept_authorized_returns_when_uid_matches (positive)
+#   - listener_accept_authorized_drops_when_uid_does_not_match (negative)
+#   - listener_bind_rejects_world_accessible_mode (mode validation)
+# in crates/halmasuit-greetd/src/server.rs.
 
 {
   system,
@@ -208,6 +211,20 @@ pkgs.testers.runNixOSTest {
         assert sock_group == "halmasuit-greeter", (
             f"greetd.sock should be group halmasuit-greeter (from "
             f"services.halmasuit.greeterGroup), got {sock_group!r}"
+        )
+
+        # Direct reachability probe: from the greeter user's uid, can
+        # we actually open the socket file with write permission?
+        # `connect(AF_UNIX)` requires write on the socket inode, so
+        # `test -w` is a faithful proxy for "the greeter can connect".
+        # Isolates module-config correctness from suite 4's auth-flow:
+        # if 0660 + group=halmasuit-greeter is wrong (wrong mode, wrong
+        # group, dropped Group= directive), this fails focused right
+        # here rather than as a confusing connect-time timeout in
+        # suite 4.
+        machine.succeed(
+            "runuser -u halmasuit-greeter -- "
+            "test -w /run/halmasuit/greetd.sock"
         )
 
     # ──────────────────────────────────────────────────────────────────

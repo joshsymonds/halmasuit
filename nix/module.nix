@@ -44,7 +44,11 @@ in
     };
 
     greeterUid = lib.mkOption {
-      type        = lib.types.nullOr lib.types.int;
+      # `ints.unsigned` (≥ 0) matches the consumer's u32 type in
+      # `crates/halmasuit/src/main.rs` and POSIX uid_t. A plain `int`
+      # would accept negative values that then fail silently at
+      # runtime when the env var doesn't parse as u32.
+      type        = lib.types.nullOr lib.types.ints.unsigned;
       default     = null;
       example     = 999;
       description = ''
