@@ -1020,6 +1020,11 @@ because splitting them is what causes the boot flash — shipping a v2
 that exists only after `graphical.target` would be a worse Plymouth and
 solve nothing of the project's stated mission.
 
+Implementation is staged into **Phase A** (rootfs spine) and **Phase
+B** (initramfs survival). The split is execution sequencing only;
+the architectural commitment is unchanged. Phase A is complete as of
+2026-05-14 — see [`PLAN.md`](PLAN.md) for the in-scope status table.
+
 Scope:
 
 - `halmasuit-kms`: DRM/KMS direct-scanout core. Open device, become
