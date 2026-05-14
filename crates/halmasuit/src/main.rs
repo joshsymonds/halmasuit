@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +28,9 @@ use calloop::{
     EventLoop, Interest, LoopHandle, Mode as CalloopMode, PostAction, RegistrationToken,
 };
 use halmasuit_greetd::PamSession;
-use halmasuit_greetd::server::{Connection, PamSessionFactory, bind_socket, peer_credentials};
+use halmasuit_greetd::server::{
+    Connection, PamSessionFactory, SpawnRequest, bind_socket, peer_credentials,
+};
 use halmasuit_introspect::{Event, Phase, ShutdownReason, emit};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
@@ -80,6 +83,9 @@ struct HalmasuitState {
     /// Authorised greeter UID; connections from any other uid are
     /// dropped by `handle_listener_ready`.
     greeter_uid: u32,
+    /// Path to the `halmasuit-spawn` setuid helper, invoked when a
+    /// connection reaches `SpawnRequest`.
+    spawn_bin: PathBuf,
     /// Held so the registered listener token survives for the lifetime
     /// of the compositor; calloop drops the source on shutdown.
     _greetd_listener_token: Option<RegistrationToken>,
@@ -349,6 +355,25 @@ fn handle_connection_ready(
                                 uid: spawn.uid,
                                 gid: spawn.gid,
                             });
+                            match invoke_spawn(&state.spawn_bin, &spawn) {
+                                Ok(child) => {
+                                    tracing::info!(
+                                        spawn_pid = child.id(),
+                                        uid = spawn.uid,
+                                        "halmasuit-spawn launched"
+                                    );
+                                }
+                                Err(e) => {
+                                    // Logged but not fatal — the greeter
+                                    // can retry, and halmasuit itself is
+                                    // still running.
+                                    tracing::warn!(
+                                        error = %e,
+                                        spawn_bin = ?state.spawn_bin,
+                                        "failed to invoke halmasuit-spawn"
+                                    );
+                                }
+                            }
                             connstate.close_after_drain = true;
                         }
                         if out.close {
@@ -463,6 +488,53 @@ fn greetd_socket_path_from_env() -> PathBuf {
 
 fn pam_service_from_env() -> String {
     std::env::var("HALMASUIT_PAM_SERVICE").unwrap_or_else(|_| "halmasuit".into())
+}
+
+/// Path to the `halmasuit-spawn` setuid helper. Configurable via env
+/// (the NixOS module sets it to `/run/wrappers/bin/halmasuit-spawn`).
+/// Fallback resolves via `$PATH` — useful in dev / test where the
+/// build artifact is on the path.
+fn spawn_bin_from_env() -> PathBuf {
+    std::env::var_os("HALMASUIT_SPAWN_BIN")
+        .map_or_else(|| PathBuf::from("halmasuit-spawn"), PathBuf::from)
+}
+
+/// Construct the `Command` that invokes `halmasuit-spawn` with the
+/// resolved spawn parameters. Argv shape (from halmasuit-spawn's
+/// `parse_argv` docstring):
+///
+/// ```text
+/// halmasuit-spawn <uid> <gid> <user> -- <cmd> [args...]
+/// ```
+///
+/// The child's environment is cleared and re-populated from
+/// `request.env` (each entry is a `KEY=VALUE` string per the greetd
+/// protocol). `halmasuit-spawn`'s allowlist filters the env before
+/// execve.
+fn build_spawn_command(spawn_bin: &Path, request: &SpawnRequest) -> Command {
+    let mut cmd = Command::new(spawn_bin);
+    cmd.arg(request.uid.to_string());
+    cmd.arg(request.gid.to_string());
+    cmd.arg(&request.username);
+    cmd.arg("--");
+    for c in &request.cmd {
+        cmd.arg(c);
+    }
+    cmd.env_clear();
+    for env in &request.env {
+        if let Some((k, v)) = env.split_once('=') {
+            cmd.env(k, v);
+        }
+    }
+    cmd
+}
+
+/// Fire-and-forget spawn of `halmasuit-spawn`. Returns the spawned
+/// `Child` (kept by the caller only for the PID; we never `wait`).
+/// The session running under the new user is the kernel's
+/// responsibility after `execve`.
+fn invoke_spawn(spawn_bin: &Path, request: &SpawnRequest) -> io::Result<Child> {
+    build_spawn_command(spawn_bin, request).spawn()
 }
 
 // ── Wayland event-loop integration ──────────────────────────────────────
@@ -636,6 +708,7 @@ fn main() -> io::Result<()> {
             service: pam_service,
         }),
         greeter_uid,
+        spawn_bin: spawn_bin_from_env(),
         _greetd_listener_token: Some(greetd_listener_token),
     };
 
@@ -654,4 +727,79 @@ fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    fn sample_request() -> SpawnRequest {
+        SpawnRequest {
+            username: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            cmd: vec!["niri".into(), "--session".into()],
+            env: vec![
+                "XDG_SESSION_TYPE=wayland".into(),
+                "WAYLAND_DISPLAY=wayland-0".into(),
+            ],
+        }
+    }
+
+    #[test]
+    fn build_spawn_command_constructs_correct_argv() {
+        let cmd = build_spawn_command(Path::new("/usr/bin/halmasuit-spawn"), &sample_request());
+        assert_eq!(cmd.get_program(), OsStr::new("/usr/bin/halmasuit-spawn"));
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+        assert_eq!(args.len(), 6);
+        assert_eq!(args[0], OsStr::new("1000"));
+        assert_eq!(args[1], OsStr::new("1000"));
+        assert_eq!(args[2], OsStr::new("alice"));
+        assert_eq!(args[3], OsStr::new("--"));
+        assert_eq!(args[4], OsStr::new("niri"));
+        assert_eq!(args[5], OsStr::new("--session"));
+    }
+
+    #[test]
+    fn build_spawn_command_populates_env_from_greetd_request() {
+        let cmd = build_spawn_command(Path::new("/bin/true"), &sample_request());
+        // env_clear() then individual env() calls. get_envs() yields
+        // only what we explicitly set; verify both pairs are present
+        // and that we did NOT inherit PATH/HOME from the test process.
+        let map: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(
+            map.get(OsStr::new("XDG_SESSION_TYPE")),
+            Some(&Some(OsStr::new("wayland")))
+        );
+        assert_eq!(
+            map.get(OsStr::new("WAYLAND_DISPLAY")),
+            Some(&Some(OsStr::new("wayland-0")))
+        );
+        assert!(!map.contains_key(OsStr::new("PATH")));
+        assert!(!map.contains_key(OsStr::new("HOME")));
+    }
+
+    #[test]
+    fn build_spawn_command_ignores_env_entries_without_equals() {
+        // Defensive: a malformed greetd peer might send a `MALFORMED`
+        // string. We split at the first `=`; entries without one are
+        // silently dropped.
+        let mut req = sample_request();
+        req.env.push("MALFORMED_NO_EQUALS".into());
+        let cmd = build_spawn_command(Path::new("/bin/true"), &req);
+        let map: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert!(!map.contains_key(OsStr::new("MALFORMED_NO_EQUALS")));
+    }
+
+    #[test]
+    fn spawn_bin_from_env_falls_back_to_path_lookup() {
+        // With no env override set (this test relies on nextest's
+        // per-test isolation; we don't mutate env in this module),
+        // the resolved path is the bare "halmasuit-spawn" — a
+        // relative PathBuf the OS resolves via $PATH at spawn time.
+        if std::env::var_os("HALMASUIT_SPAWN_BIN").is_none() {
+            assert_eq!(spawn_bin_from_env(), PathBuf::from("halmasuit-spawn"));
+        }
+    }
 }
