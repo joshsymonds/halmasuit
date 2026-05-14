@@ -101,19 +101,24 @@ struct HalmasuitState {
     /// of the compositor; calloop drops the source on shutdown.
     _greetd_listener_token: Option<RegistrationToken>,
 
-    /// Active DRM scanout. Acquired in `main()` while still root via
-    /// `DRM_IOCTL_SET_MASTER`, then mode-set to scan out a dumb buffer
-    /// filled with `HALMASUIT_BRAND_CLEAR` (#0a0014). The master
-    /// designation lives on the underlying fd and survives `setresuid`
-    /// to the compositor user (drm-master-probe Phase 1). The dumb
-    /// buffer + framebuffer + CRTC handles are pinned here for the
-    /// process lifetime; dropping this field tears down scanout
-    /// cleanly (kernel reaps fb on fd close, dumb buffer destroys via
-    /// RAII).
+    /// The GLES + GBM + DrmCompositor stack. Constructed in `main()`
+    /// while still root via [`drm::setup_drm_backend`]; the underlying
+    /// DRM fd's master designation survives the subsequent `setresuid`
+    /// to the compositor user (drm-master-probe Phase 1).
+    ///
+    /// Mutated from the calloop callback for `DrmEvent::VBlank` —
+    /// each vblank acks the previous frame and (currently) re-renders
+    /// the same brand clear color. Subsequent epic subtasks (B.3+)
+    /// will populate the element list with wl_clients.
     ///
     /// `None` only when `HALMASUIT_SKIP_DRM_MASTER` was set (dev/test
     /// bypass); production deployments never see this.
-    _active_scanout: Option<drm::ActiveScanout>,
+    drm_backend: Option<drm::DrmBackend>,
+
+    /// calloop registration of the DRM event source. Holding this
+    /// token keeps the page-flip event stream wired into the event
+    /// loop; dropping it would silently unregister vblank handling.
+    _drm_token: Option<RegistrationToken>,
 
     /// Greeter we spawned at startup, held as a pid + pidfd pair.
     /// The pidfd is the kernel-anchored signal target (race-free
@@ -623,34 +628,16 @@ fn spawn_bin_from_env() -> PathBuf {
 /// fast unit test before the visual VM gate.
 const HALMASUIT_BRAND_CLEAR: [u8; 4] = drm::xrgb_le(0x0A, 0x00, 0x14);
 
-/// Open `/dev/dri/card0` (or the device named by `HALMASUIT_DRM_DEVICE`),
-/// acquire master via `DRM_IOCTL_SET_MASTER`, and mode-set the first
-/// connected connector to scan out a dumb buffer filled with the brand
-/// clear color. Returns the resulting `ActiveScanout` held by the
-/// caller for the process lifetime, or `None` when
-/// `HALMASUIT_SKIP_DRM_MASTER` is set in the environment. The skip
-/// path is for ad-hoc dev launches and integration tests that spawn
-/// halmasuit on a host without DRM; the production NixOS module never
-/// sets it.
+/// Resolve the DRM device path to use, honoring overrides and the
+/// `HALMASUIT_SKIP_DRM_MASTER` dev/test bypass. Returns `Ok(None)` only
+/// when the bypass is set under non-root euid (a tracked, warned-about
+/// dev launch); returns the path otherwise.
 ///
-/// drm-master-probe Phases 0-3 empirically validated that the master
-/// designation + held fd survive `setresuid` (which the caller does
-/// later in `drop_privileges`) and that SETCRTC works on virtio-gpu-pci
-/// in the NixOS test substrate.
-///
-/// # Errors
-///
-/// Bubbles any open(2)/ioctl(2)/SETCRTC failure with context. A
-/// production deployment that fails here fails the entire unit —
-/// running without DRM master defeats the architecture.
-fn acquire_drm_master_and_scan_out() -> io::Result<Option<drm::ActiveScanout>> {
+/// Fail-closed under euid 0 if the bypass is requested — the SKIP path
+/// disarms a core architectural invariant and must not be honored from
+/// the production systemd unit.
+fn drm_device_path_from_env() -> io::Result<Option<PathBuf>> {
     if std::env::var_os("HALMASUIT_SKIP_DRM_MASTER").is_some() {
-        // Fail-closed if running as root: production halmasuit always
-        // starts as root (the systemd unit has User= unset so it can
-        // bind sockets in /run/halmasuit and acquire DRM master). The
-        // SKIP bypass is for ad-hoc dev launches as a normal user.
-        // Honoring it under root would silently disarm the
-        // architecture's core requirement.
         if nix::unistd::geteuid().is_root() {
             return Err(io::Error::other(
                 "HALMASUIT_SKIP_DRM_MASTER is the dev/test bypass; refusing \
@@ -664,11 +651,10 @@ fn acquire_drm_master_and_scan_out() -> io::Result<Option<drm::ActiveScanout>> {
         );
         return Ok(None);
     }
-    let path = std::env::var_os("HALMASUIT_DRM_DEVICE")
-        .map_or_else(|| PathBuf::from("/dev/dri/card0"), PathBuf::from);
-    let card = drm::open_and_set_master(&path)?;
-    let scanout = drm::scan_out_clear_color(card, HALMASUIT_BRAND_CLEAR)?;
-    Ok(Some(scanout))
+    Ok(Some(std::env::var_os("HALMASUIT_DRM_DEVICE").map_or_else(
+        || PathBuf::from("/dev/dri/card0"),
+        PathBuf::from,
+    )))
 }
 
 /// Resolve compositor uid from env. `HALMASUIT_COMPOSITOR_UID` is
@@ -1126,25 +1112,12 @@ fn main() -> io::Result<()> {
         version: env!("CARGO_PKG_VERSION"),
     });
 
-    // DRM master + scanout FIRST, while we're still root. The master
-    // designation lives on the file descriptor and survives the
-    // in-process `setresuid` at the bottom of this function
-    // (drm-master-probe Phase 1). The dumb buffer + framebuffer +
-    // CRTC handles are pinned in `HalmasuitState._active_scanout`
-    // for the process lifetime. Pixels start showing as soon as
-    // SETCRTC returns: the brand clear color `#0a0014` is on the
-    // display until a wl_client commits a buffer (subsequent
-    // subtasks layer that). Only emit the phase events when master
-    // was actually acquired — the SKIP path is dev/test only.
-    let active_scanout = acquire_drm_master_and_scan_out()?;
-    if active_scanout.is_some() {
-        emit(&Event::PhaseEntered {
-            phase: Phase::DrmMasterAcquired,
-        });
-        emit(&Event::PhaseEntered {
-            phase: Phase::ScanoutActive,
-        });
-    }
+    // Resolve the DRM device path before anything else (the path may
+    // be `None` for the dev/test SKIP path). The actual DRM/GBM/EGL/GLES
+    // setup happens further down, after the calloop event loop is
+    // built — `setup_drm_backend` needs `loop_handle` to wire the
+    // page-flip event source.
+    let drm_device_path = drm_device_path_from_env()?;
 
     // Initialize the Wayland display + protocol state.
     let display: Display<HalmasuitState> = Display::new().map_err(io::Error::other)?;
@@ -1157,27 +1130,6 @@ fn main() -> io::Result<()> {
 
     let output_manager_state =
         OutputManagerState::new_with_xdg_output::<HalmasuitState>(&display_handle);
-    // Synthesized placeholder output. Geometry is invented; the
-    // advertisement exists so clients can discover an output and
-    // proceed past their wl_registry phase. Real geometry lands when
-    // the DRM backend wires actual modes (subsequent task).
-    let output_mode = Mode {
-        size: (1920, 1080).into(),
-        refresh: 60_000, // 60 Hz, in mHz per the wl_output spec
-    };
-    let output = Output::new(
-        "output-0".to_owned(),
-        PhysicalProperties {
-            size: (480, 270).into(), // mm; ~96 DPI assumption
-            subpixel: Subpixel::Unknown,
-            make: "halmasuit".to_owned(),
-            model: "synthesized-1080p".to_owned(),
-            serial_number: String::new(),
-        },
-    );
-    output.create_global::<HalmasuitState>(&display_handle);
-    output.change_current_state(Some(output_mode), None, None, Some((0, 0).into()));
-    output.set_preferred(output_mode);
 
     // wl_shm. Empty formats iter requests just ARGB8888 + XRGB8888,
     // which the spec mandates always be advertised. Additional formats
@@ -1187,6 +1139,57 @@ fn main() -> io::Result<()> {
     let mut event_loop: EventLoop<HalmasuitState> =
         EventLoop::try_new().map_err(io::Error::other)?;
     let loop_handle = event_loop.handle();
+
+    // Build the DRM backend if a device path was resolved. The real
+    // case (production) goes through `drm::setup_drm_backend` and
+    // returns the smithay `Output` backed by the actual connector
+    // mode. The SKIP case (dev/test, non-root) synthesizes a 1920x1080
+    // placeholder so wl_clients can still discover an output global.
+    let (drm_backend, drm_token, output) = if let Some(path) = &drm_device_path {
+        let (backend, token, real_output) = drm::setup_drm_backend(
+            path,
+            &loop_handle,
+            |event, _meta, state: &mut HalmasuitState| match event {
+                smithay::backend::drm::DrmEvent::VBlank(_crtc) => {
+                    if let Some(backend) = state.drm_backend.as_mut()
+                        && let Err(e) = backend.frame_submitted()
+                    {
+                        tracing::warn!(error = %e, "DRM frame_submitted failed");
+                    }
+                }
+                smithay::backend::drm::DrmEvent::Error(e) => {
+                    tracing::warn!(error = %e, "DRM device error");
+                }
+            },
+        )?;
+        real_output.create_global::<HalmasuitState>(&display_handle);
+        emit(&Event::PhaseEntered {
+            phase: Phase::DrmMasterAcquired,
+        });
+        (Some(backend), Some(token), real_output)
+    } else {
+        // SKIP path: synthesized placeholder. Geometry is invented;
+        // the advertisement exists so clients can discover an output
+        // and proceed past their wl_registry phase.
+        let output_mode = Mode {
+            size: (1920, 1080).into(),
+            refresh: 60_000, // 60 Hz, in mHz per the wl_output spec
+        };
+        let synth = Output::new(
+            "output-0".to_owned(),
+            PhysicalProperties {
+                size: (480, 270).into(), // mm; ~96 DPI assumption
+                subpixel: Subpixel::Unknown,
+                make: "halmasuit".to_owned(),
+                model: "synthesized-1080p".to_owned(),
+                serial_number: String::new(),
+            },
+        );
+        synth.create_global::<HalmasuitState>(&display_handle);
+        synth.change_current_state(Some(output_mode), None, None, Some((0, 0).into()));
+        synth.set_preferred(output_mode);
+        (None, None, synth)
+    };
 
     // Bind the Wayland listening socket. smithay's ListeningSocketSource
     // places the socket at $XDG_RUNTIME_DIR/<name>; production halmasuit's
@@ -1305,9 +1308,35 @@ fn main() -> io::Result<()> {
         greeter_uid,
         spawn_bin: spawn_bin_from_env(),
         _greetd_listener_token: Some(greetd_listener_token),
-        _active_scanout: active_scanout,
+        drm_backend,
+        _drm_token: drm_token,
         greeter,
     };
+
+    // Kick off the render loop with one initial frame. The page-flip
+    // for this frame triggers the next vblank, which our DRM event
+    // handler observes (`frame_submitted`) — that's the keepalive for
+    // the render loop. Future damage events (B.3+ wl_client commits)
+    // will queue additional frames. For now the scene is just the
+    // brand clear color.
+    //
+    // `Phase::ScanoutActive` fires here, on the first successful
+    // `queue_frame` — moved from B.1's "post-SETCRTC" timing to
+    // "first pixel via GLES" per the epic's IMMUTABLE Requirement #5
+    // semantics. The SKIP-path state (no `drm_backend`) emits neither
+    // event.
+    if let Some(backend) = state.drm_backend.as_mut() {
+        let queued = backend.render_one_frame(HALMASUIT_BRAND_CLEAR)?;
+        if queued {
+            emit(&Event::PhaseEntered {
+                phase: Phase::ScanoutActive,
+            });
+        } else {
+            tracing::warn!(
+                "initial render_frame produced no damage; ScanoutActive deferred until next vblank"
+            );
+        }
+    }
 
     // Privilege drop. The DRM master FD and both Unix sockets are
     // acquired above while we still have euid==0; everything from

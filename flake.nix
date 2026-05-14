@@ -88,14 +88,18 @@
 
             # Native libraries smithay links against. smithay's
             # `wayland_frontend` minimum pulls in libxkbcommon for keymap
-            # handling; later features (`backend_libinput`, `backend_drm`,
-            # `renderer_gl`) will add libinput, libgbm, libegl, libdrm.
+            # handling; `backend_gbm` + `renderer_gl` pull in libgbm
+            # (Mesa) at link time. libEGL is dynamically loaded at runtime
+            # via libloading; not a build-time link dep. libdrm comes
+            # transitively via drm-rs / gbm-sys.
             # libpam is for halmasuit-pam's FFI (pam-sys links against
             # libpam.so.0 via `links = "pam"` in its Cargo.toml).
             buildInputs = with pkgs; [
               libxkbcommon
               wayland
               pam
+              libgbm
+              libGL
             ];
 
             # bindgen (used transitively by pam-sys at build time) needs
@@ -151,12 +155,25 @@
             #   shellHook; rustPlatform.buildRustPackage has its own
             #   sandboxed env, so we duplicate the wiring here.
             nativeBuildInputs = [ pkgs.pkg-config pkgs.llvmPackages.libclang ];
-            # Runtime deps:
+            # Runtime + link deps:
             # - libxkbcommon: smithay needs it for keymap handling.
             # - wayland: smithay's protocol scanner.
             # - pam: pam-sys links against libpam.so.0 at runtime via
             #   `links = "pam"` in its Cargo.toml.
-            buildInputs       = [ pkgs.libxkbcommon pkgs.wayland pkgs.pam ];
+            # - libgbm: smithay's `backend_gbm` + `renderer_gl` link
+            #   against libgbm.so via gbm-sys at build time.
+            # - libGL (libglvnd): provides `libEGL.so.1` which smithay
+            #   dlopens at runtime via libloading. Adding it to
+            #   buildInputs ensures `rustPlatform.buildRustPackage`
+            #   sets RPATH so the dlopen succeeds without relying on
+            #   LD_LIBRARY_PATH propagation.
+            buildInputs       = [
+              pkgs.libxkbcommon
+              pkgs.wayland
+              pkgs.pam
+              pkgs.libgbm
+              pkgs.libGL
+            ];
             # bindgen invokes clang directly (bypassing NIX_CFLAGS_COMPILE).
             # Mirror the shellHook so pam-sys's build.rs finds
             # <security/pam_appl.h> and its transitive <unistd.h>.

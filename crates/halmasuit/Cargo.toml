@@ -22,9 +22,20 @@ halmasuit-greetd     = { path = "../halmasuit-greetd",     version = "0.1" }
 halmasuit-pam        = { path = "../halmasuit-pam",        version = "0.1" }
 tracing.workspace            = true
 tracing-subscriber.workspace = true
-# smithay carries Wayland-server protocol state. `wayland_frontend` is
-# the minimum feature for the Wayland-server protocol surface.
-smithay = { workspace = true, features = ["wayland_frontend"] }
+# smithay features:
+# - `wayland_frontend`: Wayland-server protocol state.
+# - `backend_drm`: DrmDevice / DrmSurface / DrmCompositor — replaces the
+#   dumb-buffer scanout from B.1.
+# - `backend_gbm`: GbmDevice / GbmAllocator / GbmFramebufferExporter for
+#   GLES-rendered scanout buffers.
+# - `renderer_gl`: GlesRenderer (auto-enables `backend_egl` per smithay's
+#   Cargo.toml).
+smithay = { workspace = true, features = [
+    "wayland_frontend",
+    "backend_drm",
+    "backend_gbm",
+    "renderer_gl",
+] }
 # calloop comes in two ways: (1) via smithay's reexport for general
 # event-loop use, (2) directly here for the `signals` feature smithay
 # doesn't enable. Cargo unifies to one version with merged features.
@@ -37,12 +48,11 @@ calloop.workspace            = true
 # - `process`: waitpid in the SIGCHLD reaper so dead greeter / session
 #   children don't accumulate as zombies
 nix = { workspace = true, features = ["user", "signal", "process"] }
-# DRM-rs (v0.15) — typed wrappers around DRM master acquisition,
-# resource enumeration, dumb-buffer allocation, and SETCRTC. Used by
-# the `drm` submodule. Same pin as drm-master-probe and
-# halmasuit-visual-test-standin so the workspace shares one drm-rs
-# version.
-drm = "0.15"
+# drm-rs types reach halmasuit via `smithay::reexports::drm` — same
+# version smithay itself uses (0.14 at the pinned rev), avoiding the
+# multi-version-of-drm problem (smithay's DrmDevice impls drm 0.14's
+# `ControlDevice`; a separate `drm = "0.15"` direct dep would expose a
+# different trait and method resolution would silently miss).
 # Linux capabilities for drop_privileges' CAP_KILL preservation —
 # halmasuit must retain signal authority over its greeter child
 # (uid 999) post-deprivilege to uid 998. Pure-Rust over libc.
