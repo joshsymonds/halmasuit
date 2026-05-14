@@ -269,10 +269,12 @@
           system = "x86_64-linux";
           inherit nixpkgs nix-config;
         };
-        halmasuit-introspect = import ./tests/halmasuit-introspect.nix {
+        halmasuit-vm = import ./tests/halmasuit-vm.nix {
           system    = "x86_64-linux";
           inherit nixpkgs;
-          halmasuit = self.packages.x86_64-linux.halmasuit;
+          halmasuit            = self.packages.x86_64-linux.halmasuit;
+          halmasuit-spawn      = self.packages.x86_64-linux.halmasuit-spawn;
+          halmasuit-vm-client  = self.packages.x86_64-linux.halmasuit-vm-client;
         };
         halmasuit-spawn = import ./tests/halmasuit-spawn.nix {
           system          = "x86_64-linux";
