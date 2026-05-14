@@ -51,6 +51,16 @@ pkgs.testers.runNixOSTest {
         greeterUid    = 999;
         greeterGroup  = "halmasuit-greeter";
         compositorUid = 998;
+        # Test greeter: a shell script that simply sleeps forever, so
+        # we can `ps` the running process and inspect its uid. Real
+        # production deployments point this at DankGreeter or any
+        # greetd-protocol greeter. The wait-forever shape lets the
+        # existing full-auth suite (4) still drive its own protocol
+        # client without contention — they share the same greetd
+        # socket, but the test greeter never makes any requests.
+        greeterCommand = "${pkgs.writeShellScript "halmasuit-test-greeter" ''
+          exec ${pkgs.coreutils}/bin/sleep infinity
+        ''}";
         # useSetuidWrapper left at default (true) — the wrapper is what
         # lets the deprivileged halmasuit re-elevate halmasuit-spawn at
         # exec time. Setting it false here would break suite 4's full-
@@ -207,6 +217,15 @@ pkgs.testers.runNixOSTest {
                 f"no phase_entered{{phase={phase}}} event captured. Events: {events}"
             )
 
+        # greeter_spawned is a top-level Event variant (not a Phase),
+        # emitted after halmasuit fork+execs the configured greeter.
+        # Pid must be a positive int.
+        greeter = find(events, "greeter_spawned")
+        assert greeter is not None, f"no greeter_spawned event: {events}"
+        assert isinstance(greeter.get("pid"), int) and greeter["pid"] > 0, (
+            f"greeter_spawned.pid must be positive int: {greeter}"
+        )
+
         # Phase ordering is load-bearing:
         # - drm_master_acquired must precede wayland_ready (DRM master is
         #   the first privileged op; smithay setup follows)
@@ -302,6 +321,51 @@ pkgs.testers.runNixOSTest {
         assert len(gids) == 4 and len(set(gids)) == 1, (
             f"halmasuit's four gid components must all match after setresgid, "
             f"got {status_gid!r}"
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Suite 2.7: Greeter child process exists and runs as greeter uid
+    # ──────────────────────────────────────────────────────────────────
+    with subtest("greeter child process runs as greeter uid"):
+        # captured_events() already validated greeter_spawned in suite 1;
+        # here we drill into the actual process: confirm it's alive and
+        # its uid/euid match the configured greeterUid (999).
+        events = captured_events()
+        greeter = find(events, "greeter_spawned")
+        assert greeter is not None, "greeter_spawned missing (caught in suite 1)"
+        greeter_pid = greeter["pid"]
+        # /proc/<pid>/status exists → process exists. Process disappeared
+        # between event emission and now → the spawned greeter died,
+        # which is a real failure mode worth surfacing.
+        status = machine.succeed(
+            f"cat /proc/{greeter_pid}/status"
+        )
+        # Greeter must run as halmasuit-greeter (uid 999) on all four
+        # uid components — the same setresuid pin used elsewhere.
+        uid_line = next(
+            (l for l in status.splitlines() if l.startswith("Uid:")),
+            None,
+        )
+        assert uid_line is not None, f"no Uid: line in greeter status: {status}"
+        uid_parts = uid_line.split()[1:5]
+        assert uid_parts == ["999", "999", "999", "999"], (
+            f"greeter uid components must all be 999 (greeterUid), got {uid_parts}"
+        )
+        # Greeter's parent must be halmasuit. Catches a regression where
+        # the fork lifecycle goes wrong and the greeter ends up
+        # reparented to init.
+        ppid_line = next(
+            (l for l in status.splitlines() if l.startswith("PPid:")),
+            None,
+        )
+        assert ppid_line is not None, f"no PPid: line in greeter status: {status}"
+        ppid = ppid_line.split()[1]
+        halmasuit_pid = machine.succeed(
+            "systemctl show -p MainPID --value halmasuit.service"
+        ).strip()
+        assert ppid == halmasuit_pid, (
+            f"greeter's parent must be halmasuit (pid {halmasuit_pid}), "
+            f"got ppid {ppid!r}"
         )
 
     # ──────────────────────────────────────────────────────────────────

@@ -94,6 +94,29 @@ in
       '';
     };
 
+    greeterCommand = lib.mkOption {
+      type        = lib.types.nullOr lib.types.str;
+      default     = null;
+      example     = lib.literalExpression ''"''${pkgs.dankgreeter}/bin/dankgreeter"'';
+      description = ''
+        Absolute path to the greeter binary halmasuit fork+execs as a
+        child of itself at startup. The child runs as the greeter
+        system user (uid = `greeterUid`) and inherits a minimal env
+        including `XDG_RUNTIME_DIR=/run/halmasuit`,
+        `WAYLAND_DISPLAY=wayland-0`, and
+        `GREETD_SOCK=/run/halmasuit/greetd.sock` so the greeter can
+        connect to halmasuit's Wayland and greetd sockets as a normal
+        client.
+
+        Set to `null` to run halmasuit without spawning a greeter —
+        useful for dev / VM tests; production deployments always set
+        this to the greeter binary's path.
+
+        No support for argv: the value is a single path. If you need
+        arguments, wrap in a `pkgs.writeShellScript`.
+      '';
+    };
+
     useSetuidWrapper = lib.mkOption {
       type        = lib.types.bool;
       default     = true;
@@ -292,6 +315,11 @@ in
         # Privilege-drop target. halmasuit reads this after binding
         # sockets and `setresuid`s to it in-process.
         HALMASUIT_COMPOSITOR_UID = toString cfg.compositorUid;
+      } // lib.optionalAttrs (cfg.greeterCommand != null) {
+        # Greeter binary halmasuit fork+execs at startup as the
+        # greeter user. See `services.halmasuit.greeterCommand`.
+        HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
+      } // {
         # Resolved path to halmasuit-spawn. With the setuid wrapper
         # enabled, this points at /run/wrappers/bin/<name>; otherwise
         # it's the raw store path.

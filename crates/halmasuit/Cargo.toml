@@ -32,7 +32,10 @@ calloop.workspace            = true
 # nix features used by halmasuit:
 # - `user`: getuid, setresuid, setresgid for the privilege drop path
 # - `ioctl`: the `ioctl_none!` macro that generates the DRM_IOCTL_SET_MASTER wrapper
-nix = { workspace = true, features = ["user", "ioctl"] }
+# - `signal`: sigprocmask in the greeter pre_exec closure (the parent
+#   blocks SIGTERM/SIGINT for calloop's signalfd; the greeter child
+#   needs the default mask restored before execve)
+nix = { workspace = true, features = ["user", "ioctl", "signal"] }
 
 [dev-dependencies]
 nix        = { workspace = true, features = ["signal", "user", "ioctl"] }

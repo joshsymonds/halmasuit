@@ -76,6 +76,15 @@ pub enum Event {
         /// Resolved Linux gid.
         gid: u32,
     },
+    /// halmasuit fork+exec'd the configured greeter as a child of
+    /// itself. The greeter runs as the greeter system user; the FD
+    /// table inherits the Wayland + greetd socket paths via env vars.
+    /// Emitted once at startup, when `HALMASUIT_GREETER_COMMAND` is
+    /// set and the spawn succeeded.
+    GreeterSpawned {
+        /// PID of the spawned greeter process.
+        pid: u32,
+    },
 }
 
 /// Compositor phases.
@@ -200,6 +209,13 @@ mod tests {
         });
         assert_eq!(v["event"], "fatal");
         assert_eq!(v["message"], "boom");
+    }
+
+    #[test]
+    fn event_greeter_spawned_carries_pid() {
+        let v = round_trip(&Event::GreeterSpawned { pid: 1234 });
+        assert_eq!(v["event"], "greeter_spawned");
+        assert_eq!(v["pid"], 1234);
     }
 
     #[test]

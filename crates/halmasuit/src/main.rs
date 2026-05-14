@@ -100,6 +100,13 @@ struct HalmasuitState {
     /// `None` only when `HALMASUIT_SKIP_DRM_MASTER` was set (dev/test
     /// bypass); production deployments never see this.
     _drm_master: Option<std::fs::File>,
+
+    /// Greeter child process spawned at startup. Held so the Child
+    /// struct lives for halmasuit's lifetime — dropping it would
+    /// close the parent's pipe ends but not reap the process; the
+    /// kernel keeps the zombie entry until we explicitly `wait`.
+    /// `None` when `HALMASUIT_GREETER_COMMAND` was unset.
+    _greeter_child: Option<Child>,
 }
 
 /// Per-client metadata. smithay's `CompositorHandler` requires us to
@@ -590,6 +597,92 @@ fn compositor_uid_from_env() -> Option<u32> {
 /// All three uid components (real, effective, saved) are set to the
 /// same value so the process cannot resurrect root via `seteuid(0)`
 /// later.
+/// Path of the greeter binary to exec at startup. Returns `None` when
+/// `HALMASUIT_GREETER_COMMAND` is unset (dev mode — halmasuit runs
+/// without a greeter). Production deployments always set it via
+/// `services.halmasuit.greeterCommand`.
+fn greeter_command_from_env() -> Option<PathBuf> {
+    std::env::var_os("HALMASUIT_GREETER_COMMAND").map(PathBuf::from)
+}
+
+/// Spawn the greeter binary as a child process running under the
+/// greeter system user. Must be called while halmasuit is still
+/// root — the child uses `setresuid` between fork and exec.
+///
+/// The child inherits a minimal env: only what a greetd-protocol
+/// greeter actually needs to find halmasuit's sockets and identify
+/// itself. The Wayland socket lives at $XDG_RUNTIME_DIR/wayland-0
+/// per smithay's convention; `GREETD_SOCK` is the standard env
+/// variable greeters look up for the auth socket.
+///
+/// # Errors
+/// Bubbles passwd-lookup failure, fork failure, or exec failure
+/// with context.
+fn spawn_greeter(greeter_uid: u32, command: &Path) -> io::Result<Child> {
+    use nix::unistd::{Gid, Uid, User};
+    use std::os::unix::process::CommandExt;
+
+    let user = User::from_uid(Uid::from_raw(greeter_uid))
+        .map_err(|e| io::Error::other(format!("getpwuid({greeter_uid}): {e}")))?
+        .ok_or_else(|| io::Error::other(format!("no passwd entry for uid {greeter_uid}")))?;
+
+    let gid_raw = user.gid.as_raw();
+    let greeter_name = user.name.clone();
+    let greeter_home = user.dir;
+
+    let mut cmd = Command::new(command);
+    cmd.env_clear()
+        .env("USER", &greeter_name)
+        .env("LOGNAME", &greeter_name)
+        .env("HOME", greeter_home.as_os_str())
+        .env("XDG_RUNTIME_DIR", "/run/halmasuit")
+        .env("WAYLAND_DISPLAY", "wayland-0")
+        .env("GREETD_SOCK", "/run/halmasuit/greetd.sock")
+        // PATH so the greeter can exec children (session command,
+        // PAM helpers). Match systemd's default unit PATH.
+        .env(
+            "PATH",
+            "/run/wrappers/bin:/run/current-system/sw/bin:/usr/bin:/bin",
+        );
+
+    // SAFETY: `pre_exec` runs in the forked child between `fork(2)`
+    // and `execve(2)`. The closure must only call async-signal-safe
+    // syscalls (man signal-safety(7)). `setgroups`, `setresgid`,
+    // and `setresuid` are all on the AS-safe list. We do NOT
+    // allocate, log, or take any Rust mutex here.
+    let target_gid = Gid::from_raw(gid_raw);
+    let target_uid = Uid::from_raw(greeter_uid);
+    #[expect(
+        unsafe_code,
+        reason = "pre_exec runs between fork and exec; closure body is async-signal-safe"
+    )]
+    unsafe {
+        cmd.pre_exec(move || {
+            // Restore the default signal mask. The parent (halmasuit)
+            // blocks SIGTERM/SIGINT to drive them via calloop's
+            // signalfd source; that mask propagates through fork+
+            // execve and would leave the greeter unable to receive
+            // either signal — systemd's SIGTERM on unit stop is
+            // ignored, the cgroup never empties, and the unit ends
+            // up in 'failed' state after the final-sigterm timeout.
+            let empty = nix::sys::signal::SigSet::empty();
+            nix::sys::signal::sigprocmask(
+                nix::sys::signal::SigmaskHow::SIG_SETMASK,
+                Some(&empty),
+                None,
+            )?;
+
+            nix::unistd::setgroups(&[target_gid])?;
+            nix::unistd::setresgid(target_gid, target_gid, target_gid)?;
+            nix::unistd::setresuid(target_uid, target_uid, target_uid)?;
+            Ok(())
+        });
+    }
+
+    cmd.spawn()
+        .map_err(|e| io::Error::other(format!("spawn greeter {}: {e}", command.display())))
+}
+
 fn drop_privileges(uid: u32) -> io::Result<()> {
     use nix::unistd::{Uid, getegid, setresgid, setresuid};
 
@@ -810,6 +903,37 @@ fn main() -> io::Result<()> {
     // greeter is the running user.
     let (greetd_listener_token, greeter_uid, pam_service) = setup_greetd_listener(&loop_handle)?;
 
+    // Spawn the configured greeter while halmasuit is still root.
+    // The child uses `pre_exec` to setresuid into the greeter user
+    // before execve, so the greeter never sees root. After the
+    // fork, the parent (halmasuit) proceeds into its own privilege
+    // drop below. Greeter failure logs but doesn't abort halmasuit:
+    // operators may run halmasuit without a greeter during dev.
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "if/else is easier to read than nested map_or_else closures here"
+    )]
+    let greeter_child = if let Some(cmd) = greeter_command_from_env() {
+        match spawn_greeter(greeter_uid, &cmd) {
+            Ok(child) => {
+                let pid = child.id();
+                tracing::info!(greeter_pid = pid, greeter_cmd = %cmd.display(), "greeter spawned");
+                emit(&Event::GreeterSpawned { pid });
+                Some(child)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, greeter_cmd = %cmd.display(), "greeter spawn failed");
+                None
+            }
+        }
+    } else {
+        tracing::warn!(
+            "HALMASUIT_GREETER_COMMAND unset; halmasuit running without a greeter. \
+             Production deployments set this via services.halmasuit.greeterCommand."
+        );
+        None
+    };
+
     let mut state = HalmasuitState {
         running: true,
         display_handle,
@@ -830,6 +954,7 @@ fn main() -> io::Result<()> {
         spawn_bin: spawn_bin_from_env(),
         _greetd_listener_token: Some(greetd_listener_token),
         _drm_master: drm_master,
+        _greeter_child: greeter_child,
     };
 
     // Privilege drop. Both Unix sockets and (in a future task) the
