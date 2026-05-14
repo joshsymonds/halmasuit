@@ -499,6 +499,47 @@ fn spawn_bin_from_env() -> PathBuf {
         .map_or_else(|| PathBuf::from("halmasuit-spawn"), PathBuf::from)
 }
 
+/// Resolve compositor uid from env. `HALMASUIT_COMPOSITOR_UID` is
+/// the operator's contract: when set, halmasuit drops privileges to
+/// that uid after binding its sockets. When unset, no drop happens
+/// (useful for ad-hoc dev launches).
+fn compositor_uid_from_env() -> Option<u32> {
+    std::env::var("HALMASUIT_COMPOSITOR_UID").ok()?.parse().ok()
+}
+
+/// Drop privileges to the configured compositor uid. The gid and
+/// supplementary group set were pinned at unit-startup via systemd
+/// `Group=` + `SupplementaryGroups=` in the NixOS module; this
+/// function pins the saved-set-gid against later resurrection and
+/// drops the uid. Supplementary groups (`shadow` in production, so
+/// halmasuit-pam can read /etc/shadow directly without forking
+/// unix_chkpwd) are intentionally NOT cleared — systemd already
+/// constrained them at startup, and clearing here would defeat that.
+///
+/// Order is load-bearing:
+///   1. `setresgid(egid, egid, egid)` — pin all three gid components
+///      to the current egid so we can't `setresgid(0,0,0)` later.
+///   2. `setresuid` — drop uid. Once euid is non-zero the gid can no
+///      longer change, so this is strictly last.
+///
+/// All three uid components (real, effective, saved) are set to the
+/// same value so the process cannot resurrect root via `seteuid(0)`
+/// later.
+fn drop_privileges(uid: u32) -> io::Result<()> {
+    use nix::unistd::{Uid, getegid, setresgid, setresuid};
+
+    // Pin the gid (no-op for the active value; the load-bearing effect
+    // is forcing saved-set-gid == egid so future setresgid resurrection
+    // can't recover root's gid).
+    let egid = getegid();
+    setresgid(egid, egid, egid).map_err(|e| io::Error::other(format!("setresgid({egid}): {e}")))?;
+
+    let u = Uid::from_raw(uid);
+    setresuid(u, u, u).map_err(|e| io::Error::other(format!("setresuid({u}): {e}")))?;
+
+    Ok(())
+}
+
 /// Construct the `Command` that invokes `halmasuit-spawn` with the
 /// resolved spawn parameters. Argv shape (from halmasuit-spawn's
 /// `parse_argv` docstring):
@@ -711,6 +752,27 @@ fn main() -> io::Result<()> {
         spawn_bin: spawn_bin_from_env(),
         _greetd_listener_token: Some(greetd_listener_token),
     };
+
+    // Privilege drop. Both Unix sockets and (in a future task) the
+    // DRM master FD are acquired above while we still have euid==0;
+    // everything from here onwards runs as the configured compositor
+    // system user. The setuid wrapper for halmasuit-spawn (set up by
+    // the NixOS module's `security.wrappers`) is what allows us to
+    // still execve halmasuit-spawn after this drop. When the operator
+    // hasn't set HALMASUIT_COMPOSITOR_UID, we log and continue — that
+    // mode is for ad-hoc dev launches outside the unit.
+    if let Some(uid) = compositor_uid_from_env() {
+        drop_privileges(uid)?;
+        emit(&Event::PhaseEntered {
+            phase: Phase::Deprivileged,
+        });
+    } else {
+        tracing::warn!(
+            "HALMASUIT_COMPOSITOR_UID unset; staying as current user. \
+             This is expected in dev launches; production deployments \
+             set it via services.halmasuit.compositorUid."
+        );
+    }
 
     // Main loop: wait briefly for any source to fire, then flush any
     // pending outgoing events to clients. flush_clients lives on the

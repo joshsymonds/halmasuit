@@ -94,6 +94,12 @@ pub enum Phase {
     /// greetd protocol socket is bound and accepting greeter connections.
     /// The compositor is ready to host a greeter and drive PAM.
     GreetdReady,
+    /// In-process privilege drop completed: the compositor started as
+    /// root (to bind sockets under `/run/halmasuit/` and, in a future
+    /// task, to acquire DRM master) and has now `setresuid`'d to the
+    /// configured compositor system user. Emitted after the drop
+    /// succeeds; subsequent code runs unprivileged.
+    Deprivileged,
 }
 
 /// Reason a clean shutdown was initiated.

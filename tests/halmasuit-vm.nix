@@ -50,10 +50,12 @@ pkgs.testers.runNixOSTest {
         spawnPackage  = halmasuit-spawn;
         greeterUid    = 999;
         greeterGroup  = "halmasuit-greeter";
-        # pamService + installPamConfig left at their defaults
-        # (halmasuit + true) — module installs /etc/pam.d/halmasuit
-        # with NixOS's default unixAuth stack, which is what alice's
-        # cleartext-password user below lands on.
+        compositorUid = 998;
+        # useSetuidWrapper left at default (true) — the wrapper is what
+        # lets the deprivileged halmasuit re-elevate halmasuit-spawn at
+        # exec time. Setting it false here would break suite 4's full-
+        # auth path (compositor user can't setresuid into alice).
+        # pamService + installPamConfig left at defaults.
       };
 
       # Greeter system user. uid 999 matches services.halmasuit.greeterUid
@@ -67,6 +69,24 @@ pkgs.testers.runNixOSTest {
         description  = "halmasuit greeter peer (test)";
       };
       users.groups.halmasuit-greeter.gid = 999;
+
+      # Compositor system user. uid 998 matches
+      # services.halmasuit.compositorUid above; halmasuit setresuids
+      # into this uid after binding its sockets. Group is
+      # halmasuit-greeter so the post-drop process retains the group
+      # ownership that lets it accept() on the sockets it bound (the
+      # sockets are root:halmasuit-greeter mode 0660 from suite 2).
+      # `shadow` as an extra group gives pam_unix.so the direct
+      # read access to /etc/shadow it needs to skip the unix_chkpwd
+      # helper fork — see ARCHITECTURE.md / nix/module.nix for
+      # the rationale (shadow-group membership is more reliable and
+      # auditable than the cross-namespace setuid-helper dance).
+      users.users.halmasuit-compositor = {
+        isSystemUser = true;
+        uid          = 998;
+        group        = "halmasuit-greeter";
+        description  = "halmasuit compositor process identity (test)";
+      };
 
       # The user halmasuit-greetd will authenticate. Both uid AND gid
       # must be ≥ UID_MIN (1000) — halmasuit-spawn's load-bearing floor
@@ -109,10 +129,10 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("halmasuit.service")
 
     # Wait for the latest startup phase before any assertions; once
-    # greetd_ready is in the journal, all earlier phases necessarily
-    # arrived too.
+    # deprivileged is in the journal, all earlier phases necessarily
+    # arrived too (deprivileged fires last in main()'s init sequence).
     machine.wait_until_succeeds(
-        "journalctl -u halmasuit | grep -qF 'greetd_ready'",
+        "journalctl -u halmasuit | grep -qF 'deprivileged'",
         timeout=30,
     )
 
@@ -175,11 +195,25 @@ pkgs.testers.runNixOSTest {
         assert started.get("version") == "0.1.0", (
             f"started.version must match Cargo.toml: {started}"
         )
-        for phase in ("init", "wayland_ready", "greetd_ready"):
+        for phase in ("init", "wayland_ready", "greetd_ready", "deprivileged"):
             evt = find_phase(events, phase)
             assert evt is not None, (
                 f"no phase_entered{{phase={phase}}} event captured. Events: {events}"
             )
+
+        # Privilege drop must land AFTER greetd_ready: sockets are
+        # bound while still root, then halmasuit setresuids. If a
+        # future refactor reorders these, the test catches it.
+        phase_order = [
+            inner["phase"]
+            for (_, inner) in events
+            if inner.get("event") == "phase_entered"
+        ]
+        gd_idx = phase_order.index("greetd_ready")
+        dp_idx = phase_order.index("deprivileged")
+        assert gd_idx < dp_idx, (
+            f"deprivileged must follow greetd_ready, got order: {phase_order}"
+        )
 
     # ──────────────────────────────────────────────────────────────────
     # Suite 2: Sockets on disk with correct permissions
@@ -225,6 +259,36 @@ pkgs.testers.runNixOSTest {
         machine.succeed(
             "runuser -u halmasuit-greeter -- "
             "test -w /run/halmasuit/greetd.sock"
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Suite 2.5: Process identity after privilege drop
+    # ──────────────────────────────────────────────────────────────────
+    with subtest("process runs as compositor uid after deprivilege"):
+        # /proc/<pid>/status's Uid: line shows real/effective/saved/fs
+        # uids — all four MUST be 998 after halmasuit's setresuid. A
+        # mismatch means the drop didn't take or partially took.
+        pid = machine.succeed("systemctl show -p MainPID --value halmasuit.service").strip()
+        assert pid.isdigit() and int(pid) > 0, f"halmasuit MainPID must be positive int, got {pid!r}"
+        status_uid = machine.succeed(
+            f"awk '/^Uid:/ {{print $2,$3,$4,$5}}' /proc/{pid}/status"
+        ).strip()
+        assert status_uid == "998 998 998 998", (
+            f"halmasuit must run as uid 998 (services.halmasuit.compositorUid) "
+            f"on all four uid components after the drop; got {status_uid!r}"
+        )
+        # gid pinning: setresgid(egid, egid, egid) means saved-set-gid
+        # equals current egid — the Gid: line should show four equal
+        # values. We don't pin the absolute value here because that's
+        # controlled by greeterGroup (already exercised in suite 2's
+        # `stat -c '%G'`); we only assert all four match.
+        status_gid = machine.succeed(
+            f"awk '/^Gid:/ {{print $2,$3,$4,$5}}' /proc/{pid}/status"
+        ).strip()
+        gids = status_gid.split()
+        assert len(gids) == 4 and len(set(gids)) == 1, (
+            f"halmasuit's four gid components must all match after setresgid, "
+            f"got {status_gid!r}"
         )
 
     # ──────────────────────────────────────────────────────────────────

@@ -5,11 +5,12 @@
 # (wayland-0) under /run/halmasuit/. Greeters authorize via SO_PEERCRED:
 # only the configured `greeterUid` may speak the greetd protocol.
 #
-# Today the unit runs as root (User= unset). The Phase A epic requires
-# non-root *by completion*; the privilege drop lands when the first
-# privileged code path (DRM master, Wayland socket in /run) lands and
-# wants to refuse it. Keeping User= explicit-absent here makes the audit
-# trail obvious.
+# The unit starts as root (User= unset on purpose). halmasuit binds
+# its sockets while still privileged, then in-process `setresuid`s to
+# the configured `compositorUid`. From that point on every halmasuit
+# code path runs unprivileged; the only setuid binary on the closure
+# is halmasuit-spawn (wrapped via `security.wrappers` when
+# `useSetuidWrapper = true`).
 
 { config, lib, pkgs, ... }:
 
@@ -78,6 +79,39 @@ in
       '';
     };
 
+    compositorUid = lib.mkOption {
+      type        = lib.types.nullOr lib.types.ints.unsigned;
+      default     = null;
+      example     = 998;
+      description = ''
+        UID halmasuit `setresuid`s to in-process after binding its
+        sockets. The compositor system user is the responsibility of
+        the operator: declare it in `users.users.<name>` and pass the
+        uid here. UID 0 is rejected by the assertion below: the whole
+        point of the privilege drop is to NOT run as root.
+
+        Must be set when `services.halmasuit.enable = true`.
+      '';
+    };
+
+    useSetuidWrapper = lib.mkOption {
+      type        = lib.types.bool;
+      default     = true;
+      description = ''
+        When true, wraps `halmasuit-spawn` via `security.wrappers` with
+        the setuid bit so the deprivileged halmasuit process can still
+        execve it and get its uid elevated by the kernel at exec time.
+
+        Setting this to true forces `serviceConfig.NoNewPrivileges =
+        false` on the halmasuit unit: with `NoNewPrivileges = true` the
+        kernel ignores the setuid bit at exec time, defeating the whole
+        wrapper. The trade-off is documented next to the directive.
+
+        Set to false only when halmasuit itself runs as root for the
+        entire lifetime (dev / VM tests against an old shape).
+      '';
+    };
+
     pamService = lib.mkOption {
       type        = lib.types.str;
       default     = "halmasuit";
@@ -129,6 +163,22 @@ in
           rejects connections whose peer uid does not match.
         '';
       }
+      {
+        assertion = cfg.compositorUid != null;
+        message   = ''
+          services.halmasuit.compositorUid must be set when
+          services.halmasuit.enable = true. halmasuit drops privileges
+          to this uid after binding its sockets.
+        '';
+      }
+      {
+        assertion = (cfg.compositorUid or 0) != 0;
+        message   = ''
+          services.halmasuit.compositorUid must not be 0 (root). The
+          privilege drop is load-bearing per the ARCHITECTURE.md threat
+          model; setting it to 0 would defeat the split.
+        '';
+      }
     ];
 
     # Default PAM service file — gives us unixAuth-backed pam_unix +
@@ -138,6 +188,22 @@ in
     # declare security.pam.services.<name> themselves.
     security.pam.services = lib.mkIf cfg.installPamConfig {
       ${cfg.pamService} = {};
+    };
+
+    # Setuid wrapper for halmasuit-spawn. After halmasuit deprivileges
+    # itself, it still needs to fork+exec halmasuit-spawn to bring up
+    # the authenticated user's session — halmasuit-spawn's own
+    # `setresuid` requires euid==0, which the kernel grants at exec
+    # time via the setuid bit on this wrapper. The real binary lives
+    # in the nix store; security.wrappers writes a tiny setuid shim
+    # at /run/wrappers/bin/halmasuit-spawn that re-execs it.
+    security.wrappers = lib.mkIf cfg.useSetuidWrapper {
+      halmasuit-spawn = {
+        owner  = "root";
+        group  = "root";
+        setuid = true;
+        source = "${cfg.spawnPackage}/bin/halmasuit-spawn";
+      };
     };
 
     systemd.services.halmasuit = {
@@ -160,32 +226,50 @@ in
         # there. stdout stays silent for now.
         StandardOutput = "null";
         StandardError  = "journal";
-        # RuntimeDirectory creates /run/halmasuit/ with the unit's UID
-        # (currently root; future `compositor` user inherits ownership
-        # automatically when User= is set). The Wayland socket lives at
-        # /run/halmasuit/wayland-0 — smithay's ListeningSocketSource
-        # places the socket at $XDG_RUNTIME_DIR/<name>.
+        # RuntimeDirectory creates /run/halmasuit/ with the unit's UID.
+        # Unit starts as root, so /run/halmasuit is owned root:<Group=>;
+        # halmasuit binds its sockets here BEFORE the in-process
+        # `setresuid`, so after the drop the compositor user still has
+        # accept() on the sockets even though it can't create new
+        # files under this dir.
         RuntimeDirectory     = "halmasuit";
         RuntimeDirectoryMode = "0755";
-        # Hardening minimums. Looser than the eventual `compositor` user
-        # posture but already restricts the obvious abuse paths. Each
-        # directive below is free for Phase A's userspace-only work; some
-        # (notably MemoryDenyWriteExecute, RestrictNamespaces) will need
-        # auditable relaxations when DRM/Wayland/smithay's GL backend land.
-        NoNewPrivileges        = true;
+        # `shadow` group access lets halmasuit-pam (running as the
+        # compositor uid) call `getspnam` directly on /etc/shadow
+        # rather than forking the setuid `unix_chkpwd` helper.
+        # The fork path is fragile: any inherited seccomp filter or
+        # NNP bit on halmasuit silently disables the setuid bit on
+        # the helper, leaving auth wedged with a confusing
+        # "user unknown" log line. Direct shadow access is the
+        # documented escape: pam_unix tries `getspnam` first and
+        # only falls back to the helper on EPERM.
+        SupplementaryGroups    = [ "shadow" ];
+        # Hardening that does NOT imply NoNewPrivileges, so it's safe
+        # to apply regardless of whether the setuid wrapper is in use.
         ProtectSystem          = "strict";
         ProtectHome            = true;
         PrivateTmp             = true;
+        ProtectControlGroups   = true;
+      } // lib.optionalAttrs (!cfg.useSetuidWrapper) {
+        SystemCallArchitectures = "native";
+        # NNP-implying hardening. Each directive below implicitly sets
+        # `NoNewPrivileges=yes` per systemd.exec(5); with NNP on, the
+        # kernel ignores the setuid bit on exec'd children, which
+        # breaks the halmasuit-spawn wrapper handoff and pam_unix's
+        # unix_chkpwd fork (both rely on setuid escalation). When
+        # `useSetuidWrapper = true` we trade these directives for the
+        # privilege split — halmasuit-spawn is the only setuid binary
+        # on the closure and is itself audit-grade (microscopic,
+        # fuzzed, UID_MIN floor).
+        NoNewPrivileges        = true;
         ProtectKernelTunables  = true;
         ProtectKernelModules   = true;
         ProtectKernelLogs      = true;
-        ProtectControlGroups   = true;
         RestrictNamespaces     = true;
         RestrictRealtime       = true;
         RestrictSUIDSGID       = true;
         LockPersonality        = true;
         MemoryDenyWriteExecute = true;
-        SystemCallArchitectures = "native";
         SystemCallFilter       = [ "@system-service" ];
       } // lib.optionalAttrs (cfg.greeterGroup != null) {
         # Process egid → inherited by Unix sockets bound under
@@ -205,11 +289,16 @@ in
         # PAM service file lookup key — must match
         # /etc/pam.d/<HALMASUIT_PAM_SERVICE>.
         HALMASUIT_PAM_SERVICE = cfg.pamService;
-        # Resolved path to halmasuit-spawn. Production deployments that
-        # deprivilege halmasuit itself will override this to point at a
-        # security.wrappers setuid wrapper; for the root-running Phase A
-        # unit the binary is invoked directly.
-        HALMASUIT_SPAWN_BIN   = "${cfg.spawnPackage}/bin/halmasuit-spawn";
+        # Privilege-drop target. halmasuit reads this after binding
+        # sockets and `setresuid`s to it in-process.
+        HALMASUIT_COMPOSITOR_UID = toString cfg.compositorUid;
+        # Resolved path to halmasuit-spawn. With the setuid wrapper
+        # enabled, this points at /run/wrappers/bin/<name>; otherwise
+        # it's the raw store path.
+        HALMASUIT_SPAWN_BIN =
+          if cfg.useSetuidWrapper
+          then "/run/wrappers/bin/halmasuit-spawn"
+          else "${cfg.spawnPackage}/bin/halmasuit-spawn";
       };
     };
   };
