@@ -247,11 +247,13 @@
       nixosModules.halmasuit = ./nix/module.nix;
 
       # Overlay exposing halmasuit-related packages under their bare names so
-      # the NixOS module's default = pkgs.halmasuit resolves. Consumers apply
-      # this once (`nixpkgs.overlays = [ halmasuit.overlays.default ];`) and
-      # then services.halmasuit.enable = true works without further wiring.
+      # the NixOS module's `default = pkgs.halmasuit` / `default =
+      # pkgs.halmasuit-spawn` resolutions work. Consumers apply this once
+      # (`nixpkgs.overlays = [ halmasuit.overlays.default ];`) and then
+      # `services.halmasuit.enable = true` works without further wiring.
       overlays.default = final: _prev: {
-        halmasuit = self.packages.${final.stdenv.hostPlatform.system}.halmasuit;
+        halmasuit       = self.packages.${final.stdenv.hostPlatform.system}.halmasuit;
+        halmasuit-spawn = self.packages.${final.stdenv.hostPlatform.system}.halmasuit-spawn;
       };
 
       # NixOS VM tests run on Linux only. Limited to x86_64-linux because

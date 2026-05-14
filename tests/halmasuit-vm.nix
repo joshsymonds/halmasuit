@@ -13,10 +13,11 @@
 #      Event::SessionRequested → halmasuit-spawn invocation
 #   5. Clean shutdown via systemctl stop
 #
-# The wrong-UID-rejection path is covered by unit tests in
-# halmasuit-greetd (accept_authorized + Listener::bind mode validation);
-# duplicating it here would require a second authorised-socket-group
-# user just for the rejection assertion — disproportionate effort.
+# The greeter peer in suite 4 runs as a real non-root system user
+# (halmasuit-greeter, uid 999) so SO_PEERCRED authorization exercises the
+# production shape. The wrong-UID-rejection path itself is covered by
+# unit tests in halmasuit-greetd (accept_authorized + Listener::bind
+# mode validation).
 
 {
   system,
@@ -37,27 +38,32 @@ pkgs.testers.runNixOSTest {
     {
       imports = [ ../nix/module.nix ];
 
+      # Exercise the full module option surface — no inline systemd env
+      # patches. If a production deployment differs from this, it's a
+      # module-design issue we want to catch here.
       services.halmasuit = {
-        enable  = true;
-        package = halmasuit;
+        enable        = true;
+        package       = halmasuit;
+        spawnPackage  = halmasuit-spawn;
+        greeterUid    = 999;
+        greeterGroup  = "halmasuit-greeter";
+        # pamService + installPamConfig left at their defaults
+        # (halmasuit + true) — module installs /etc/pam.d/halmasuit
+        # with NixOS's default unixAuth stack, which is what alice's
+        # cleartext-password user below lands on.
       };
 
-      # halmasuit's greetd I/O reads three env vars to pick the
-      # greeter UID, the PAM service file name, and the spawn-helper
-      # path. For Phase A the unit runs as root, so:
-      #   - HALMASUIT_GREETER_UID=0: the test script runs as root, so
-      #     SO_PEERCRED matches on connect.
-      #   - HALMASUIT_PAM_SERVICE=halmasuit: matches the
-      #     security.pam.services entry below; gives us /etc/pam.d/halmasuit.
-      #   - HALMASUIT_SPAWN_BIN points at the halmasuit-spawn package's
-      #     binary directly. Setuid-via-security.wrappers is unneeded in
-      #     Phase A because the unit IS root; production (compositor-user
-      #     unit) wraps it via security.wrappers and that's a separate task.
-      systemd.services.halmasuit.environment = {
-        HALMASUIT_GREETER_UID = "0";
-        HALMASUIT_PAM_SERVICE = "halmasuit";
-        HALMASUIT_SPAWN_BIN   = "${halmasuit-spawn}/bin/halmasuit-spawn";
+      # Greeter system user. uid 999 matches services.halmasuit.greeterUid
+      # above; SO_PEERCRED on the greetd socket will only accept this uid.
+      # Below UID_MIN (1000) on purpose: this is a system account, not a
+      # human login.
+      users.users.halmasuit-greeter = {
+        isSystemUser = true;
+        uid          = 999;
+        group        = "halmasuit-greeter";
+        description  = "halmasuit greeter peer (test)";
       };
+      users.groups.halmasuit-greeter.gid = 999;
 
       # The user halmasuit-greetd will authenticate. Both uid AND gid
       # must be ≥ UID_MIN (1000) — halmasuit-spawn's load-bearing floor
@@ -72,23 +78,17 @@ pkgs.testers.runNixOSTest {
       };
       users.groups.alice.gid = 1000;
 
-      # /etc/pam.d/halmasuit. NixOS's default services.pam config
-      # (unixAuth=true) gives us pam_unix-backed password auth, which
-      # is what alice's cleartext-password user above lands on.
-      security.pam.services.halmasuit = {};
-
       # Tools the testScript invokes:
       # - wayland-utils: the `wayland-info` global discovery client.
       # - halmasuit-vm-client: drives the greetd protocol from the
       #   testScript via a stable CLI (separate package; built from
       #   crates/halmasuit-vm-client).
-      # - halmasuit-spawn: HALMASUIT_SPAWN_BIN above references its
-      #   binary path. Adding it to systemPackages makes the binary
-      #   reachable on the closure even though we don't $PATH it.
+      # - halmasuit-spawn here is reachable on the closure via the
+      #   module's spawnPackage option — no need to add it to
+      #   systemPackages separately.
       environment.systemPackages = [
         pkgs.wayland-utils
         halmasuit-vm-client
-        halmasuit-spawn
       ];
 
       virtualisation = {
@@ -197,6 +197,19 @@ pkgs.testers.runNixOSTest {
         mode = machine.succeed("stat -c '%a' /run/halmasuit/greetd.sock").strip()
         assert mode == "660", f"greetd.sock should be mode 0660, got {mode}"
 
+        # With services.halmasuit.greeterGroup = "halmasuit-greeter",
+        # systemd sets the unit's Group=, so files halmasuit binds
+        # inherit that gid. Verify the socket actually landed in the
+        # right group — otherwise SO_PEERCRED would still pass but the
+        # 0660 mode would lock the greeter out at connect-time.
+        sock_group = machine.succeed(
+            "stat -c '%G' /run/halmasuit/greetd.sock"
+        ).strip()
+        assert sock_group == "halmasuit-greeter", (
+            f"greetd.sock should be group halmasuit-greeter (from "
+            f"services.halmasuit.greeterGroup), got {sock_group!r}"
+        )
+
     # ──────────────────────────────────────────────────────────────────
     # Suite 3: Wayland globals reachable via a real Wayland client
     # ──────────────────────────────────────────────────────────────────
@@ -216,19 +229,26 @@ pkgs.testers.runNixOSTest {
     # Suite 4: Full greetd auth round-trip + session spawn
     # ──────────────────────────────────────────────────────────────────
     with subtest("full auth and session spawn"):
-        # Stage alice's password in a file readable by root (the
-        # test script's effective uid); halmasuit-vm-client reads
-        # it via --password-file. We avoid putting the password
-        # on the argv (which would land in /proc/<pid>/cmdline).
+        # Stage alice's password in a file readable by the greeter
+        # user; halmasuit-vm-client reads it via --password-file. We
+        # avoid putting the password on the argv (which would land in
+        # /proc/<pid>/cmdline).
         machine.succeed("printf 'testpassword' > /tmp/alice.pw")
+        machine.succeed("chown halmasuit-greeter:halmasuit-greeter /tmp/alice.pw")
         machine.succeed("chmod 600 /tmp/alice.pw")
 
-        # Drive the full handshake. /run/current-system/sw/bin/true
-        # is NixOS's stable path to coreutils' true — alice will
-        # exec it (via halmasuit-spawn) and exit 0. We don't track
-        # that child; the test asserts halmasuit reached the spawn
-        # invocation, which is what the event surface tells us.
+        # Drive the full handshake AS THE GREETER USER. SO_PEERCRED on
+        # the greetd socket only authorizes uid 999 (halmasuit-greeter),
+        # which matches services.halmasuit.greeterUid = 999 above —
+        # this is the production shape, not root-as-greeter.
+        #
+        # /run/current-system/sw/bin/true is NixOS's stable path to
+        # coreutils' true — alice will exec it (via halmasuit-spawn)
+        # and exit 0. We don't track that child; the test asserts
+        # halmasuit reached the spawn invocation, which is what the
+        # event surface tells us.
         machine.succeed(
+            "runuser -u halmasuit-greeter -- "
             "halmasuit-vm-client full-auth /run/halmasuit/greetd.sock alice "
             "--password-file /tmp/alice.pw "
             "--cmd /run/current-system/sw/bin/true "
