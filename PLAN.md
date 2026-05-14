@@ -59,22 +59,28 @@ owned by `compositor`.
 
 ## In scope
 
-| Component | Minimum bar for v2 |
-|---|---|
-| `halmasuit` binary | smithay-based Wayland server. Takes DRM master directly (`DRM_IOCTL_SET_MASTER`, not via logind). Starts in initramfs, survives `switch_root` via `SurviveFinalKillSignal=yes` in the unit's `[Unit]` section (validated by drm-master-probe Phase 2; `@argv[0]` from Phase 1 is the documented fallback for systemd < v255), drops to `compositor` user via `setresuid`, hosts one foreground `wl_client` at a time. |
-| `halmasuit-spawn` | Correct from day one. ~80 lines, `#![forbid(unsafe_code)]`, UID floor (load-bearing per ARCHITECTURE.md threat model row 11), audit-grade. |
-| `halmasuit-greetd` | Full greetd wire protocol with locally-owned types (clean-room reimplementation from the [protocol spec](https://man.sr.ht/~kennylevinsen/greetd/protocol.md); the upstream `greetd_ipc` crate is GPL-3-only and would force halmasuit's binary to GPL). State machine + real PAM in-process. Accepts existing greetd-compatible greeters (DankGreeter, regreet, tuigreet, gtkgreet, agreety) unchanged. Drift mitigation: canonical-payload roundtrip tests pin the JSON shape against the spec. |
-| `halmasuit-splash` | **Static logo** painted via dumb buffer. NOT animated, NOT shader-driven. A single image, just enough that "the system didn't brick" is visually obvious. The Vulkan/wgpu "sizzle" splash is a Phase B polish pass. |
-| `halmasuit-luks` | systemd password-agent. Happy path: render prompt, accept passphrase, submit via the agent socket protocol. No retry UI, no advanced options. |
-| `halmasuit-fsck` | systemd-fsckd progress. Happy path: progress display. No repair-decision Y/N flow yet. |
-| `halmasuit-emergency` | `emergency.target` adapter. Happy path: graphical PAM-as-root prompt, exec a terminal. No recovery-menu UX. |
-| `halmasuit-kms`, `halmasuit-protocols`, `halmasuit-ipc`, `halmasuit-cli` | Backing crates per ARCHITECTURE.md workspace layout. |
-| Introspection surface | NDJSON events to stderr/journald from `main()` line 1 via `tracing` + `tracing-subscriber`. Live snapshot via `/run/halmasuit/introspect.sock` and `org.halmasuit.Debug.Introspect.Snapshot()` once rootfs is reached. Socket mode 0600, owned by `compositor`. PAM message text redacted before emission. Query-only; separate D-Bus interface from `org.halmasuit.Compositor1`. Lands first in build order (see "Build order" above). |
-| `sd_notify` / SIGTERM handling | drm-master-probe Phase 1 identified that rootfs systemd sends SIGTERM to the orphan unit ~1s post-`switch_root`. v2 Phase A handles this via a graceful SIGTERM handler in halmasuit (independent of the killall survival mechanism — Phase 2's `SurviveFinalKillSignal=yes` covers the killall; the post-pivot orphan-unit SIGTERM is separate). The cleaner alternative — `execve` at switch_root + `sd_notify` registration with rootfs systemd (Phase 3 validated this works) — is a v3 polish that avoids the SIGTERM handler entirely. (Empirical findings in RESEARCH.md Phases 1, 2, 3.) |
-| NixOS module | `services.halmasuit.enable = true;` replaces **both** Plymouth and greetd. Wires initramfs + rootfs systemd units, setuid bit on `halmasuit-spawn`, PAM service file `halmasuit`, `compositor` and `greeter` system users, polkit policies. Includes `boot.initrd.kernelModules` for the target hardware's GPU driver. |
-| DankGreeter launcher patch | ~20 lines in DMS to skip the nested-niri spawn when `WAYLAND_DISPLAY` is set by halmasuit. |
-| `tests/login-flash.nix` | Flipped from expected-RED to GREEN gate; the v1 measurement v2 satisfies. |
-| `tests/full-boot-flash.nix` | New test: frame-capture continuity from kernel handoff through to `SESSION` phase. Asserts no all-black frame and no DSSIM jump across any transition. |
+Status legend: **Done** (landed + tested) · **In flight** (partial,
+under active iteration) · **Queued** (Phase A scope, not started) ·
+**Deferred to Phase B** (deliberately out of Phase A — initramfs +
+adapter crates).
+
+| Component | Status | Minimum bar / current state |
+|---|---|---|
+| `halmasuit` binary — smithay scaffolding | Done | smithay 0.7 (pinned to niri's rev) scaffolding; `wl_compositor`, `xdg_wm_base`, `wl_seat`, `wl_output`, `wl_shm` advertised; lifecycle events emit through `halmasuit-introspect`. Tested via `tests/halmasuit-introspect.nix` (NixOS VM). |
+| `halmasuit` binary — greetd I/O integration | **Queued (next task)** | calloop wiring: `halmasuit_greetd::server::Listener` bound at `/run/halmasuit/greetd.sock`, per-connection state with `halmasuit_pam::PamThread` factory, `SpawnRequest` handoff to `halmasuit-spawn` invocation. Emits `Phase::GreetdReady`. |
+| `halmasuit` binary — DRM master + setresuid | Queued | Direct `DRM_IOCTL_SET_MASTER` on `/dev/dri/card0` (no logind). Drop to `compositor` user via `setresuid`. Phase A does NOT include initramfs survival (`SurviveFinalKillSignal=yes` / `@argv[0]`) — that's Phase B; v2 Phase A runs from `multi-user.target` only. |
+| `halmasuit-spawn` | Done | Audit-grade ~140 lines, `#![forbid(unsafe_code)]`, UID floor (load-bearing per ARCHITECTURE.md row 11), pwent validation, env allowlist, fuzz harness. Reviewed (task #9 security fix). |
+| `halmasuit-greetd` | Done | Wire types (clean-room re-derivation from the [protocol spec](https://man.sr.ht/~kennylevinsen/greetd/protocol.md); upstream `greetd_ipc` is GPL-3-only and would force halmasuit's binary to GPL), state machine, length-prefixed JSON codec, `Listener` (SO_PEERCRED, world-mode rejection, `accept_authorized`), `Connection` (per-fd driver with `Zeroizing` read buffer + explicit size cap + propagated codec errors). 49 unit + proptests. `gambit:review` complete (18 improvements implemented). |
+| `halmasuit-pam` | Done | Real libpam FFI quarantined to this crate (`#![deny(unsafe_code)]` + per-block `#[expect]`). `Pam` RAII handle, `bridge_conv` extern "C" callback (catch_unwind, zeroized response buffers, NUL-rejection), `PAM_FAIL_DELAY` no-op, `PamThread` worker driving `halmasuit_greetd::PamSession` with bounded `recv_timeout`. 27 tests. `gambit:review` complete (3 gaps + 14 improvements all addressed). |
+| `halmasuit-splash` | Queued | **Static logo** painted via dumb buffer. NOT animated, NOT shader-driven. A single image, just enough that "the system didn't brick" is visually obvious. The Vulkan/wgpu "sizzle" splash is a Phase B polish pass. |
+| `halmasuit-luks` / `-fsck` / `-emergency` | Deferred to Phase B | Adapter crates that depend on initramfs (`luks`, `fsck`) or recovery flows (`emergency`). Phase A is rootfs-only. |
+| `halmasuit-kms` / `-protocols` / `-ipc` / `-cli` | Stub | Workspace crates exist but bodies are placeholders. Concrete code lands as the integration centerpiece needs each piece. `halmasuit-kms` will likely populate during the DRM master task. |
+| Introspection surface | In flight | **Done:** NDJSON events to stderr/journald from `main()` line 1 via `tracing` + `tracing-subscriber` (`halmasuit-introspect` crate; lifecycle events `Started`/`PhaseEntered`/`Shutdown`/`Fatal`). **Queued:** live snapshot socket at `/run/halmasuit/introspect.sock` + `org.halmasuit.Debug.Introspect.Snapshot()`; redaction policy for `pam_message` content. |
+| `sd_notify` / SIGTERM handling | In flight (Phase A scope is partial) | **Done:** graceful SIGTERM handler in halmasuit (lifecycle test asserts `Shutdown { reason: signal_term }`). **Phase B:** `SurviveFinalKillSignal=yes` for switch_root survival (validated by drm-master-probe Phase 2) plus `execve` re-pivot + `sd_notify` registration with rootfs systemd (Phase 3 validated). Phase A doesn't ship initramfs survival, so neither lands here. |
+| NixOS module | In flight | **Done:** `services.halmasuit.enable = true` with `RuntimeDirectory=halmasuit`, hardening (NoNewPrivileges, ProtectKernel*, SystemCallFilter, etc.), setuid wrapper for `halmasuit-spawn`. **Queued:** PAM service file `/etc/pam.d/halmasuit`, `compositor` + `greeter` system users, replacement of greetd in `dms-niri`, `boot.initrd.kernelModules`. |
+| DankGreeter launcher patch | Queued | ~20 lines in DMS to skip the nested-niri spawn when `WAYLAND_DISPLAY` is set by halmasuit. Last step before the login-flash flip. |
+| `tests/login-flash.nix` | Queued (final step) | Currently inverted (RED-by-design until v2 ships). Flips to a GREEN gate when the integration above is complete; CI's `continue-on-error: true` + `expected-fail` interpretation gets removed at the same time. |
+| `tests/full-boot-flash.nix` | Deferred to Phase B | Frame-capture continuity from kernel handoff through to `SESSION` phase; depends on initramfs survival being in place. |
 
 ## Out of scope (Phase B or later)
 
@@ -93,15 +99,17 @@ owned by `compositor`.
 ## Open decisions for the v2 brainstorm
 
 Carried forward from ARCHITECTURE.md "Open decisions" + things this plan
-deliberately defers to the epic:
+deliberately defers to the epic. **Resolved** entries kept as a record
+of the decision; **Open** entries still need answering as the
+consuming code lands.
 
-- **PAM bindings strategy.** `pam-client` and `pam-sys` are both stale (2022/2023). Decision: use-as-is / fork / thin-FFI-via-bindgen. Decide when the auth code lands.
-- **smithay revision pin.** Pin to whatever niri or cosmic-comp is currently on. Decide at v2 start.
-- **`halmasuit-luks` prompt rendering form.** Replace splash with prompt vs. overlay prompt via subsurface composition. Decide when the adapter is implemented.
-- **`org.halmasuit.Compositor1` D-Bus surface.** Method list depends on what desktop-environment integration actually needs.
-- **`org.halmasuit.Debug.Introspect` surface shape.** Single `Snapshot()` method vs. signal-based event stream over D-Bus vs. both. Exact NDJSON schema (surface roles, geometry units, phase enum). Redaction policy for `pam_message` content. Decide as the auth code and first introspection consumer land — the stderr/tracing half lands earlier and is schema-flexible by virtue of being unstructured `tracing` events at first.
-- **OCR in `full-boot-flash` test.** May defer text-leak detection to a later test if tesseract bindings prove fiddly.
-- **Build order within "broadly working."** User preference is the thin-spine approach. Open question: start with `halmasuit-spawn` (small, security-critical, standalone) before the spine, or start directly with the spine and add `halmasuit-spawn` as the first integration dep? Brainstorm decides.
+- ~~**PAM bindings strategy.**~~ **RESOLVED:** `pam-sys` 1.0.0-alpha5 directly, no wrapper crate. Implemented in `halmasuit-pam`; review-approved. See ARCHITECTURE.md "Open decisions" row 1 for the full rationale.
+- ~~**smithay revision pin.**~~ **RESOLVED:** pinned to niri's current git revision (`ff5fa7df...`) in workspace `Cargo.toml`.
+- ~~**Build order within "broadly working."**~~ **RESOLVED:** introspection sink landed first (per the stated constraint), then `halmasuit-spawn` audit-grade, then the smithay spine, then `halmasuit-greetd` + `halmasuit-pam`. The integration-centerpiece task (calloop wiring) ties them together next.
+- **`halmasuit-luks` prompt rendering form.** Replace splash with prompt vs. overlay prompt via subsurface composition. *Decision deferred to Phase B (when the adapter lands).*
+- **`org.halmasuit.Compositor1` D-Bus surface.** Method list depends on what desktop-environment integration actually needs. *Decision deferred to the D-Bus implementation task.*
+- **`org.halmasuit.Debug.Introspect` surface shape.** Single `Snapshot()` method vs. signal-based event stream over D-Bus vs. both. Exact NDJSON schema (surface roles, geometry units, phase enum). Redaction policy for `pam_message` content. *Decision deferred to the snapshot-socket task; the stderr/tracing half is already shipping and is schema-flexible.*
+- **OCR in `full-boot-flash` test.** May defer text-leak detection if tesseract bindings prove fiddly. *Decision deferred to Phase B (when full-boot-flash is built).*
 
 ## See also
 

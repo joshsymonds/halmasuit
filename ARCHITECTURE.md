@@ -1204,8 +1204,10 @@ These are explicit "we know this needs deciding, just not yet":
    the `extern "C"` conv (panic-across-FFI is UB), `zeroize` response
    buffers on the conv thread after `strdup`, set `PAM_RUSER`/`PAM_TTY`
    before `authenticate`, handle `PAM_NEW_AUTHTOK_REQD` distinctly.
-2. **smithay revision** (v2). Pin to whatever niri or cosmic-comp is on
-   when v2 begins. Update on a deliberate cadence; not bleeding-edge.
+2. ~~**smithay revision** (v2).~~ **RESOLVED: pinned to niri's current
+   git revision** (`ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef`) in
+   workspace `Cargo.toml`. Re-evaluate the pin opportunistically when
+   touching smithay-adjacent code; no time-driven update cadence.
 3. ~~**`switch_root` re-exec mechanism** (v2).~~ **RESOLVED via
    empirical validation in [`RESEARCH.md`](RESEARCH.md) Phases 1, 2,
    and 3:** production halmasuit uses `SurviveFinalKillSignal=yes`
