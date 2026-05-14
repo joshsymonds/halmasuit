@@ -108,14 +108,26 @@ struct HalmasuitState {
     /// bypass); production deployments never see this.
     _drm_master: Option<std::fs::File>,
 
-    /// Greeter child process spawned at startup. Killed in the
+    /// Greeter we spawned at startup, held as a pid + pidfd pair.
+    /// The pidfd is the kernel-anchored signal target (race-free
+    /// across pid recycling — `pidfd_send_signal(2)`); the pid is
+    /// retained for the introspection event field. Killed in the
     /// `SessionRequested` handler — per Epic #1, the greeter
-    /// wl_client must be killed before the user session
-    /// (niri) takes halmasuit's foreground slot. The SIGCHLD
-    /// reaper in `signal_handler` picks up the zombie.
-    /// `None` when `HALMASUIT_GREETER_COMMAND` was unset OR the
-    /// greeter has already been killed.
-    greeter_child: Option<Child>,
+    /// wl_client must be killed before the user session takes
+    /// halmasuit's foreground slot. The SIGCHLD reaper picks up
+    /// the zombie. `None` when `HALMASUIT_GREETER_COMMAND` was
+    /// unset OR the greeter slot has already been consumed by
+    /// the kill-on-session-start path.
+    greeter: Option<GreeterHandle>,
+}
+
+/// Greeter identity post-spawn. The pidfd is the load-bearing
+/// authoritative reference to the greeter process — sending
+/// signals through it is immune to the pid-reuse race that
+/// raw `kill(pid, …)` exhibits after SIGCHLD reaps the entry.
+struct GreeterHandle {
+    pid: u32,
+    pidfd: std::os::fd::OwnedFd,
 }
 
 /// Per-client metadata. smithay's `CompositorHandler` requires us to
@@ -368,6 +380,10 @@ fn handle_listener_ready(
     clippy::needless_pass_by_ref_mut,
     reason = "calloop callback signature requires &mut NoIoDrop<T>; we go through Deref"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "callback body is one state-machine step; splitting hurts readability more than it helps"
+)]
 fn handle_connection_ready(
     id: usize,
     readiness: calloop::Readiness,
@@ -405,18 +421,26 @@ fn handle_connection_ready(
                             // the per-client teardown, niri can take
                             // the foreground slot. The SIGCHLD reaper
                             // picks up the resulting zombie.
-                            if let Some(mut greeter) = state.greeter_child.take() {
-                                let pid = greeter.id();
-                                match greeter.kill() {
+                            if let Some(greeter) = state.greeter.take() {
+                                let pid = greeter.pid;
+                                // SIGKILL via pidfd: race-free wrt pid
+                                // reuse. If the greeter already exited
+                                // (e.g. crashed earlier and the SIGCHLD
+                                // reaper consumed the entry), this
+                                // returns ESRCH — we surface that as a
+                                // GreeterKillFailed event and proceed.
+                                match pidfd_send_signal(&greeter.pidfd, libc::SIGKILL) {
                                     Ok(()) => {
                                         emit(&Event::GreeterTerminated { pid });
                                     }
                                     Err(e) => {
+                                        let error = format!("{e}");
                                         tracing::warn!(
-                                            error = %e,
+                                            %error,
                                             greeter_pid = pid,
-                                            "failed to SIGKILL greeter on session start"
+                                            "pidfd_send_signal greeter SIGKILL failed; session proceeds"
                                         );
+                                        emit(&Event::GreeterKillFailed { pid, error });
                                     }
                                 }
                             }
@@ -674,7 +698,7 @@ fn greeter_command_from_env() -> Option<PathBuf> {
 /// # Errors
 /// Bubbles passwd-lookup failure, fork failure, or exec failure
 /// with context.
-fn spawn_greeter(greeter_uid: u32, command: &Path) -> io::Result<Child> {
+fn spawn_greeter(greeter_uid: u32, command: &Path) -> io::Result<GreeterHandle> {
     use nix::unistd::{Gid, Uid, User};
     use std::os::unix::process::CommandExt;
 
@@ -735,8 +759,92 @@ fn spawn_greeter(greeter_uid: u32, command: &Path) -> io::Result<Child> {
         });
     }
 
-    cmd.spawn()
-        .map_err(|e| io::Error::other(format!("spawn greeter {}: {e}", command.display())))
+    let child = cmd
+        .spawn()
+        .map_err(|e| io::Error::other(format!("spawn greeter {}: {e}", command.display())))?;
+    let pid = child.id();
+    // Acquire a pidfd for the freshly-spawned child. The pidfd is the
+    // race-free signal target — `kill(pid, …)` after SIGCHLD reaps
+    // the entry can hit a recycled pid (and with our retained
+    // `CAP_KILL`, would signal whichever unrelated process now holds
+    // it). pidfd_send_signal targets the original task by fd and
+    // returns `ESRCH` once that task has terminated, regardless of
+    // pid reuse. There is a tiny window between Command::spawn
+    // returning and our pidfd_open here in which the greeter could
+    // exit and a new process inherit the pid — for which we
+    // tolerate the same risk one round (the next kill returns
+    // ESRCH if reused, plus the freshly-opened pidfd is still
+    // bound to whatever was at the pid at fd-open time).
+    let pidfd =
+        pidfd_open_for(pid).map_err(|e| io::Error::other(format!("pidfd_open({pid}): {e}")))?;
+    // Child handle is dropped here. On Unix, Child::drop is a no-op
+    // (doesn't kill, doesn't reap); we no longer need the type-level
+    // identity once the pidfd is in hand. SIGCHLD reaper handles
+    // termination accounting via waitpid.
+    drop(child);
+    Ok(GreeterHandle { pid, pidfd })
+}
+
+/// Open a pidfd for an existing pid.
+///
+/// Wraps `pidfd_open(2)` (Linux ≥ 5.3). Returns an `OwnedFd` that
+/// can be passed to `pidfd_send_signal_owned` for race-free signal
+/// delivery, then closed on drop.
+///
+/// # Errors
+/// Any errno from `pidfd_open` (notably `ESRCH` if the pid has
+/// already exited between fork and this call).
+fn pidfd_open_for(pid: u32) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+
+    let pid_signed = i32::try_from(pid)
+        .map_err(|_| io::Error::other(format!("pid {pid} does not fit in i32")))?;
+    // SAFETY: `pidfd_open(2)` is a numeric syscall with no pointer
+    // arguments. Returns a non-negative fd on success or -1 with
+    // errno set on failure. We construct the OwnedFd only on success.
+    #[expect(unsafe_code, reason = "raw pidfd_open syscall via libc")]
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::pid_t::from(pid_signed), 0_u32) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // syscall returns `c_long` (i64 on x86_64); a valid fd from
+    // `pidfd_open(2)` fits in i32 by construction (kernel-side
+    // fd allocator caps well below INT_MAX). Use try_from for the
+    // narrowing to surface any future drift.
+    let raw_fd: i32 = i32::try_from(raw)
+        .map_err(|_| io::Error::other(format!("pidfd_open returned out-of-range fd {raw}")))?;
+    // SAFETY: `raw_fd` is a fresh kernel fd from the successful
+    // syscall above; nothing else holds it.
+    #[expect(unsafe_code, reason = "wrap fresh fd into OwnedFd")]
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
+    Ok(fd)
+}
+
+/// Send a signal to a pidfd. Race-free wrt pid reuse — if the
+/// task has terminated, returns `ESRCH` regardless of whether
+/// the pid has been reused.
+///
+/// # Errors
+/// Any errno from `pidfd_send_signal(2)`.
+fn pidfd_send_signal(pidfd: &std::os::fd::OwnedFd, sig: i32) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `pidfd_send_signal(2)` reads the fd numerically and
+    // an optional `siginfo_t` pointer (we pass NULL — kernel
+    // synthesizes the siginfo from the calling context). flags=0.
+    #[expect(unsafe_code, reason = "raw pidfd_send_signal syscall via libc")]
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            sig,
+            std::ptr::null::<libc::siginfo_t>(),
+            0_u32,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Reap any zombie children with `waitpid(-1, WNOHANG)` in a loop.
@@ -765,28 +873,67 @@ fn reap_zombie_children() {
 /// intentionally NOT cleared.
 ///
 /// Order is load-bearing:
-///   1. `prctl(PR_SET_KEEPCAPS, 1)` — without this, `setresuid`
-///      below would clear the permitted capability set entirely as
-///      part of the root → non-root transition. KeepCaps preserves
-///      the permitted set; the effective set is still cleared and
-///      must be rebuilt explicitly via `capset` (step 4).
-///   2. `setresgid(egid, egid, egid)` — pin all three gid components.
+///   1. Drop bounding-set bits except those `halmasuit-spawn` needs
+///      after its setuid-root execve. Per capabilities(7) for
+///      set-user-ID-root binaries with no file caps:
+///      `P'(permitted) = P(inheritable) | P(bounding)`. Keep
+///      `{CAP_KILL, CAP_SETUID, CAP_SETGID}` — the only caps
+///      halmasuit or any binary it deliberately execs need.
+///      `PR_CAPBSET_DROP` requires `CAP_SETPCAP` in the *effective*
+///      set, which is full at this point (we're still root, no
+///      `setresuid` yet). Doing this drop AFTER `setresuid` would
+///      fail with `EPERM` because the kernel clears `effective` on
+///      the root → non-root transition.
+///   2. `prctl(PR_SET_KEEPCAPS, 1)` — without this, `setresuid`
+///      below would clear the permitted capability set entirely.
+///      KeepCaps preserves permitted; effective is still cleared
+///      and must be rebuilt via `capset` (step 5).
+///   3. `setresgid(egid, egid, egid)` — pin all three gid components.
 ///      Belt-and-suspenders; the `setresuid` below is what actually
 ///      removes the ability to change gid (CAP_SETGID drops with
 ///      the uid transition).
-///   3. `setresuid(uid, uid, uid)` — drop uid. All three components
+///   4. `setresuid(uid, uid, uid)` — drop uid. All three components
 ///      set to the same value so the process cannot resurrect root.
 ///      Permitted caps survive due to KeepCaps; effective caps are
 ///      kernel-cleared.
-///   4. `capset` to restore `{CAP_KILL}` in the effective + permitted
-///      sets, dropping every other capability halmasuit had as root.
-///      Halmasuit retains exactly one elevated power post-drop: the
-///      ability to send signals to its children regardless of uid.
+///   5. Single `capset(2)` writing both permitted and effective to
+///      `{CAP_KILL}` in one syscall. The `caps` crate's high-level
+///      `set()` does `capget+capset` per CapSet, so calling it
+///      twice would be 4 syscalls; the kernel's `cap_user_data_t`
+///      carries effective + permitted + inheritable in one payload
+///      that `capset(2)` updates atomically. We bypass `caps::set`
+///      for that.
+///
+/// We deliberately do NOT set `SECBIT_NOROOT` (it would prevent
+/// `halmasuit-spawn`'s setuid-root execve from gaining the caps
+/// listed in step 1) or `SECBIT_NO_SETUID_FIXUP` (it would
+/// suppress all cap changes on uid transitions, sidestepping the
+/// `KEEP_CAPS` + `capset` dance — but at the cost of leaving
+/// the permitted set at "everything halmasuit had as root,"
+/// which is the opposite of what we want).
 fn drop_privileges(uid: u32) -> io::Result<()> {
-    use std::collections::HashSet;
-
     use caps::{CapSet, Capability};
     use nix::unistd::{Uid, getegid, setresgid, setresuid};
+
+    // Step 1: shrink bounding set while we're still root with
+    // CAP_SETPCAP in effective. The bounding set is preserved
+    // across setresuid, fork, and execve — dropping bits here has
+    // the same effect on children as doing it post-drop, and is
+    // syscall-cheaper because PR_CAPBSET_DROP doesn't need the
+    // capset choreography otherwise required to re-raise
+    // CAP_SETPCAP after setresuid clears effective.
+    let keep_in_bounding = [
+        Capability::CAP_KILL,
+        Capability::CAP_SETUID,
+        Capability::CAP_SETGID,
+    ];
+    for cap in caps::all() {
+        if keep_in_bounding.contains(&cap) {
+            continue;
+        }
+        caps::drop(None, CapSet::Bounding, cap)
+            .map_err(|e| io::Error::other(format!("bounding drop {cap}: {e}")))?;
+    }
 
     caps::securebits::set_keepcaps(true)
         .map_err(|e| io::Error::other(format!("set_keepcaps(true): {e}")))?;
@@ -797,16 +944,71 @@ fn drop_privileges(uid: u32) -> io::Result<()> {
     let u = Uid::from_raw(uid);
     setresuid(u, u, u).map_err(|e| io::Error::other(format!("setresuid({u}): {e}")))?;
 
-    // Pin caps to {CAP_KILL}. Permitted is the upper bound on
-    // effective; setting both to the same singleton drops everything
-    // else halmasuit had as root.
-    let mut wanted = HashSet::new();
-    wanted.insert(Capability::CAP_KILL);
-    caps::set(None, CapSet::Permitted, &wanted)
-        .map_err(|e| io::Error::other(format!("capset permitted={{CAP_KILL}}: {e}")))?;
-    caps::set(None, CapSet::Effective, &wanted)
-        .map_err(|e| io::Error::other(format!("capset effective={{CAP_KILL}}: {e}")))?;
+    capset_permitted_effective_cap_kill()
+        .map_err(|e| io::Error::other(format!("capset permitted=effective={{CAP_KILL}}: {e}")))?;
 
+    Ok(())
+}
+
+/// Single `capset(2)` writing the calling thread's permitted +
+/// effective sets to `{CAP_KILL}` and clearing inheritable.
+/// Encapsulates the raw FFI so the caller stays unsafe-free.
+///
+/// # Errors
+/// Any errno from `capset(2)`.
+fn capset_permitted_effective_cap_kill() -> io::Result<()> {
+    // _LINUX_CAPABILITY_VERSION_3 — the only version still supported
+    // by recent kernels. CAP_KILL = 5 per uapi/linux/capability.h.
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    const CAP_KILL_BIT: u32 = 1 << 5;
+
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    let mut header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0, // 0 ⇒ calling thread
+    };
+    // _V3 takes a [CapData; 2] (low 32 + high 32 bits of the cap
+    // bitmask). CAP_KILL fits in the low half; high half stays zero.
+    let data = [
+        CapData {
+            effective: CAP_KILL_BIT,
+            permitted: CAP_KILL_BIT,
+            inheritable: 0,
+        },
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+    ];
+
+    // SAFETY: `capset(2)` reads `header` (one CapHeader) and `data`
+    // (two CapData entries) by pointer. Both are valid stack
+    // allocations of the correct repr(C) layout for kernel
+    // `__user_cap_header_struct` / `__user_cap_data_struct`.
+    // Returns 0 on success, -1 with errno on failure.
+    #[expect(unsafe_code, reason = "raw capset syscall via libc")]
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            std::ptr::addr_of_mut!(header),
+            data.as_ptr(),
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -1031,13 +1233,12 @@ fn main() -> io::Result<()> {
         clippy::option_if_let_else,
         reason = "if/else is easier to read than nested map_or_else closures here"
     )]
-    let greeter_child = if let Some(cmd) = greeter_command_from_env() {
+    let greeter = if let Some(cmd) = greeter_command_from_env() {
         match spawn_greeter(greeter_uid, &cmd) {
-            Ok(child) => {
-                let pid = child.id();
-                tracing::info!(greeter_pid = pid, greeter_cmd = %cmd.display(), "greeter spawned");
-                emit(&Event::GreeterSpawned { pid });
-                Some(child)
+            Ok(handle) => {
+                tracing::info!(greeter_pid = handle.pid, greeter_cmd = %cmd.display(), "greeter spawned");
+                emit(&Event::GreeterSpawned { pid: handle.pid });
+                Some(handle)
             }
             Err(e) => {
                 tracing::error!(error = %e, greeter_cmd = %cmd.display(), "greeter spawn failed");
@@ -1072,7 +1273,7 @@ fn main() -> io::Result<()> {
         spawn_bin: spawn_bin_from_env(),
         _greetd_listener_token: Some(greetd_listener_token),
         _drm_master: drm_master,
-        greeter_child,
+        greeter,
     };
 
     // Privilege drop. The DRM master FD and both Unix sockets are

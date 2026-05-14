@@ -42,6 +42,11 @@ nix = { workspace = true, features = ["user", "ioctl", "signal", "process"] }
 # halmasuit must retain signal authority over its greeter child
 # (uid 999) post-deprivilege to uid 998. Pure-Rust over libc.
 caps.workspace = true
+# libc for raw syscall wrappers: pidfd_open / pidfd_send_signal
+# (the race-free signal path against the greeter), capset (single-
+# call permitted+effective={CAP_KILL} that the `caps` crate's
+# high-level API doesn't expose).
+libc.workspace = true
 
 [dev-dependencies]
 nix        = { workspace = true, features = ["signal", "user", "ioctl", "process"] }

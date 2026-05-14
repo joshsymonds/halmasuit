@@ -95,6 +95,18 @@ pub enum Event {
         /// PID of the greeter we killed.
         pid: u32,
     },
+    /// halmasuit attempted to terminate the greeter on session start
+    /// but the signal call failed (typically `ESRCH` — greeter had
+    /// already exited before we got here). The session start
+    /// proceeds regardless; an already-exited greeter is the
+    /// architecturally-desired state, just reached via a different
+    /// path than our explicit kill.
+    GreeterKillFailed {
+        /// PID we attempted to signal.
+        pid: u32,
+        /// `Display` form of the kernel error.
+        error: String,
+    },
 }
 
 /// Compositor phases.
@@ -254,6 +266,17 @@ mod tests {
         let v = round_trip(&Event::GreeterTerminated { pid: 1234 });
         assert_eq!(v["event"], "greeter_terminated");
         assert_eq!(v["pid"], 1234);
+    }
+
+    #[test]
+    fn event_greeter_kill_failed_carries_pid_and_error() {
+        let v = round_trip(&Event::GreeterKillFailed {
+            pid: 1234,
+            error: "No such process (os error 3)".to_owned(),
+        });
+        assert_eq!(v["event"], "greeter_kill_failed");
+        assert_eq!(v["pid"], 1234);
+        assert_eq!(v["error"], "No such process (os error 3)");
     }
 
     #[test]
