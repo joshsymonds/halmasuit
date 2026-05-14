@@ -112,6 +112,55 @@ adapter crates).
 | dms-niri integration on gnomon | **Cross-repo** | Replace `services.greetd.enable` with `services.halmasuit.enable` in gnomon's host config; declare halmasuit-greeter / halmasuit-compositor users. |
 | Real-hardware shakedown on gnomon | **Cross-repo** | Boot halmasuit on actual KMS hardware (not virtio-gpu); will likely surface integration issues VM tests can't see. |
 
+## Phase B: initramfs survival
+
+**Starting state (as of Phase A close).** The rootfs compositor is
+done end-to-end in VM tests. drm-master-probe Phases 0–3 already
+empirically validated the load-bearing mechanics Phase B builds on:
+`DRM_IOCTL_SET_MASTER` survives `setresuid` and fork (Phases 0–1),
+and survives `switch_root` + `execve` with the same FD remaining
+master (Phase 3, `tests/drm-master-probe-phase3.nix`). Phase B is
+production wiring on validated foundations.
+
+**First task: `initrd-handoff-probe`** — a research crate analogous
+to drm-master-probe, exercising the full halmasuit binary across
+the initramfs → rootfs boundary. drm-master-probe-phase3 covers
+the bare exec test; this probe extends it to halmasuit's full
+Wayland + greetd + pidfd surface area. Should:
+
+1. Run halmasuit from `boot.initrd.systemd.services.halmasuit` —
+   acquire DRM master, bind the Wayland socket, emit lifecycle
+   events to a sink that survives the pivot (journald cross-pivot
+   continuity is the test surface here).
+2. Either re-exec across `switch_root` (Phase 3 pattern: new PID,
+   FDs preserved by hand) or stay with the same PID via
+   `SurviveFinalKillSignal=yes` (Phase 2 pattern). Decide per the
+   handoff-mechanism Open Decision below.
+3. Assert post-pivot continuity: same DRM master fd usable for
+   ioctls, Wayland socket reachable by a fresh client spawned on
+   the rootfs side, single NDJSON event stream visible in rootfs
+   journald.
+
+This is scaffolding for the production wiring, not production
+halmasuit-from-initrd. Stub the greetd + PAM paths for the probe;
+the goal is to flush out the cross-pivot mechanics in isolation
+before the production halmasuit binary depends on them.
+
+### Phase B production build order (after the probe is green)
+
+| Item | Notes |
+|---|---|
+| halmasuit binary — `--features initramfs` gate | Per ARCHITECTURE.md: differs from the rootfs path only in DRM open (direct, no logind) and password-agent registration. Same crate; both feature configurations should pass `just check`. |
+| `halmasuit-splash` | Static logo painted via dumb-buffer KMS write. Same crate used in `INITRAMFS_SPLASH`, `ROOTFS_SPLASH`, and `SHUTDOWN_SPLASH` phases. The animated/wgpu "sizzle" path is a polish pass deferred until full-boot-flash is reliably green. |
+| `halmasuit-luks` | systemd password-agent Wayland client. Runs as root in initramfs by necessity (no user db yet). Highest-risk surface in Phase B — sees passphrases. Decision on rendering form (foreground replacement vs subsurface overlay) lands at this task. |
+| NixOS module — initrd wiring | `boot.initrd.systemd.services.halmasuit`, `boot.initrd.kernelModules` for the target GPU driver, Mesa + ICDs in the initramfs closure (~100MB add per ARCHITECTURE.md "Capability and cost"). |
+| `tests/full-boot-flash.nix` | The Phase B hard gate. Frame-capture continuity from kernel handoff through SESSION; asserts no all-black frames and no DSSIM jump across any transition. Replaces Plymouth's role in proving "the boot looks right." |
+| Plymouth removal on gnomon | Cross-repo. After full-boot-flash is green in VM, switch gnomon's nix-config to drop `boot.plymouth.enable` and add `services.halmasuit.enable` with the new initrd options. |
+
+Open decisions specific to Phase B (initramfs handoff mechanism,
+`halmasuit-luks` UI form, OCR in full-boot-flash) are listed in the
+**Open decisions** section below.
+
 ## Out of scope (Phase B or later)
 
 | Item | Reason |
