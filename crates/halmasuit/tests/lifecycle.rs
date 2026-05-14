@@ -40,6 +40,12 @@ fn spawn() -> (Child, mpsc::Receiver<String>, TempDir) {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_halmasuit"))
         .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        // Lifecycle tests run on the cargo build host, which has no
+        // /dev/dri/card0. The production path acquires DRM master
+        // before any other init; bypass it here so these tests can
+        // exercise the rest of the lifecycle without a real GPU.
+        // The VM test exercises the real DRM master path.
+        .env("HALMASUIT_SKIP_DRM_MASTER", "1")
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()

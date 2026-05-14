@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -89,6 +90,16 @@ struct HalmasuitState {
     /// Held so the registered listener token survives for the lifetime
     /// of the compositor; calloop drops the source on shutdown.
     _greetd_listener_token: Option<RegistrationToken>,
+
+    /// DRM master file descriptor. Acquired in `main()` while still
+    /// root via `DRM_IOCTL_SET_MASTER` and retained for the process
+    /// lifetime — the master designation lives on the FD and survives
+    /// `setresuid` to the compositor user (drm-master-probe Phase 1).
+    /// Holding this File pins the kernel-side master ownership; if it
+    /// were dropped, another DRM client could acquire master.
+    /// `None` only when `HALMASUIT_SKIP_DRM_MASTER` was set (dev/test
+    /// bypass); production deployments never see this.
+    _drm_master: Option<std::fs::File>,
 }
 
 /// Per-client metadata. smithay's `CompositorHandler` requires us to
@@ -499,6 +510,60 @@ fn spawn_bin_from_env() -> PathBuf {
         .map_or_else(|| PathBuf::from("halmasuit-spawn"), PathBuf::from)
 }
 
+// DRM_IOCTL_SET_MASTER = _IO('d', 0x1e). Defined in <drm/drm.h>; the
+// macro below generates a Rust wrapper that ioctl(fd, 0x641e) — the
+// argument-less master-acquire ioctl. Used by `acquire_drm_master`.
+//
+// drm-master-probe Phases 0-3 empirically validated the syscall
+// mechanics (acquire on a freshly-opened card0 fd, survival across
+// setresuid, survival across switch_root + exec). This file is the
+// production wiring of the same call into halmasuit's main().
+nix::ioctl_none!(drm_set_master, b'd', 0x1e);
+
+/// Open `/dev/dri/card0` (or the device named by `HALMASUIT_DRM_DEVICE`)
+/// and call `DRM_IOCTL_SET_MASTER`. Returns the opened `File` (held by
+/// the caller for the process lifetime — the master designation lives
+/// on the FD), or `None` when `HALMASUIT_SKIP_DRM_MASTER` is set in
+/// the environment. The skip path is for ad-hoc dev launches and
+/// integration tests that spawn halmasuit on a host without DRM; the
+/// production NixOS module never sets it.
+///
+/// # Errors
+/// Bubbles any `open(2)` or `ioctl(2)` failure with context. A
+/// production deployment that fails here fails the entire unit —
+/// running without DRM master defeats the architecture.
+fn acquire_drm_master() -> io::Result<Option<std::fs::File>> {
+    if std::env::var_os("HALMASUIT_SKIP_DRM_MASTER").is_some() {
+        tracing::warn!(
+            "HALMASUIT_SKIP_DRM_MASTER set — not acquiring DRM master. \
+             This is the dev/test bypass; production deployments \
+             MUST NOT set it."
+        );
+        return Ok(None);
+    }
+    let path = std::env::var_os("HALMASUIT_DRM_DEVICE")
+        .map_or_else(|| PathBuf::from("/dev/dri/card0"), PathBuf::from);
+    let dev = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| io::Error::other(format!("open({}): {e}", path.display())))?;
+    let raw = dev.as_raw_fd();
+    // SAFETY: `drm_set_master` is the nix-generated wrapper for
+    // ioctl(fd, DRM_IOCTL_SET_MASTER). `raw` is a valid kernel fd
+    // we just opened above; the ioctl takes no argument and
+    // performs no memory access beyond the fd. Failure is reported
+    // via `Err`. The only invariant is that the fd be valid, which
+    // is upheld by `dev` outliving this call.
+    #[expect(unsafe_code, reason = "raw ioctl through nix-generated wrapper")]
+    unsafe {
+        drm_set_master(raw).map_err(|e| {
+            io::Error::other(format!("DRM_IOCTL_SET_MASTER on {}: {e}", path.display()))
+        })?;
+    }
+    Ok(Some(dev))
+}
+
 /// Resolve compositor uid from env. `HALMASUIT_COMPOSITOR_UID` is
 /// the operator's contract: when set, halmasuit drops privileges to
 /// that uid after binding its sockets. When unset, no drop happens
@@ -628,6 +693,19 @@ fn main() -> io::Result<()> {
         version: env!("CARGO_PKG_VERSION"),
     });
 
+    // DRM master FIRST, while we're still root. The master designation
+    // lives on the file descriptor and survives the in-process
+    // `setresuid` at the bottom of this function (drm-master-probe
+    // Phase 1). After this point, the FD is held by `HalmasuitState`
+    // for the process lifetime. Only emit the phase event when master
+    // was actually acquired — the SKIP path is dev/test only.
+    let drm_master = acquire_drm_master()?;
+    if drm_master.is_some() {
+        emit(&Event::PhaseEntered {
+            phase: Phase::DrmMasterAcquired,
+        });
+    }
+
     // Initialize the Wayland display + protocol state.
     let display: Display<HalmasuitState> = Display::new().map_err(io::Error::other)?;
     let display_handle = display.handle();
@@ -751,6 +829,7 @@ fn main() -> io::Result<()> {
         greeter_uid,
         spawn_bin: spawn_bin_from_env(),
         _greetd_listener_token: Some(greetd_listener_token),
+        _drm_master: drm_master,
     };
 
     // Privilege drop. Both Unix sockets and (in a future task) the

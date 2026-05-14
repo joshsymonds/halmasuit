@@ -29,11 +29,12 @@ smithay = { workspace = true, features = ["wayland_frontend"] }
 # event-loop use, (2) directly here for the `signals` feature smithay
 # doesn't enable. Cargo unifies to one version with merged features.
 calloop.workspace            = true
-# nix::unistd::getuid for resolving the default greeter UID when
-# HALMASUIT_GREETER_UID isn't set in the environment.
-nix = { workspace = true, features = ["user"] }
+# nix features used by halmasuit:
+# - `user`: getuid, setresuid, setresgid for the privilege drop path
+# - `ioctl`: the `ioctl_none!` macro that generates the DRM_IOCTL_SET_MASTER wrapper
+nix = { workspace = true, features = ["user", "ioctl"] }
 
 [dev-dependencies]
-nix        = { workspace = true, features = ["signal", "user"] }
+nix        = { workspace = true, features = ["signal", "user", "ioctl"] }
 serde_json.workspace = true
 tempfile.workspace   = true

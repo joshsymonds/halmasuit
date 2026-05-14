@@ -195,24 +195,37 @@ pkgs.testers.runNixOSTest {
         assert started.get("version") == "0.1.0", (
             f"started.version must match Cargo.toml: {started}"
         )
-        for phase in ("init", "wayland_ready", "greetd_ready", "deprivileged"):
+        for phase in (
+            "init",
+            "drm_master_acquired",
+            "wayland_ready",
+            "greetd_ready",
+            "deprivileged",
+        ):
             evt = find_phase(events, phase)
             assert evt is not None, (
                 f"no phase_entered{{phase={phase}}} event captured. Events: {events}"
             )
 
-        # Privilege drop must land AFTER greetd_ready: sockets are
-        # bound while still root, then halmasuit setresuids. If a
-        # future refactor reorders these, the test catches it.
+        # Phase ordering is load-bearing:
+        # - drm_master_acquired must precede wayland_ready (DRM master is
+        #   the first privileged op; smithay setup follows)
+        # - deprivileged must follow greetd_ready (sockets are bound while
+        #   still root, then setresuid)
         phase_order = [
             inner["phase"]
             for (_, inner) in events
             if inner.get("event") == "phase_entered"
         ]
+        dm_idx = phase_order.index("drm_master_acquired")
+        wr_idx = phase_order.index("wayland_ready")
         gd_idx = phase_order.index("greetd_ready")
         dp_idx = phase_order.index("deprivileged")
+        assert dm_idx < wr_idx, (
+            f"drm_master_acquired must precede wayland_ready, got: {phase_order}"
+        )
         assert gd_idx < dp_idx, (
-            f"deprivileged must follow greetd_ready, got order: {phase_order}"
+            f"deprivileged must follow greetd_ready, got: {phase_order}"
         )
 
     # ──────────────────────────────────────────────────────────────────
