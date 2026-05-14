@@ -26,9 +26,10 @@
 
 use libc::{c_int, c_void};
 use pam_sys::{
-    PAM_BUF_ERR, PAM_CONV_ERR, PAM_ERROR_MSG, PAM_PROMPT_ECHO_OFF, PAM_PROMPT_ECHO_ON, PAM_RUSER,
-    PAM_SUCCESS, PAM_TEXT_INFO, PAM_TTY, PAM_USER, pam_acct_mgmt, pam_authenticate, pam_conv,
-    pam_end, pam_get_item, pam_handle_t, pam_message, pam_response, pam_set_item, pam_start,
+    PAM_BUF_ERR, PAM_CONV_ERR, PAM_ERROR_MSG, PAM_FAIL_DELAY, PAM_PROMPT_ECHO_OFF,
+    PAM_PROMPT_ECHO_ON, PAM_RUSER, PAM_SUCCESS, PAM_TEXT_INFO, PAM_TTY, PAM_USER, pam_acct_mgmt,
+    pam_authenticate, pam_conv, pam_end, pam_get_item, pam_handle_t, pam_message, pam_response,
+    pam_set_item, pam_start,
 };
 use std::ffi::{CStr, CString, NulError};
 use std::panic;
@@ -189,6 +190,35 @@ impl PamError {
             Self::Nul(_) => None,
         }
     }
+}
+
+// ── PAM_FAIL_DELAY override ─────────────────────────────────────────────
+//
+// libpam's default `pam_fail_delay(3)` causes pam_unix (and many
+// other modules) to call `usleep` for a random 1-3 seconds on
+// authentication failure. With halmasuit's synchronous PamSession
+// trait that runs on the calloop event-loop thread, that sleep
+// freezes the entire compositor's event loop — including its ability
+// to redraw, accept new connections, and respond to SIGTERM — for
+// the duration. The pam_fail_delay(3) man page explicitly says
+// event-driven applications "may wish to override" the default by
+// registering their own delay callback via
+// `pam_set_item(handle, PAM_FAIL_DELAY, callback)`. The callback we
+// register does nothing — failed authentication returns immediately
+// and the I/O layer can decide what (if anything) to do about
+// throttling at a higher level.
+
+#[expect(
+    unsafe_code,
+    reason = "extern \"C\" PAM fail-delay callback. No-op body; takes \
+              raw pointer arguments but reads no memory through them \
+              and cannot panic, so no catch_unwind needed."
+)]
+const unsafe extern "C" fn noop_fail_delay(
+    _retval: c_int,
+    _delay_usec: libc::c_uint,
+    _appdata_ptr: *mut c_void,
+) {
 }
 
 // ── Conv callback (the unsafe core) ─────────────────────────────────────
@@ -407,16 +437,45 @@ impl Pam {
                 &raw mut handle,
             )
         };
-        if status == PAM_SUCCESS as c_int {
-            Ok(Self {
-                handle,
-                _conv: conv,
-                _bridge: boxed_bridge,
-                last_status: status,
-            })
-        } else {
-            Err(PamError::Start(status))
+        if status != PAM_SUCCESS as c_int {
+            return Err(PamError::Start(status));
         }
+
+        // Install the no-op fail-delay callback BEFORE returning so it's
+        // in place for the eventual pam_authenticate call. libpam stores
+        // the function pointer; since `noop_fail_delay` has static
+        // lifetime, the pointer remains valid for the transaction.
+        #[expect(
+            unsafe_code,
+            reason = "FFI: pam_set_item(PAM_FAIL_DELAY, fn_ptr). The \
+                      function pointer has static lifetime; libpam \
+                      stores it for the duration of the PAM transaction \
+                      (until pam_end). The function-pointer-to-void-ptr \
+                      cast is the documented libpam idiom for this item."
+        )]
+        let delay_status =
+            unsafe { pam_set_item(handle, PAM_FAIL_DELAY, noop_fail_delay as *const c_void) };
+        if delay_status != PAM_SUCCESS as c_int {
+            // pam_set_item failed — we need to clean up the handle we
+            // just allocated before returning the error.
+            #[expect(
+                unsafe_code,
+                reason = "FFI: pam_end releases the handle we just \
+                          allocated via pam_start before returning \
+                          the error to the caller."
+            )]
+            unsafe {
+                pam_end(handle, delay_status);
+            }
+            return Err(PamError::SetItem(delay_status));
+        }
+
+        Ok(Self {
+            handle,
+            _conv: conv,
+            _bridge: boxed_bridge,
+            last_status: status,
+        })
     }
 
     /// Set a PAM item (e.g. `PAM_RUSER`, `PAM_TTY`, `PAM_XDISPLAY`).
