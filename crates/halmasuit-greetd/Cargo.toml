@@ -22,6 +22,9 @@ thiserror.workspace  = true
 # Unix socket peer-credential lookup (SO_PEERCRED via nix wrappers,
 # so this crate stays #![forbid(unsafe_code)]).
 nix                  = { workspace = true, features = ["socket", "user"] }
+# Wipe Connection::read_buf on drop so plaintext credentials
+# (PostAuthMessageResponse bodies) don't linger in heap memory.
+zeroize.workspace    = true
 
 [dev-dependencies]
 proptest.workspace   = true

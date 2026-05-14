@@ -299,25 +299,18 @@ impl SessionState {
             // ── Spawning ────────────────────────────────────────────────
             // Once a session has been spawned, no further requests are
             // meaningful. The greeter `wl_client` is killed by the I/O
-            // layer at this point; any stray requests are protocol
-            // violations from a confused greeter.
-            (
-                Self::Spawning { .. },
-                Request::CreateSession { .. } | Request::PostAuthMessageResponse { .. },
-            ) => Err(StateMachineError::DoubleCreate),
-            (Self::Spawning { .. }, Request::StartSession { .. }) => {
-                Err(StateMachineError::DoubleCreate)
-            }
-            (Self::Spawning { .. }, Request::CancelSession) => {
-                Err(StateMachineError::CancelWithoutSession)
-            }
+            // layer at this point; any stray request — regardless of
+            // kind — is a protocol violation by a confused greeter.
+            // All four kinds collapse to `DoubleCreate` for consistency.
+            (Self::Spawning { .. }, _) => Err(StateMachineError::DoubleCreate),
         }
     }
 
     fn advance_pam(&mut self, username: String, pam: &mut dyn PamSession) -> Response {
-        *self = Self::Authenticating {
-            username: username.clone(),
-        };
+        // No intermediate `*self = Authenticating { ... }` write here —
+        // `translate_pam_step` unconditionally overwrites `*self` in
+        // every arm (Challenge → Authenticating, Success → AuthSuccess,
+        // Failure → Idle). The previous intermediate write was dead.
         translate_pam_step(self, pam.step(None), username)
     }
 
@@ -358,12 +351,40 @@ fn translate_pam_step(state: &mut SessionState, step: PamStep, username: String)
         }
         PamStep::Failure { reason } => {
             *state = SessionState::Idle;
+            // Cap the description length so a misbehaving PamSession
+            // implementation can't produce a reason longer than the
+            // wire-format MAX_MESSAGE_SIZE and silently wedge the
+            // greeter (encode would fail; the I/O layer would close
+            // the connection). 4 KiB is plenty for any reasonable
+            // PAM error message.
+            let description = truncate_description(reason);
             Response::Error {
                 error_type: ErrorType::AuthError,
-                description: reason,
+                description,
             }
         }
     }
+}
+
+/// Upper bound on `Response::Error::description` chosen well below
+/// [`MAX_MESSAGE_SIZE`] so a PamSession that produces a pathologically
+/// long reason can't make a Response that fails to encode. Truncates
+/// at a UTF-8 char boundary to keep the resulting string valid.
+const MAX_ERROR_DESCRIPTION: usize = 4 * 1024;
+
+fn truncate_description(mut reason: String) -> String {
+    if reason.len() <= MAX_ERROR_DESCRIPTION {
+        return reason;
+    }
+    // Find the last char boundary at or before MAX_ERROR_DESCRIPTION
+    // so the truncated string remains valid UTF-8.
+    let mut cut = MAX_ERROR_DESCRIPTION;
+    while !reason.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    reason.truncate(cut);
+    reason.push_str(" [truncated]");
+    reason
 }
 
 // ── Wire codec ──────────────────────────────────────────────────────────
@@ -461,43 +482,55 @@ pub fn try_decode<T: serde::de::DeserializeOwned>(
     Ok(Some((msg, needed)))
 }
 
+/// Test-only helpers shared across this crate's tests modules. Both
+/// `mod tests` in lib.rs and `mod tests` in server.rs need a scripted
+/// PamSession; keeping the impl in one place prevents drift between
+/// them.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use proptest::prelude::*;
+pub(crate) mod test_helpers {
+    use super::{PamSession, PamStep};
     use std::collections::VecDeque;
 
-    struct MockPam {
+    /// PamSession that returns scripted [`PamStep`]s in order, then
+    /// `PamStep::Failure` once the script is exhausted.
+    pub struct ScriptedPam {
         steps: VecDeque<PamStep>,
     }
 
-    impl MockPam {
-        fn scripted(steps: Vec<PamStep>) -> Self {
+    impl ScriptedPam {
+        pub fn new(steps: Vec<PamStep>) -> Self {
             Self {
                 steps: steps.into(),
             }
         }
-        fn empty() -> Self {
+        pub fn empty() -> Self {
             Self {
                 steps: VecDeque::new(),
             }
         }
     }
 
-    impl PamSession for MockPam {
+    impl PamSession for ScriptedPam {
         fn step(&mut self, _response: Option<String>) -> PamStep {
             self.steps.pop_front().unwrap_or_else(|| PamStep::Failure {
-                reason: "no more scripted steps".into(),
+                reason: "scripted PAM exhausted".into(),
             })
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_helpers::ScriptedPam;
+    use super::*;
+    use proptest::prelude::*;
 
     // ── happy-path single-round ─────────────────────────────────────────
 
     #[test]
     fn create_then_immediate_success() {
         let mut state = SessionState::default();
-        let mut pam = MockPam::scripted(vec![PamStep::Success {
+        let mut pam = ScriptedPam::new(vec![PamStep::Success {
             uid: 1000,
             gid: 1000,
         }]);
@@ -523,7 +556,7 @@ mod tests {
     #[test]
     fn create_challenge_response_success() {
         let mut state = SessionState::default();
-        let mut pam = MockPam::scripted(vec![
+        let mut pam = ScriptedPam::new(vec![
             PamStep::Challenge {
                 kind: AuthMessageType::Secret,
                 prompt: "password:".into(),
@@ -563,7 +596,7 @@ mod tests {
     #[test]
     fn auth_failure_returns_to_idle() {
         let mut state = SessionState::default();
-        let mut pam = MockPam::scripted(vec![PamStep::Failure {
+        let mut pam = ScriptedPam::new(vec![PamStep::Failure {
             reason: "bad password".into(),
         }]);
         let r = state
@@ -591,7 +624,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
         };
-        let mut pam = MockPam::empty();
+        let mut pam = ScriptedPam::empty();
         let r = state
             .handle(
                 Request::StartSession {
@@ -619,7 +652,7 @@ mod tests {
     #[test]
     fn start_session_in_idle_refused() {
         let mut state = SessionState::Idle;
-        let mut pam = MockPam::empty();
+        let mut pam = ScriptedPam::empty();
         let err = state
             .handle(
                 Request::StartSession {
@@ -638,7 +671,7 @@ mod tests {
         let mut state = SessionState::Authenticating {
             username: "alice".into(),
         };
-        let mut pam = MockPam::empty();
+        let mut pam = ScriptedPam::empty();
         let err = state
             .handle(
                 Request::StartSession {
@@ -656,7 +689,7 @@ mod tests {
         let mut state = SessionState::Authenticating {
             username: "alice".into(),
         };
-        let mut pam = MockPam::empty();
+        let mut pam = ScriptedPam::empty();
         let err = state
             .handle(
                 Request::CreateSession {
@@ -671,7 +704,7 @@ mod tests {
     #[test]
     fn response_in_idle_refused() {
         let mut state = SessionState::Idle;
-        let mut pam = MockPam::empty();
+        let mut pam = ScriptedPam::empty();
         let err = state
             .handle(
                 Request::PostAuthMessageResponse {
@@ -686,7 +719,7 @@ mod tests {
     #[test]
     fn cancel_in_idle_refused() {
         let mut state = SessionState::Idle;
-        let mut pam = MockPam::empty();
+        let mut pam = ScriptedPam::empty();
         let err = state.handle(Request::CancelSession, &mut pam).unwrap_err();
         assert_eq!(err, StateMachineError::CancelWithoutSession);
     }
@@ -696,7 +729,7 @@ mod tests {
         let mut state = SessionState::Authenticating {
             username: "alice".into(),
         };
-        let mut pam = MockPam::empty();
+        let mut pam = ScriptedPam::empty();
         let r = state.handle(Request::CancelSession, &mut pam).unwrap();
         assert_eq!(r, Response::Success);
         assert_eq!(state, SessionState::Idle);
@@ -709,7 +742,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
         };
-        let mut pam = MockPam::empty();
+        let mut pam = ScriptedPam::empty();
         let r = state.handle(Request::CancelSession, &mut pam).unwrap();
         assert_eq!(r, Response::Success);
         assert_eq!(state, SessionState::Idle);
@@ -976,6 +1009,66 @@ mod tests {
         buf.extend_from_slice(b"xxxxx");
         let r: Result<Option<(Request, usize)>, CodecError> = try_decode(&buf);
         assert!(matches!(r, Err(CodecError::Json(_))), "got: {r:?}");
+    }
+
+    #[test]
+    fn codec_roundtrips_near_max_size_payload() {
+        // Build a CreateSession with a username large enough that the
+        // encoded message approaches MAX_MESSAGE_SIZE. JSON overhead
+        // for `{"type":"create_session","username":"..."}` is ~40
+        // bytes; pick a length that leaves room.
+        let big: String = "a".repeat(MAX_MESSAGE_SIZE as usize - 200);
+        let req = Request::CreateSession { username: big };
+        let bytes = encode(&req).expect("encode near-max payload");
+        let (decoded, consumed): (Request, usize) =
+            try_decode(&bytes).expect("decode").expect("complete");
+        assert_eq!(decoded, req);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn codec_rejects_encode_of_oversized_payload() {
+        // Push past MAX_MESSAGE_SIZE so encode itself errors before
+        // any wire transmission. The username alone exceeds the cap.
+        let huge: String = "x".repeat(MAX_MESSAGE_SIZE as usize + 1);
+        let req = Request::CreateSession { username: huge };
+        let r = encode(&req);
+        assert!(
+            matches!(r, Err(CodecError::OversizedMessage(_, _))),
+            "got: {r:?}"
+        );
+    }
+
+    #[test]
+    fn translate_pam_step_truncates_oversized_failure_reason() {
+        // A misbehaving PamSession could return an enormous reason
+        // string; translate_pam_step caps it so the resulting
+        // Response::Error stays well below MAX_MESSAGE_SIZE and never
+        // fails to encode.
+        let mut state = SessionState::Authenticating {
+            username: "alice".into(),
+        };
+        let huge_reason: String = "z".repeat(MAX_MESSAGE_SIZE as usize);
+        let resp = translate_pam_step(
+            &mut state,
+            PamStep::Failure {
+                reason: huge_reason,
+            },
+            "alice".into(),
+        );
+        let Response::Error { description, .. } = resp else {
+            panic!("expected Error response");
+        };
+        assert!(
+            description.len() < MAX_MESSAGE_SIZE as usize,
+            "description {} exceeded MAX_MESSAGE_SIZE",
+            description.len()
+        );
+        assert!(
+            description.ends_with(" [truncated]"),
+            "expected truncation marker, got tail: {:?}",
+            &description[description.len().saturating_sub(20)..]
+        );
     }
 
     // ── property tests ──────────────────────────────────────────────────
