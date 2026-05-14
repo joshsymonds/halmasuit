@@ -478,7 +478,13 @@ fn handle_connection_ready(
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     tracing::warn!(error = %e, id, "read failed on greetd connection");
+                    // Peer is gone; pending writes can never be delivered.
+                    // Clear so the close_after_drain predicate below fires
+                    // immediately instead of leaving the source registered
+                    // for a closed fd, which calloop would then keep firing
+                    // (POLLHUP) producing a tight error-log loop.
                     connstate.close_after_drain = true;
+                    connstate.write_buf.clear();
                     break;
                 }
             }
@@ -492,7 +498,10 @@ fn handle_connection_ready(
             }
             match stream_ref.write(&connstate.write_buf) {
                 Ok(0) => {
+                    // Peer closed write side with no progress; abandon the
+                    // remaining buffer rather than spinning on retries.
                     connstate.close_after_drain = true;
+                    connstate.write_buf.clear();
                     break;
                 }
                 Ok(n) => {
@@ -501,7 +510,14 @@ fn handle_connection_ready(
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     tracing::warn!(error = %e, id, "write failed on greetd connection");
+                    // Peer is gone; the buffered reply can't reach it.
+                    // Without clearing write_buf, the close_after_drain
+                    // predicate below stays false, the source stays
+                    // registered, calloop re-fires on POLLHUP/POLLERR, we
+                    // loop. Clear so this single warning fires once and
+                    // the connection is reaped on the next predicate check.
                     connstate.close_after_drain = true;
+                    connstate.write_buf.clear();
                     break;
                 }
             }
