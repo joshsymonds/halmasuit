@@ -27,33 +27,24 @@ fmt:
 test:
     cargo nextest run --workspace --all-features --no-fail-fast --no-tests=pass
 
-# NixOS VM tests (headless, CI-style). smoke-boot + halmasuit-introspect
-# must pass; login-flash is expected to FAIL until halmasuit v2 (the failure
-# is the v1 baseline measurement of the greetd→niri flash). An unexpected
-# pass on login-flash means either v2 just landed (advance!) or the test
-# broke.
+# NixOS VM tests (headless, CI-style). All gates are hard gates now —
+# login-flash is GREEN under halmasuit v2 (the long-lived compositor
+# preserves PID continuity across greeter→session). The inversion that
+# the v1 baseline depended on is gone.
 test-vm:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "── smoke-boot (must pass) ──"
+    echo "── smoke-boot ──"
     nix build .#checks.x86_64-linux.smoke-boot -L --print-build-logs --no-link
     echo
-    echo "── halmasuit-introspect (must pass) ──"
-    nix build .#checks.x86_64-linux.halmasuit-introspect -L --print-build-logs --no-link
+    echo "── halmasuit-vm ──"
+    nix build .#checks.x86_64-linux.halmasuit-vm -L --print-build-logs --no-link
     echo
-    echo "── halmasuit-spawn (must pass) ──"
+    echo "── halmasuit-spawn ──"
     nix build .#checks.x86_64-linux.halmasuit-spawn -L --print-build-logs --no-link
     echo
-    echo "── login-flash (expected RED until v2) ──"
-    if nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link; then
-        echo
-        echo "ERROR: login-flash unexpectedly PASSED. Either the flash is gone (advance to v2!)"
-        echo "       or the test is broken (audit before celebrating)."
-        exit 1
-    else
-        echo
-        echo "OK: login-flash FAILED as expected — v1 baseline holds (greetd→niri restart is the flash)."
-    fi
+    echo "── login-flash ──"
+    nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link
 
 # Phase 0 research probe: validate userspace DRM master persistence from
 # rootfs boot through multi-user.target. Headless gate; for visual

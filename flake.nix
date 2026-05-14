@@ -268,8 +268,10 @@
           inherit nixpkgs nix-config;
         };
         login-flash = import ./tests/login-flash.nix {
-          system = "x86_64-linux";
-          inherit nixpkgs nix-config;
+          system               = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit            = self.packages.x86_64-linux.halmasuit;
+          halmasuit-spawn      = self.packages.x86_64-linux.halmasuit-spawn;
         };
         halmasuit-vm = import ./tests/halmasuit-vm.nix {
           system    = "x86_64-linux";

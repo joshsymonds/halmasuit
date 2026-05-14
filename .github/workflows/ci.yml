@@ -53,43 +53,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Lint + unit gate (must pass)
+      - name: Lint + unit gate
         run: nix develop --command just check
 
-      - name: Smoke test (must pass)
+      - name: Smoke test
         run: nix build .#checks.x86_64-linux.smoke-boot -L --print-build-logs --no-link
 
-      - name: Flash detection (expected RED until halmasuit v2)
-        id: flash-test
-        continue-on-error: true
-        run: |
-          if nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link 2>&1 | tee /tmp/flash.log; then
-            echo "result=unexpected-pass" >> "$GITHUB_OUTPUT"
-          else
-            echo "result=expected-fail" >> "$GITHUB_OUTPUT"
-          fi
+      - name: halmasuit VM gate
+        run: nix build .#checks.x86_64-linux.halmasuit-vm -L --print-build-logs --no-link
 
-      - name: Interpret flash result
-        run: |
-          case "${{ steps.flash-test.outputs.result }}" in
-            expected-fail)
-              echo "::notice::v1 baseline OK — flash detected as expected. v2 (halmasuit) will make this go green." ;;
-            unexpected-pass)
-              echo "::error::login-flash unexpectedly PASSED. Either the flash is gone (great, advance to v2!) or the test is broken (audit before celebrating)."
-              exit 1 ;;
-            *)
-              echo "::error::flash-test step produced no result"; exit 1 ;;
-          esac
+      - name: halmasuit-spawn VM gate
+        run: nix build .#checks.x86_64-linux.halmasuit-spawn -L --print-build-logs --no-link
 
-      # Only the v1 flash-detection log is useful as a CI artifact today
-      # (smoke-boot passes; failures there mean the framework broke, not
-      # the system under test). Once v2 lands and we have visual frame
-      # captures, expand this list.
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02    # v4
-        if: failure()
-        with:
-          name: vm-test-artifacts
-          path: |
-            /tmp/flash.log
-          if-no-files-found: ignore
-          retention-days: 7
+      - name: login-flash (hard gate)
+        run: nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link
