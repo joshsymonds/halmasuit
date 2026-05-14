@@ -456,6 +456,41 @@ pkgs.testers.runNixOSTest {
             timeout=5,
         )
 
+        # The greeter must be killed BEFORE niri (the session) takes
+        # the foreground slot — see Epic #1's immutable requirement.
+        # halmasuit emits `greeter_terminated` between
+        # `session_requested` and the halmasuit-spawn invocation.
+        machine.wait_until_succeeds(
+            "journalctl -u halmasuit | grep -qF 'greeter_terminated'",
+            timeout=5,
+        )
+        events = captured_events()
+        terminated = find(events, "greeter_terminated")
+        assert terminated is not None, (
+            f"no greeter_terminated event captured. Events tail: {events[-10:]}"
+        )
+        greeter_pid_in_event = terminated.get("pid")
+        assert (
+            isinstance(greeter_pid_in_event, int) and greeter_pid_in_event > 0
+        ), (
+            f"greeter_terminated.pid must be positive int: {terminated}"
+        )
+        # PID must match the earlier greeter_spawned event.
+        spawned = find(events, "greeter_spawned")
+        assert spawned is not None, "greeter_spawned missing (caught in suite 1)"
+        assert greeter_pid_in_event == spawned["pid"], (
+            f"greeter_terminated.pid {greeter_pid_in_event!r} must match "
+            f"greeter_spawned.pid {spawned['pid']!r}"
+        )
+
+        # The greeter process should actually be gone from /proc.
+        # SIGKILL + the SIGCHLD reaper added in the earlier review
+        # pass should clear it; a stuck zombie would show up here.
+        machine.wait_until_succeeds(
+            f"! test -d /proc/{greeter_pid_in_event}",
+            timeout=5,
+        )
+
     # ──────────────────────────────────────────────────────────────────
     # Suite 5: Clean shutdown
     # ──────────────────────────────────────────────────────────────────

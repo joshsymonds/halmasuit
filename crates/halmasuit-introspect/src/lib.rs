@@ -85,6 +85,16 @@ pub enum Event {
         /// PID of the spawned greeter process.
         pid: u32,
     },
+    /// halmasuit sent SIGKILL to the greeter child as part of the
+    /// session-start handover. Per ARCHITECTURE.md / Epic #1: "the
+    /// greeter wl_client is killed before niri becomes foreground" —
+    /// emitted between `SessionRequested` and the `halmasuit-spawn`
+    /// invocation so the greeter releases halmasuit's foreground
+    /// slot before the user session asks for it.
+    GreeterTerminated {
+        /// PID of the greeter we killed.
+        pid: u32,
+    },
 }
 
 /// Compositor phases.
@@ -236,6 +246,13 @@ mod tests {
     fn event_greeter_spawned_carries_pid() {
         let v = round_trip(&Event::GreeterSpawned { pid: 1234 });
         assert_eq!(v["event"], "greeter_spawned");
+        assert_eq!(v["pid"], 1234);
+    }
+
+    #[test]
+    fn event_greeter_terminated_carries_pid() {
+        let v = round_trip(&Event::GreeterTerminated { pid: 1234 });
+        assert_eq!(v["event"], "greeter_terminated");
         assert_eq!(v["pid"], 1234);
     }
 

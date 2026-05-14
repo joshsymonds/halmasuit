@@ -74,6 +74,10 @@ calloop            = { version = "0.14", features = ["signals"] }
 # POSIX bindings. drm-master-probe has its own entry (different feature set);
 # this entry is for v2 production crates that need signal/kill/etc.
 nix                = "0.30"
+# Linux capability(7) primitives — capset, securebits::set_keepcaps —
+# used by halmasuit's drop_privileges to retain CAP_KILL across the
+# in-process setresuid. Pure-Rust over libc syscalls; no C deps.
+caps               = "0.5"
 # Property-based testing. halmasuit-spawn argv parser + the future greetd
 # state machine both lean on it for boundary-condition coverage.
 proptest           = "1"

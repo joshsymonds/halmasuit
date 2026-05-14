@@ -108,12 +108,14 @@ struct HalmasuitState {
     /// bypass); production deployments never see this.
     _drm_master: Option<std::fs::File>,
 
-    /// Greeter child process spawned at startup. Held so the Child
-    /// struct lives for halmasuit's lifetime — dropping it would
-    /// close the parent's pipe ends but not reap the process; the
-    /// kernel keeps the zombie entry until we explicitly `wait`.
-    /// `None` when `HALMASUIT_GREETER_COMMAND` was unset.
-    _greeter_child: Option<Child>,
+    /// Greeter child process spawned at startup. Killed in the
+    /// `SessionRequested` handler — per Epic #1, the greeter
+    /// wl_client must be killed before the user session
+    /// (niri) takes halmasuit's foreground slot. The SIGCHLD
+    /// reaper in `signal_handler` picks up the zombie.
+    /// `None` when `HALMASUIT_GREETER_COMMAND` was unset OR the
+    /// greeter has already been killed.
+    greeter_child: Option<Child>,
 }
 
 /// Per-client metadata. smithay's `CompositorHandler` requires us to
@@ -395,6 +397,29 @@ fn handle_connection_ready(
                                 uid: spawn.uid,
                                 gid: spawn.gid,
                             });
+                            // Kill the greeter before invoking the
+                            // session spawn. Per Epic #1: "the greeter
+                            // wl_client is killed before niri becomes
+                            // foreground." The greeter's Wayland
+                            // connection drops, halmasuit notices via
+                            // the per-client teardown, niri can take
+                            // the foreground slot. The SIGCHLD reaper
+                            // picks up the resulting zombie.
+                            if let Some(mut greeter) = state.greeter_child.take() {
+                                let pid = greeter.id();
+                                match greeter.kill() {
+                                    Ok(()) => {
+                                        emit(&Event::GreeterTerminated { pid });
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            greeter_pid = pid,
+                                            "failed to SIGKILL greeter on session start"
+                                        );
+                                    }
+                                }
+                            }
                             match invoke_spawn(&state.spawn_bin, &spawn) {
                                 Ok(child) => {
                                     tracing::info!(
@@ -714,26 +739,6 @@ fn spawn_greeter(greeter_uid: u32, command: &Path) -> io::Result<Child> {
         .map_err(|e| io::Error::other(format!("spawn greeter {}: {e}", command.display())))
 }
 
-/// Drop privileges to the configured compositor uid. The gid and
-/// supplementary group set were pinned at unit-startup via systemd
-/// `Group=` + `SupplementaryGroups=` in the NixOS module; supplementary
-/// groups (`shadow` in production, so halmasuit-pam can read
-/// `/etc/shadow` directly without forking `unix_chkpwd`) are
-/// intentionally NOT cleared — systemd already constrained them at
-/// startup, and clearing here would defeat that.
-///
-/// Order is load-bearing:
-///   1. `setresgid(egid, egid, egid)` — pin all three gid components
-///      to the current egid. This is belt-and-suspenders; the
-///      `setresuid` below is what actually removes the ability to
-///      change gid (it drops CAP_SETGID with the uid transition to
-///      non-zero, after which `setresgid` calls return EPERM).
-///   2. `setresuid` — drop uid. Strictly last because it severs
-///      `CAP_SETGID`.
-///
-/// All three uid components (real, effective, saved) are set to the
-/// same value so the process cannot resurrect root via `seteuid(0)`
-/// later.
 /// Reap any zombie children with `waitpid(-1, WNOHANG)` in a loop.
 /// Called from the SIGCHLD handler: signal delivery is coalesced
 /// (multiple children dying between handler runs produce one signal),
@@ -751,14 +756,56 @@ fn reap_zombie_children() {
     }
 }
 
+/// Drop privileges to the configured compositor uid, preserving
+/// `CAP_KILL` so halmasuit retains signal authority over its greeter
+/// child (which runs under a different uid) on session start.
+/// Supplementary groups were pinned at unit-startup via systemd
+/// `SupplementaryGroups=` (`shadow` in production, so halmasuit-pam
+/// can `getspnam` directly without forking `unix_chkpwd`); they are
+/// intentionally NOT cleared.
+///
+/// Order is load-bearing:
+///   1. `prctl(PR_SET_KEEPCAPS, 1)` — without this, `setresuid`
+///      below would clear the permitted capability set entirely as
+///      part of the root → non-root transition. KeepCaps preserves
+///      the permitted set; the effective set is still cleared and
+///      must be rebuilt explicitly via `capset` (step 4).
+///   2. `setresgid(egid, egid, egid)` — pin all three gid components.
+///      Belt-and-suspenders; the `setresuid` below is what actually
+///      removes the ability to change gid (CAP_SETGID drops with
+///      the uid transition).
+///   3. `setresuid(uid, uid, uid)` — drop uid. All three components
+///      set to the same value so the process cannot resurrect root.
+///      Permitted caps survive due to KeepCaps; effective caps are
+///      kernel-cleared.
+///   4. `capset` to restore `{CAP_KILL}` in the effective + permitted
+///      sets, dropping every other capability halmasuit had as root.
+///      Halmasuit retains exactly one elevated power post-drop: the
+///      ability to send signals to its children regardless of uid.
 fn drop_privileges(uid: u32) -> io::Result<()> {
+    use std::collections::HashSet;
+
+    use caps::{CapSet, Capability};
     use nix::unistd::{Uid, getegid, setresgid, setresuid};
+
+    caps::securebits::set_keepcaps(true)
+        .map_err(|e| io::Error::other(format!("set_keepcaps(true): {e}")))?;
 
     let egid = getegid();
     setresgid(egid, egid, egid).map_err(|e| io::Error::other(format!("setresgid({egid}): {e}")))?;
 
     let u = Uid::from_raw(uid);
     setresuid(u, u, u).map_err(|e| io::Error::other(format!("setresuid({u}): {e}")))?;
+
+    // Pin caps to {CAP_KILL}. Permitted is the upper bound on
+    // effective; setting both to the same singleton drops everything
+    // else halmasuit had as root.
+    let mut wanted = HashSet::new();
+    wanted.insert(Capability::CAP_KILL);
+    caps::set(None, CapSet::Permitted, &wanted)
+        .map_err(|e| io::Error::other(format!("capset permitted={{CAP_KILL}}: {e}")))?;
+    caps::set(None, CapSet::Effective, &wanted)
+        .map_err(|e| io::Error::other(format!("capset effective={{CAP_KILL}}: {e}")))?;
 
     Ok(())
 }
@@ -1025,7 +1072,7 @@ fn main() -> io::Result<()> {
         spawn_bin: spawn_bin_from_env(),
         _greetd_listener_token: Some(greetd_listener_token),
         _drm_master: drm_master,
-        _greeter_child: greeter_child,
+        greeter_child,
     };
 
     // Privilege drop. The DRM master FD and both Unix sockets are

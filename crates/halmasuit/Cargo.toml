@@ -38,6 +38,10 @@ calloop.workspace            = true
 # - `process`: waitpid in the SIGCHLD reaper so dead greeter / session
 #   children don't accumulate as zombies
 nix = { workspace = true, features = ["user", "ioctl", "signal", "process"] }
+# Linux capabilities for drop_privileges' CAP_KILL preservation —
+# halmasuit must retain signal authority over its greeter child
+# (uid 999) post-deprivilege to uid 998. Pure-Rust over libc.
+caps.workspace = true
 
 [dev-dependencies]
 nix        = { workspace = true, features = ["signal", "user", "ioctl", "process"] }
