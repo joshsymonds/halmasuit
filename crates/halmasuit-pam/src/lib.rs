@@ -4,26 +4,29 @@
 //! halmasuit-greetd can stay `#![forbid(unsafe_code)]`. The public
 //! surface is:
 //!
-//! - [`Pam`] — RAII handle around `pam_handle_t`.
-//! - [`conv_pair`] — builds a paired [`ConvBridge`] (kept inside `Pam`,
-//!   the conv callback dereferences this) and [`ConvDriver`] (the
-//!   outside-the-thread driver that delivers responses and receives
-//!   prompts). The driver is what the upcoming `PamSession` impl
-//!   talks to.
+//! - [`PamThread`] — production worker-thread driver that owns a PAM
+//!   transaction and implements `halmasuit_greetd::PamSession`. This
+//!   is what halmasuit-greetd's `Connection` consumes via the
+//!   `PamSessionFactory` trait.
+//! - [`PamError`] — typed errors from the FFI surface.
+//! - [`PromptChallenge`] and [`PamMessageStyle`] — value types
+//!   describing one PAM conversation message.
 //!
-//! The conv callback ([`bridge_conv`]) marshals each
-//! `pam_message` → [`PromptChallenge`] over the channel, waits for a
-//! [`Zeroizing<String>`] response, then `libc::calloc`s a
-//! `pam_response` array and `libc::strdup`s each response into it for
-//! PAM to free. All panicable paths are wrapped in `catch_unwind`
-//! because panicking across an `extern "C"` boundary is UB.
+//! Lower-level building blocks (`Pam`, `ConvBridge`, `ConvDriver`,
+//! `conv_pair`) are `pub(crate)`: the unsafe quarantine. Everything
+//! external should go through `PamThread`.
 //!
-//! What's NOT here yet: the worker-thread driver that runs
-//! `pam_authenticate` blocking and exposes the trait
-//! `halmasuit_greetd::PamSession`. That's the next task.
+//! Internally, the conv callback ([`bridge_conv`]) marshals each
+//! `pam_message` → [`PromptChallenge`] over a rendezvous channel,
+//! waits for a [`Zeroizing<Vec<u8>>`] response, then `libc::calloc`s
+//! a `pam_response` array and `libc::strdup`s each response into it
+//! for PAM to free. All panicable paths are wrapped in
+//! `catch_unwind` because panicking across an `extern "C"` boundary
+//! is UB.
 
 #![deny(unsafe_code)]
 
+use halmasuit_greetd::{AuthMessageType, PamSession, PamStep};
 use libc::{c_int, c_void};
 use pam_sys::{
     PAM_BUF_ERR, PAM_CONV_ERR, PAM_ERROR_MSG, PAM_FAIL_DELAY, PAM_PROMPT_ECHO_OFF,
@@ -35,6 +38,7 @@ use std::ffi::{CStr, CString, NulError};
 use std::panic;
 use std::ptr;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::thread::JoinHandle;
 use std::time::Duration;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -42,11 +46,10 @@ use zeroize::Zeroizing;
 // ── PAM message types ───────────────────────────────────────────────────
 
 /// The four message styles PAM's conv callback delivers, narrowed
-/// from `pam_message::msg_style` (a raw `c_uint` in the bindings).
+/// from `pam_message::msg_style` (a raw `c_int` in the bindings).
 ///
-/// Maps 1:1 to `halmasuit_greetd::AuthMessageType`; the translation
-/// happens in the `PamSession` impl (next task) rather than here so
-/// `halmasuit-pam` doesn't yet depend on `halmasuit-greetd`.
+/// Maps 1:1 to [`halmasuit_greetd::AuthMessageType`]; the translation
+/// happens in [`translate_style`] inside the [`PamSession`] impl below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PamMessageStyle {
     /// `PAM_PROMPT_ECHO_ON` — visible input (e.g. username).
@@ -89,23 +92,24 @@ pub struct PromptChallenge {
 /// PAM-side half of the conv channel pair. Owned by [`Pam`]; the
 /// `bridge_conv` callback dereferences `pam_conv::appdata_ptr` (a
 /// pointer to this) to push challenges and pull responses.
-pub struct ConvBridge {
+pub(crate) struct ConvBridge {
     challenge_tx: SyncSender<PromptChallenge>,
     response_rx: Receiver<Zeroizing<String>>,
 }
 
-/// Outside-the-thread half. The (future) `PamSession` impl receives
-/// challenges on `challenge_rx` and sends responses on `response_tx`.
-pub struct ConvDriver {
-    pub challenge_rx: Receiver<PromptChallenge>,
-    pub response_tx: SyncSender<Zeroizing<String>>,
+/// Outside-the-thread half. [`PamThread`]'s `recv_next` reads
+/// challenges from `challenge_rx`; its `step()` impl writes
+/// responses to `response_tx`.
+pub(crate) struct ConvDriver {
+    pub(crate) challenge_rx: Receiver<PromptChallenge>,
+    pub(crate) response_tx: SyncSender<Zeroizing<String>>,
 }
 
 /// Build a paired bridge + driver. Each channel is rendezvous
 /// (capacity 0) so the conv callback and the driver synchronize
 /// step-by-step.
 #[must_use]
-pub fn conv_pair() -> (ConvBridge, ConvDriver) {
+pub(crate) fn conv_pair() -> (ConvBridge, ConvDriver) {
     let (challenge_tx, challenge_rx) = sync_channel(0);
     let (response_tx, response_rx) = sync_channel(0);
     (
@@ -224,6 +228,29 @@ const unsafe extern "C" fn noop_fail_delay(
 
 // ── Conv callback (the unsafe core) ─────────────────────────────────────
 
+/// Free the first `count` `.resp` entries of a libc-calloc'd
+/// `pam_response` array, then free the array itself. Used by
+/// [`bridge_conv`] when it needs to abort partway through the
+/// response-marshalling loop (interior-NUL response or strdup OOM).
+fn rollback_resp_array(resp_array: *mut pam_response, count: usize) {
+    // SAFETY: resp_array came from libc::calloc in bridge_conv; each
+    // .resp entry up to `count` was set from libc::strdup. Both pair
+    // with libc::free.
+    #[expect(
+        unsafe_code,
+        reason = "rolling back libc allocations on partial-failure paths."
+    )]
+    unsafe {
+        for j in 0..count {
+            let prev = (*resp_array.add(j)).resp;
+            if !prev.is_null() {
+                libc::free(prev.cast::<c_void>());
+            }
+        }
+        libc::free(resp_array.cast::<c_void>());
+    }
+}
+
 #[expect(
     unsafe_code,
     reason = "extern \"C\" PAM conv callback. The callback is invoked \
@@ -323,21 +350,26 @@ unsafe extern "C" fn bridge_conv(
             // Going through CString would deallocate without zeroing
             // (std::ffi::CString::Drop just frees), leaving credential
             // residue accessible until the heap slot is reused.
-            // Interior NULs are stripped silently — libpam can't carry
-            // NUL bytes in resp anyway.
-            let mut bytes: Zeroizing<Vec<u8>> =
-                Zeroizing::new(r.as_bytes().iter().copied().filter(|b| *b != 0).collect());
+            let mut bytes: Zeroizing<Vec<u8>> = Zeroizing::new(r.as_bytes().to_vec());
             // r (Zeroizing<String>) drops here, wiping the original buffer.
             drop(r);
+            // Interior NULs are a hard error: silently stripping or
+            // truncating would mutate the user's response under their
+            // nose and could change the authentication outcome. libpam
+            // can't carry NUL bytes in resp anyway — reject explicitly.
+            if bytes.contains(&0) {
+                rollback_resp_array(resp_array, i);
+                return PAM_CONV_ERR as c_int;
+            }
             // Append the trailing NUL so the buffer is a valid C string
             // for strdup. The buffer now contains exactly one NUL byte:
             // the trailing one we just pushed.
             bytes.push(0);
             // SAFETY: bytes contains a single trailing NUL (we just
-            // pushed it; the filter above guarantees no interior NULs).
-            // libc::strdup copies into a new libpam-owned allocation;
-            // bytes (Zeroizing<Vec<u8>>) drops at the end of this
-            // iteration, wiping the source.
+            // pushed it; the interior-NUL check above guarantees no
+            // interior NULs). libc::strdup copies into a new
+            // libpam-owned allocation; bytes (Zeroizing<Vec<u8>>) drops
+            // at the end of this iteration, wiping the source.
             #[expect(
                 unsafe_code,
                 reason = "strdup copies a NUL-terminated Zeroizing<Vec<u8>>; \
@@ -346,18 +378,7 @@ unsafe extern "C" fn bridge_conv(
             let dup = unsafe { libc::strdup(bytes.as_ptr().cast::<libc::c_char>()) };
             if dup.is_null() {
                 // OOM partway through; free what we allocated already.
-                // SAFETY: resp_array and prior .resp pointers all came
-                // from libc allocators paired with libc::free.
-                #[expect(unsafe_code, reason = "rolling back libc allocations on OOM.")]
-                unsafe {
-                    for j in 0..i {
-                        let prev = (*resp_array.add(j)).resp;
-                        if !prev.is_null() {
-                            libc::free(prev.cast::<c_void>());
-                        }
-                    }
-                    libc::free(resp_array.cast::<c_void>());
-                }
+                rollback_resp_array(resp_array, i);
                 return PAM_BUF_ERR as c_int;
             }
             // SAFETY: resp_array[i] is in-bounds (i < n) and points at
@@ -388,7 +409,18 @@ unsafe extern "C" fn bridge_conv(
 /// `pam_end` on drop. `Pam` is `!Send` (inherited from the raw
 /// `pam_handle_t` pointer); a worker-thread pattern that uses this
 /// must construct the `Pam` on the worker thread itself.
-pub struct Pam {
+///
+/// # INVARIANT: drop order
+///
+/// `pam_end(self.handle, ...)` runs in our `Drop` impl. Rust drops
+/// the struct's *fields* in declaration order **after** the `Drop`
+/// impl returns. The fields `_conv` and `_bridge` are therefore
+/// still valid throughout the `pam_end` call — libpam dereferences
+/// the conv pointer and `appdata_ptr` during cleanup. **Do not
+/// reorder these fields** and **do not move cleanup into a field's
+/// own `Drop`** without re-thinking this invariant. A wrong order
+/// would let libpam dereference freed memory.
+pub(crate) struct Pam {
     handle: *mut pam_handle_t,
     // The pam_conv struct must outlive the handle: pam_start stores
     // a pointer to it (does not copy). Keep it pinned via Box.
@@ -626,9 +658,6 @@ impl Drop for Pam {
 // invokes step() and pumps responses + receives challenges via the
 // conv-channel pair built by `conv_pair`.
 
-use halmasuit_greetd::{AuthMessageType, PamSession, PamStep};
-use std::thread::JoinHandle;
-
 /// Terminal outcome of the PAM conversation, computed by the worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PamOutcome {
@@ -651,6 +680,21 @@ enum PamOutcome {
 /// the worker drops its `Pam` (releasing libpam state via `pam_end`),
 /// and tries to send the outcome (which fails silently — receiver is
 /// gone). The worker handle is detached.
+///
+/// # Detached-worker accumulation under cancel + retry
+///
+/// Because the worker is detached and libpam offers no cancellation
+/// point, a rapid greeter-side cancel/retry loop can briefly run
+/// multiple workers in parallel — each carries its own PAM
+/// transaction through to libpam's natural return (which may take
+/// up to the `PAM_FAIL_DELAY` of the underlying module if we hadn't
+/// overridden it, or up to a slow NSS / network-PAM module's
+/// internal timeout otherwise). In normal use this window is
+/// bounded by user typing speed; a buggy or malicious greeter
+/// driving the loop in software could transiently keep N workers
+/// alive. The compositor process itself remains responsive (the
+/// calloop thread is freed as soon as the new worker hands off its
+/// first challenge or terminal outcome).
 pub struct PamThread {
     config: PamThreadConfig,
     state: ThreadState,
@@ -667,7 +711,7 @@ pub struct PamThread {
     step_timeout: Duration,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct PamThreadConfig {
     service: String,
     username: String,
@@ -681,9 +725,11 @@ enum ThreadState {
         challenge_rx: Receiver<PromptChallenge>,
         response_tx: SyncSender<Zeroizing<String>>,
         outcome_rx: Receiver<PamOutcome>,
-        // Detached; JoinHandle held only so the type stays Send and
-        // for clarity. We don't .join() on drop — the worker exits
-        // on its own once the bridge channels close.
+        // Retained for potential future graceful-shutdown via .join();
+        // detached today. We don't .join() on drop — the worker exits
+        // on its own once the bridge channels close, and joining could
+        // make Drop block on libpam (which doesn't expose a
+        // cancellation point).
         _worker: JoinHandle<()>,
     },
     Done,
@@ -742,7 +788,9 @@ impl PamThread {
     fn spawn(&mut self) {
         let (bridge, driver) = conv_pair();
         let (outcome_tx, outcome_rx) = sync_channel(1);
-        let config = self.config.clone();
+        // Move config into the worker — the PamThread doesn't reference
+        // it again after spawning. Saves four String allocations.
+        let config = std::mem::take(&mut self.config);
         let worker = std::thread::spawn(move || run_pam(&config, bridge, &outcome_tx));
         self.state = ThreadState::Running {
             challenge_rx: driver.challenge_rx,
@@ -882,9 +930,17 @@ fn try_pam(config: &PamThreadConfig, bridge: ConvBridge) -> Result<(u32, u32), S
     pam.authenticate().map_err(|e| e.to_string())?;
     pam.acct_mgmt().map_err(|e| e.to_string())?;
     let resolved = pam.get_user().map_err(|e| e.to_string())?;
+    // Genericized failure reason to avoid account enumeration: an
+    // attacker who reaches the post-auth pwent branch already knows
+    // the credentials they submitted are correct (pam_authenticate
+    // succeeded). Distinguishing "no pwent for known user" from
+    // "pwent IO error" reveals whether the user exists in the local
+    // passwd database vs only in the PAM stack (e.g. LDAP without
+    // local nss-ldap caching). Collapse both into the same message;
+    // the verbose form belongs in a debug log once one exists.
     let pw = nix::unistd::User::from_name(&resolved)
-        .map_err(|e| format!("pwent lookup failed for {resolved}: {e}"))?
-        .ok_or_else(|| format!("no pwent for {resolved}"))?;
+        .map_err(|_e| "post-auth account lookup failed".to_string())?
+        .ok_or_else(|| "post-auth account lookup failed".to_string())?;
     Ok((pw.uid.as_raw(), pw.gid.as_raw()))
 }
 
@@ -986,12 +1042,14 @@ mod tests {
     }
 
     #[test]
-    fn pam_thread_set_builders_compose() {
-        // Just verifies the builder methods chain cleanly — the actual
-        // RUSER/TTY values get exercised by the VM test (which is the
-        // real gate, since unit tests can't write /etc/pam.d/).
+    fn pam_thread_set_builders_record_values() {
         let mut pt = PamThread::new("other", "nobody");
         pt.set_ruser("compositor").set_tty("/dev/tty1");
+        assert_eq!(pt.config.ruser.as_deref(), Some("compositor"));
+        assert_eq!(pt.config.tty.as_deref(), Some("/dev/tty1"));
+        // service / username are also recorded from new()
+        assert_eq!(pt.config.service, "other");
+        assert_eq!(pt.config.username, "nobody");
     }
 
     #[test]
@@ -1303,45 +1361,157 @@ mod tests {
     }
 
     #[test]
-    fn bridge_conv_strips_interior_nuls_from_response() {
-        let got = call_bridge_conv(&[(PAM_PROMPT_ECHO_OFF, "p:")], |driver| {
+    fn bridge_conv_rejects_interior_nul_response() {
+        // Drive bridge_conv directly because call_bridge_conv asserts
+        // PAM_SUCCESS; we expect PAM_CONV_ERR here.
+        let (bridge, driver) = conv_pair();
+        let mut boxed_bridge = Box::new(bridge);
+        let appdata: *mut c_void =
+            std::ptr::from_mut::<ConvBridge>(boxed_bridge.as_mut()).cast::<c_void>();
+
+        let prompt_cstr = CString::new("password:").unwrap();
+        let message = pam_message {
+            msg_style: PAM_PROMPT_ECHO_OFF,
+            msg: prompt_cstr.as_ptr().cast_mut(),
+        };
+        let msg_ptr: *const pam_message = &raw const message;
+        let mut resp_out: *mut pam_response = ptr::null_mut();
+
+        // Send a response with an interior NUL via the driver.
+        let driver_thread = std::thread::spawn(move || {
             let _ = driver.challenge_rx.recv().unwrap();
             driver
                 .response_tx
                 .send(Zeroizing::new("hu\0nter".into()))
                 .unwrap();
         });
-        assert_eq!(got, vec!["hunter".to_string()]);
+
+        let status = {
+            #[expect(unsafe_code, reason = "test the interior-NUL refusal path")]
+            unsafe {
+                bridge_conv(
+                    1,
+                    std::ptr::from_ref::<*const pam_message>(&msg_ptr).cast_mut(),
+                    &raw mut resp_out,
+                    appdata,
+                )
+            }
+        };
+        driver_thread.join().unwrap();
+        assert_eq!(status, PAM_CONV_ERR as c_int);
+        assert!(
+            resp_out.is_null(),
+            "rejected response array should remain null"
+        );
     }
 
     // ── bridge_conv error paths ─────────────────────────────────────────
+    //
+    // The guard `num_msg <= 0 || msg.is_null() || resp.is_null() ||
+    // appdata_ptr.is_null()` short-circuits. To prove each branch is
+    // load-bearing, each test below leaves *only* the named branch
+    // invalid; the other three are valid pointers / a valid num_msg.
 
-    #[test]
-    fn bridge_conv_rejects_null_appdata() {
-        let mut resp_out: *mut pam_response = ptr::null_mut();
-        let status = {
-            #[expect(unsafe_code, reason = "test the null-appdata refusal path")]
-            unsafe {
-                bridge_conv(1, ptr::null_mut(), &raw mut resp_out, ptr::null_mut())
-            }
+    /// Build a single valid `pam_message` (PAM_TEXT_INFO; libpam will
+    /// not try to write a meaningful response, but the conv callback
+    /// has to handle it anyway). The CString backing `msg.msg` is
+    /// returned alongside so the caller can keep it alive for the
+    /// duration of the bridge_conv call.
+    fn one_valid_message() -> (CString, pam_message) {
+        let cs = CString::new("hello").unwrap();
+        let m = pam_message {
+            msg_style: PAM_TEXT_INFO,
+            msg: cs.as_ptr().cast_mut(),
         };
-        assert_eq!(status, PAM_CONV_ERR as c_int);
+        (cs, m)
     }
 
     #[test]
-    fn bridge_conv_rejects_negative_num_msg() {
+    fn bridge_conv_rejects_null_appdata_in_isolation() {
+        let (cs, message) = one_valid_message();
+        let msg_ptr: *const pam_message = &raw const message;
+        let mut resp_out: *mut pam_response = ptr::null_mut();
+        let status = {
+            #[expect(unsafe_code, reason = "isolated null-appdata guard test")]
+            unsafe {
+                bridge_conv(
+                    1,
+                    std::ptr::from_ref::<*const pam_message>(&msg_ptr).cast_mut(),
+                    &raw mut resp_out,
+                    ptr::null_mut(), // only null thing
+                )
+            }
+        };
+        assert_eq!(status, PAM_CONV_ERR as c_int);
+        drop(cs); // keep cs alive through the call above
+    }
+
+    #[test]
+    fn bridge_conv_rejects_negative_num_msg_in_isolation() {
+        let (bridge, _driver) = conv_pair();
+        let mut boxed_bridge = Box::new(bridge);
+        let appdata: *mut c_void =
+            std::ptr::from_mut::<ConvBridge>(boxed_bridge.as_mut()).cast::<c_void>();
+        let (cs, message) = one_valid_message();
+        let msg_ptr: *const pam_message = &raw const message;
+        let mut resp_out: *mut pam_response = ptr::null_mut();
+        let status = {
+            #[expect(unsafe_code, reason = "isolated negative-num_msg guard test")]
+            unsafe {
+                bridge_conv(
+                    -1, // only invalid input
+                    std::ptr::from_ref::<*const pam_message>(&msg_ptr).cast_mut(),
+                    &raw mut resp_out,
+                    appdata,
+                )
+            }
+        };
+        assert_eq!(status, PAM_CONV_ERR as c_int);
+        drop(cs);
+    }
+
+    #[test]
+    fn bridge_conv_rejects_null_msg_in_isolation() {
         let (bridge, _driver) = conv_pair();
         let mut boxed_bridge = Box::new(bridge);
         let appdata: *mut c_void =
             std::ptr::from_mut::<ConvBridge>(boxed_bridge.as_mut()).cast::<c_void>();
         let mut resp_out: *mut pam_response = ptr::null_mut();
         let status = {
-            #[expect(unsafe_code, reason = "test the num_msg<=0 refusal path")]
+            #[expect(unsafe_code, reason = "isolated null-msg guard test")]
             unsafe {
-                bridge_conv(-1, ptr::null_mut(), &raw mut resp_out, appdata)
+                bridge_conv(
+                    1,
+                    ptr::null_mut(), // only null thing
+                    &raw mut resp_out,
+                    appdata,
+                )
             }
         };
         assert_eq!(status, PAM_CONV_ERR as c_int);
+    }
+
+    #[test]
+    fn bridge_conv_rejects_null_resp_in_isolation() {
+        let (bridge, _driver) = conv_pair();
+        let mut boxed_bridge = Box::new(bridge);
+        let appdata: *mut c_void =
+            std::ptr::from_mut::<ConvBridge>(boxed_bridge.as_mut()).cast::<c_void>();
+        let (cs, message) = one_valid_message();
+        let msg_ptr: *const pam_message = &raw const message;
+        let status = {
+            #[expect(unsafe_code, reason = "isolated null-resp guard test")]
+            unsafe {
+                bridge_conv(
+                    1,
+                    std::ptr::from_ref::<*const pam_message>(&msg_ptr).cast_mut(),
+                    ptr::null_mut(), // only null thing
+                    appdata,
+                )
+            }
+        };
+        assert_eq!(status, PAM_CONV_ERR as c_int);
+        drop(cs);
     }
 
     #[test]
