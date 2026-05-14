@@ -38,6 +38,12 @@ calloop.workspace            = true
 # - `process`: waitpid in the SIGCHLD reaper so dead greeter / session
 #   children don't accumulate as zombies
 nix = { workspace = true, features = ["user", "ioctl", "signal", "process"] }
+# DRM-rs (v0.15) — typed wrappers around DRM master acquisition,
+# resource enumeration, dumb-buffer allocation, and SETCRTC. Used by
+# the `drm` submodule. Same pin as drm-master-probe and
+# halmasuit-visual-test-standin so the workspace shares one drm-rs
+# version.
+drm = "0.15"
 # Linux capabilities for drop_privileges' CAP_KILL preservation —
 # halmasuit must retain signal authority over its greeter child
 # (uid 999) post-deprivilege to uid 998. Pure-Rust over libc.

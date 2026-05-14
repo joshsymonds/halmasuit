@@ -48,6 +48,9 @@ test-vm:
     echo
     echo "── visual-standin ──"
     nix build .#checks.x86_64-linux.visual-standin -L --print-build-logs --no-link
+    echo
+    echo "── visual-halmasuit-clear ──"
+    nix build .#checks.x86_64-linux.visual-halmasuit-clear -L --print-build-logs --no-link
 
 # Regenerate one or all visual-test goldens. Runs the named test
 # interactively (driverInteractive), with HALMASUIT_GOLDEN_REGEN=1 and

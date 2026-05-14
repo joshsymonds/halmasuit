@@ -358,6 +358,13 @@
           halmasuit-visual-test-standin = self.packages.x86_64-linux.halmasuit-visual-test-standin;
           ssimulacra2-cli               = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        visual-halmasuit-clear = import ./tests/visual-halmasuit-clear.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit       = self.packages.x86_64-linux.halmasuit;
+          halmasuit-spawn = self.packages.x86_64-linux.halmasuit-spawn;
+          ssimulacra2-cli = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
       };
     };
 }

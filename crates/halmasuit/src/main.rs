@@ -6,15 +6,18 @@
 // advertises foundational protocol globals: `wl_compositor`,
 // `wl_subcompositor`, `xdg_wm_base`, `wl_seat`, `wl_output`, `wl_shm`.
 // Connecting clients can create surfaces, top-levels, software buffers,
-// and discover inputs/outputs. Nothing renders yet (no scanout backend);
-// the advertised output is a synthesized 1920×1080@60Hz placeholder
-// until DRM lands. Additional globals (`linux-dmabuf-v1`,
-// `presentation-time`, `ext-session-lock-v1`, …) land in subsequent
-// tasks. See ARCHITECTURE.md.
+// and discover inputs/outputs. Scanout is via a dumb-buffer clear color
+// (`#0a0014` brand purple); the GLES + DrmCompositor renderer is a
+// subsequent subtask. The advertised wl_output stays at a synthesized
+// 1920×1080@60Hz placeholder until smithay's output state is wired to
+// real DRM mode info (also a subsequent subtask). Additional globals
+// (`linux-dmabuf-v1`, `presentation-time`, `ext-session-lock-v1`, …)
+// land later. See ARCHITECTURE.md.
+
+mod drm;
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -98,15 +101,19 @@ struct HalmasuitState {
     /// of the compositor; calloop drops the source on shutdown.
     _greetd_listener_token: Option<RegistrationToken>,
 
-    /// DRM master file descriptor. Acquired in `main()` while still
-    /// root via `DRM_IOCTL_SET_MASTER` and retained for the process
-    /// lifetime — the master designation lives on the FD and survives
-    /// `setresuid` to the compositor user (drm-master-probe Phase 1).
-    /// Holding this File pins the kernel-side master ownership; if it
-    /// were dropped, another DRM client could acquire master.
+    /// Active DRM scanout. Acquired in `main()` while still root via
+    /// `DRM_IOCTL_SET_MASTER`, then mode-set to scan out a dumb buffer
+    /// filled with `HALMASUIT_BRAND_CLEAR` (#0a0014). The master
+    /// designation lives on the underlying fd and survives `setresuid`
+    /// to the compositor user (drm-master-probe Phase 1). The dumb
+    /// buffer + framebuffer + CRTC handles are pinned here for the
+    /// process lifetime; dropping this field tears down scanout
+    /// cleanly (kernel reaps fb on fd close, dumb buffer destroys via
+    /// RAII).
+    ///
     /// `None` only when `HALMASUIT_SKIP_DRM_MASTER` was set (dev/test
     /// bypass); production deployments never see this.
-    _drm_master: Option<std::fs::File>,
+    _active_scanout: Option<drm::ActiveScanout>,
 
     /// Greeter we spawned at startup, held as a pid + pidfd pair.
     /// The pidfd is the kernel-anchored signal target (race-free
@@ -604,29 +611,34 @@ fn spawn_bin_from_env() -> PathBuf {
         .map_or_else(|| PathBuf::from("halmasuit-spawn"), PathBuf::from)
 }
 
-// DRM_IOCTL_SET_MASTER = _IO('d', 0x1e). Defined in <drm/drm.h>; the
-// macro below generates a Rust wrapper that ioctl(fd, 0x641e) — the
-// argument-less master-acquire ioctl. Used by `acquire_drm_master`.
-//
-// drm-master-probe Phases 0-3 empirically validated the syscall
-// mechanics (acquire on a freshly-opened card0 fd, survival across
-// setresuid, survival across switch_root + exec). This file is the
-// production wiring of the same call into halmasuit's main().
-nix::ioctl_none!(drm_set_master, b'd', 0x1e);
+/// Brand clear color rendered before any wl_client connects: `#0a0014`
+/// in XRGB8888 little-endian (`[B, G, R, X]`). Per the visual-compositor
+/// epic's IMMUTABLE Requirement #5, this distinguishes "halmasuit alive,
+/// no client yet" from "halmasuit broken / producing black" — every
+/// frame painted before halmasuit-splash connects is this exact color.
+const HALMASUIT_BRAND_CLEAR: [u8; 4] = [0x14, 0x00, 0x0A, 0x00];
 
-/// Open `/dev/dri/card0` (or the device named by `HALMASUIT_DRM_DEVICE`)
-/// and call `DRM_IOCTL_SET_MASTER`. Returns the opened `File` (held by
-/// the caller for the process lifetime — the master designation lives
-/// on the FD), or `None` when `HALMASUIT_SKIP_DRM_MASTER` is set in
-/// the environment. The skip path is for ad-hoc dev launches and
-/// integration tests that spawn halmasuit on a host without DRM; the
-/// production NixOS module never sets it.
+/// Open `/dev/dri/card0` (or the device named by `HALMASUIT_DRM_DEVICE`),
+/// acquire master via `DRM_IOCTL_SET_MASTER`, and mode-set the first
+/// connected connector to scan out a dumb buffer filled with the brand
+/// clear color. Returns the resulting `ActiveScanout` held by the
+/// caller for the process lifetime, or `None` when
+/// `HALMASUIT_SKIP_DRM_MASTER` is set in the environment. The skip
+/// path is for ad-hoc dev launches and integration tests that spawn
+/// halmasuit on a host without DRM; the production NixOS module never
+/// sets it.
+///
+/// drm-master-probe Phases 0-3 empirically validated that the master
+/// designation + held fd survive `setresuid` (which the caller does
+/// later in `drop_privileges`) and that SETCRTC works on virtio-gpu-pci
+/// in the NixOS test substrate.
 ///
 /// # Errors
-/// Bubbles any `open(2)` or `ioctl(2)` failure with context. A
+///
+/// Bubbles any open(2)/ioctl(2)/SETCRTC failure with context. A
 /// production deployment that fails here fails the entire unit —
 /// running without DRM master defeats the architecture.
-fn acquire_drm_master() -> io::Result<Option<std::fs::File>> {
+fn acquire_drm_master_and_scan_out() -> io::Result<Option<drm::ActiveScanout>> {
     if std::env::var_os("HALMASUIT_SKIP_DRM_MASTER").is_some() {
         // Fail-closed if running as root: production halmasuit always
         // starts as root (the systemd unit has User= unset so it can
@@ -649,25 +661,9 @@ fn acquire_drm_master() -> io::Result<Option<std::fs::File>> {
     }
     let path = std::env::var_os("HALMASUIT_DRM_DEVICE")
         .map_or_else(|| PathBuf::from("/dev/dri/card0"), PathBuf::from);
-    let dev = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .map_err(|e| io::Error::other(format!("open({}): {e}", path.display())))?;
-    let raw = dev.as_raw_fd();
-    // SAFETY: `drm_set_master` is the nix-generated wrapper for
-    // ioctl(fd, DRM_IOCTL_SET_MASTER). `raw` is a valid kernel fd
-    // we just opened above; the ioctl takes no argument and
-    // performs no memory access beyond the fd. Failure is reported
-    // via `Err`. The only invariant is that the fd be valid, which
-    // is upheld by `dev` outliving this call.
-    #[expect(unsafe_code, reason = "raw ioctl through nix-generated wrapper")]
-    unsafe {
-        drm_set_master(raw).map_err(|e| {
-            io::Error::other(format!("DRM_IOCTL_SET_MASTER on {}: {e}", path.display()))
-        })?;
-    }
-    Ok(Some(dev))
+    let card = drm::open_and_set_master(&path)?;
+    let scanout = drm::scan_out_clear_color(card, HALMASUIT_BRAND_CLEAR)?;
+    Ok(Some(scanout))
 }
 
 /// Resolve compositor uid from env. `HALMASUIT_COMPOSITOR_UID` is
@@ -1125,16 +1121,23 @@ fn main() -> io::Result<()> {
         version: env!("CARGO_PKG_VERSION"),
     });
 
-    // DRM master FIRST, while we're still root. The master designation
-    // lives on the file descriptor and survives the in-process
-    // `setresuid` at the bottom of this function (drm-master-probe
-    // Phase 1). After this point, the FD is held by `HalmasuitState`
-    // for the process lifetime. Only emit the phase event when master
+    // DRM master + scanout FIRST, while we're still root. The master
+    // designation lives on the file descriptor and survives the
+    // in-process `setresuid` at the bottom of this function
+    // (drm-master-probe Phase 1). The dumb buffer + framebuffer +
+    // CRTC handles are pinned in `HalmasuitState._active_scanout`
+    // for the process lifetime. Pixels start showing as soon as
+    // SETCRTC returns: the brand clear color `#0a0014` is on the
+    // display until a wl_client commits a buffer (subsequent
+    // subtasks layer that). Only emit the phase events when master
     // was actually acquired — the SKIP path is dev/test only.
-    let drm_master = acquire_drm_master()?;
-    if drm_master.is_some() {
+    let active_scanout = acquire_drm_master_and_scan_out()?;
+    if active_scanout.is_some() {
         emit(&Event::PhaseEntered {
             phase: Phase::DrmMasterAcquired,
+        });
+        emit(&Event::PhaseEntered {
+            phase: Phase::ScanoutActive,
         });
     }
 
@@ -1297,7 +1300,7 @@ fn main() -> io::Result<()> {
         greeter_uid,
         spawn_bin: spawn_bin_from_env(),
         _greetd_listener_token: Some(greetd_listener_token),
-        _drm_master: drm_master,
+        _active_scanout: active_scanout,
         greeter,
     };
 

@@ -388,6 +388,7 @@ version = "0.1.0"
 dependencies = [
  "calloop",
  "caps",
+ "drm",
  "halmasuit-greetd",
  "halmasuit-introspect",
  "halmasuit-pam",

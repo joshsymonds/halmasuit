@@ -140,6 +140,15 @@ pub enum Phase {
     /// the master designation survives `setresuid`, so subsequent
     /// phases run as the compositor user with master still held.
     DrmMasterAcquired,
+    /// CRTC drive armed: a dumb buffer (or, after the GLES subtask,
+    /// a GBM-backed framebuffer) has been wrapped as a DRM framebuffer
+    /// and pushed via SETCRTC, so the chosen connector is now
+    /// scanning out halmasuit-owned pixels. Pre-client scanout shows
+    /// the brand clear color `#0a0014` — observable in tests as
+    /// evidence that halmasuit is alive but no wl_client has yet
+    /// committed a buffer. Emitted exactly once per process lifetime,
+    /// after `DrmMasterAcquired` and before any client connects.
+    ScanoutActive,
 }
 
 /// Reason a clean shutdown was initiated.
@@ -234,6 +243,15 @@ mod tests {
         });
         assert_eq!(v["event"], "phase_entered");
         assert_eq!(v["phase"], "deprivileged");
+    }
+
+    #[test]
+    fn event_phase_entered_scanout_active_serializes() {
+        let v = round_trip(&Event::PhaseEntered {
+            phase: Phase::ScanoutActive,
+        });
+        assert_eq!(v["event"], "phase_entered");
+        assert_eq!(v["phase"], "scanout_active");
     }
 
     #[test]
