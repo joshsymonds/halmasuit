@@ -1,0 +1,27 @@
+[package]
+name        = "halmasuit-vm-client"
+description = "Greetd-protocol test client. Drives halmasuit's greetd socket from VM tests and ad-hoc debugging sessions. Uses halmasuit-greetd's own wire types — can't drift from the daemon."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+halmasuit-greetd     = { path = "../halmasuit-greetd", version = "0.1" }
+thiserror.workspace  = true
+# For the structured stdout log line that the testScript can parse —
+# `emit_io_log` serializes each tx/rx message to JSON.
+serde.workspace      = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "halmasuit-vm-client"
+path = "src/main.rs"

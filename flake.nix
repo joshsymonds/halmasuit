@@ -144,11 +144,27 @@
               allowBuiltinFetchGit = true;
             };
             cargoBuildFlags    = [ "-p" "halmasuit" ];
-            # smithay needs libxkbcommon (keymap handling, even in the
-            # wayland-server-only feature set) and libwayland (for the
-            # protocol scanner / pkg-config probing).
-            nativeBuildInputs = [ pkgs.pkg-config ];
-            buildInputs       = [ pkgs.libxkbcommon pkgs.wayland ];
+            # Native deps:
+            # - pkg-config: smithay's build script probes for libwayland.
+            # - llvmPackages.libclang: bindgen (transitively via pam-sys)
+            #   runs clang at build time. The dev shell exports this via
+            #   shellHook; rustPlatform.buildRustPackage has its own
+            #   sandboxed env, so we duplicate the wiring here.
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.llvmPackages.libclang ];
+            # Runtime deps:
+            # - libxkbcommon: smithay needs it for keymap handling.
+            # - wayland: smithay's protocol scanner.
+            # - pam: pam-sys links against libpam.so.0 at runtime via
+            #   `links = "pam"` in its Cargo.toml.
+            buildInputs       = [ pkgs.libxkbcommon pkgs.wayland pkgs.pam ];
+            # bindgen invokes clang directly (bypassing NIX_CFLAGS_COMPILE).
+            # Mirror the shellHook so pam-sys's build.rs finds
+            # <security/pam_appl.h> and its transitive <unistd.h>.
+            env = {
+              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+              BINDGEN_EXTRA_CLANG_ARGS =
+                "-I${pkgs.pam}/include -I${pkgs.glibc.dev}/include";
+            };
             # Integration tests spawn the binary and send POSIX signals; the
             # Nix sandbox doesn't permit that cleanly. `just check` is the
             # canonical gate; the NixOS VM test (next task) is the deployment-side gate.
@@ -157,6 +173,27 @@
               description = "halmasuit Linux system compositor (v2 Phase A spine)";
               license     = pkgs.lib.licenses.asl20;
               mainProgram = "halmasuit";
+            };
+          };
+
+          # halmasuit-vm-client — tiny greetd-protocol test client.
+          # Shipped as a separate Nix package so VM tests can install
+          # it via environment.systemPackages and drive halmasuit's
+          # greetd socket from the testScript.
+          halmasuit-vm-client = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-vm-client";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [ "-p" "halmasuit-vm-client" ];
+            doCheck = false;
+            meta = {
+              description = "halmasuit greetd-protocol test client";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-vm-client";
             };
           };
 

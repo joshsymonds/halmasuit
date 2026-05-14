@@ -10,6 +10,7 @@ members = [
     "crates/halmasuit-cli",
     "crates/halmasuit-spawn",
     "crates/halmasuit-test",
+    "crates/halmasuit-vm-client",
     # Research probe — not v2 production. See RESEARCH.md.
     "crates/drm-master-probe",
     "xtask",
