@@ -143,12 +143,28 @@ fn emits_started_init_then_wayland_ready_within_one_second() {
         "third event must be Phase::WaylandReady: {wayland_ready}"
     );
 
-    // The Wayland socket file must exist on disk at this point.
-    let socket_path = runtime_dir.path().join("wayland-0");
+    let greetd_ready = next_event(&rx);
+    assert_eq!(
+        greetd_ready["event"], "phase_entered",
+        "fourth event: {greetd_ready}"
+    );
+    assert_eq!(
+        greetd_ready["phase"], "greetd_ready",
+        "fourth event must be Phase::GreetdReady: {greetd_ready}"
+    );
+
+    // Both sockets must exist on disk at this point.
+    let wayland_socket = runtime_dir.path().join("wayland-0");
     assert!(
-        socket_path.exists(),
+        wayland_socket.exists(),
         "wayland-0 socket must exist at {}",
-        socket_path.display()
+        wayland_socket.display()
+    );
+    let greetd_socket = runtime_dir.path().join("greetd.sock");
+    assert!(
+        greetd_socket.exists(),
+        "greetd socket must exist at {}",
+        greetd_socket.display()
     );
 
     send_signal(&child, Signal::SIGTERM);
@@ -163,6 +179,7 @@ fn sigterm_emits_shutdown_signal_term_and_exits_zero() {
     let _ = next_event(&rx); // started
     let _ = next_event(&rx); // phase_entered init
     let _ = next_event(&rx); // phase_entered wayland_ready
+    let _ = next_event(&rx); // phase_entered greetd_ready
 
     send_signal(&child, Signal::SIGTERM);
 
@@ -184,6 +201,7 @@ fn sigint_emits_shutdown_signal_int_and_exits_zero() {
     let _ = next_event(&rx); // started
     let _ = next_event(&rx); // phase_entered init
     let _ = next_event(&rx); // phase_entered wayland_ready
+    let _ = next_event(&rx); // phase_entered greetd_ready
 
     send_signal(&child, Signal::SIGINT);
 

@@ -63,6 +63,19 @@ pub enum Event {
         /// credential material or unredacted user input.
         message: String,
     },
+    /// A greeter session reached the `Spawning` state — PAM authentication
+    /// completed and `StartSession` was received. The compositor hands
+    /// the resolved uid/gid to `halmasuit-spawn` (the corresponding `cmd`
+    /// and `env` from the greetd protocol are not emitted on this event
+    /// surface because they carry user-influenced strings; the redaction
+    /// policy lives in the snapshot-socket task).
+    SessionRequested {
+        /// Resolved Linux uid for the authenticated user, as returned by
+        /// PAM + pwent lookup.
+        uid: u32,
+        /// Resolved Linux gid.
+        gid: u32,
+    },
 }
 
 /// Compositor phases.
@@ -78,6 +91,9 @@ pub enum Phase {
     /// protocol globals are advertised yet — clients see an empty global
     /// list. Globals are added as their consuming code lands.
     WaylandReady,
+    /// greetd protocol socket is bound and accepting greeter connections.
+    /// The compositor is ready to host a greeter and drive PAM.
+    GreetdReady,
 }
 
 /// Reason a clean shutdown was initiated.

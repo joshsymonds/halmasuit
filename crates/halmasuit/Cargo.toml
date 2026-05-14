@@ -13,6 +13,13 @@ workspace = true
 
 [dependencies]
 halmasuit-introspect = { path = "../halmasuit-introspect", version = "0.1" }
+# greetd-protocol server building blocks: Listener, Connection,
+# PamSessionFactory. Compositor binds the socket and drives the
+# per-connection state machine from calloop callbacks.
+halmasuit-greetd     = { path = "../halmasuit-greetd",     version = "0.1" }
+# PAM FFI quarantine: the PamSessionFactory impl in this binary
+# returns a PamThread for each accepted greeter session.
+halmasuit-pam        = { path = "../halmasuit-pam",        version = "0.1" }
 tracing.workspace            = true
 tracing-subscriber.workspace = true
 # smithay carries Wayland-server protocol state. `wayland_frontend` is
@@ -22,8 +29,11 @@ smithay = { workspace = true, features = ["wayland_frontend"] }
 # event-loop use, (2) directly here for the `signals` feature smithay
 # doesn't enable. Cargo unifies to one version with merged features.
 calloop.workspace            = true
+# nix::unistd::getuid for resolving the default greeter UID when
+# HALMASUIT_GREETER_UID isn't set in the environment.
+nix = { workspace = true, features = ["user"] }
 
 [dev-dependencies]
-nix        = { workspace = true, features = ["signal"] }
+nix        = { workspace = true, features = ["signal", "user"] }
 serde_json.workspace = true
 tempfile.workspace   = true

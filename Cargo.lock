@@ -378,7 +378,9 @@ name = "halmasuit"
 version = "0.1.0"
 dependencies = [
  "calloop",
+ "halmasuit-greetd",
  "halmasuit-introspect",
+ "halmasuit-pam",
  "nix 0.30.1",
  "serde_json",
  "smithay",

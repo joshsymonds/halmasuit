@@ -92,14 +92,7 @@ impl Listener {
     /// Otherwise any `io::Error` from `UnixListener::bind` or
     /// `set_permissions`.
     pub fn bind(path: &Path, mode: u32) -> std::io::Result<Self> {
-        if mode & 0o007 != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Listener::bind refuses world-accessible mode {mode:#o}"),
-            ));
-        }
-        let inner = UnixListener::bind(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        let inner = bind_socket(path, mode)?;
         Ok(Self {
             inner,
             path: path.to_owned(),
@@ -168,6 +161,60 @@ impl Listener {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Toggle non-blocking mode on the inner socket. Required before
+    /// integrating with an event loop (calloop, mio, etc.) — see the
+    /// `Blocking` section of [`Self::accept_with_creds`].
+    ///
+    /// # Errors
+    ///
+    /// Any `io::Error` from the underlying `setsockopt`.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.inner.set_nonblocking(nonblocking)
+    }
+}
+
+/// Bind a greetd Unix socket and return the raw [`UnixListener`].
+///
+/// Performs the same validation as [`Listener::bind`] (rejects mode
+/// bits granting world access, chmod's to the requested mode after
+/// bind) but does NOT wrap the result in the [`Listener`] auto-unlink
+/// guard. Production callers (the halmasuit binary integrating with
+/// calloop) use this; tests use [`Listener::bind`] to get the
+/// auto-unlink-on-drop guard.
+///
+/// The caller is responsible for the bound path's lifecycle —
+/// typically, production runs under systemd's
+/// `RuntimeDirectory=halmasuit` which handles cleanup on unit stop.
+///
+/// # Errors
+///
+/// `io::ErrorKind::InvalidInput` if `mode` grants world access
+/// (`mode & 0o007 != 0`). Otherwise any `io::Error` from
+/// `UnixListener::bind` or `set_permissions`.
+pub fn bind_socket(path: &Path, mode: u32) -> std::io::Result<UnixListener> {
+    if mode & 0o007 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("bind_socket refuses world-accessible mode {mode:#o}"),
+        ));
+    }
+    let sock = UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    Ok(sock)
+}
+
+/// Look up the peer's credentials on an accepted [`UnixStream`].
+///
+/// Exposed for callers that drive the accept loop themselves
+/// (e.g. the halmasuit binary's calloop integration) and therefore
+/// can't use [`Listener::accept_with_creds`] / `accept_authorized`.
+///
+/// # Errors
+///
+/// Any `io::Error` from `getsockopt(SO_PEERCRED)`.
+pub fn peer_credentials(stream: &UnixStream) -> std::io::Result<PeerCredentials> {
+    peer_creds(stream)
 }
 
 impl Drop for Listener {
