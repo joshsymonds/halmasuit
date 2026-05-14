@@ -34,7 +34,8 @@ use pam_sys::{
 use std::ffi::{CStr, CString, NulError};
 use std::panic;
 use std::ptr;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::time::Duration;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -653,6 +654,17 @@ enum PamOutcome {
 pub struct PamThread {
     config: PamThreadConfig,
     state: ThreadState,
+    /// Maximum time `PamSession::step` will block waiting for the
+    /// next challenge or terminal outcome. If the worker is wedged
+    /// inside libpam (e.g. a network PAM module like SSSD blocking
+    /// on an unreachable LDAP server, or a broken NSS module),
+    /// `step` returns `PamStep::Failure` after this duration instead
+    /// of hanging the calloop thread indefinitely.
+    ///
+    /// The worker thread is NOT killed on timeout — libpam doesn't
+    /// expose a cancellation point. It stays detached until libpam
+    /// eventually returns.
+    step_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -677,9 +689,19 @@ enum ThreadState {
     Done,
 }
 
+/// Default upper bound on [`PamSession::step`] recv duration.
+///
+/// 30 s comfortably covers `pam_unix` (typically tens of ms) plus
+/// slow NSS or a sluggish network-PAM module while still keeping a
+/// wedged libpam from hanging the calloop thread forever. Override
+/// per-instance with [`PamThread::with_step_timeout`].
+pub const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl PamThread {
     /// Build a new PamThread for `service_name` as `username`. No
-    /// worker thread is spawned yet.
+    /// worker thread is spawned yet. The per-step recv timeout
+    /// defaults to [`DEFAULT_STEP_TIMEOUT`]; override with
+    /// [`Self::with_step_timeout`] before the first `step()` call.
     #[must_use]
     pub fn new(service_name: &str, username: &str) -> Self {
         Self {
@@ -690,7 +712,17 @@ impl PamThread {
                 tty: None,
             },
             state: ThreadState::NotStarted,
+            step_timeout: DEFAULT_STEP_TIMEOUT,
         }
+    }
+
+    /// Override the per-step recv timeout. See [`Self`]'s field doc
+    /// for the rationale. Mostly useful in tests; production should
+    /// keep the default.
+    #[must_use]
+    pub const fn with_step_timeout(mut self, timeout: Duration) -> Self {
+        self.step_timeout = timeout;
+        self
     }
 
     /// Set `PAM_RUSER` (the requesting user) for the upcoming PAM
@@ -720,8 +752,9 @@ impl PamThread {
         };
     }
 
-    /// After a successful send-or-spawn, block on the next challenge
-    /// or terminal outcome.
+    /// After a successful send-or-spawn, block on the next challenge,
+    /// terminal outcome, or the configured timeout — whichever comes
+    /// first.
     fn recv_next(&mut self) -> PamStep {
         let ThreadState::Running {
             challenge_rx,
@@ -731,22 +764,57 @@ impl PamThread {
         else {
             unreachable!("recv_next called outside ThreadState::Running");
         };
-        if let Ok(c) = challenge_rx.recv() {
-            return PamStep::Challenge {
+        match await_next_step(challenge_rx, outcome_rx, self.step_timeout) {
+            NextStep::Challenge(c) => PamStep::Challenge {
                 kind: translate_style(c.style),
                 prompt: c.message,
-            };
+            },
+            NextStep::Outcome(outcome) => {
+                self.state = ThreadState::Done;
+                match outcome {
+                    PamOutcome::Success { uid, gid } => PamStep::Success { uid, gid },
+                    PamOutcome::Failure { reason } => PamStep::Failure { reason },
+                }
+            }
+            NextStep::Timeout => {
+                self.state = ThreadState::Done;
+                PamStep::Failure {
+                    reason: format!(
+                        "PAM auth exceeded the per-step timeout of {:?}",
+                        self.step_timeout
+                    ),
+                }
+            }
         }
-        // Worker dropped Pam → challenge channel closed. The outcome
-        // is in the (1-slot buffered) outcome channel by construction:
-        // the worker drops Pam THEN sends the outcome.
-        let outcome = outcome_rx.recv().unwrap_or_else(|_| PamOutcome::Failure {
-            reason: "worker exited without an outcome".into(),
-        });
-        self.state = ThreadState::Done;
-        match outcome {
-            PamOutcome::Success { uid, gid } => PamStep::Success { uid, gid },
-            PamOutcome::Failure { reason } => PamStep::Failure { reason },
+    }
+}
+
+/// Outcome of one channel-await inside [`PamThread::recv_next`].
+/// Extracted so the timeout / disconnect / challenge branching is
+/// unit-testable without a real worker thread.
+enum NextStep {
+    Challenge(PromptChallenge),
+    Outcome(PamOutcome),
+    Timeout,
+}
+
+fn await_next_step(
+    challenge_rx: &Receiver<PromptChallenge>,
+    outcome_rx: &Receiver<PamOutcome>,
+    timeout: Duration,
+) -> NextStep {
+    match challenge_rx.recv_timeout(timeout) {
+        Ok(c) => NextStep::Challenge(c),
+        Err(RecvTimeoutError::Timeout) => NextStep::Timeout,
+        Err(RecvTimeoutError::Disconnected) => {
+            // Worker dropped Pam → challenge channel closed. The
+            // outcome is in the (1-slot buffered) outcome channel by
+            // construction: the worker drops Pam THEN sends the
+            // outcome.
+            let outcome = outcome_rx.recv().unwrap_or_else(|_| PamOutcome::Failure {
+                reason: "worker exited without an outcome".into(),
+            });
+            NextStep::Outcome(outcome)
         }
     }
 }
@@ -947,6 +1015,94 @@ mod tests {
         // machine driver (running on the calloop thread) can own it.
         fn assert_send<T: Send>() {}
         assert_send::<PamThread>();
+    }
+
+    // ── await_next_step (the recv-timeout primitive) ────────────────────
+
+    #[test]
+    fn await_next_step_returns_challenge_when_one_arrives() {
+        let (challenge_tx, challenge_rx) = sync_channel::<PromptChallenge>(1);
+        let (_outcome_tx, outcome_rx) = sync_channel::<PamOutcome>(1);
+
+        challenge_tx
+            .send(PromptChallenge {
+                style: PamMessageStyle::PromptEchoOff,
+                message: "password:".into(),
+            })
+            .unwrap();
+
+        let r = await_next_step(&challenge_rx, &outcome_rx, Duration::from_secs(5));
+        match r {
+            NextStep::Challenge(c) => {
+                assert_eq!(c.style, PamMessageStyle::PromptEchoOff);
+                assert_eq!(c.message, "password:");
+            }
+            other => panic!("expected Challenge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn await_next_step_returns_timeout_when_no_message_in_window() {
+        // Hold both senders so the channels stay connected; never send.
+        // recv_timeout fires Timeout before Disconnected.
+        let (_challenge_tx_held, challenge_rx) = sync_channel::<PromptChallenge>(1);
+        let (_outcome_tx_held, outcome_rx) = sync_channel::<PamOutcome>(1);
+
+        let start = std::time::Instant::now();
+        let r = await_next_step(&challenge_rx, &outcome_rx, Duration::from_millis(50));
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(r, NextStep::Timeout),
+            "expected Timeout, got {r:?}"
+        );
+        // Sanity: actually waited at least the requested window.
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "elapsed {elapsed:?} < 50ms"
+        );
+        // And not absurdly longer (catches accidental no-op timeout).
+        assert!(elapsed < Duration::from_secs(1), "elapsed {elapsed:?} > 1s");
+    }
+
+    #[test]
+    fn await_next_step_returns_outcome_when_channels_disconnect() {
+        let (challenge_tx, challenge_rx) = sync_channel::<PromptChallenge>(1);
+        let (outcome_tx, outcome_rx) = sync_channel::<PamOutcome>(1);
+
+        // Simulate the worker's order: send outcome, then drop the
+        // challenge tx (which closes the channel).
+        outcome_tx
+            .send(PamOutcome::Failure {
+                reason: "bad password".into(),
+            })
+            .unwrap();
+        drop(challenge_tx);
+        drop(outcome_tx);
+
+        let r = await_next_step(&challenge_rx, &outcome_rx, Duration::from_secs(5));
+        match r {
+            NextStep::Outcome(PamOutcome::Failure { reason }) => {
+                assert_eq!(reason, "bad password");
+            }
+            other => panic!("expected Outcome::Failure, got {other:?}"),
+        }
+    }
+
+    impl std::fmt::Debug for NextStep {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Challenge(c) => write!(f, "Challenge({c:?})"),
+                Self::Outcome(o) => write!(f, "Outcome({o:?})"),
+                Self::Timeout => write!(f, "Timeout"),
+            }
+        }
+    }
+
+    #[test]
+    fn pam_thread_with_step_timeout_overrides_default() {
+        let pt = PamThread::new("other", "nobody").with_step_timeout(Duration::from_millis(1));
+        assert_eq!(pt.step_timeout, Duration::from_millis(1));
     }
 
     // ── process_prompts (the safe core) ─────────────────────────────────
