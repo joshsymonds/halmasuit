@@ -59,6 +59,45 @@
           cargo = toolchain;
           rustc = toolchain;
         };
+
+      # Rust target triple for the musl-static build of
+      # halmasuit-spawn. The setuid-root helper MUST be statically
+      # linked: a dynamic glibc binary dlopens NSS modules *inside the
+      # privileged process* before the privilege drop (initgroups(3) →
+      # nss). musl resolves /etc/group itself with no dlopen, so the
+      # privileged window touches no plugin code. This is the F3 /
+      # ARCHITECTURE.md "statically linked" hardening invariant; the
+      # build enforces it instead of merely asserting it in a comment.
+      muslRustTargetFor = system: {
+        "x86_64-linux"  = "x86_64-unknown-linux-musl";
+        "aarch64-linux" = "aarch64-unknown-linux-musl";
+      }.${system};
+
+      # rustPlatform whose stdenv targets static musl, for
+      # halmasuit-spawn only. The pinned rust-overlay toolchain is
+      # reused (single source of truth with rustup) with the musl
+      # rust-std added; pkgsStatic supplies the musl/static stdenv that
+      # buildRustPackage's build+install hooks key off.
+      rustPlatformStaticFor = system:
+        let
+          pkgs      = pkgsFor system;
+          toolchain = (rustToolchainFor pkgs).override {
+            targets = [ (muslRustTargetFor system) ];
+          };
+          # A real cross stdenv: buildPlatform stays gnu (so cargo
+          # build scripts / proc-macros compile and *run* natively on
+          # the builder) while hostPlatform is musl (so the shipped
+          # binary links static musl). pkgsStatic conflates the two and
+          # breaks the external toolchain's build scripts.
+          crossPkgs = {
+            "x86_64-linux"  = pkgs.pkgsCross.musl64;
+            "aarch64-linux" = pkgs.pkgsCross.aarch64-multiplatform-musl;
+          }.${system};
+        in
+        crossPkgs.makeRustPlatform {
+          cargo = toolchain;
+          rustc = toolchain;
+        };
     in
     {
       devShells = forEachSystem (system:
@@ -145,8 +184,9 @@
 
       packages = forEachSystem (system:
         let
-          pkgs         = pkgsFor system;
-          rustPlatform = rustPlatformFor pkgs;
+          pkgs               = pkgsFor system;
+          rustPlatform       = rustPlatformFor pkgs;
+          rustPlatformStatic = rustPlatformStaticFor system;
         in
         {
           # `nix build` with no attribute builds the compositor.
@@ -274,7 +314,7 @@
           # as a separate Nix package so the production NixOS module can
           # wrap it with security.wrappers (setuid bit) and the VM test
           # can install + invoke it as a real setuid binary.
-          halmasuit-spawn = rustPlatform.buildRustPackage {
+          halmasuit-spawn = rustPlatformStatic.buildRustPackage {
             pname   = "halmasuit-spawn";
             version = "0.1.0";
             src     = ./.;
@@ -284,8 +324,29 @@
             };
             cargoBuildFlags    = [ "-p" "halmasuit-spawn" ];
             doCheck = false; # VM test is the deployment-side gate
+            # crt-static is already implied by the *-musl target, but
+            # set it explicitly so a future stdenv/toolchain change
+            # can't silently produce a dynamically-linked setuid helper.
+            # Scope it to the musl *host* target only — a global
+            # RUSTFLAGS would also static-PIE the gnu *build-platform*
+            # build scripts (libc/nix), which then SIGSEGV on the
+            # builder.
+            "CARGO_TARGET_${pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] (muslRustTargetFor system))}_RUSTFLAGS" =
+              "-C target-feature=+crt-static";
+            # Build-enforced hardening invariant: a statically linked
+            # ELF has no PT_INTERP program header. If one appears, the
+            # binary would dlopen NSS inside the privileged process —
+            # fail the build rather than ship the regression. This is
+            # what makes "statically linked" a gate, not a comment (F3).
+            postInstall = ''
+              if "$READELF" -l "$out/bin/halmasuit-spawn" | grep -qw INTERP; then
+                echo "halmasuit-spawn: PT_INTERP present — not statically linked." >&2
+                echo "The setuid-root helper must be static (F3 / ARCHITECTURE.md)." >&2
+                exit 1
+              fi
+            '';
             meta = {
-              description = "halmasuit setuid-root privilege-drop helper";
+              description = "halmasuit setuid-root privilege-drop helper (static musl)";
               license     = pkgs.lib.licenses.asl20;
               mainProgram = "halmasuit-spawn";
             };
