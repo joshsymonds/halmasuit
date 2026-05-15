@@ -71,6 +71,17 @@ serde_json         = "1"
 # Per-test tempdirs for integration tests that spawn binaries needing
 # XDG_RUNTIME_DIR or similar isolation.
 tempfile           = "3"
+# D-Bus for the test-only `org.halmasuit.Debug.Introspect.Snapshot`
+# method. zbus 5.x per CLAUDE.md. Default features only — that uses
+# the bundled `async-io` executor, NOT tokio and NOT glib (CLAUDE.md
+# forbids glib). Pulled in ONLY by halmasuit's `frame_audit` feature
+# (optional dep); the production binary never links it.
+zbus               = "5"
+# PNG encoder for `Snapshot()`. Deliberately the small `png` crate,
+# NOT the `image` crate — Epic #1 req 7 forbids `image` in the
+# production cargo-tree, and we keep it out of the debug tree too.
+# `frame_audit`-gated optional dep.
+png                = "0.17"
 # Smithay — Rust Wayland compositor toolkit. Pinned to niri's current
 # commit (matching their Cargo.toml workspace dep). default-features
 # disabled so each consumer crate picks only what it needs.

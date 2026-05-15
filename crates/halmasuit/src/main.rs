@@ -14,6 +14,8 @@
 // (`linux-dmabuf-v1`, `presentation-time`, `ext-session-lock-v1`, …)
 // land later. See ARCHITECTURE.md.
 
+#[cfg(feature = "frame_audit")]
+mod dbus;
 mod drm;
 #[cfg(feature = "frame_audit")]
 mod frame_audit;
@@ -1476,6 +1478,19 @@ fn main() -> io::Result<()> {
                 "initial render_frame produced no damage; ScanoutActive deferred until next vblank"
             );
         }
+    }
+
+    // frame_audit only: start the D-Bus `Snapshot()` server, handing
+    // it a clone of the render loop's snapshot slot. Started before
+    // the privilege drop below, so the background thread's bus
+    // connection authenticates as the current euid (root in
+    // production deploys); the connection persists across the
+    // subsequent setresuid. Best-effort — `serve` logs and the
+    // thread exits if the bus is unreachable. Absent entirely from
+    // the production binary.
+    #[cfg(feature = "frame_audit")]
+    if let Some(backend) = state.drm_backend.as_ref() {
+        dbus::serve(backend.snapshot_handle());
     }
 
     // Privilege drop. The DRM master FD and both Unix sockets are

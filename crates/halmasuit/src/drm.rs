@@ -138,6 +138,21 @@ pub struct DrmBackend {
     /// stream. Only exists in `halmasuit-debug`.
     #[cfg(feature = "frame_audit")]
     frame_counter: u64,
+    /// Latest composited frame, published every audited frame for the
+    /// D-Bus `Snapshot()` method to read. Only exists in
+    /// `halmasuit-debug`.
+    #[cfg(feature = "frame_audit")]
+    snapshot_buf: crate::dbus::SnapshotBuffer,
+}
+
+impl DrmBackend {
+    /// A clone of the shared snapshot slot, to hand to the D-Bus
+    /// server. The render loop publishes into it; `Snapshot()` reads.
+    #[cfg(feature = "frame_audit")]
+    #[must_use]
+    pub fn snapshot_handle(&self) -> crate::dbus::SnapshotBuffer {
+        self.snapshot_buf.clone()
+    }
 }
 
 /// Set up the full DRM/GBM/EGL/GLES/DrmCompositor stack on the device
@@ -160,6 +175,15 @@ pub struct DrmBackend {
 ///
 /// Bubbles any DRM ioctl, GBM allocation, EGL initialization, or
 /// calloop registration failure with context.
+// reason: a single linear DRM→GBM→EGL→GLES→DrmCompositor→calloop
+// init sequence. The ordering is load-bearing (master before GBM,
+// EGL before GLES, surface before compositor); splitting it into
+// helpers scatters that ordering across the module for no
+// readability or testability gain.
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear hardware-init sequence; ordering is load-bearing"
+)]
 pub fn setup_drm_backend<S, F>(
     path: &Path,
     loop_handle: &smithay::reexports::calloop::LoopHandle<'static, S>,
@@ -323,6 +347,8 @@ where
             renderer,
             #[cfg(feature = "frame_audit")]
             frame_counter: 0,
+            #[cfg(feature = "frame_audit")]
+            snapshot_buf: crate::dbus::new_buffer(),
         },
         registration_token,
         output,
@@ -469,6 +495,42 @@ impl DrmBackend {
     where
         E: smithay::backend::renderer::element::RenderElement<GlesRenderer>,
     {
+        let (rgba, wu, hu) = self.read_frame_rgba(output, elements, clear_color)?;
+        let stats = crate::frame_audit::analyze(&rgba, wu, hu);
+        // Publish the frame for the D-Bus `Snapshot()` reader. A
+        // poisoned lock must not abort the render loop.
+        if let Ok(mut slot) = self.snapshot_buf.lock() {
+            *slot = Some(crate::dbus::FrameBuf {
+                rgba,
+                width: wu,
+                height: hu,
+            });
+        }
+        halmasuit_introspect::emit(&halmasuit_introspect::Event::FrameRendered {
+            frame_id: self.frame_counter,
+            mean_luminance: stats.mean_luminance,
+            backdrop_coverage: stats.backdrop_coverage,
+            phash: stats.phash,
+        });
+        self.frame_counter += 1;
+        Ok(())
+    }
+
+    /// Render `elements` (+ the clear color) into an offscreen texture
+    /// and read it back as tightly-packed RGBA8 (`[R, G, B, A]` per
+    /// pixel). Shared by `audit_frame` (analysis + `FrameRendered`)
+    /// and the D-Bus `Snapshot()` publisher so the GL plumbing exists
+    /// once. Returns `(rgba, width_px, height_px)`.
+    #[cfg(feature = "frame_audit")]
+    fn read_frame_rgba<E>(
+        &mut self,
+        output: &smithay::output::Output,
+        elements: &[E],
+        clear_color: [u8; 4],
+    ) -> io::Result<(Vec<u8>, usize, usize)>
+    where
+        E: smithay::backend::renderer::element::RenderElement<GlesRenderer>,
+    {
         use smithay::backend::allocator::Fourcc;
         use smithay::backend::renderer::damage::OutputDamageTracker;
         use smithay::backend::renderer::gles::GlesTexture;
@@ -495,7 +557,7 @@ impl DrmBackend {
             (w, h).into(),
         )
         .map_err(|e| io::Error::other(format!("frame_audit create_buffer: {e}")))?;
-        let (mean_luminance, backdrop_coverage, phash) = {
+        let rgba = {
             let mut fb = Bind::bind(&mut self.renderer, &mut tex)
                 .map_err(|e| io::Error::other(format!("frame_audit bind: {e}")))?;
             let mut dt = OutputDamageTracker::from_output(output);
@@ -510,17 +572,9 @@ impl DrmBackend {
             drop(fb);
             let bytes = ExportMem::map_texture(&mut self.renderer, &mapping)
                 .map_err(|e| io::Error::other(format!("frame_audit map_texture: {e}")))?;
-            let stats = crate::frame_audit::analyze(bytes, wu, hu);
-            (stats.mean_luminance, stats.backdrop_coverage, stats.phash)
+            bytes.to_vec()
         };
-        halmasuit_introspect::emit(&halmasuit_introspect::Event::FrameRendered {
-            frame_id: self.frame_counter,
-            mean_luminance,
-            backdrop_coverage,
-            phash,
-        });
-        self.frame_counter += 1;
-        Ok(())
+        Ok((rgba, wu, hu))
     }
 
     /// Acknowledge a page-flip completion. Called from the

@@ -19,11 +19,13 @@ workspace = true
 # arbitrary-file-write surface — neither belongs in the privileged
 # production compositor. The flake exposes `halmasuit` (this off) and
 # `halmasuit-debug` (this on); visual VM tests consume the latter.
-# Empty dep list on purpose: luminance/coverage are arithmetic over
-# the readback bytes and the perceptual hash is an in-house 8x8
-# average-hash — pulling `img_hash`/`image` here would violate Epic #1
-# req 7 (production `cargo tree` must list neither).
-frame_audit = []
+# `dep:zbus`/`dep:png` are the ONLY feature deps: zbus serves the
+# `org.halmasuit.Debug.Introspect.Snapshot` method, png encodes the
+# captured frame. Both optional, so production `cargo tree` lists
+# neither (Epic #1 req 7). Still no `img_hash`/`image`: luminance/
+# coverage are arithmetic and the perceptual hash is an in-house 8x8
+# average-hash.
+frame_audit = ["dep:zbus", "dep:png"]
 
 [dependencies]
 halmasuit-introspect = { path = "../halmasuit-introspect", version = "0.1" }
@@ -75,6 +77,10 @@ nix = { workspace = true, features = ["user", "signal", "process"] }
 # Linux capabilities for drop_privileges' CAP_KILL preservation —
 # halmasuit must retain signal authority over its greeter child
 # (uid 999) post-deprivilege to uid 998. Pure-Rust over libc.
+# frame_audit-only. `optional = true` keeps them out of the default
+# (production) dependency graph entirely; `frame_audit` turns them on.
+zbus = { workspace = true, optional = true }
+png  = { workspace = true, optional = true }
 caps.workspace = true
 # libc for raw syscall wrappers: pidfd_open / pidfd_send_signal
 # (the race-free signal path against the greeter), capset (single-
