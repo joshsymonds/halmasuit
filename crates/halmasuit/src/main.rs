@@ -1320,6 +1320,20 @@ fn invoke_spawn(spawn_bin: &Path, request: &SpawnRequest) -> io::Result<Child> {
     build_spawn_command(spawn_bin, request).spawn()
 }
 
+/// Whether a peer that just connected to the Wayland socket is
+/// authorised, given its SO_PEERCRED `peer_uid`.
+///
+/// Epic #1 R1. The socket is chmod 0660 to the `halmasuit-greeter`
+/// group so the greeter/session can `connect(2)` — but group
+/// membership is not identity. A peer is authorised iff its uid is
+/// the greeter uid (pre-auth, the only client) or the authenticated
+/// session uid (post-auth, recorded by [`start_session`]). The
+/// greeter uid stays valid post-auth because greeter teardown can
+/// race the session connect. Mirrors the greetd listener's uid check.
+fn wayland_peer_authorized(peer_uid: u32, greeter_uid: u32, session_uid: Option<u32>) -> bool {
+    peer_uid == greeter_uid || session_uid == Some(peer_uid)
+}
+
 /// Start the authenticated user session: invoke `halmasuit-spawn`,
 /// and *only if it succeeds* record the session uid and tear the
 /// greeter down.
@@ -1590,10 +1604,32 @@ fn main() -> io::Result<()> {
         })?;
     }
 
-    // New-client handler: hand each accepted UnixStream to the Display
-    // with a fresh per-client state.
+    // New-client handler: SO_PEERCRED-gate every accepted stream
+    // before handing it to the Display. The 0660 chmod above only
+    // restricts to the halmasuit-greeter group; this is the peer
+    // *identity* gate (greeter pre-auth / session post-auth) that
+    // stops a hostile in-group uid from connecting to wayland-0 to
+    // screenshot / inject. Mirrors the greetd listener's uid gate.
     loop_handle
         .insert_source(socket, |stream, (), state: &mut HalmasuitState| {
+            let creds = match peer_credentials(&stream) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "peer_credentials failed; dropping wayland connection");
+                    drop(stream);
+                    return;
+                }
+            };
+            if !wayland_peer_authorized(creds.uid, state.greeter_uid, state.session_uid) {
+                tracing::warn!(
+                    peer_uid = creds.uid,
+                    greeter_uid = state.greeter_uid,
+                    session_uid = ?state.session_uid,
+                    "rejected wayland connection from unauthorised uid",
+                );
+                drop(stream);
+                return;
+            }
             let client_data = Arc::new(ClientState {
                 compositor_state: CompositorClientState::default(),
             });
@@ -1859,6 +1895,37 @@ mod tests {
         let cmd = build_spawn_command(Path::new("/bin/true"), &req);
         let map: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert!(!map.contains_key(OsStr::new("MALFORMED_NO_EQUALS")));
+    }
+
+    // R1 port: the Wayland accept path authorises a peer iff its
+    // SO_PEERCRED uid is the greeter uid (pre-auth) or the recorded
+    // session uid (post-auth). FVC only chmods the socket 0660 — group
+    // restriction, not peer identity; this closes that gap.
+    #[test]
+    fn wayland_peer_greeter_accepted_pre_auth() {
+        assert!(wayland_peer_authorized(1000, 1000, None));
+    }
+
+    #[test]
+    fn wayland_peer_session_accepted_post_auth() {
+        assert!(wayland_peer_authorized(1001, 1000, Some(1001)));
+    }
+
+    #[test]
+    fn wayland_peer_greeter_still_accepted_post_auth() {
+        assert!(wayland_peer_authorized(1000, 1000, Some(1001)));
+    }
+
+    #[test]
+    fn wayland_peer_unrelated_uid_rejected_pre_and_post_auth() {
+        assert!(!wayland_peer_authorized(1234, 1000, None));
+        assert!(!wayland_peer_authorized(1234, 1000, Some(1001)));
+    }
+
+    #[test]
+    fn wayland_peer_root_rejected() {
+        assert!(!wayland_peer_authorized(0, 1000, Some(1001)));
+        assert!(!wayland_peer_authorized(0, 1000, None));
     }
 
     // R2/R3 port: spawn must be invoked and confirmed BEFORE the
