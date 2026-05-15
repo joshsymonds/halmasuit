@@ -1,15 +1,15 @@
-# tests/visual-halmasuit-layer.nix — B.3 visual gate.
+# tests/visual-halmasuit-layer.nix — B.3 visual gate (Snapshot()).
 #
-# Boots halmasuit, then runs `halmasuit-layer-shell-test-client` as a
-# wl_client of halmasuit. The client binds `wlr-layer-shell` BACKGROUND
-# with a 1280×800 solid-green (`#16C44E`) shm buffer; halmasuit's
-# commit handler imports the buffer, composes it into the next frame,
-# and queues a page-flip. QMP screendump captures the result;
-# ssimulacra2 compares to the golden.
+# Boots halmasuit (halmasuit-debug, frame_audit on), then runs
+# `halmasuit-layer-shell-test-client` as a wl_client. The client binds
+# wlr-layer-shell BACKGROUND with a fullscreen solid-green (`#16C44E`)
+# shm buffer; halmasuit imports it, composites it over the brand clear,
+# and scans it out. Capture is the in-process `Snapshot()` D-Bus method
+# (a CPU readback of the exact composited frame), NOT a QMP screendump.
 #
-# The new golden differs from `halmasuit-clear-color.png` (uniform
-# brand purple) — confirming halmasuit is actually compositing the
-# client and not just falling back to the clear-only path.
+# The golden differs from `halmasuit-clear-color.png` (uniform brand
+# purple) — proving halmasuit actually composites the client rather
+# than falling back to clear-only.
 
 {
   system,
@@ -45,7 +45,7 @@ pkgs.testers.runNixOSTest {
 
       services.halmasuit = {
         enable         = true;
-        package        = halmasuit;
+        package        = halmasuit; # halmasuit-debug (frame_audit) via flake
         spawnPackage   = halmasuit-spawn;
         greeterUid     = 999;
         greeterGroup   = "halmasuit-greeter";
@@ -56,11 +56,16 @@ pkgs.testers.runNixOSTest {
         greeterCommand = "${halmasuit-layer-shell-test-client}/bin/halmasuit-layer-shell-test-client";
       };
 
+      # Snapshot() writes its PNG post-privilege-drop (uid 998) under
+      # ProtectSystem=strict — a world-writable, non-PrivateTmp /run
+      # dir added to ReadWritePaths. In sync with visual.py's
+      # GUEST_SNAPSHOT_DIR.
+      systemd.tmpfiles.rules = [ "d /run/hsnap 0777 root root -" ];
+      systemd.services.halmasuit.serviceConfig.ReadWritePaths = [ "/run/hsnap" ];
+
       # Greeter system user needs access to the wayland socket. The
-      # module's `SupplementaryGroups = ["shadow"]` + the socket's
-      # 0660 mode + greeter-group ownership handle that; the greeter
-      # also needs XDG_RUNTIME_DIR pointing at /run/halmasuit so its
-      # wayland-client discovery picks up the socket.
+      # module's `SupplementaryGroups`/0660 socket + greeter-group
+      # ownership handle that.
       users.users.halmasuit-greeter = {
         isSystemUser = true;
         uid          = 999;
@@ -99,10 +104,10 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_unit("halmasuit.service")
 
-    # Wait for halmasuit to reach scanout_active (it's painting #0a0014
-    # standalone). Then wait for the test client to paint — eprintln
-    # `layer-shell-test-client: painted 1280x800` lands in the unit's
-    # journal because the greeter inherits halmasuit's stdio.
+    # Wait for halmasuit scanout, then the test client to paint, then
+    # the D-Bus name. The client's paint triggers a commit → halmasuit
+    # re-composites → audit_frame republishes the snapshot buffer with
+    # the green frame.
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF 'scanout_active'",
         timeout=30,
@@ -111,12 +116,18 @@ pkgs.testers.runNixOSTest {
         "journalctl -u halmasuit | grep -qF 'layer-shell-test-client: painted'",
         timeout=30,
     )
+    machine.wait_until_succeeds(
+        "busctl --system status org.halmasuit",
+        timeout=30,
+    )
 
-    # Halmasuit's commit handler renders synchronously on every client
-    # commit. Give QEMU's display layer a beat for the resulting page-
-    # flip to land in QMP's screendump buffer.
-    import time
-    time.sleep(0.5)
+    introspect = machine.succeed(
+        "busctl --system introspect org.halmasuit "
+        "/org/halmasuit/Debug/Introspect"
+    )
+    assert "Snapshot" in introspect, (
+        f"Snapshot method missing from Introspect interface:\n{introspect}"
+    )
 
     visual.assert_matches_golden(machine, "halmasuit-layer-green")
 

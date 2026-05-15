@@ -314,28 +314,6 @@
             };
           };
 
-          # halmasuit-visual-test-standin — throwaway DRM dumb-buffer
-          # paint used by tests/visual-standin.nix to prove the
-          # headless-GL + golden capture pipeline works end-to-end
-          # before halmasuit's real renderer exists. Retired once the
-          # halmasuit renderer subtask lands.
-          halmasuit-visual-test-standin = rustPlatform.buildRustPackage {
-            pname   = "halmasuit-visual-test-standin";
-            version = "0.1.0";
-            src     = ./.;
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-              allowBuiltinFetchGit = true;
-            };
-            cargoBuildFlags    = [ "-p" "halmasuit-visual-test-standin" ];
-            doCheck = false; # NixOS VM test is the actual test
-            meta = {
-              description = "Visual-test stand-in for halmasuit (DRM dumb-buffer paint)";
-              license     = pkgs.lib.licenses.asl20;
-              mainProgram = "halmasuit-visual-test-standin";
-            };
-          };
-
           # ssimulacra2_rs — pure-Rust port of the SSIMULACRA2
           # perceptual image-diff metric. Used by visual VM tests as
           # the golden-comparison engine. Chosen over the C++
@@ -425,23 +403,21 @@
           system = "x86_64-linux";
           inherit nixpkgs;
         };
-        visual-standin = import ./tests/visual-standin.nix {
-          system = "x86_64-linux";
-          inherit nixpkgs;
-          halmasuit-visual-test-standin = self.packages.x86_64-linux.halmasuit-visual-test-standin;
-          ssimulacra2-cli               = self.packages.x86_64-linux.ssimulacra2-cli;
-        };
+        # Visual gates consume `halmasuit-debug` (frame_audit on): the
+        # capture path is the in-process `Snapshot()` D-Bus method,
+        # not QMP screendump. Structural tests above stay on the
+        # production `halmasuit` package.
         visual-halmasuit-clear = import ./tests/visual-halmasuit-clear.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
-          halmasuit       = self.packages.x86_64-linux.halmasuit;
+          halmasuit       = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-spawn = self.packages.x86_64-linux.halmasuit-spawn;
           ssimulacra2-cli = self.packages.x86_64-linux.ssimulacra2-cli;
         };
         visual-halmasuit-layer = import ./tests/visual-halmasuit-layer.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
-          halmasuit                        = self.packages.x86_64-linux.halmasuit;
+          halmasuit                        = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-spawn                  = self.packages.x86_64-linux.halmasuit-spawn;
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
           ssimulacra2-cli                  = self.packages.x86_64-linux.ssimulacra2-cli;

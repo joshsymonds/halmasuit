@@ -194,6 +194,35 @@ in
     # `hardware.graphics.enable` is NixOS's canonical setup for both.
     hardware.graphics.enable = true;
 
+    # D-Bus system bus + policy for the test-only
+    # `org.halmasuit.Debug.Introspect` interface (the `Snapshot()`
+    # method, present only in the `frame_audit`/`halmasuit-debug`
+    # build). halmasuit's D-Bus server thread connects to the system
+    # bus BEFORE the in-process privilege drop, so it authenticates as
+    # root and requests the `org.halmasuit` name as root — hence the
+    # `user="root"` own-grant. The policy is completely inert for the
+    # production `halmasuit` package, which never links zbus and never
+    # requests the name; shipping it unconditionally keeps the module
+    # single-codepath. `services.dbus.enable` is required because the
+    # minimal VM-test images don't bring the system bus up otherwise.
+    services.dbus.enable = true;
+    services.dbus.packages = [
+      (pkgs.writeTextDir "share/dbus-1/system.d/org.halmasuit.conf" ''
+        <!DOCTYPE busconfig PUBLIC
+          "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+          "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+        <busconfig>
+          <policy user="root">
+            <allow own="org.halmasuit"/>
+          </policy>
+          <policy context="default">
+            <allow send_destination="org.halmasuit"/>
+            <allow receive_sender="org.halmasuit"/>
+          </policy>
+        </busconfig>
+      '')
+    ];
+
     # Default PAM service file — gives us unixAuth-backed pam_unix +
     # pam_env + pam_limits, which is what halmasuit-pam exercises in
     # the VM test and is the conventional starting stack for greeters.

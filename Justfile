@@ -46,9 +46,6 @@ test-vm:
     echo "── login-flash ──"
     nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link
     echo
-    echo "── visual-standin ──"
-    nix build .#checks.x86_64-linux.visual-standin -L --print-build-logs --no-link
-    echo
     echo "── visual-halmasuit-clear ──"
     nix build .#checks.x86_64-linux.visual-halmasuit-clear -L --print-build-logs --no-link
     echo
@@ -66,9 +63,9 @@ test-vm:
 # loop is the only check.
 #
 # Usage:
-#   just update-goldens                  # all visual tests
-#   just update-goldens visual-standin   # one named test
-update-goldens name="visual-standin":
+#   just update-goldens visual-halmasuit-clear   # one named test
+#   just update-goldens visual-halmasuit-layer
+update-goldens name="visual-halmasuit-clear":
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Regenerating goldens for: {{name}}"

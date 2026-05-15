@@ -13,10 +13,6 @@ members = [
     "crates/halmasuit-vm-client",
     # Research probe — not v2 production. See RESEARCH.md.
     "crates/drm-master-probe",
-    # Visual-test stand-in — throwaway, retired once halmasuit's
-    # renderer can paint its own clear color. See
-    # tests/visual-standin.nix.
-    "crates/halmasuit-visual-test-standin",
     # Layer-shell test client — throwaway, used by
     # tests/visual-halmasuit-layer.nix to verify halmasuit composites
     # wl_clients via wlr-layer-shell. Replaced by halmasuit-splash in

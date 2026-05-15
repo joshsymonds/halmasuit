@@ -8,10 +8,11 @@ Importable from a `testScript` via::
 
 The module wraps three concerns:
 
-  * `capture(machine, name)` — `machine.screenshot(name)` plus host-side
-    path resolution. The NixOS test driver writes screenshots into its
-    output directory (`${out}` for store-built tests; `/tmp/...` for
-    interactive runs).
+  * `capture(machine, name)` — calls halmasuit's `Snapshot()` D-Bus
+    method (a CPU readback of the real composited frame, NOT a QMP
+    screenshot of QEMU's display) and copies the resulting PNG to the
+    driver's output directory (`${out}` for store-built tests;
+    `/tmp/...` for interactive runs).
 
   * `ssimulacra2_compare(expected, actual)` — shells out to the
     `ssimulacra2_rs` CLI and returns the perceptual similarity score
@@ -57,25 +58,48 @@ from pathlib import Path
 DEFAULT_THRESHOLD = 90.0
 
 
-def capture(machine, name: str) -> Path:
-    """Take a screenshot and return the host-side PNG path.
+# Guest-side directory the Snapshot() PNG is written into. The visual
+# test machine config must create this writable by halmasuit's
+# post-privilege-drop uid and add it to the unit's ReadWritePaths
+# (halmasuit runs under ProtectSystem=strict). Kept in sync with the
+# `tmpfiles`/`ReadWritePaths` wiring in tests/visual-halmasuit-*.nix.
+GUEST_SNAPSHOT_DIR = "/run/hsnap"
 
-    `machine.screenshot(name)` writes into the NixOS test driver's
-    output directory. The driver also exports the output directory via
-    the `out` env var when running under `nix build`; fall back to
-    common locations.
+
+def capture(machine, name: str) -> Path:
+    """Capture the real composited frame via halmasuit's `Snapshot()`
+    D-Bus method and return the host-side PNG path.
+
+    This is NOT a QMP screenshot of QEMU's display. We call
+    `org.halmasuit.Debug.Introspect.Snapshot` (present only in the
+    `frame_audit`/`halmasuit-debug` build), which does a CPU readback
+    of the exact frame halmasuit composited and PNG-encodes it. The
+    test must already have waited for the bus name to be owned before
+    calling this (a frame must have been composited, too — Snapshot
+    errors loudly otherwise).
+
+    The PNG is written guest-side into ``GUEST_SNAPSHOT_DIR`` then
+    copied to the driver's output directory.
     """
-    machine.screenshot(name)
+    guest_path = f"{GUEST_SNAPSHOT_DIR}/{name}.png"
+    # `busctl call ... Snapshot s <path>` — the `s` signature is the
+    # single string arg. machine.succeed raises with the guest stderr
+    # if the method returns a D-Bus error (no frame yet, unwritable
+    # path, name not owned).
+    machine.succeed(
+        "busctl --system call org.halmasuit "
+        "/org/halmasuit/Debug/Introspect "
+        f"org.halmasuit.Debug.Introspect Snapshot s {guest_path!r}"
+    )
+    # Pull the guest file into the test driver's output dir.
+    machine.copy_from_vm(guest_path)
     out_dir = os.environ.get("out") or os.environ.get("TMPDIR") or "/tmp"
-    candidate = Path(out_dir) / f"{name}.png"
-    if candidate.exists():
-        return candidate
     for d in (out_dir, "/tmp", "."):
         p = Path(d) / f"{name}.png"
         if p.exists():
             return p
     raise FileNotFoundError(
-        f"screenshot {name!r} not found after machine.screenshot(); "
+        f"Snapshot {name!r} not found after copy_from_vm({guest_path}); "
         f"searched out={out_dir}, /tmp, cwd. Listing {out_dir}:\n"
         + _safe_listdir(out_dir)
     )

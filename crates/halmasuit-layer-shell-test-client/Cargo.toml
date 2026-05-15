@@ -8,8 +8,8 @@ license.workspace        = true
 repository.workspace     = true
 authors.workspace        = true
 
-# Same rationale as halmasuit-visual-test-standin: built via nixpkgs's
-# pinned rustc, looser MSRV is fine.
+# Throwaway test client: built via nixpkgs's pinned rustc, so a
+# looser MSRV than the workspace pin is fine.
 rust-version       = "1.87"
 
 [lints]

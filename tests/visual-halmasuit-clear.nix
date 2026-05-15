@@ -1,24 +1,17 @@
 # tests/visual-halmasuit-clear.nix — first visual gate against the real
-# halmasuit binary.
+# halmasuit binary (halmasuit-debug, frame_audit on).
 #
-# Proves that halmasuit's DRM backend (the subtask-B.1 slice: dumb buffer
-# + mode-set + SETCRTC) actually drives the display. Before this test
-# halmasuit only HELD the master designation as a token, painting nothing;
-# any client connection had to be the first thing to put pixels on screen.
-# This test pins the precondition: halmasuit alone (with no client) shows
-# the brand color #0a0014.
+# Pins the precondition that halmasuit alone — no wl_client connected —
+# scans out the brand color #0a0014. Capture is the in-process
+# `Snapshot()` D-Bus method (a CPU readback of the exact composited
+# frame), NOT a QMP screendump of QEMU's display: Snapshot reads
+# halmasuit's own framebuffer, so the QEMU display substrate is
+# irrelevant and transient/pre-flip sampling cannot occur. ssimulacra2
+# compares the PNG to the checked-in golden.
 #
-# Captured via QMP screendump on virtio-gpu-pci — the dumb-buffer path
-# populates QEMU's display console without needing virtio-vga-gl or
-# egl-headless (validated by tests/visual-standin.nix using the same
-# substrate). When B.2 (GLES + DrmCompositor) lands, this test will need
-# to swap to a GL-capable virtio device because the renderer changes;
-# the assertion (#0a0014 visible before any client commits) stays.
-#
-# Greeter is `sleep infinity` — same as halmasuit-vm.nix's test
-# greeter. We never actually drive auth here; the test waits for
-# halmasuit's `scanout_active` event in the journal, screenshots,
-# compares to the golden.
+# Greeter is `sleep infinity` — we never drive auth here; the test
+# waits for halmasuit's `scanout_active` event and for the D-Bus name
+# to be owned, then calls Snapshot().
 
 {
   system,
@@ -47,7 +40,7 @@ pkgs.testers.runNixOSTest {
   };
 
   nodes.machine =
-    { pkgs, lib, ... }:
+    { pkgs, ... }:
     {
       imports = [
         ../nix/module.nix
@@ -56,7 +49,7 @@ pkgs.testers.runNixOSTest {
 
       services.halmasuit = {
         enable         = true;
-        package        = halmasuit;
+        package        = halmasuit; # halmasuit-debug (frame_audit) via flake
         spawnPackage   = halmasuit-spawn;
         greeterUid     = 999;
         greeterGroup   = "halmasuit-greeter";
@@ -67,6 +60,15 @@ pkgs.testers.runNixOSTest {
           exec ${pkgs.coreutils}/bin/sleep infinity
         ''}";
       };
+
+      # Snapshot() runs inside halmasuit AFTER its privilege drop (uid
+      # 998) and halmasuit runs under ProtectSystem=strict, so it needs
+      # an explicitly-writable, non-PrivateTmp path to write the PNG.
+      # A world-writable tmpfiles dir on /run (not namespaced by
+      # PrivateTmp) added to the unit's ReadWritePaths. Kept in sync
+      # with visual.py's GUEST_SNAPSHOT_DIR.
+      systemd.tmpfiles.rules = [ "d /run/hsnap 0777 root root -" ];
+      systemd.services.halmasuit.serviceConfig.ReadWritePaths = [ "/run/hsnap" ];
 
       users.users.halmasuit-greeter = {
         isSystemUser = true;
@@ -80,11 +82,6 @@ pkgs.testers.runNixOSTest {
         uid          = 998;
         group        = "halmasuit-greeter";
       };
-
-      # hardware.graphics.enable + LIBGL_ALWAYS_SOFTWARE +
-      # LD_LIBRARY_PATH are now set by services.halmasuit.enable in
-      # nix/module.nix — every halmasuit deployment needs Mesa once
-      # the GLES renderer is in place, not just this visual gate.
 
       virtualisation = {
         memorySize = 1024;
@@ -111,17 +108,27 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_unit("halmasuit.service")
 
-    # Wait for halmasuit to emit scanout_active before screenshotting.
-    # That event fires after SETCRTC succeeds, so the brand clear
-    # color is on the display by the time we sample.
+    # scanout_active fires after the first frame is composited+queued;
+    # audit_frame then publishes it into the snapshot buffer.
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF 'scanout_active'",
         timeout=30,
     )
+    # The frame_audit D-Bus server owns the name once it's ready.
+    machine.wait_until_succeeds(
+        "busctl --system status org.halmasuit",
+        timeout=30,
+    )
 
-    # Give QEMU's display layer a beat to settle on the painted frame.
-    import time
-    time.sleep(0.5)
+    # Task #7's deferred live proof: Snapshot is exposed on
+    # org.halmasuit.Debug.Introspect (and nowhere else).
+    introspect = machine.succeed(
+        "busctl --system introspect org.halmasuit "
+        "/org/halmasuit/Debug/Introspect"
+    )
+    assert "Snapshot" in introspect, (
+        f"Snapshot method missing from Introspect interface:\n{introspect}"
+    )
 
     visual.assert_matches_golden(machine, "halmasuit-clear-color")
 

@@ -139,24 +139,30 @@ impl Introspect {
 /// denied logs a warning and the thread exits — frame_audit's
 /// `FrameRendered` stream is unaffected, only `Snapshot()` is.
 pub fn serve(buf: SnapshotBuffer) {
+    // Build the connection on the CALLER's thread, synchronously,
+    // before returning. main() calls this before the privilege drop,
+    // so the bus connection authenticates as the pre-drop euid (root
+    // in production deploys) deterministically — not racing the
+    // setresuid the way a thread-internal connect would. The D-Bus
+    // policy then only has to grant name ownership to root.
+    let conn = match zbus::blocking::connection::Builder::system()
+        .and_then(|b| b.name("org.halmasuit"))
+        .and_then(|b| b.serve_at("/org/halmasuit/Debug/Introspect", Introspect { buf }))
+        .and_then(zbus::blocking::connection::Builder::build)
+    {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::warn!(error = %e, "frame_audit D-Bus serve failed; Snapshot() unavailable");
+            return;
+        }
+    };
+    tracing::info!("frame_audit D-Bus Snapshot() ready on org.halmasuit.Debug.Introspect");
+    // Hand the established connection to a holder thread that parks to
+    // keep it (and the served object) alive for the process lifetime.
+    // zbus dispatches method calls on its own internal executor.
     std::thread::Builder::new()
         .name("halmasuit-dbus".to_owned())
         .spawn(move || {
-            let conn = match zbus::blocking::connection::Builder::system()
-                .and_then(|b| b.name("org.halmasuit"))
-                .and_then(|b| {
-                    b.serve_at("/org/halmasuit/Debug/Introspect", Introspect { buf })
-                })
-                .and_then(zbus::blocking::connection::Builder::build)
-            {
-                Ok(conn) => conn,
-                Err(e) => {
-                    tracing::warn!(error = %e, "frame_audit D-Bus serve failed; Snapshot() unavailable");
-                    return;
-                }
-            };
-            tracing::info!("frame_audit D-Bus Snapshot() ready on org.halmasuit.Debug.Introspect");
-            // Keep `conn` alive; zbus dispatches on its own executor.
             let _conn = conn;
             loop {
                 std::thread::park();
