@@ -1513,19 +1513,58 @@ smithay::delegate_shm!(HalmasuitState);
 /// a crash-loop's. There is intentionally no retry cap that
 /// eventually exits — that would reintroduce the flash. An unbroken
 /// error loop is still not a flash.
-fn run_loop_iteration(body: impl FnOnce() -> io::Result<()>) {
+///
+/// The degraded-iteration log is rate-limited. calloop's dispatch
+/// timeout is an upper bound, not a floor: a persistently-ready
+/// faulted fd (e.g. a Wayland client fd stuck at HUP) returns from
+/// `dispatch` immediately every iteration, so the loop spins at CPU
+/// speed. Logging once per iteration would reproduce the prior
+/// broken-pipe pathology (~237k lines in ~535s). `consecutive_errors`
+/// (owned by the caller, reset on the first clean iteration) gates
+/// the log to the first few failures plus power-of-two boundaries —
+/// O(log n) lines for n failures — and emits a one-line recovery
+/// summary when the fault clears.
+fn run_loop_iteration(consecutive_errors: &mut u32, body: impl FnOnce() -> io::Result<()>) {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::error!(
-            error = %e,
-            "event-loop dispatch error; degrading in place — \
-             process exit would re-acquire DRM master and flash"
-        ),
-        Err(_panic) => tracing::error!(
-            "event-loop iteration panicked; degrading in place — \
-             process exit would re-acquire DRM master and flash"
-        ),
+        Ok(Ok(())) => {
+            if *consecutive_errors != 0 {
+                tracing::error!(
+                    suppressed = *consecutive_errors,
+                    "event-loop recovered after degraded iterations"
+                );
+                *consecutive_errors = 0;
+            }
+        }
+        Ok(Err(e)) => {
+            *consecutive_errors += 1;
+            if should_log_degraded(*consecutive_errors) {
+                tracing::error!(
+                    error = %e,
+                    consecutive = *consecutive_errors,
+                    "event-loop dispatch error; degrading in place — \
+                     process exit would re-acquire DRM master and flash"
+                );
+            }
+        }
+        Err(_panic) => {
+            *consecutive_errors += 1;
+            if should_log_degraded(*consecutive_errors) {
+                tracing::error!(
+                    consecutive = *consecutive_errors,
+                    "event-loop iteration panicked; degrading in place — \
+                     process exit would re-acquire DRM master and flash"
+                );
+            }
+        }
     }
+}
+
+/// Whether the `n`-th consecutive degraded iteration should be logged.
+/// First five, then power-of-two boundaries: O(log n) lines for a
+/// persistent fault instead of one-per-iteration, while still
+/// surfacing the fault promptly and marking escalation.
+const fn should_log_degraded(n: u32) -> bool {
+    n <= 5 || n.is_power_of_two()
 }
 
 #[allow(
@@ -1919,8 +1958,11 @@ fn main() -> io::Result<()> {
     // pending outgoing events to clients. flush_clients lives on the
     // DisplayHandle (cloned earlier) since Display itself is now owned
     // by the calloop source above.
+    // Consecutive failed-iteration counter for the R5 degrade-in-place
+    // log rate-limiter; reset on the first clean iteration.
+    let mut consecutive_errors = 0u32;
     while state.running {
-        run_loop_iteration(|| {
+        run_loop_iteration(&mut consecutive_errors, || {
             event_loop
                 .dispatch(Some(Duration::from_millis(16)), &mut state)
                 .map_err(io::Error::other)?;
@@ -2046,31 +2088,77 @@ mod tests {
     #[test]
     fn run_loop_iteration_ok_runs_body_and_returns() {
         let ran = AtomicUsize::new(0);
-        run_loop_iteration(|| {
+        let mut streak = 0u32;
+        run_loop_iteration(&mut streak, || {
             ran.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
         assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert_eq!(streak, 0, "a clean iteration keeps the error streak at 0");
     }
 
     #[test]
     fn run_loop_iteration_err_does_not_escape() {
         let ran = AtomicUsize::new(0);
-        run_loop_iteration(|| {
+        let mut streak = 0u32;
+        run_loop_iteration(&mut streak, || {
             ran.fetch_add(1, Ordering::SeqCst);
             Err(io::Error::other("dispatch blew up"))
         });
         assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert_eq!(streak, 1, "an Err iteration increments the error streak");
     }
 
     #[test]
     fn run_loop_iteration_panic_does_not_escape() {
         let ran = AtomicUsize::new(0);
-        run_loop_iteration(|| {
+        let mut streak = 0u32;
+        run_loop_iteration(&mut streak, || {
             ran.fetch_add(1, Ordering::SeqCst);
             panic!("calloop callback panicked");
         });
         assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            streak, 1,
+            "a panicking iteration increments the error streak"
+        );
+    }
+
+    #[test]
+    fn run_loop_iteration_ok_resets_streak() {
+        // A recovered iteration zeroes the streak so the next fault
+        // burst logs from the start again (and emits a recovery line).
+        let mut streak = 7u32;
+        run_loop_iteration(&mut streak, || Ok(()));
+        assert_eq!(streak, 0, "recovery resets the consecutive-error streak");
+    }
+
+    #[test]
+    fn degraded_log_is_rate_limited_under_persistent_fault() {
+        // The R5 degrade-in-place path must NOT log once per iteration
+        // (a persistently-ready faulted fd spins with no per-iteration
+        // delay — that produced the prior ~237k-lines/535s pattern).
+        // Log the first few, then only on power-of-two boundaries, so
+        // N failures cost O(log N) lines, not O(N).
+        assert!(should_log_degraded(1));
+        assert!(should_log_degraded(5));
+        assert!(
+            !should_log_degraded(6),
+            "6 is suppressed (not <=5, not pow2)"
+        );
+        assert!(!should_log_degraded(7));
+        assert!(should_log_degraded(8), "powers of two still log (boundary)");
+        assert!(!should_log_degraded(1000));
+        assert!(should_log_degraded(1024));
+        // O(log N) bound: across 1..=1_000_000 failures, far fewer than
+        // the prior incident's hundreds-of-lines-per-second.
+        let logged = (1u32..=1_000_000)
+            .filter(|&n| should_log_degraded(n))
+            .count();
+        assert!(
+            logged < 30,
+            "expected O(log N) logged lines over 1e6 failures, got {logged}"
+        );
     }
 
     // R1 port: the Wayland accept path authorises a peer iff its
