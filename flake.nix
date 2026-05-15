@@ -529,6 +529,15 @@
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Epic layer E2: real keystroke → libinput → wl_seat →
+        # focused client. Production halmasuit (input is core).
+        halmasuit-input = import ./tests/halmasuit-input.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-spawn                   = self.packages.x86_64-linux.halmasuit-spawn;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+        };
       };
     };
 }

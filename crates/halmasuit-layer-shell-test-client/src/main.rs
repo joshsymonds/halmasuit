@@ -29,6 +29,10 @@ use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::registry_handlers;
+use smithay_client_toolkit::seat::keyboard::{
+    KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers,
+};
+use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -37,11 +41,14 @@ use smithay_client_toolkit::shell::wlr_layer::{
 use smithay_client_toolkit::shm::slot::SlotPool;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
+    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_registry,
+    delegate_seat, delegate_shm,
 };
 
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
+use smithay_client_toolkit::reexports::client::protocol::wl_keyboard;
 use smithay_client_toolkit::reexports::client::protocol::wl_output;
+use smithay_client_toolkit::reexports::client::protocol::wl_seat;
 use smithay_client_toolkit::reexports::client::protocol::wl_shm::Format;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface;
 use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
@@ -121,7 +128,16 @@ fn main() -> anyhow::Result<()> {
         // the output mode.
         layer_surface.set_anchor(Anchor::all());
     }
-    layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
+    // HALMASUIT_TESTCLIENT_KEYBOARD=1 → request exclusive keyboard
+    // focus so halmasuit's focus policy routes libinput keys here;
+    // the client logs every keysym it receives (the input VM test
+    // asserts on that). Default: no keyboard (the other scenes).
+    let want_keyboard = std::env::var("HALMASUIT_TESTCLIENT_KEYBOARD").is_ok();
+    layer_surface.set_keyboard_interactivity(if want_keyboard {
+        KeyboardInteractivity::Exclusive
+    } else {
+        KeyboardInteractivity::None
+    });
     layer_surface.set_exclusive_zone(-1); // ignore exclusive zones
     layer_surface.commit();
 
@@ -131,6 +147,8 @@ fn main() -> anyhow::Result<()> {
     let mut state = State {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
+        seat_state: SeatState::new(&globals, &qh),
+        keyboard: None,
         shm,
         _compositor_state: compositor,
         _layer_shell: layer_shell,
@@ -153,6 +171,8 @@ fn main() -> anyhow::Result<()> {
 struct State {
     registry_state: RegistryState,
     output_state: OutputState,
+    seat_state: SeatState,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
     shm: Shm,
     /// Held for the surface's lifetime; the layer surface goes away if
     /// the LayerShell global is dropped.
@@ -304,15 +324,134 @@ impl ShmHandler for State {
     }
 }
 
+impl SeatHandler for State {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            match self.seat_state.get_keyboard(qh, &seat, None) {
+                Ok(kb) => {
+                    eprintln!("layer-shell-test-client: keyboard capability acquired");
+                    self.keyboard = Some(kb);
+                }
+                Err(e) => eprintln!("layer-shell-test-client: get_keyboard failed: {e}"),
+            }
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Keyboard
+            && let Some(kb) = self.keyboard.take()
+        {
+            kb.release();
+        }
+    }
+}
+
+impl KeyboardHandler for State {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
+        eprintln!("layer-shell-test-client: keyboard enter");
+    }
+
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+    }
+
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        // The single line the input VM test asserts on. raw() is the
+        // xkb keysym (e.g. 0x61 for 'a').
+        eprintln!(
+            "layer-shell-test-client: key press keysym=0x{:x}",
+            event.keysym.raw()
+        );
+    }
+
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+    }
+
+    fn repeat_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        eprintln!(
+            "layer-shell-test-client: key repeat keysym=0x{:x}",
+            event.keysym.raw()
+        );
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: Modifiers,
+        _: RawModifiers,
+        _: u32,
+    ) {
+    }
+}
+
 impl ProvidesRegistryState for State {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 delegate_compositor!(State);
 delegate_output!(State);
+delegate_seat!(State);
+delegate_keyboard!(State);
 delegate_shm!(State);
 delegate_layer!(State);
 delegate_registry!(State);

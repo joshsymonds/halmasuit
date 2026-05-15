@@ -46,6 +46,9 @@ test-vm:
     echo "── login-flash ──"
     nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link
     echo
+    echo "── halmasuit-input ──"
+    nix build .#checks.x86_64-linux.halmasuit-input -L --print-build-logs --no-link
+    echo
     echo "── visual-halmasuit-clear ──"
     nix build .#checks.x86_64-linux.visual-halmasuit-clear -L --print-build-logs --no-link
     echo

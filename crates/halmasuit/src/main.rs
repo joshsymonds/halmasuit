@@ -40,13 +40,18 @@ use halmasuit_greetd::server::{
     Connection, PamSessionFactory, SpawnRequest, bind_socket, peer_credentials,
 };
 use halmasuit_introspect::{Event, Phase, ShutdownReason, emit};
+use smithay::backend::input::{Event as InputEventTrait, InputEvent, KeyboardKeyEvent};
+use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
+use smithay::backend::session::Session;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::desktop::layer_map_for_output;
+use smithay::input::keyboard::FilterResult;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
+use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
@@ -76,10 +81,9 @@ struct HalmasuitState {
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
     seat_state: SeatState<Self>,
-    // `_seat` is retained so the seat global stays registered for the
-    // lifetime of the compositor; capabilities are added when real
-    // input devices come online in a future task.
-    _seat: Seat<Self>,
+    /// The single `wl_seat` (keyboard + pointer). libinput events are
+    /// routed here and forwarded to the keyboard-focused client.
+    seat: Seat<Self>,
     // OutputManagerState exists to keep the xdg_output_manager global
     // alive; nothing reads the field directly (delegate_output! handles
     // dispatch via the type), hence the leading underscore.
@@ -185,6 +189,44 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
+impl HalmasuitState {
+    /// Route one libinput event to the seat. Keyboard keys go to the
+    /// keyboard-focused client (focus is set by
+    /// [`Self::set_keyboard_focus`], driven by the layer-shell
+    /// keyboard-interactivity policy in the commit handler — layer F
+    /// replaces that with the greeter→session machine). Pointer
+    /// capability exists; full pointer routing (focus-follows,
+    /// cursor) is layer F's concern, so non-keyboard events are
+    /// accepted but not yet dispatched.
+    fn dispatch_libinput(&mut self, event: InputEvent<LibinputInputBackend>) {
+        if let InputEvent::Keyboard { event } = event {
+            let Some(keyboard) = self.seat.get_keyboard() else {
+                return;
+            };
+            let serial = SERIAL_COUNTER.next_serial();
+            let time = event.time_msec();
+            let code = event.key_code();
+            let key_state = event.state();
+            keyboard.input::<(), _>(self, code, key_state, serial, time, |_, _, _| {
+                FilterResult::Forward
+            });
+        }
+    }
+
+    /// Point keyboard focus at `surface` (or clear it). No-op if it is
+    /// already the focus, to avoid enter/leave churn.
+    fn set_keyboard_focus(&mut self, surface: Option<WlSurface>) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        if keyboard.current_focus() == surface {
+            return;
+        }
+        let serial = SERIAL_COUNTER.next_serial();
+        keyboard.set_focus(self, surface, serial);
+    }
+}
+
 impl CompositorHandler for HalmasuitState {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
@@ -255,6 +297,17 @@ impl CompositorHandler for HalmasuitState {
                     };
                     if self.seen_layer_roles.insert(role) {
                         emit(&Event::ClientFirstFrame { role });
+                    }
+                    // Default keyboard-focus policy (layer E2): a
+                    // layer-shell client that requests keyboard
+                    // interactivity gets keyboard focus. Layer F
+                    // replaces this with the greeter→session
+                    // foreground state machine. `set_keyboard_focus`
+                    // is a no-op if it is already focused.
+                    if layer.cached_state().keyboard_interactivity
+                        != smithay::wayland::shell::wlr_layer::KeyboardInteractivity::None
+                    {
+                        self.set_keyboard_focus(Some(surface.clone()));
                     }
                 }
             }
@@ -1294,7 +1347,15 @@ fn main() -> io::Result<()> {
     let xdg_shell_state = XdgShellState::new::<HalmasuitState>(&display_handle);
 
     let mut seat_state = SeatState::new();
-    let seat = seat_state.new_wl_seat(&display_handle, "seat0".to_owned());
+    let mut seat = seat_state.new_wl_seat(&display_handle, "seat0".to_owned());
+    // Keyboard + pointer capabilities. Real events arrive via the
+    // libinput backend (inserted on the DRM path below) and are
+    // routed to the focused client. XkbConfig::default() is the
+    // system default layout; 200ms delay / 25Hz repeat is the
+    // conventional wlroots default.
+    seat.add_keyboard(smithay::input::keyboard::XkbConfig::default(), 200, 25)
+        .map_err(|e| io::Error::other(format!("seat.add_keyboard: {e}")))?;
+    seat.add_pointer();
 
     let output_manager_state =
         OutputManagerState::new_with_xdg_output::<HalmasuitState>(&display_handle);
@@ -1351,6 +1412,23 @@ fn main() -> io::Result<()> {
                 }
             },
         )?;
+
+        // libinput, fed device fds through the SAME seatd session
+        // (validated surviving setresuid by drm-master-probe Phase 4).
+        // Events are routed to the keyboard-focused client.
+        let mut libinput = smithay::reexports::input::Libinput::new_with_udev(
+            LibinputSessionInterface::from(session.clone()),
+        );
+        libinput.udev_assign_seat(&session.seat()).map_err(|()| {
+            io::Error::other(format!("libinput udev_assign_seat({})", session.seat()))
+        })?;
+        loop_handle
+            .insert_source(
+                LibinputInputBackend::new(libinput),
+                |event, (), state: &mut HalmasuitState| state.dispatch_libinput(event),
+            )
+            .map_err(|e| io::Error::other(format!("insert libinput backend: {e}")))?;
+
         real_output.create_global::<HalmasuitState>(&display_handle);
         emit(&Event::PhaseEntered {
             phase: Phase::DrmMasterAcquired,
@@ -1505,7 +1583,7 @@ fn main() -> io::Result<()> {
         compositor_state,
         xdg_shell_state,
         seat_state,
-        _seat: seat,
+        seat,
         _output_manager_state: output_manager_state,
         output,
         shm_state,
