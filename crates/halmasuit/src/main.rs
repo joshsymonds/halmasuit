@@ -1430,6 +1430,38 @@ smithay::delegate_seat!(HalmasuitState);
 smithay::delegate_output!(HalmasuitState);
 smithay::delegate_shm!(HalmasuitState);
 
+/// Run one main-loop iteration behind a fault boundary (Epic #1 R5).
+///
+/// `body` is the dispatch+flush step. A `?`-propagated `Err` or a
+/// panic in any calloop callback would otherwise unwind out of
+/// `main()` → non-zero exit → systemd `Restart=on-failure` → DRM
+/// master re-acquired → the visible flash this project exists to
+/// delete. So neither escapes: an `Err` is logged and the loop
+/// continues; a panic is caught and the loop continues.
+///
+/// `AssertUnwindSafe` is deliberate. The body borrows `&mut state`,
+/// which is not `UnwindSafe`, so a caught panic may leave compositor
+/// state inconsistent. Per R5 the no-flash invariant outranks a
+/// possibly-degraded session: staying alive degraded beats a
+/// guaranteed flash, and clean re-exec recovery is Phase B's job, not
+/// a crash-loop's. There is intentionally no retry cap that
+/// eventually exits — that would reintroduce the flash. An unbroken
+/// error loop is still not a flash.
+fn run_loop_iteration(body: impl FnOnce() -> io::Result<()>) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!(
+            error = %e,
+            "event-loop dispatch error; degrading in place — \
+             process exit would re-acquire DRM master and flash"
+        ),
+        Err(_panic) => tracing::error!(
+            "event-loop iteration panicked; degrading in place — \
+             process exit would re-acquire DRM master and flash"
+        ),
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "main() is the wiring point — splitting smithay+greetd+calloop \
@@ -1822,15 +1854,21 @@ fn main() -> io::Result<()> {
     // DisplayHandle (cloned earlier) since Display itself is now owned
     // by the calloop source above.
     while state.running {
-        event_loop
-            .dispatch(Some(Duration::from_millis(16)), &mut state)
-            .map_err(io::Error::other)?;
-        state
-            .display_handle
-            .flush_clients()
-            .map_err(io::Error::other)?;
+        run_loop_iteration(|| {
+            event_loop
+                .dispatch(Some(Duration::from_millis(16)), &mut state)
+                .map_err(io::Error::other)?;
+            state
+                .display_handle
+                .flush_clients()
+                .map_err(io::Error::other)?;
+            Ok(())
+        });
     }
 
+    // Reached only via the deliberate Shutdown path (`state.running`
+    // cleared in the SIGTERM/SIGINT closure): a clean exit 0, which
+    // systemd's `Restart=on-failure` correctly does NOT restart.
     Ok(())
 }
 
@@ -1895,6 +1933,41 @@ mod tests {
         let cmd = build_spawn_command(Path::new("/bin/true"), &req);
         let map: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert!(!map.contains_key(OsStr::new("MALFORMED_NO_EQUALS")));
+    }
+
+    // R5 port: neither a dispatch Err nor a callback panic may escape
+    // the loop iteration — escaping = process exit = systemd restart =
+    // DRM re-acquire = the flash this project exists to delete.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn run_loop_iteration_ok_runs_body_and_returns() {
+        let ran = AtomicUsize::new(0);
+        run_loop_iteration(|| {
+            ran.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn run_loop_iteration_err_does_not_escape() {
+        let ran = AtomicUsize::new(0);
+        run_loop_iteration(|| {
+            ran.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("dispatch blew up"))
+        });
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn run_loop_iteration_panic_does_not_escape() {
+        let ran = AtomicUsize::new(0);
+        run_loop_iteration(|| {
+            ran.fetch_add(1, Ordering::SeqCst);
+            panic!("calloop callback panicked");
+        });
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
     // R1 port: the Wayland accept path authorises a peer iff its
