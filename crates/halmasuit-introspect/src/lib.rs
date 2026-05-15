@@ -121,6 +121,18 @@ pub enum Event {
         /// `Display` form of the spawn failure.
         error: String,
     },
+    /// The greeter process exited BEFORE authentication completed
+    /// (`session_uid` was still unset when the SIGCHLD reaper observed
+    /// the death). The unexpected-death path: distinct from
+    /// `GreeterTerminated` (the deliberate post-auth SIGKILL) and
+    /// `GreeterKillFailed` (that SIGKILL racing an already-exited
+    /// greeter). Emitted so a greeter crash/exit pre-auth surfaces as
+    /// an explicit event instead of silently wedging the compositor
+    /// with no greeter, no session, and a discarded waitpid status.
+    GreeterDiedPreAuth {
+        /// PID of the greeter that exited pre-auth.
+        pid: u32,
+    },
     /// A composited frame was scanned out, with the test-only
     /// `frame_audit` analysis of its pixels. The variant is defined
     /// unconditionally so `halmasuit-introspect` (and its consumers'
@@ -381,6 +393,13 @@ mod tests {
         assert_eq!(v["event"], "session_spawn_failed");
         assert_eq!(v["uid"], 1000);
         assert_eq!(v["error"], "No such file or directory (os error 2)");
+    }
+
+    #[test]
+    fn event_greeter_died_pre_auth_carries_pid() {
+        let v = round_trip(&Event::GreeterDiedPreAuth { pid: 4242 });
+        assert_eq!(v["event"], "greeter_died_pre_auth");
+        assert_eq!(v["pid"], 4242);
     }
 
     #[test]

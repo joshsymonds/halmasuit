@@ -1115,12 +1115,78 @@ fn pidfd_send_signal(pidfd: &std::os::fd::OwnedFd, sig: i32) -> io::Result<()> {
 /// until `waitpid` reports no more reapable children. Without this,
 /// dead halmasuit-spawn / greeter / session children accumulate as
 /// zombies and eventually exhaust the pid namespace.
-fn reap_zombie_children() {
+/// What a reaped child's pid means relative to the greeter lifecycle.
+#[derive(Debug, PartialEq, Eq)]
+enum ReapOutcome {
+    /// The greeter exited before authentication completed — the wedge
+    /// condition (no greeter client, no session, nothing else notices).
+    GreeterDiedPreAuth,
+    /// The greeter exited after a session spawn was confirmed —
+    /// `start_session` already SIGKILLed it and emitted
+    /// `GreeterTerminated`; the expected zombie.
+    GreeterDiedExpected,
+    /// A non-greeter child (halmasuit-spawn, the session, or an
+    /// already-cleared greeter slot).
+    Other,
+}
+
+/// Classify a reaped pid against the tracked greeter pid and the
+/// authentication state (`session_uid` is `Some` once `start_session`
+/// confirmed a spawn). Pure so the wedge logic is unit-testable
+/// without driving real children through `waitpid`.
+fn classify_reaped_child(
+    reaped_pid: u32,
+    greeter_pid: Option<u32>,
+    session_uid: Option<u32>,
+) -> ReapOutcome {
+    if greeter_pid != Some(reaped_pid) {
+        return ReapOutcome::Other;
+    }
+    if session_uid.is_none() {
+        ReapOutcome::GreeterDiedPreAuth
+    } else {
+        ReapOutcome::GreeterDiedExpected
+    }
+}
+
+/// Reap zombie children (coalesced SIGCHLD: one signal may cover
+/// several deaths — loop until `waitpid` drains). Beyond reaping,
+/// attribute each death: a greeter exit *before* authentication (R4)
+/// is surfaced as `GreeterDiedPreAuth` and the now-stale greeter
+/// handle cleared, instead of vanishing into a discarded status.
+fn reap_zombie_children(state: &mut HalmasuitState) {
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
     loop {
-        match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
+        let status = match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) | Err(_) => return,
-            Ok(status) => tracing::debug!(?status, "reaped child"),
+            Ok(status) => status,
+        };
+        let reaped_pid = match status {
+            WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _) => {
+                Some(pid.as_raw().cast_unsigned())
+            }
+            _ => None,
+        };
+        match reaped_pid.map(|pid| {
+            (
+                pid,
+                classify_reaped_child(
+                    pid,
+                    state.greeter.as_ref().map(|g| g.pid),
+                    state.session_uid,
+                ),
+            )
+        }) {
+            Some((pid, ReapOutcome::GreeterDiedPreAuth)) => {
+                state.greeter = None;
+                emit(&Event::GreeterDiedPreAuth { pid });
+                tracing::warn!(greeter_pid = pid, "greeter exited before authentication");
+            }
+            Some((pid, ReapOutcome::GreeterDiedExpected)) => {
+                state.greeter = None;
+                tracing::debug!(?status, greeter_pid = pid, "reaped greeter post-auth");
+            }
+            _ => tracing::debug!(?status, "reaped child"),
         }
     }
 }
@@ -1679,7 +1745,7 @@ fn main() -> io::Result<()> {
         .insert_source(
             signals,
             |event, (), state: &mut HalmasuitState| match event.signal() {
-                Signal::SIGCHLD => reap_zombie_children(),
+                Signal::SIGCHLD => reap_zombie_children(state),
                 sig => {
                     let reason = match sig {
                         Signal::SIGTERM => ShutdownReason::SignalTerm,
@@ -1933,6 +1999,43 @@ mod tests {
         let cmd = build_spawn_command(Path::new("/bin/true"), &req);
         let map: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert!(!map.contains_key(OsStr::new("MALFORMED_NO_EQUALS")));
+    }
+
+    // R4 port: the SIGCHLD reaper must distinguish which child died.
+    // Greeter exit pre-auth (session_uid still None) is the wedge
+    // condition that previously vanished into a discarded waitpid
+    // status.
+    #[test]
+    fn classify_greeter_death_pre_auth() {
+        assert_eq!(
+            classify_reaped_child(4242, Some(4242), None),
+            ReapOutcome::GreeterDiedPreAuth
+        );
+    }
+
+    #[test]
+    fn classify_greeter_death_expected_post_auth() {
+        assert_eq!(
+            classify_reaped_child(4242, Some(4242), Some(1000)),
+            ReapOutcome::GreeterDiedExpected
+        );
+    }
+
+    #[test]
+    fn classify_non_greeter_child_is_other() {
+        assert_eq!(
+            classify_reaped_child(99, Some(4242), None),
+            ReapOutcome::Other
+        );
+        assert_eq!(
+            classify_reaped_child(99, Some(4242), Some(1000)),
+            ReapOutcome::Other
+        );
+    }
+
+    #[test]
+    fn classify_with_no_greeter_tracked_is_other() {
+        assert_eq!(classify_reaped_child(4242, None, None), ReapOutcome::Other);
     }
 
     // R5 port: neither a dispatch Err nor a callback panic may escape
