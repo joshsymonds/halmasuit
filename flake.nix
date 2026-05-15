@@ -100,6 +100,14 @@
               pam
               libgbm
               libGL
+              # libseat.pc / libseat.so for drm-master-probe's `phase4`
+              # feature (libseat-sys). `just check` runs clippy
+              # `--all-features`, which enables phase4, so the devShell
+              # needs libseat at build time. Provided by seatd.
+              seatd
+              # libinput.pc for smithay's backend_libinput (input-sys)
+              # under the same feature.
+              libinput
             ];
 
             # bindgen (used transitively by pam-sys at build time) needs
@@ -289,6 +297,39 @@
             };
           };
 
+          # drm-master-probe-phase4 — the SAME probe built with the
+          # `phase4` cargo feature (libseat/seatd survival across
+          # setresuid). Separate package so the phase-0–3 tests keep
+          # the lean DRM-only closure (no smithay/libseat/libinput);
+          # mirrors the halmasuit/halmasuit-debug split. libseat-sys /
+          # input-sys link libseat/libinput via pkg-config.
+          drm-master-probe-phase4 = rustPlatform.buildRustPackage {
+            pname   = "drm-master-probe-phase4";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags   = [ "-p" "drm-master-probe" "--features" "phase4" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            # libseat (seatd), libudev (udev), libinput, and
+            # libxkbcommon (input-sys links it). Mirrors the devShell
+            # set that links `--features phase4` cleanly.
+            buildInputs       = [
+              pkgs.seatd
+              pkgs.libinput
+              pkgs.libxkbcommon
+              pkgs.udev
+              pkgs.libgbm
+            ];
+            doCheck = false; # the NixOS VM test (drm-master-probe-phase4) is the test
+            meta = {
+              description = "Phase 4 research probe — libseat/seatd session survival across setresuid";
+              license     = pkgs.lib.licenses.asl20;
+            };
+          };
+
           # halmasuit-layer-shell-test-client — throwaway sctk-based
           # wl_client that binds wlr-layer-shell BACKGROUND, paints a
           # known solid color via wl_shm, holds. Used by
@@ -434,6 +475,10 @@
           inherit nixpkgs;
         };
         drm-master-probe-phase3 = import ./tests/drm-master-probe-phase3.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+        };
+        drm-master-probe-phase4 = import ./tests/drm-master-probe-phase4.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
         };

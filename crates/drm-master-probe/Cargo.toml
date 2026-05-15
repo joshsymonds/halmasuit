@@ -18,9 +18,32 @@ authors.workspace  = true
 [lints]
 workspace = true
 
+[features]
+# Phase 4 (libseat/seatd session survival across setresuid). OFF by
+# default so Phases 0–3 keep their lean DRM-only closure (no
+# smithay/libseat/libinput). The flake builds a separate
+# `drm-master-probe-phase4` package with this on; phase-0–3 tests use
+# the featureless package. Mirrors the halmasuit/halmasuit-debug split.
+phase4 = ["dep:smithay"]
+
 [dependencies]
 anyhow = "1"
 drm    = "0.15"
+# Phase 4 only: LibSeatSession (seatd-brokered device fds), the
+# session's DRM open, LibinputInputBackend. Optional — absent from
+# the default probe's closure (Phases 0–3 stay lean DRM-only).
+# `calloop`, `input` and `rustix` come via smithay's reexports, so no
+# separate deps and no version skew with smithay's pins.
+smithay = { workspace = true, optional = true, features = [
+    "backend_session_libseat",
+    "backend_libinput",
+    # `backend_udev` is what enables `input/udev` →
+    # `Libinput::new_with_udev` / `udev_assign_seat` (the
+    # seat-scoped device discovery the probe needs). `backend_libinput`
+    # alone does not.
+    "backend_udev",
+    "backend_drm",
+] }
 # Phase 1: setresuid for the privilege-drop step post-switch_root. The
 # `user` feature gates nix::unistd::{Uid, setresuid}.
 # Phase 3: execve (process feature) for the exec-across-switch_root test.
