@@ -314,6 +314,40 @@
             };
           };
 
+          # halmasuit-splash — the real system background wl_client.
+          # wgpu (GL backend) renders the HALMASUIT_SPLASH_IMAGE PNG
+          # fullscreen on a wlr-layer-shell BACKGROUND surface. wgpu
+          # and wayland-client(dlopen) dlopen libEGL/libGL/libwayland
+          # at runtime; like halmasuit those are dropped from RPATH
+          # because nothing link-references them, so re-add them with
+          # patchelf (same treatment as the halmasuit package).
+          halmasuit-splash = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-splash";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags   = [ "-p" "halmasuit-splash" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [
+              pkgs.libxkbcommon
+              pkgs.wayland
+              pkgs.libGL
+            ];
+            doCheck = false;
+            postFixup = ''
+              patchelf --add-rpath "${pkgs.libGL}/lib:${pkgs.wayland}/lib" \
+                $out/bin/halmasuit-splash
+            '';
+            meta = {
+              description = "halmasuit system background (wgpu PNG layer-shell BACKGROUND client)";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-splash";
+            };
+          };
+
           # ssimulacra2_rs — pure-Rust port of the SSIMULACRA2
           # perceptual image-diff metric. Used by visual VM tests as
           # the golden-comparison engine. Chosen over the C++
@@ -421,6 +455,14 @@
           halmasuit-spawn                  = self.packages.x86_64-linux.halmasuit-spawn;
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
           ssimulacra2-cli                  = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        visual-halmasuit-splash = import ./tests/visual-halmasuit-splash.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit        = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-spawn  = self.packages.x86_64-linux.halmasuit-spawn;
+          halmasuit-splash = self.packages.x86_64-linux.halmasuit-splash;
+          ssimulacra2-cli  = self.packages.x86_64-linux.ssimulacra2-cli;
         };
       };
     };

@@ -116,6 +116,19 @@ in
       '';
     };
 
+    splashImage = lib.mkOption {
+      type        = lib.types.nullOr lib.types.path;
+      default     = null;
+      example     = lib.literalExpression ''./branding/wallpaper.png'';
+      description = ''
+        Absolute path to a PNG `halmasuit-splash` paints fullscreen as
+        the system background. When set, exported to halmasuit's unit
+        environment as `HALMASUIT_SPLASH_IMAGE`; `halmasuit-splash`
+        (run as a wlr-layer-shell BACKGROUND client of halmasuit)
+        reads it. `null` runs halmasuit with no splash configured.
+      '';
+    };
+
     pamService = lib.mkOption {
       type        = lib.types.str;
       default     = "halmasuit";
@@ -349,6 +362,9 @@ in
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.
         HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
+      } // lib.optionalAttrs (cfg.splashImage != null) {
+        # Read by halmasuit-splash. See `services.halmasuit.splashImage`.
+        HALMASUIT_SPLASH_IMAGE = toString cfg.splashImage;
       };
     };
   };

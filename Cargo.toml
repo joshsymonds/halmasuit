@@ -15,9 +15,11 @@ members = [
     "crates/drm-master-probe",
     # Layer-shell test client — throwaway, used by
     # tests/visual-halmasuit-layer.nix to verify halmasuit composites
-    # wl_clients via wlr-layer-shell. Replaced by halmasuit-splash in
-    # B.4.
+    # wl_clients via wlr-layer-shell.
     "crates/halmasuit-layer-shell-test-client",
+    # halmasuit-splash — the real system background wl_client (wgpu,
+    # PNG-as-texture, layer-shell BACKGROUND). Epic layer C.
+    "crates/halmasuit-splash",
     "xtask",
 ]
 # cargo-fuzz subworkspace needs nightly rustc + libfuzzer-sys; isolated
@@ -97,6 +99,30 @@ caps               = "0.5"
 # Property-based testing. halmasuit-spawn argv parser + the future greetd
 # state machine both lean on it for boundary-condition coverage.
 proptest           = "1"
+# halmasuit-splash (the system background wl_client) deps. NOT used by
+# the halmasuit compositor binary — these never enter halmasuit's
+# cargo-tree (Epic #1 req 7 is about halmasuit, not its sibling
+# clients). `image` here is fine for the same reason.
+# - wgpu: GPU surface + textured fullscreen quad. GL backend in-VM
+#   (Mesa/llvmpipe, already wired by nix/module.nix).
+# - raw-window-handle 0.6: bridge wayland-client's wl_surface/
+#   wl_display pointers into wgpu (matches wgpu 22's RWH major).
+# - image: decode the splash PNG. default features (incl. png).
+# - pollster: block_on for wgpu's async adapter/device init.
+wgpu               = "22"
+raw-window-handle  = "0.6"
+image              = { version = "0.25", default-features = false, features = ["png"] }
+pollster           = "0.3"
+# Direct wayland-client (in addition to sctk's re-export, same crate
+# via unification) ONLY to turn on the system libwayland backend:
+# `dlopen` → `wayland-backend/dlopen` → `client_system`, which is what
+# exposes the raw `wl_display`/`wl_surface` pointers wgpu's wayland
+# WSI needs. Without it sctk uses the pure-Rust backend (no C
+# pointers) and wgpu cannot create a surface.
+# `system` → wayland-backend/client_system (the sys ObjectId/Backend
+# that expose `as_ptr`/`display_ptr`); `dlopen` → load libwayland at
+# runtime instead of link-time (matches how Mesa/wgpu load it).
+wayland-client     = { version = "0.31", features = [ "dlopen", "system" ] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
