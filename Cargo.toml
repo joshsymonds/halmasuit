@@ -20,6 +20,9 @@ members = [
     # halmasuit-splash — the real system background wl_client (wgpu,
     # PNG-as-texture, layer-shell BACKGROUND). Epic layer C.
     "crates/halmasuit-splash",
+    # Throwaway xdg_toplevel test client — exercises halmasuit's F1
+    # xdg-shell compositing path.
+    "crates/halmasuit-toplevel-test-client",
     "xtask",
 ]
 # cargo-fuzz subworkspace needs nightly rustc + libfuzzer-sys; isolated

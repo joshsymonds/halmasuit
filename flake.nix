@@ -366,6 +366,28 @@
             };
           };
 
+          # halmasuit-toplevel-test-client — throwaway sctk xdg_toplevel
+          # client (fullscreen solid colour) exercising halmasuit's F1
+          # xdg-shell compositing path.
+          halmasuit-toplevel-test-client = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-toplevel-test-client";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [ "-p" "halmasuit-toplevel-test-client" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [ pkgs.libxkbcommon pkgs.wayland ];
+            doCheck = false;
+            meta = {
+              description = "xdg_toplevel test client for halmasuit F1 visual gate";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-toplevel-test-client";
+            };
+          };
+
           # halmasuit-splash — the real system background wl_client.
           # wgpu (GL backend) renders the HALMASUIT_SPLASH_IMAGE PNG
           # fullscreen on a wlr-layer-shell BACKGROUND surface. wgpu
@@ -528,6 +550,17 @@
           halmasuit-splash                  = self.packages.x86_64-linux.halmasuit-splash;
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Epic layer F1: real xdg_toplevel composited fullscreen
+        # over the splash background.
+        visual-halmasuit-toplevel = import ./tests/visual-halmasuit-toplevel.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                      = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-spawn                = self.packages.x86_64-linux.halmasuit-spawn;
+          halmasuit-splash               = self.packages.x86_64-linux.halmasuit-splash;
+          halmasuit-toplevel-test-client = self.packages.x86_64-linux.halmasuit-toplevel-test-client;
+          ssimulacra2-cli                = self.packages.x86_64-linux.ssimulacra2-cli;
         };
         # Epic layer E2: real keystroke → libinput → wl_seat →
         # focused client. Production halmasuit (input is core).

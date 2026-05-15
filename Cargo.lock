@@ -1084,6 +1084,14 @@ name = "halmasuit-test"
 version = "0.1.0"
 
 [[package]]
+name = "halmasuit-toplevel-test-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "smithay-client-toolkit",
+]
+
+[[package]]
 name = "halmasuit-vm-client"
 version = "0.1.0"
 dependencies = [

@@ -107,6 +107,11 @@ struct HalmasuitState {
     /// continuity assertion keys off the first
     /// `ClientFirstFrame { role: Background }`.
     seen_layer_roles: std::collections::HashSet<halmasuit_introspect::LayerRole>,
+    /// The single fullscreen xdg_toplevel composited above the splash
+    /// (greeter/session). v1 is one output, no window management — at
+    /// most one toplevel is the foreground. Layer F1 focuses whatever
+    /// maps; F2 makes this greetd-lifecycle-driven.
+    foreground_toplevel: Option<ToplevelSurface>,
     /// The libseat session brokering halmasuit's DRM (and, in E2, the
     /// libinput) device fds. Retained for the process lifetime: if it
     /// drops, seatd tears the session down and the brokered fds are
@@ -313,12 +318,35 @@ impl CompositorHandler for HalmasuitState {
             }
         }
 
-        // Re-render the scene with the now-current buffers. For B.3
-        // the call is synchronous (one frame per commit) — fine for
-        // single-client low-frequency scenes. B.5+ adds frame_audit
-        // and a calloop-idle-scheduled damage-driven path.
+        // Foreground xdg_toplevel keyboard-focus policy (F1 default:
+        // focus whatever toplevel maps; F2 makes this greetd-driven).
+        // On the toplevel's first buffered commit, give it keyboard
+        // focus so input from E2 reaches it.
+        let fg_surface = self
+            .foreground_toplevel
+            .as_ref()
+            .map(|t| t.wl_surface().clone());
+        if fg_surface.as_ref() == Some(surface) {
+            let has_buffer =
+                smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
+                    s.buffer().is_some()
+                })
+                .unwrap_or(false);
+            if has_buffer {
+                self.set_keyboard_focus(Some(surface.clone()));
+            }
+        }
+
+        // Re-render the scene with the now-current buffers (synchronous
+        // one-frame-per-commit; fine for these low-frequency scenes).
+        // The foreground toplevel is composited above the layer
+        // background by `render_layer_elements`.
         if let Some(backend) = self.drm_backend.as_mut()
-            && let Err(e) = backend.render_layer_elements(&self.output, HALMASUIT_BRAND_CLEAR)
+            && let Err(e) = backend.render_layer_elements(
+                &self.output,
+                fg_surface.as_ref(),
+                HALMASUIT_BRAND_CLEAR,
+            )
         {
             tracing::warn!(error = %e, "render_layer_elements on commit failed");
         }
@@ -385,8 +413,13 @@ impl WlrLayerShellHandler for HalmasuitState {
         // teardown (Epic #1 req 11/17). Drop the LayerMap lock first;
         // render_layer_elements re-locks it for this output.
         drop(map);
+        let fg = self
+            .foreground_toplevel
+            .as_ref()
+            .map(|t| t.wl_surface().clone());
         if let Some(backend) = self.drm_backend.as_mut()
-            && let Err(e) = backend.render_layer_elements(&self.output, HALMASUIT_BRAND_CLEAR)
+            && let Err(e) =
+                backend.render_layer_elements(&self.output, fg.as_ref(), HALMASUIT_BRAND_CLEAR)
         {
             tracing::warn!(error = %e, "render_layer_elements on layer_destroyed failed");
         }
@@ -400,12 +433,39 @@ impl XdgShellHandler for HalmasuitState {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        // A client created an xdg_toplevel. Send a configure so the
-        // client knows it can proceed; real geometry comes when an
-        // output exists. For now: zero-size configure is a valid
-        // "compositor-decides" signal.
-        tracing::debug!("new xdg_toplevel");
+        // halmasuit hosts exactly one fullscreen toplevel above the
+        // splash (the greeter, then the session — F2 makes the swap
+        // greetd-driven). Configure it to the output mode, fullscreen
+        // + activated, so the client paints full-screen immediately.
+        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+        let (w, h): (i32, i32) = self
+            .output
+            .current_mode()
+            .map_or((1280, 800), |m| (m.size.w, m.size.h));
+        surface.with_pending_state(|state| {
+            state.size = Some((w, h).into());
+            state.states.set(xdg_toplevel::State::Activated);
+            state.states.set(xdg_toplevel::State::Fullscreen);
+        });
         surface.send_configure();
+        tracing::info!(w, h, "xdg_toplevel mapped as fullscreen foreground");
+        self.foreground_toplevel = Some(surface);
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        if self.foreground_toplevel.as_ref() == Some(&surface) {
+            self.foreground_toplevel = None;
+            // The foreground is gone — clear keyboard focus and
+            // re-composite so the layers beneath (splash) reappear
+            // immediately (no stale/black frame; req 11/17).
+            self.set_keyboard_focus(None);
+            if let Some(backend) = self.drm_backend.as_mut()
+                && let Err(e) =
+                    backend.render_layer_elements(&self.output, None, HALMASUIT_BRAND_CLEAR)
+            {
+                tracing::warn!(error = %e, "render on toplevel_destroyed failed");
+            }
+        }
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -1589,6 +1649,7 @@ fn main() -> io::Result<()> {
         shm_state,
         layer_shell_state,
         seen_layer_roles: std::collections::HashSet::new(),
+        foreground_toplevel: None,
         _libseat_session: libseat_session,
         loop_handle: loop_handle.clone(),
         connections: HashMap::new(),

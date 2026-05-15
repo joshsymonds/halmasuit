@@ -359,6 +359,7 @@ impl DrmBackend {
     pub fn render_layer_elements(
         &mut self,
         output: &smithay::output::Output,
+        foreground: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
         clear_color: [u8; 4],
     ) -> io::Result<bool> {
         use smithay::backend::renderer::element::Kind;
@@ -369,39 +370,54 @@ impl DrmBackend {
         use smithay::utils::Scale;
         use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
+        let scale = Scale::from(1.0);
         let map = layer_map_for_output(output);
         let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
-        // smithay render-element lists are FRONT-TO-BACK: the first
-        // element is topmost (drawn last, over the rest). Walk the
-        // wlr-layer stack from the top down — Overlay, Top, Bottom,
-        // Background — so the persistent background ends up beneath
-        // everything else rather than painted over it.
-        for which in [
-            WlrLayer::Overlay,
-            WlrLayer::Top,
-            WlrLayer::Bottom,
-            WlrLayer::Background,
-        ] {
-            for layer in map.layers_on(which) {
-                let surface = layer.wl_surface();
-                // Honor the LayerMap-computed geometry — a centered or
-                // anchored non-fullscreen layer must render at its
-                // actual position, not (0,0). Scale 1.0, so logical
-                // coords map 1:1 to physical.
-                let loc = map.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
-                let location: smithay::utils::Point<i32, smithay::utils::Physical> =
-                    (loc.x, loc.y).into();
-                let scale = Scale::from(1.0);
-                let mut surface_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+        let mut push_surface_at =
+            |renderer: &mut GlesRenderer,
+             surface: &_,
+             loc: smithay::utils::Point<i32, smithay::utils::Physical>| {
+                let mut es: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                     render_elements_from_surface_tree(
-                        &mut self.renderer,
+                        renderer,
                         surface,
-                        location,
+                        loc,
                         scale,
                         1.0,
                         Kind::Unspecified,
                     );
-                elements.append(&mut surface_elements);
+                elements.append(&mut es);
+            };
+
+        // smithay render-element lists are FRONT-TO-BACK: the first
+        // element is topmost (drawn last, over the rest). Scene
+        // z-order, top → bottom: Overlay, Top, the foreground xdg
+        // toplevel (greeter/session), Bottom, Background (splash).
+        // The toplevel sits above the wallpaper/normal layers and
+        // below OSK/lock/notification overlays.
+        for which in [WlrLayer::Overlay, WlrLayer::Top] {
+            for layer in map.layers_on(which) {
+                let loc = map.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
+                push_surface_at(
+                    &mut self.renderer,
+                    layer.wl_surface(),
+                    (loc.x, loc.y).into(),
+                );
+            }
+        }
+        if let Some(top) = foreground {
+            // Single fullscreen toplevel at the origin (v1: one
+            // output, no window management).
+            push_surface_at(&mut self.renderer, top, (0, 0).into());
+        }
+        for which in [WlrLayer::Bottom, WlrLayer::Background] {
+            for layer in map.layers_on(which) {
+                let loc = map.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
+                push_surface_at(
+                    &mut self.renderer,
+                    layer.wl_surface(),
+                    (loc.x, loc.y).into(),
+                );
             }
         }
         drop(map);
