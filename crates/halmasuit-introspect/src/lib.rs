@@ -150,6 +150,29 @@ pub enum Event {
         /// Which layer-shell role first painted.
         role: LayerRole,
     },
+    /// The compositor's foreground client changed, driven by the
+    /// greetd lifecycle (NOT process/connection identity). `Greeter`
+    /// from startup; `Session` once `start_session` succeeds and the
+    /// greeter is torn down. Unconditional state-transition marker
+    /// (like `GreeterSpawned`); `tests/visual-foreground.nix` keys
+    /// the no-flash continuity assertion off the ordering of these
+    /// against the `FrameRendered` stream (Epic #1 req 17).
+    ForegroundChanged {
+        /// The new foreground.
+        to: Foreground,
+    },
+}
+
+/// Which client halmasuit treats as the foreground (composited above
+/// the splash background, keyboard focus target). Decided by the
+/// greetd lifecycle, never by which client connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Foreground {
+    /// The greeter is foreground (pre-auth).
+    Greeter,
+    /// The user session is foreground (post `start_session`).
+    Session,
 }
 
 /// wlr-layer-shell layer (mirrors `wlr_layer::Layer`).
@@ -253,7 +276,7 @@ pub fn emit(event: &Event) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, LayerRole, Phase, ShutdownReason, emit};
+    use super::{Event, Foreground, LayerRole, Phase, ShutdownReason, emit};
     use serde_json::Value;
 
     fn round_trip(event: &Event) -> Value {
@@ -371,6 +394,21 @@ mod tests {
         assert_eq!(v["mean_luminance"], 0.375);
         assert_eq!(v["backdrop_coverage"], 0.987);
         assert_eq!(v["phash"], 0xDEAD_BEEF_0000_1234u64);
+    }
+
+    #[test]
+    fn event_foreground_changed_carries_target() {
+        let v = round_trip(&Event::ForegroundChanged {
+            to: Foreground::Greeter,
+        });
+        assert_eq!(v["event"], "foreground_changed");
+        assert_eq!(v["to"], "greeter");
+        assert_eq!(
+            round_trip(&Event::ForegroundChanged {
+                to: Foreground::Session
+            })["to"],
+            "session"
+        );
     }
 
     #[test]

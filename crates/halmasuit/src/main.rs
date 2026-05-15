@@ -109,9 +109,13 @@ struct HalmasuitState {
     seen_layer_roles: std::collections::HashSet<halmasuit_introspect::LayerRole>,
     /// The single fullscreen xdg_toplevel composited above the splash
     /// (greeter/session). v1 is one output, no window management — at
-    /// most one toplevel is the foreground. Layer F1 focuses whatever
-    /// maps; F2 makes this greetd-lifecycle-driven.
+    /// most one toplevel is the foreground.
     foreground_toplevel: Option<ToplevelSurface>,
+    /// Which client is the foreground, driven by the greetd lifecycle
+    /// (req 17): `Greeter` until `start_session` succeeds, then
+    /// `Session`. Gates keyboard focus (greeter layer vs session
+    /// toplevel) so focus follows the lifecycle, not connection order.
+    foreground: halmasuit_introspect::Foreground,
     /// The libseat session brokering halmasuit's DRM (and, in E2, the
     /// libinput) device fds. Retained for the process lifetime: if it
     /// drops, seatd tears the session down and the brokered fds are
@@ -303,14 +307,15 @@ impl CompositorHandler for HalmasuitState {
                     if self.seen_layer_roles.insert(role) {
                         emit(&Event::ClientFirstFrame { role });
                     }
-                    // Default keyboard-focus policy (layer E2): a
-                    // layer-shell client that requests keyboard
-                    // interactivity gets keyboard focus. Layer F
-                    // replaces this with the greeter→session
-                    // foreground state machine. `set_keyboard_focus`
-                    // is a no-op if it is already focused.
-                    if layer.cached_state().keyboard_interactivity
-                        != smithay::wayland::shell::wlr_layer::KeyboardInteractivity::None
+                    // Focus-follows-foreground (req 17): a
+                    // keyboard-interactive layer client (the greeter)
+                    // gets keyboard focus only while the foreground is
+                    // `Greeter`. After `start_session` the foreground
+                    // is `Session`, so a lingering/teardown greeter
+                    // layer never steals focus from the session.
+                    if self.foreground == halmasuit_introspect::Foreground::Greeter
+                        && layer.cached_state().keyboard_interactivity
+                            != smithay::wayland::shell::wlr_layer::KeyboardInteractivity::None
                     {
                         self.set_keyboard_focus(Some(surface.clone()));
                     }
@@ -318,15 +323,18 @@ impl CompositorHandler for HalmasuitState {
             }
         }
 
-        // Foreground xdg_toplevel keyboard-focus policy (F1 default:
-        // focus whatever toplevel maps; F2 makes this greetd-driven).
-        // On the toplevel's first buffered commit, give it keyboard
-        // focus so input from E2 reaches it.
+        // Focus-follows-foreground (req 17): the session's
+        // xdg_toplevel gets keyboard focus on its first buffered
+        // commit, but only once the greetd lifecycle has put the
+        // foreground in `Session` (set in the SpawnRequest handler) —
+        // never on connection identity alone.
         let fg_surface = self
             .foreground_toplevel
             .as_ref()
             .map(|t| t.wl_surface().clone());
-        if fg_surface.as_ref() == Some(surface) {
+        if self.foreground == halmasuit_introspect::Foreground::Session
+            && fg_surface.as_ref() == Some(surface)
+        {
             let has_buffer =
                 smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
                     s.buffer().is_some()
@@ -737,6 +745,18 @@ fn handle_connection_ready(
                                     }
                                 }
                             }
+                            // The greetd lifecycle has authorised a
+                            // session: the greeter is gone, the
+                            // session is being spawned. Foreground is
+                            // now Session — the splash stays beneath,
+                            // halmasuit's PID is unchanged (login-flash
+                            // invariant), and the session's
+                            // xdg_toplevel is composited + focused when
+                            // it maps (gated on this state, req 17).
+                            state.foreground = halmasuit_introspect::Foreground::Session;
+                            emit(&Event::ForegroundChanged {
+                                to: halmasuit_introspect::Foreground::Session,
+                            });
                             match invoke_spawn(&state.spawn_bin, &spawn) {
                                 Ok(child) => {
                                     tracing::info!(
@@ -1622,6 +1642,9 @@ fn main() -> io::Result<()> {
             Ok(handle) => {
                 tracing::info!(greeter_pid = handle.pid, greeter_cmd = %cmd.display(), "greeter spawned");
                 emit(&Event::GreeterSpawned { pid: handle.pid });
+                emit(&Event::ForegroundChanged {
+                    to: halmasuit_introspect::Foreground::Greeter,
+                });
                 Some(handle)
             }
             Err(e) => {
@@ -1650,6 +1673,7 @@ fn main() -> io::Result<()> {
         layer_shell_state,
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
+        foreground: halmasuit_introspect::Foreground::Greeter,
         _libseat_session: libseat_session,
         loop_handle: loop_handle.clone(),
         connections: HashMap::new(),

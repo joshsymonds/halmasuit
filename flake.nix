@@ -562,6 +562,19 @@
           halmasuit-toplevel-test-client = self.packages.x86_64-linux.halmasuit-toplevel-test-client;
           ssimulacra2-cli                = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Epic layer F2: greetd-driven greeter→session foreground
+        # swap; no-flash continuity across the REAL transition.
+        visual-foreground = import ./tests/visual-foreground.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-spawn                   = self.packages.x86_64-linux.halmasuit-spawn;
+          halmasuit-splash                  = self.packages.x86_64-linux.halmasuit-splash;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-toplevel-test-client    = self.packages.x86_64-linux.halmasuit-toplevel-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # Epic layer E2: real keystroke → libinput → wl_seat →
         # focused client. Production halmasuit (input is core).
         halmasuit-input = import ./tests/halmasuit-input.nix {

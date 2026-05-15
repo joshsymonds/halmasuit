@@ -63,6 +63,9 @@ test-vm:
     echo
     echo "── visual-halmasuit-toplevel ──"
     nix build .#checks.x86_64-linux.visual-halmasuit-toplevel -L --print-build-logs --no-link
+    echo
+    echo "── visual-foreground ──"
+    nix build .#checks.x86_64-linux.visual-foreground -L --print-build-logs --no-link
 
 # Regenerate one or all visual-test goldens. Runs the named test
 # interactively (driverInteractive), with HALMASUIT_GOLDEN_REGEN=1 and
