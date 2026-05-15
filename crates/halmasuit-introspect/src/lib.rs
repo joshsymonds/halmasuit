@@ -107,6 +107,20 @@ pub enum Event {
         /// `Display` form of the kernel error.
         error: String,
     },
+    /// halmasuit reached `SpawnRequest` (PAM succeeded, `StartSession`
+    /// received) but invoking `halmasuit-spawn` failed. The greeter is
+    /// deliberately left running and is NOT signalled — a live greeter
+    /// is a recoverable state the user can retry from; a dead greeter
+    /// with no session is the black screen the spawn-before-kill
+    /// ordering exists to prevent. No `GreeterTerminated` /
+    /// `GreeterKillFailed` accompanies this event because the greeter
+    /// was never touched on this path.
+    SessionSpawnFailed {
+        /// Resolved Linux uid the session would have run as.
+        uid: u32,
+        /// `Display` form of the spawn failure.
+        error: String,
+    },
     /// A composited frame was scanned out, with the test-only
     /// `frame_audit` analysis of its pixels. The variant is defined
     /// unconditionally so `halmasuit-introspect` (and its consumers'
@@ -356,6 +370,17 @@ mod tests {
         assert_eq!(v["event"], "greeter_kill_failed");
         assert_eq!(v["pid"], 1234);
         assert_eq!(v["error"], "No such process (os error 3)");
+    }
+
+    #[test]
+    fn event_session_spawn_failed_carries_uid_and_error() {
+        let v = round_trip(&Event::SessionSpawnFailed {
+            uid: 1000,
+            error: "No such file or directory (os error 2)".to_owned(),
+        });
+        assert_eq!(v["event"], "session_spawn_failed");
+        assert_eq!(v["uid"], 1000);
+        assert_eq!(v["error"], "No such file or directory (os error 2)");
     }
 
     #[test]

@@ -171,6 +171,14 @@ struct HalmasuitState {
     /// unset OR the greeter slot has already been consumed by
     /// the kill-on-session-start path.
     greeter: Option<GreeterHandle>,
+
+    /// uid of the authenticated user session, recorded by
+    /// `start_session` once `halmasuit-spawn` has been confirmed. The
+    /// Wayland accept path authorises a connecting peer when its
+    /// SO_PEERCRED uid is `greeter_uid` (pre-auth) or this value
+    /// (post-auth); the session connects under its own uid, distinct
+    /// from the greeter's. `None` until a session spawn succeeds.
+    session_uid: Option<u32>,
 }
 
 /// Greeter identity post-spawn. The pidfd is the load-bearing
@@ -706,56 +714,25 @@ fn handle_connection_ready(
                                 uid: spawn.uid,
                                 gid: spawn.gid,
                             });
-                            // Kill the greeter before invoking the
-                            // session spawn. Per Epic #1: "the greeter
-                            // wl_client is killed before niri becomes
-                            // foreground." The greeter's Wayland
-                            // connection drops, halmasuit notices via
-                            // the per-client teardown, niri can take
-                            // the foreground slot. The SIGCHLD reaper
-                            // picks up the resulting zombie.
-                            if let Some(greeter) = state.greeter.take() {
-                                let pid = greeter.pid;
-                                // SIGKILL via pidfd: race-free wrt pid
-                                // reuse. If the greeter already exited
-                                // (e.g. crashed earlier and the SIGCHLD
-                                // reaper consumed the entry), this
-                                // returns ESRCH — we surface that as a
-                                // GreeterKillFailed event and proceed.
-                                match pidfd_send_signal(&greeter.pidfd, libc::SIGKILL) {
-                                    Ok(()) => {
-                                        emit(&Event::GreeterTerminated { pid });
-                                    }
-                                    Err(e) => {
-                                        let error = format!("{e}");
-                                        tracing::warn!(
-                                            %error,
-                                            greeter_pid = pid,
-                                            "pidfd_send_signal greeter SIGKILL failed; session proceeds"
-                                        );
-                                        emit(&Event::GreeterKillFailed { pid, error });
-                                    }
-                                }
-                            }
-                            match invoke_spawn(&state.spawn_bin, &spawn) {
-                                Ok(child) => {
-                                    tracing::info!(
-                                        spawn_pid = child.id(),
-                                        uid = spawn.uid,
-                                        "halmasuit-spawn launched"
-                                    );
-                                }
-                                Err(e) => {
-                                    // Logged but not fatal — the greeter
-                                    // can retry, and halmasuit itself is
-                                    // still running.
-                                    tracing::warn!(
-                                        error = %e,
-                                        spawn_bin = ?state.spawn_bin,
-                                        "failed to invoke halmasuit-spawn"
-                                    );
-                                }
-                            }
+                            // Spawn FIRST, then kill the greeter — and
+                            // only if the spawn is confirmed. The
+                            // greeter is the recoverable fallback: a
+                            // spawn failure must leave it alive (a dead
+                            // greeter with no session is the black
+                            // screen this project exists to eliminate).
+                            // start_session records the authenticated
+                            // uid and SIGKILLs the greeter on success;
+                            // the SIGCHLD reaper collects the zombie.
+                            // Result is intentionally dropped: success
+                            // and the recoverable failure are both fully
+                            // handled inside (events emitted, state
+                            // updated); the connection closes either way.
+                            let _ = start_session(
+                                &state.spawn_bin,
+                                &spawn,
+                                &mut state.greeter,
+                                &mut state.session_uid,
+                            );
                             connstate.close_after_drain = true;
                         }
                         if out.close {
@@ -1343,6 +1320,71 @@ fn invoke_spawn(spawn_bin: &Path, request: &SpawnRequest) -> io::Result<Child> {
     build_spawn_command(spawn_bin, request).spawn()
 }
 
+/// Start the authenticated user session: invoke `halmasuit-spawn`,
+/// and *only if it succeeds* record the session uid and tear the
+/// greeter down.
+///
+/// Ordering is load-bearing (Epic #1 R3). Killing the greeter before
+/// invoking spawn meant a spawn failure left a dead greeter with no
+/// session — an unrecoverable black screen, the exact failure this
+/// project exists to eliminate. Here the greeter is the recoverable
+/// fallback: it is signalled strictly after the spawn is confirmed,
+/// so a spawn failure leaves the user at a live greeter they can
+/// retry from, and a `SessionSpawnFailed` event is emitted instead of
+/// `GreeterTerminated`.
+///
+/// `session_uid` is set before the greeter teardown so the Wayland
+/// accept path can authorise the session's own connection (which
+/// arrives under the authenticated uid, distinct from the greeter's)
+/// as soon as the session process exists.
+fn start_session(
+    spawn_bin: &Path,
+    request: &SpawnRequest,
+    greeter: &mut Option<GreeterHandle>,
+    session_uid: &mut Option<u32>,
+) -> io::Result<Child> {
+    let child = match invoke_spawn(spawn_bin, request) {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                spawn_bin = ?spawn_bin,
+                "failed to invoke halmasuit-spawn; greeter retained for retry"
+            );
+            emit(&Event::SessionSpawnFailed {
+                uid: request.uid,
+                error: format!("{e}"),
+            });
+            return Err(e);
+        }
+    };
+
+    *session_uid = Some(request.uid);
+    tracing::info!(
+        spawn_pid = child.id(),
+        uid = request.uid,
+        "halmasuit-spawn launched"
+    );
+
+    if let Some(greeter) = greeter.take() {
+        let pid = greeter.pid;
+        match pidfd_send_signal(&greeter.pidfd, libc::SIGKILL) {
+            Ok(()) => emit(&Event::GreeterTerminated { pid }),
+            Err(e) => {
+                let error = format!("{e}");
+                tracing::warn!(
+                    %error,
+                    greeter_pid = pid,
+                    "pidfd_send_signal greeter SIGKILL failed; session proceeds"
+                );
+                emit(&Event::GreeterKillFailed { pid, error });
+            }
+        }
+    }
+
+    Ok(child)
+}
+
 // ── Wayland event-loop integration ──────────────────────────────────────
 
 /// calloop callback for the wayland Display source. The Display is
@@ -1663,6 +1705,7 @@ fn main() -> io::Result<()> {
         drm_backend,
         _drm_token: drm_token,
         greeter,
+        session_uid: None,
     };
 
     // Kick off the render loop with one initial frame. The page-flip
@@ -1816,6 +1859,68 @@ mod tests {
         let cmd = build_spawn_command(Path::new("/bin/true"), &req);
         let map: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert!(!map.contains_key(OsStr::new("MALFORMED_NO_EQUALS")));
+    }
+
+    // R2/R3 port: spawn must be invoked and confirmed BEFORE the
+    // greeter is killed. Spawn failure must leave the greeter running
+    // (recoverable) and emit SessionSpawnFailed, never GreeterTerminated.
+    #[test]
+    fn start_session_spawn_failure_retains_greeter_and_records_no_uid() {
+        let bin = Path::new("/nonexistent/halmasuit-spawn-does-not-exist");
+        let req = sample_request(); // uid 1000
+        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let mut greeter = Some(GreeterHandle {
+            pid: 4242,
+            pidfd: devnull.into(),
+        });
+        let mut session_uid: Option<u32> = None;
+
+        let result = start_session(bin, &req, &mut greeter, &mut session_uid);
+
+        assert!(result.is_err(), "spawn of a nonexistent bin must fail");
+        assert!(
+            greeter.is_some(),
+            "greeter MUST be retained when the session spawn fails"
+        );
+        assert_eq!(
+            session_uid, None,
+            "session_uid MUST NOT be recorded when the spawn fails"
+        );
+    }
+
+    #[test]
+    fn start_session_success_records_uid_then_kills_greeter() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let mut greeter_child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn greeter stand-in");
+        let pidfd = pidfd_open_for(greeter_child.id()).expect("pidfd_open greeter stand-in");
+        let mut greeter = Some(GreeterHandle {
+            pid: greeter_child.id(),
+            pidfd,
+        });
+        let mut session_uid: Option<u32> = None;
+        let req = sample_request(); // uid 1000
+
+        let result = start_session(Path::new("/bin/sh"), &req, &mut greeter, &mut session_uid);
+
+        let mut session_child = result.expect("spawn of /bin/sh must succeed");
+        assert_eq!(
+            session_uid,
+            Some(1000),
+            "authenticated uid MUST be recorded once the spawn is confirmed"
+        );
+        assert!(
+            greeter.is_none(),
+            "greeter MUST be taken (killed) after a confirmed spawn"
+        );
+
+        let _ = session_child.wait();
+        let _ = greeter_child.wait();
     }
 
     #[test]
