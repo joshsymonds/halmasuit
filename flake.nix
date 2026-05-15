@@ -7,7 +7,13 @@
     # nix-config provides the dms-niri module — the same module gnomon uses
     # to bring up greetd + DankGreeter + niri + DMS. We import the module's
     # file path directly and supply the inputs it expects via specialArgs.
-    nix-config.url = "github:joshsymonds/nix-config";
+    # Pinned to `main`: layer G proves halmasuit hosts the user's ACTUAL
+    # forked stack (not upstream) — epic req 18, decided 2026-05-15. The
+    # user's DMS/niri integration work lives on `josh/integration` branches
+    # of the *DMS and niri repos*, consumed transitively via nix-config's
+    # own inputs (niri-flake / the joshsymonds/niri-quality-of-life niri
+    # branch ref) — not a nix-config branch.
+    nix-config.url = "github:joshsymonds/nix-config/main";
 
     # rust-toolchain.toml is the single source of truth for halmasuit's
     # toolchain. rust-overlay reads it so Nix builds compile with the same
