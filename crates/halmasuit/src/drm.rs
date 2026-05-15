@@ -134,6 +134,10 @@ pub struct DrmBackend {
     /// GLES renderer bound to the GBM device's EGL display. Used by
     /// `render_frame` every vblank to clear + composite.
     pub renderer: GlesRenderer,
+    /// Monotonic frame counter for the `frame_audit` `FrameRendered`
+    /// stream. Only exists in `halmasuit-debug`.
+    #[cfg(feature = "frame_audit")]
+    frame_counter: u64,
 }
 
 /// Set up the full DRM/GBM/EGL/GLES/DrmCompositor stack on the device
@@ -317,6 +321,8 @@ where
         DrmBackend {
             compositor,
             renderer,
+            #[cfg(feature = "frame_audit")]
+            frame_counter: 0,
         },
         registration_token,
         output,
@@ -333,14 +339,18 @@ impl DrmBackend {
     /// # Errors
     ///
     /// Returns an error if `render_frame` or `queue_frame` fail.
-    pub fn render_one_frame(&mut self, clear_color: [u8; 4]) -> io::Result<bool> {
+    pub fn render_one_frame(
+        &mut self,
+        output: &smithay::output::Output,
+        clear_color: [u8; 4],
+    ) -> io::Result<bool> {
         // Equivalent to calling `render_layer_elements` with no layer
         // surfaces mapped — empty element list, just the clear color.
         // Kept as a thin alias so the B.2 initial-render call site in
         // main()'s startup still reads naturally.
         use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
         let elements: &[WaylandSurfaceRenderElement<GlesRenderer>] = &[];
-        self.render_with_elements_inner(elements, clear_color)
+        self.render_with_elements_inner(output, elements, clear_color)
     }
 
     /// Render a frame composed of layer-shell surfaces mapped onto
@@ -393,11 +403,12 @@ impl DrmBackend {
         }
         drop(map);
 
-        self.render_with_elements_inner(&elements, clear_color)
+        self.render_with_elements_inner(output, &elements, clear_color)
     }
 
     fn render_with_elements_inner<E>(
         &mut self,
+        output: &smithay::output::Output,
         elements: &[E],
         clear_color: [u8; 4],
     ) -> io::Result<bool>
@@ -417,7 +428,99 @@ impl DrmBackend {
         self.compositor
             .queue_frame(())
             .map_err(|e| io::Error::other(format!("queue_frame: {e}")))?;
+
+        // The frame is now queued for scanout. Under `frame_audit`
+        // (halmasuit-debug only) re-render the identical element set
+        // into an offscreen texture, read it back, analyze it, and
+        // emit `FrameRendered`. This is the per-frame GPU readback the
+        // production binary deliberately omits (Epic #1 req 6/7).
+        #[cfg(feature = "frame_audit")]
+        {
+            // Best-effort: an audit failure must never take down the
+            // compositor. Log and continue.
+            if let Err(e) = self.audit_frame(output, elements, clear_color) {
+                tracing::warn!(error = %e, "frame_audit readback failed");
+            }
+        }
+        #[cfg(not(feature = "frame_audit"))]
+        let _ = output;
+
         Ok(true)
+    }
+
+    /// Re-render `elements` (+ the clear color) into an offscreen
+    /// texture, read the pixels back to the CPU, analyze them, and
+    /// emit `Event::FrameRendered`. Test-only — see Epic #1 req 6/7.
+    ///
+    /// We render a second time into our own target rather than reading
+    /// back the `DrmCompositor` swapchain buffer: the swapchain frame
+    /// is page-flip-owned and not portably CPU-mappable, whereas a
+    /// fresh `Offscreen<GlesTexture>` + `ExportMem` is the canonical
+    /// smithay screenshot path and yields pixel-identical content for
+    /// the same element set and clear. The cost (an extra render +
+    /// GPU→CPU sync) is exactly why this is feature-gated.
+    #[cfg(feature = "frame_audit")]
+    fn audit_frame<E>(
+        &mut self,
+        output: &smithay::output::Output,
+        elements: &[E],
+        clear_color: [u8; 4],
+    ) -> io::Result<()>
+    where
+        E: smithay::backend::renderer::element::RenderElement<GlesRenderer>,
+    {
+        use smithay::backend::allocator::Fourcc;
+        use smithay::backend::renderer::damage::OutputDamageTracker;
+        use smithay::backend::renderer::gles::GlesTexture;
+        use smithay::backend::renderer::{Bind, ExportMem, Offscreen};
+        use smithay::utils::{Point, Rectangle, Size};
+
+        let mode = output
+            .current_mode()
+            .ok_or_else(|| io::Error::other("frame_audit: output has no current mode"))?;
+        let (w, h) = (mode.size.w, mode.size.h);
+        let (wu, hu) = (
+            usize::try_from(w).map_err(|_| io::Error::other("frame_audit: negative mode width"))?,
+            usize::try_from(h)
+                .map_err(|_| io::Error::other("frame_audit: negative mode height"))?,
+        );
+        if wu == 0 || hu == 0 {
+            return Err(io::Error::other("frame_audit: zero mode size"));
+        }
+        let color = xrgb_le_to_color32f(clear_color);
+
+        let mut tex: GlesTexture = Offscreen::<GlesTexture>::create_buffer(
+            &mut self.renderer,
+            Fourcc::Abgr8888,
+            (w, h).into(),
+        )
+        .map_err(|e| io::Error::other(format!("frame_audit create_buffer: {e}")))?;
+        let (mean_luminance, backdrop_coverage, phash) = {
+            let mut fb = Bind::bind(&mut self.renderer, &mut tex)
+                .map_err(|e| io::Error::other(format!("frame_audit bind: {e}")))?;
+            let mut dt = OutputDamageTracker::from_output(output);
+            dt.render_output(&mut self.renderer, &mut fb, 0, elements, color)
+                .map_err(|e| io::Error::other(format!("frame_audit render_output: {e:?}")))?;
+            let region = Rectangle::new(Point::from((0, 0)), Size::from((w, h)));
+            let mapping =
+                ExportMem::copy_framebuffer(&mut self.renderer, &fb, region, Fourcc::Abgr8888)
+                    .map_err(|e| io::Error::other(format!("frame_audit copy_framebuffer: {e}")))?;
+            // `fb` (and its tex binding) is unused past the readback;
+            // drop it before `map_texture` per significant_drop_tightening.
+            drop(fb);
+            let bytes = ExportMem::map_texture(&mut self.renderer, &mapping)
+                .map_err(|e| io::Error::other(format!("frame_audit map_texture: {e}")))?;
+            let stats = crate::frame_audit::analyze(bytes, wu, hu);
+            (stats.mean_luminance, stats.backdrop_coverage, stats.phash)
+        };
+        halmasuit_introspect::emit(&halmasuit_introspect::Event::FrameRendered {
+            frame_id: self.frame_counter,
+            mean_luminance,
+            backdrop_coverage,
+            phash,
+        });
+        self.frame_counter += 1;
+        Ok(())
     }
 
     /// Acknowledge a page-flip completion. Called from the

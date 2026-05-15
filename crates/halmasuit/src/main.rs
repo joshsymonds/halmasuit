@@ -15,6 +15,8 @@
 // land later. See ARCHITECTURE.md.
 
 mod drm;
+#[cfg(feature = "frame_audit")]
+mod frame_audit;
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -1464,7 +1466,7 @@ fn main() -> io::Result<()> {
     // semantics. The SKIP-path state (no `drm_backend`) emits neither
     // event.
     if let Some(backend) = state.drm_backend.as_mut() {
-        let queued = backend.render_one_frame(HALMASUIT_BRAND_CLEAR)?;
+        let queued = backend.render_one_frame(&state.output, HALMASUIT_BRAND_CLEAR)?;
         if queued {
             emit(&Event::PhaseEntered {
                 phase: Phase::ScanoutActive,

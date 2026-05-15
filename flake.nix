@@ -209,6 +209,21 @@
             };
           };
 
+          # halmasuit-debug — halmasuit built with the `frame_audit`
+          # Cargo feature: per-frame GPU readback + `analyze()` +
+          # `Event::FrameRendered` emission (and, next task, the
+          # `Snapshot()` D-Bus method). Visual VM tests consume THIS;
+          # the production `halmasuit` package has none of it (Epic #1
+          # req 7/14). Same derivation as `halmasuit` (all the
+          # EGL/pam/RPATH wiring is inherited) plus the feature flag;
+          # the binary is still named `halmasuit`, so the postFixup
+          # patchelf target and the NixOS module's ExecStart are
+          # unchanged.
+          halmasuit-debug = self.packages.${system}.halmasuit.overrideAttrs (old: {
+            pname = "halmasuit-debug";
+            cargoBuildFlags = old.cargoBuildFlags ++ [ "--features" "frame_audit" ];
+          });
+
           # halmasuit-vm-client — tiny greetd-protocol test client.
           # Shipped as a separate Nix package so VM tests can install
           # it via environment.systemPackages and drive halmasuit's

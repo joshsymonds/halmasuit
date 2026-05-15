@@ -107,6 +107,36 @@ pub enum Event {
         /// `Display` form of the kernel error.
         error: String,
     },
+    /// A composited frame was scanned out, with the test-only
+    /// `frame_audit` analysis of its pixels. The variant is defined
+    /// unconditionally so `halmasuit-introspect` (and its consumers'
+    /// JSON schema) stay feature-independent; only halmasuit's
+    /// *emission* of it is gated behind the `frame_audit` Cargo
+    /// feature (the analysis costs a GPU readback per frame, which is
+    /// unacceptable in the production binary — see Epic #1 req 6/7).
+    ///
+    /// Continuity invariants in `tests/visual-backdrop.nix` are
+    /// asserted over the stream of these events: after the first
+    /// background client commits, every frame must have
+    /// `mean_luminance >= 0.01` (no black frame) and, once a
+    /// BACKGROUND client has painted, `backdrop_coverage > 0.95`.
+    FrameRendered {
+        /// Monotonic per-process frame counter, starting at 0 on the
+        /// first composited frame.
+        frame_id: u64,
+        /// Mean Rec.709 perceptual luma over the whole frame,
+        /// normalized to `0.0..=1.0`. A black frame is `~0.0`.
+        mean_luminance: f64,
+        /// Fraction of pixels (`0.0..=1.0`) that differ from the brand
+        /// clear color `#0a0014` — i.e. the share of the frame a
+        /// wl_client actually painted over halmasuit's clear.
+        backdrop_coverage: f64,
+        /// 64-bit average-hash perceptual fingerprint of the frame
+        /// (8x8 luma downscale, thresholded at the mean). Lets tests
+        /// detect "the frame stopped changing" / gross content shifts
+        /// without pixel-exact comparison.
+        phash: u64,
+    },
 }
 
 /// Compositor phases.
@@ -295,6 +325,21 @@ mod tests {
         assert_eq!(v["event"], "greeter_kill_failed");
         assert_eq!(v["pid"], 1234);
         assert_eq!(v["error"], "No such process (os error 3)");
+    }
+
+    #[test]
+    fn event_frame_rendered_carries_audit_fields() {
+        let v = round_trip(&Event::FrameRendered {
+            frame_id: 42,
+            mean_luminance: 0.375,
+            backdrop_coverage: 0.987,
+            phash: 0xDEAD_BEEF_0000_1234,
+        });
+        assert_eq!(v["event"], "frame_rendered");
+        assert_eq!(v["frame_id"], 42);
+        assert_eq!(v["mean_luminance"], 0.375);
+        assert_eq!(v["backdrop_coverage"], 0.987);
+        assert_eq!(v["phash"], 0xDEAD_BEEF_0000_1234u64);
     }
 
     #[test]

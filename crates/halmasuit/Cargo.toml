@@ -11,6 +11,20 @@ authors.workspace      = true
 [lints]
 workspace = true
 
+[features]
+# Test-only in-process frame analysis. Gates the per-frame GPU
+# readback + `analyze()` + `Event::FrameRendered` emission + (next
+# task) the `Snapshot()` D-Bus method. NOT in `default`: the readback
+# forces a GPU→CPU sync (~1-2ms/frame) and `Snapshot()` is an
+# arbitrary-file-write surface — neither belongs in the privileged
+# production compositor. The flake exposes `halmasuit` (this off) and
+# `halmasuit-debug` (this on); visual VM tests consume the latter.
+# Empty dep list on purpose: luminance/coverage are arithmetic over
+# the readback bytes and the perceptual hash is an in-house 8x8
+# average-hash — pulling `img_hash`/`image` here would violate Epic #1
+# req 7 (production `cargo tree` must list neither).
+frame_audit = []
+
 [dependencies]
 halmasuit-introspect = { path = "../halmasuit-introspect", version = "0.1" }
 # greetd-protocol server building blocks: Listener, Connection,
