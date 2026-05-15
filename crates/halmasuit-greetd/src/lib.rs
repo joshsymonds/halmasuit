@@ -126,8 +126,11 @@ pub enum SessionState {
     /// greeter must answer via `PostAuthMessageResponse`.
     Authenticating { username: String },
     /// PAM completed successfully. `StartSession` is now valid. The
-    /// resolved uid/gid come from PAM (via the `pwent` lookup the real
-    /// PAM stack runs); they will be handed to `halmasuit-spawn`.
+    /// `username`, uid, and gid all come from PAM's post-auth canonical
+    /// name (`pam_get_user` → `pwent` lookup), NOT the pre-auth
+    /// client-supplied `CreateSession` string. All three are handed to
+    /// `halmasuit-spawn` together so its `initgroups(3)` resolves the
+    /// same identity the uid/gid came from.
     AuthSuccess {
         username: String,
         uid: u32,
@@ -171,8 +174,20 @@ pub enum PamStep {
         prompt: String,
     },
     /// PAM succeeded. The state machine transitions to
-    /// [`SessionState::AuthSuccess`] with the resolved uid/gid.
-    Success { uid: u32, gid: u32 },
+    /// [`SessionState::AuthSuccess`] with the resolved username/uid/gid.
+    ///
+    /// `username` is PAM's canonical name (`pam_get_user` after the
+    /// stack ran), NOT the client-supplied `CreateSession` string. It
+    /// is the name the uid/gid were resolved from, so it is also the
+    /// name `initgroups(3)` must use in `halmasuit-spawn` — carrying
+    /// the pre-auth client string there instead would let a
+    /// username-rewriting PAM stack pair one user's uid with another
+    /// user's supplementary groups.
+    Success {
+        username: String,
+        uid: u32,
+        gid: u32,
+    },
     /// PAM failed (bad password, locked account, etc.). The state
     /// machine returns to [`SessionState::Idle`] after sending the
     /// error to the greeter.
@@ -345,8 +360,22 @@ fn translate_pam_step(state: &mut SessionState, step: PamStep, username: String)
                 auth_message: prompt,
             }
         }
-        PamStep::Success { uid, gid } => {
-            *state = SessionState::AuthSuccess { username, uid, gid };
+        PamStep::Success {
+            username: resolved,
+            uid,
+            gid,
+        } => {
+            // Use PAM's canonical name, not the client-supplied
+            // `username` (which only feeds the in-flight
+            // `Authenticating` echo above). uid/gid were resolved from
+            // `resolved`; the supplementary-group lookup downstream in
+            // `halmasuit-spawn` must use the same name or it can pair
+            // one identity's uid with another's groups.
+            *state = SessionState::AuthSuccess {
+                username: resolved,
+                uid,
+                gid,
+            };
             Response::Success
         }
         PamStep::Failure { reason } => {
@@ -539,7 +568,13 @@ mod tests {
     #[test]
     fn create_then_immediate_success() {
         let mut state = SessionState::default();
+        // PAM canonicalizes "alice" → "alice.canonical" (a
+        // username-rewriting stack, e.g. pam_username/pam_mapfile).
+        // AuthSuccess must carry PAM's resolved name, NOT the
+        // client-supplied CreateSession string — that name is what
+        // halmasuit-spawn hands to initgroups(3). (F1 regression.)
         let mut pam = ScriptedPam::new(vec![PamStep::Success {
+            username: "alice.canonical".into(),
             uid: 1000,
             gid: 1000,
         }]);
@@ -555,7 +590,7 @@ mod tests {
         assert_eq!(
             state,
             SessionState::AuthSuccess {
-                username: "alice".into(),
+                username: "alice.canonical".into(),
                 uid: 1000,
                 gid: 1000,
             }
@@ -571,6 +606,7 @@ mod tests {
                 prompt: "password:".into(),
             },
             PamStep::Success {
+                username: "alice".into(),
                 uid: 1000,
                 gid: 1000,
             },
@@ -1099,6 +1135,7 @@ mod tests {
     impl PamSession for AlwaysSucceedPam {
         fn step(&mut self, _response: Option<String>) -> PamStep {
             PamStep::Success {
+                username: "resolved".into(),
                 uid: 1000,
                 gid: 1000,
             }

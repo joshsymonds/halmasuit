@@ -661,8 +661,14 @@ impl Drop for Pam {
 /// Terminal outcome of the PAM conversation, computed by the worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PamOutcome {
-    Success { uid: u32, gid: u32 },
-    Failure { reason: String },
+    Success {
+        username: String,
+        uid: u32,
+        gid: u32,
+    },
+    Failure {
+        reason: String,
+    },
 }
 
 /// PAM session driven by a worker thread.
@@ -820,7 +826,9 @@ impl PamThread {
             NextStep::Outcome(outcome) => {
                 self.state = ThreadState::Done;
                 match outcome {
-                    PamOutcome::Success { uid, gid } => PamStep::Success { uid, gid },
+                    PamOutcome::Success { username, uid, gid } => {
+                        PamStep::Success { username, uid, gid }
+                    }
                     PamOutcome::Failure { reason } => PamStep::Failure { reason },
                 }
             }
@@ -912,13 +920,13 @@ fn run_pam(config: &PamThreadConfig, bridge: ConvBridge, outcome_tx: &SyncSender
     // outcome channel. This ordering guarantees the driver reads
     // "channel closed" before reading the terminal outcome.
     let outcome = match try_pam(config, bridge) {
-        Ok((uid, gid)) => PamOutcome::Success { uid, gid },
+        Ok((username, uid, gid)) => PamOutcome::Success { username, uid, gid },
         Err(reason) => PamOutcome::Failure { reason },
     };
     let _ = outcome_tx.send(outcome);
 }
 
-fn try_pam(config: &PamThreadConfig, bridge: ConvBridge) -> Result<(u32, u32), String> {
+fn try_pam(config: &PamThreadConfig, bridge: ConvBridge) -> Result<(String, u32, u32), String> {
     let mut pam =
         Pam::start(&config.service, &config.username, bridge).map_err(|e| e.to_string())?;
     if let Some(ruser) = &config.ruser {
@@ -941,7 +949,11 @@ fn try_pam(config: &PamThreadConfig, bridge: ConvBridge) -> Result<(u32, u32), S
     let pw = nix::unistd::User::from_name(&resolved)
         .map_err(|_e| "post-auth account lookup failed".to_string())?
         .ok_or_else(|| "post-auth account lookup failed".to_string())?;
-    Ok((pw.uid.as_raw(), pw.gid.as_raw()))
+    // Return the canonical name alongside the ids it was resolved
+    // from. Downstream `initgroups(3)` must use this name, not the
+    // pre-auth client string, or a username-rewriting PAM stack could
+    // pair this uid with a different identity's supplementary groups.
+    Ok((resolved, pw.uid.as_raw(), pw.gid.as_raw()))
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

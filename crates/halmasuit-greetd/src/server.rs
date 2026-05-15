@@ -573,7 +573,12 @@ mod tests {
 
     #[test]
     fn connection_happy_path_create_then_start() {
+        // The client requests "alice"; PAM canonicalizes to
+        // "alice.canonical". The SpawnRequest — and thus
+        // halmasuit-spawn's initgroups(3) — must carry PAM's resolved
+        // name end-to-end, not the pre-auth client string. (F1.)
         let factory = Arc::new(ScriptedFactory::new(vec![vec![PamStep::Success {
+            username: "alice.canonical".into(),
             uid: 1000,
             gid: 1000,
         }]]));
@@ -601,7 +606,7 @@ mod tests {
         assert_eq!(r2, vec![Response::Success]);
         assert!(out2.close, "Spawning should set close=true");
         let spawn = out2.spawn.expect("spawn populated");
-        assert_eq!(spawn.username, "alice");
+        assert_eq!(spawn.username, "alice.canonical");
         assert_eq!(spawn.uid, 1000);
         assert_eq!(spawn.gid, 1000);
         assert_eq!(spawn.cmd, vec!["niri".to_string()]);
@@ -639,6 +644,7 @@ mod tests {
         // Feed CreateSession bytes one at a time. No reply until the
         // last byte arrives; then a single Success.
         let factory = Arc::new(ScriptedFactory::new(vec![vec![PamStep::Success {
+            username: "alice".into(),
             uid: 1000,
             gid: 1000,
         }]]));
@@ -670,6 +676,7 @@ mod tests {
                 prompt: "password:".into(),
             },
             PamStep::Success {
+                username: "alice".into(),
                 uid: 1000,
                 gid: 1000,
             },
