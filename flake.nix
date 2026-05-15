@@ -464,6 +464,15 @@
           halmasuit-splash = self.packages.x86_64-linux.halmasuit-splash;
           ssimulacra2-cli  = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        visual-backdrop = import ./tests/visual-backdrop.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-spawn                   = self.packages.x86_64-linux.halmasuit-spawn;
+          halmasuit-splash                  = self.packages.x86_64-linux.halmasuit-splash;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
       };
     };
 }

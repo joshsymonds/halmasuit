@@ -137,6 +137,37 @@ pub enum Event {
         /// without pixel-exact comparison.
         phash: u64,
     },
+    /// The first time a wlr-layer-shell client of a given role
+    /// committed a buffer halmasuit composited. Emitted once per role
+    /// per process lifetime. Unconditional (NOT `frame_audit`-gated):
+    /// it is a cheap state-transition marker in the normal event
+    /// stream, like `GreeterSpawned`. The visual-continuity assertion
+    /// in `tests/visual-backdrop.nix` uses
+    /// `ClientFirstFrame { role: Background }` as the point from which
+    /// every subsequent `FrameRendered` must show full backdrop
+    /// coverage (Epic #1 req 11).
+    ClientFirstFrame {
+        /// Which layer-shell role first painted.
+        role: LayerRole,
+    },
+}
+
+/// wlr-layer-shell layer (mirrors `wlr_layer::Layer`).
+///
+/// Duplicated here so `halmasuit-introspect` needs no smithay
+/// dependency for one enum; halmasuit maps the smithay value onto
+/// this at the emission site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerRole {
+    /// Wallpaper plane — the persistent system background (splash).
+    Background,
+    /// Below normal windows.
+    Bottom,
+    /// Above normal windows.
+    Top,
+    /// Topmost — lockscreens, OSKs, notifications.
+    Overlay,
 }
 
 /// Compositor phases.
@@ -222,7 +253,7 @@ pub fn emit(event: &Event) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, Phase, ShutdownReason, emit};
+    use super::{Event, LayerRole, Phase, ShutdownReason, emit};
     use serde_json::Value;
 
     fn round_trip(event: &Event) -> Value {
@@ -340,6 +371,22 @@ mod tests {
         assert_eq!(v["mean_luminance"], 0.375);
         assert_eq!(v["backdrop_coverage"], 0.987);
         assert_eq!(v["phash"], 0xDEAD_BEEF_0000_1234u64);
+    }
+
+    #[test]
+    fn event_client_first_frame_carries_role() {
+        let v = round_trip(&Event::ClientFirstFrame {
+            role: LayerRole::Background,
+        });
+        assert_eq!(v["event"], "client_first_frame");
+        assert_eq!(v["role"], "background");
+        for (role, name) in [
+            (LayerRole::Bottom, "bottom"),
+            (LayerRole::Top, "top"),
+            (LayerRole::Overlay, "overlay"),
+        ] {
+            assert_eq!(round_trip(&Event::ClientFirstFrame { role })["role"], name);
+        }
     }
 
     #[test]

@@ -46,15 +46,54 @@ use smithay_client_toolkit::reexports::client::protocol::wl_shm::Format;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface;
 use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
 
-/// Solid color the background surface paints. ARGB8888 little-endian
-/// (sctk's slot-pool default format), bytes `[B, G, R, A]`.
-///
-/// `#16C44E` = (R=0x16, G=0xC4, B=0x4E). A medium green, distinct
-/// from halmasuit's brand `#0a0014` so the visual golden is
-/// unambiguous about which surface painted which region.
-const TEST_COLOR_BGRA: [u8; 4] = [0x4E, 0xC4, 0x16, 0xFF];
+/// Default solid color: `#16C44E` (R=0x16, G=0xC4, B=0x4E), distinct
+/// from halmasuit's brand `#0a0014`. Stored ARGB8888 little-endian
+/// (sctk slot-pool default), bytes `[B, G, R, A]`.
+const DEFAULT_COLOR_BGRA: [u8; 4] = [0x4E, 0xC4, 0x16, 0xFF];
+
+/// Parse `#RRGGBB`/`RRGGBB` into ARGB8888-LE bytes `[B, G, R, 0xFF]`.
+fn parse_color(spec: &str) -> anyhow::Result<[u8; 4]> {
+    let hex = spec.strip_prefix('#').unwrap_or(spec);
+    anyhow::ensure!(hex.len() == 6, "color must be 6 hex digits, got {spec:?}");
+    let red = u8::from_str_radix(&hex[0..2], 16)?;
+    let green = u8::from_str_radix(&hex[2..4], 16)?;
+    let blue = u8::from_str_radix(&hex[4..6], 16)?;
+    Ok([blue, green, red, 0xFF])
+}
+
+/// Parse `WxH` into `(w, h)`.
+fn parse_size(spec: &str) -> anyhow::Result<(u32, u32)> {
+    let (ws, hs) = spec
+        .split_once('x')
+        .ok_or_else(|| anyhow::anyhow!("size must be WxH, got {spec:?}"))?;
+    Ok((ws.trim().parse()?, hs.trim().parse()?))
+}
 
 fn main() -> anyhow::Result<()> {
+    // Test fixture parametrisation (all optional; defaults reproduce
+    // the original fullscreen-green BACKGROUND client):
+    //   HALMASUIT_TESTCLIENT_LAYER  background|bottom|top|overlay
+    //   HALMASUIT_TESTCLIENT_COLOR  #RRGGBB
+    //   HALMASUIT_TESTCLIENT_SIZE   WxH  (omitted ⇒ fullscreen, anchored)
+    let layer = match std::env::var("HALMASUIT_TESTCLIENT_LAYER")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "" | "background" => Layer::Background,
+        "bottom" => Layer::Bottom,
+        "top" => Layer::Top,
+        "overlay" => Layer::Overlay,
+        other => anyhow::bail!("unknown HALMASUIT_TESTCLIENT_LAYER {other:?}"),
+    };
+    let color = match std::env::var("HALMASUIT_TESTCLIENT_COLOR") {
+        Ok(s) => parse_color(&s)?,
+        Err(_) => DEFAULT_COLOR_BGRA,
+    };
+    let fixed_size = match std::env::var("HALMASUIT_TESTCLIENT_SIZE") {
+        Ok(s) => Some(parse_size(&s)?),
+        Err(_) => None,
+    };
+
     let conn =
         Connection::connect_to_env().map_err(|e| anyhow::anyhow!("connect to wayland: {e}"))?;
     let (globals, mut event_queue) = registry_queue_init(&conn)?;
@@ -64,18 +103,24 @@ fn main() -> anyhow::Result<()> {
     let layer_shell = LayerShell::bind(&globals, &qh)?;
     let shm = Shm::bind(&globals, &qh)?;
 
-    // Create a 1280x800 surface — matches what halmasuit reports for
-    // virtio-gpu-pci by default. The layer-shell configure event will
-    // tell us the actual size halmasuit wants; we accept it.
     let surface = compositor.create_surface(&qh);
     let layer_surface = layer_shell.create_layer_surface(
         &qh,
         surface,
-        Layer::Background,
+        layer,
         Some("halmasuit-layer-shell-test-client"),
         None, // any output
     );
-    layer_surface.set_anchor(Anchor::all());
+    if let Some((w, h)) = fixed_size {
+        // Centered, fixed-size rectangle (no anchors) so the layer
+        // beneath shows around it — used for "greeter over splash".
+        layer_surface.set_anchor(Anchor::empty());
+        layer_surface.set_size(w, h);
+    } else {
+        // Fullscreen: anchored to all edges, halmasuit sizes it to
+        // the output mode.
+        layer_surface.set_anchor(Anchor::all());
+    }
     layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer_surface.set_exclusive_zone(-1); // ignore exclusive zones
     layer_surface.commit();
@@ -91,6 +136,7 @@ fn main() -> anyhow::Result<()> {
         _layer_shell: layer_shell,
         _layer_surface: layer_surface,
         pool,
+        color,
         configured: false,
         width: 0,
         height: 0,
@@ -117,6 +163,7 @@ struct State {
     /// its own `&LayerSurface`.
     _layer_surface: LayerSurface,
     pool: SlotPool,
+    color: [u8; 4],
     configured: bool,
     width: u32,
     height: u32,
@@ -164,7 +211,7 @@ impl State {
             .create_buffer(self.width as i32, height, stride, Format::Argb8888)
             .expect("create_buffer");
         for pixel in canvas.chunks_exact_mut(4) {
-            pixel.copy_from_slice(&TEST_COLOR_BGRA);
+            pixel.copy_from_slice(&self.color);
         }
         layer
             .wl_surface()

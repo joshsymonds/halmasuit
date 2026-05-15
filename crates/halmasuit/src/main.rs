@@ -97,6 +97,11 @@ struct HalmasuitState {
     /// `layer_map_for_output`). Composited in z-order during
     /// `render_with_elements` from the commit-driven render path.
     layer_shell_state: WlrLayerShellState,
+    /// Layer roles for which `Event::ClientFirstFrame` has already
+    /// been emitted (emit-once-per-role). The visual-backdrop
+    /// continuity assertion keys off the first
+    /// `ClientFirstFrame { role: Background }`.
+    seen_layer_roles: std::collections::HashSet<halmasuit_introspect::LayerRole>,
 
     // ── greetd I/O ──────────────────────────────────────────────────────
     /// LoopHandle for inserting per-connection sources from inside
@@ -221,6 +226,29 @@ impl CompositorHandler for HalmasuitState {
                 if !initial_configure_sent {
                     layer.layer_surface().send_configure();
                 }
+
+                // Emit `ClientFirstFrame { role }` once per layer
+                // role, the first time a surface of that role has a
+                // committed buffer halmasuit will composite. Drives
+                // the visual-backdrop continuity assertion (Epic #1
+                // req 11). Unconditional (not frame_audit-gated) — a
+                // cheap state-transition marker.
+                let has_buffer =
+                    smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
+                        s.buffer().is_some()
+                    })
+                    .unwrap_or(false);
+                if has_buffer {
+                    let role = match layer.layer() {
+                        Layer::Background => halmasuit_introspect::LayerRole::Background,
+                        Layer::Bottom => halmasuit_introspect::LayerRole::Bottom,
+                        Layer::Top => halmasuit_introspect::LayerRole::Top,
+                        Layer::Overlay => halmasuit_introspect::LayerRole::Overlay,
+                    };
+                    if self.seen_layer_roles.insert(role) {
+                        emit(&Event::ClientFirstFrame { role });
+                    }
+                }
             }
         }
 
@@ -287,6 +315,19 @@ impl WlrLayerShellHandler for HalmasuitState {
             .cloned();
         if let Some(layer) = to_remove {
             map.unmap_layer(&layer);
+        }
+        // A client going away changes the scene: the layer beneath
+        // (e.g. the splash background) must be re-composited now, not
+        // only on the next surviving-client commit — otherwise the
+        // last frame (the departed client) stays on screen. This is
+        // also the no-flash requirement for the real greeter→session
+        // teardown (Epic #1 req 11/17). Drop the LayerMap lock first;
+        // render_layer_elements re-locks it for this output.
+        drop(map);
+        if let Some(backend) = self.drm_backend.as_mut()
+            && let Err(e) = backend.render_layer_elements(&self.output, HALMASUIT_BRAND_CLEAR)
+        {
+            tracing::warn!(error = %e, "render_layer_elements on layer_destroyed failed");
         }
     }
 }
@@ -1441,6 +1482,7 @@ fn main() -> io::Result<()> {
         output,
         shm_state,
         layer_shell_state,
+        seen_layer_roles: std::collections::HashSet::new(),
         loop_handle: loop_handle.clone(),
         connections: HashMap::new(),
         next_conn_id: 0,

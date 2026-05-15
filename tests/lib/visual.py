@@ -223,3 +223,102 @@ def assert_matches_golden(
             f"To accept: HALMASUIT_GOLDEN_REGEN=1 just update-goldens {name}\n"
             f"To inspect: compare the two PNGs visually before regenerating."
         )
+
+
+def introspect_events(machine) -> list:
+    """Return halmasuit's introspection Event stream, in journal
+    (chronological) order, as a list of dicts.
+
+    `halmasuit-introspect::emit` serializes each `Event` to JSON and
+    logs it via tracing-subscriber's JSON formatter; journald carries
+    that line. `journalctl -o cat` yields the raw tracing line
+    (`{"timestamp":...,"fields":{"json":"<Event JSON string>"},...}`);
+    the Event itself is the JSON-encoded `fields.json` string.
+    """
+    raw = machine.succeed("journalctl -u halmasuit -o cat --no-pager")
+    events = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            outer = json.loads(line)
+        except ValueError:
+            continue
+        inner = outer.get("fields", {}).get("json")
+        if not inner:
+            continue
+        try:
+            ev = json.loads(inner)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and "event" in ev:
+            events.append(ev)
+    return events
+
+
+def assert_frame_continuity(machine) -> None:
+    """The no-flash invariant (Epic #1 req 11), asserted over the
+    full `FrameRendered` stream — NOT sampled screenshots.
+
+    - From the first `client_first_frame{role:background}` onward,
+      every `frame_rendered` must have ``backdrop_coverage > 0.95``.
+    - From the first `client_first_frame` of ANY role onward, no
+      `frame_rendered` may have ``mean_luminance < 0.01`` (no black
+      frame once a client has committed; pre-commit clear frames are
+      exempt).
+
+    Fails loudly, naming the offending event(s) and their index.
+    """
+    events = introspect_events(machine)
+
+    first_bg = None
+    first_any = None
+    for i, ev in enumerate(events):
+        if ev["event"] == "client_first_frame":
+            if first_any is None:
+                first_any = i
+            if ev.get("role") == "background" and first_bg is None:
+                first_bg = i
+    if first_bg is None:
+        raise AssertionError(
+            "no client_first_frame{role:background} in the halmasuit "
+            "event stream — splash never composited a background frame.\n"
+            f"events seen: {[e['event'] for e in events]}"
+        )
+    # A background cff is itself an "any" cff, so first_any is set and
+    # first_any <= first_bg.
+    assert first_any is not None
+
+    cov_viol = [
+        (i, ev)
+        for i, ev in enumerate(events)
+        if i >= first_bg
+        and ev["event"] == "frame_rendered"
+        and ev["backdrop_coverage"] <= 0.95
+    ]
+    lum_viol = [
+        (i, ev)
+        for i, ev in enumerate(events)
+        if i >= first_any
+        and ev["event"] == "frame_rendered"
+        and ev["mean_luminance"] < 0.01
+    ]
+    frames = sum(1 for e in events if e["event"] == "frame_rendered")
+    if cov_viol or lum_viol:
+        raise AssertionError(
+            "FrameRendered continuity invariant VIOLATED "
+            f"({frames} frames; first bg cff @#{first_bg}, "
+            f"first any cff @#{first_any}):\n"
+            f"  backdrop_coverage<=0.95 after bg: {cov_viol[:5]}\n"
+            f"  mean_luminance<0.01 after first commit: {lum_viol[:5]}"
+        )
+    print(
+        json.dumps(
+            {
+                "continuity": "OK",
+                "frames": frames,
+                "first_background_cff_index": first_bg,
+            }
+        )
+    )

@@ -405,15 +405,26 @@ impl DrmBackend {
 
         let map = layer_map_for_output(output);
         let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+        // smithay render-element lists are FRONT-TO-BACK: the first
+        // element is topmost (drawn last, over the rest). Walk the
+        // wlr-layer stack from the top down — Overlay, Top, Bottom,
+        // Background — so the persistent background ends up beneath
+        // everything else rather than painted over it.
         for which in [
-            WlrLayer::Background,
-            WlrLayer::Bottom,
-            WlrLayer::Top,
             WlrLayer::Overlay,
+            WlrLayer::Top,
+            WlrLayer::Bottom,
+            WlrLayer::Background,
         ] {
             for layer in map.layers_on(which) {
                 let surface = layer.wl_surface();
-                let location: smithay::utils::Point<i32, smithay::utils::Physical> = (0, 0).into();
+                // Honor the LayerMap-computed geometry — a centered or
+                // anchored non-fullscreen layer must render at its
+                // actual position, not (0,0). Scale 1.0, so logical
+                // coords map 1:1 to physical.
+                let loc = map.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
+                let location: smithay::utils::Point<i32, smithay::utils::Physical> =
+                    (loc.x, loc.y).into();
                 let scale = Scale::from(1.0);
                 let mut surface_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                     render_elements_from_surface_tree(
