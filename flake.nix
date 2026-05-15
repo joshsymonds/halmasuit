@@ -182,12 +182,23 @@
             #   buildInputs ensures `rustPlatform.buildRustPackage`
             #   sets RPATH so the dlopen succeeds without relying on
             #   LD_LIBRARY_PATH propagation.
+            # - seatd: libseat-sys links libseat (smithay
+            #   backend_session_libseat) — seatd brokers DRM/input
+            #   fds; halmasuit no longer self-SET_MASTERs (epic E /
+            #   drm-master-probe Phase 4).
+            # - libinput + libxkbcommon: input-sys links them
+            #   (smithay backend_libinput/backend_udev; input-sys
+            #   hardcodes -lxkbcommon). udev: libudev for seat-scoped
+            #   device discovery.
             buildInputs       = [
               pkgs.libxkbcommon
               pkgs.wayland
               pkgs.pam
               pkgs.libgbm
               pkgs.libGL
+              pkgs.seatd
+              pkgs.libinput
+              pkgs.udev
             ];
             # bindgen invokes clang directly (bypassing NIX_CFLAGS_COMPILE).
             # Mirror the shellHook so pam-sys's build.rs finds

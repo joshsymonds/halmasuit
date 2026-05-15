@@ -218,6 +218,14 @@ in
     # requests the name; shipping it unconditionally keeps the module
     # single-codepath. `services.dbus.enable` is required because the
     # minimal VM-test images don't bring the system bus up otherwise.
+    # seatd: the root device broker libseat connects to. halmasuit
+    # acquires its DRM (and, layer E2, libinput) fds through a
+    # LibSeatSession instead of self-issuing SET_MASTER — the
+    # privilege posture validated by drm-master-probe Phase 4 (seatd
+    # owns master; halmasuit never does). Required for ALL halmasuit
+    # deployments now, not just a test.
+    services.seatd.enable = true;
+
     services.dbus.enable = true;
     services.dbus.packages = [
       (pkgs.writeTextDir "share/dbus-1/system.d/org.halmasuit.conf" ''
@@ -262,10 +270,12 @@ in
     systemd.services.halmasuit = {
       description = "halmasuit — Linux system compositor";
       wantedBy    = [ "multi-user.target" ];
-      # `after` is intentionally narrow for Phase A: nothing else needs
-      # to be up. As DRM / Wayland / D-Bus integrations land, append the
-      # specific units they depend on (systemd-logind.service, etc.).
-      after       = [ "local-fs.target" ];
+      # seatd must be up before halmasuit so `LibSeatSession::new()`
+      # can reach the broker socket while halmasuit is still root
+      # (pre-privilege-drop). `requires` so a seatd failure fails
+      # halmasuit loudly rather than silently losing the GPU.
+      after       = [ "local-fs.target" "seatd.service" ];
+      requires    = [ "seatd.service" ];
 
       serviceConfig = {
         Type           = "simple";
@@ -358,6 +368,10 @@ in
         # (dri_gbm.so) still loads from the dlopen search path. The
         # libglvnd dispatch also looks here for vendor JSON.
         LD_LIBRARY_PATH = "/run/opengl-driver/lib";
+        # Force libseat's seatd backend. halmasuit runs as a system
+        # service with no logind session, so libseat's autodetect
+        # (logind → seatd → builtin) is ambiguous; pin it.
+        LIBSEAT_BACKEND = "seatd";
       } // lib.optionalAttrs (cfg.greeterCommand != null) {
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.

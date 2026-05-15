@@ -40,6 +40,7 @@ use halmasuit_greetd::server::{
     Connection, PamSessionFactory, SpawnRequest, bind_socket, peer_credentials,
 };
 use halmasuit_introspect::{Event, Phase, ShutdownReason, emit};
+use smithay::backend::session::libseat::LibSeatSession;
 use smithay::desktop::layer_map_for_output;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
@@ -102,6 +103,13 @@ struct HalmasuitState {
     /// continuity assertion keys off the first
     /// `ClientFirstFrame { role: Background }`.
     seen_layer_roles: std::collections::HashSet<halmasuit_introspect::LayerRole>,
+    /// The libseat session brokering halmasuit's DRM (and, in E2, the
+    /// libinput) device fds. Retained for the process lifetime: if it
+    /// drops, seatd tears the session down and the brokered fds are
+    /// revoked. `None` only on the SKIP (no-DRM/dev) path. Epic
+    /// layer E; survival across the privilege drop validated by
+    /// drm-master-probe Phase 4.
+    _libseat_session: Option<LibSeatSession>,
 
     // ── greetd I/O ──────────────────────────────────────────────────────
     /// LoopHandle for inserting per-connection sources from inside
@@ -1306,8 +1314,28 @@ fn main() -> io::Result<()> {
     // returns the smithay `Output` backed by the actual connector
     // mode. The SKIP case (dev/test, non-root) synthesizes a 1920x1080
     // placeholder so wl_clients can still discover an output global.
-    let (drm_backend, drm_token, output) = if let Some(path) = &drm_device_path {
+    let (drm_backend, drm_token, output, libseat_session) = if let Some(path) = &drm_device_path {
+        // Open the libseat session (seatd backend) while still root,
+        // BEFORE the privilege drop below. seatd brokers the DRM +
+        // input fds and owns DRM master; halmasuit never SET_MASTERs.
+        // drm-master-probe Phase 4 validated this session survives
+        // the subsequent setresuid.
+        let (mut session, libseat_notifier) = LibSeatSession::new().map_err(|e| {
+            io::Error::other(format!("LibSeatSession::new (is seatd reachable?): {e}"))
+        })?;
+        // Service libseat session (activate/pause) events. v1 in-VM:
+        // no VT switching (epic out-of-scope) — log only, but the
+        // source MUST be registered so libseat's event fd is drained.
+        loop_handle
+            .insert_source(
+                libseat_notifier,
+                |event, (), _state: &mut HalmasuitState| {
+                    tracing::info!(?event, "libseat session event");
+                },
+            )
+            .map_err(|e| io::Error::other(format!("insert libseat notifier: {e}")))?;
         let (backend, token, real_output) = drm::setup_drm_backend(
+            &mut session,
             path,
             &loop_handle,
             |event, _meta, state: &mut HalmasuitState| match event {
@@ -1327,7 +1355,7 @@ fn main() -> io::Result<()> {
         emit(&Event::PhaseEntered {
             phase: Phase::DrmMasterAcquired,
         });
-        (Some(backend), Some(token), real_output)
+        (Some(backend), Some(token), real_output, Some(session))
     } else {
         // SKIP path: synthesized placeholder. Geometry is invented;
         // the advertisement exists so clients can discover an output
@@ -1349,7 +1377,7 @@ fn main() -> io::Result<()> {
         synth.create_global::<HalmasuitState>(&display_handle);
         synth.change_current_state(Some(output_mode), None, None, Some((0, 0).into()));
         synth.set_preferred(output_mode);
-        (None, None, synth)
+        (None, None, synth, None)
     };
 
     // Bind the Wayland listening socket. smithay's ListeningSocketSource
@@ -1483,6 +1511,7 @@ fn main() -> io::Result<()> {
         shm_state,
         layer_shell_state,
         seen_layer_roles: std::collections::HashSet::new(),
+        _libseat_session: libseat_session,
         loop_handle: loop_handle.clone(),
         connections: HashMap::new(),
         next_conn_id: 0,

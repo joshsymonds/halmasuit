@@ -17,9 +17,7 @@
 //   * Empty element set — the entire scene is the clear color until B.3
 //     adds wlr-layer-shell
 
-use std::fs::OpenOptions;
 use std::io;
-use std::os::fd::OwnedFd;
 use std::path::Path;
 
 use smithay::backend::allocator::Fourcc;
@@ -30,26 +28,13 @@ use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmSurface};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::session::Session;
+use smithay::backend::session::libseat::LibSeatSession;
 use smithay::output::{Mode as OutputMode, Output, OutputModeSource, PhysicalProperties, Subpixel};
-use smithay::reexports::drm::Device as DrmDeviceTrait;
 use smithay::reexports::drm::control::Device as ControlDevice;
 use smithay::reexports::drm::control::connector;
+use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::DeviceFd;
-
-/// Transient newtype used only by [`open_and_set_master`] to call
-/// `acquire_master_lock` via the drm-rs typed wrapper. The kernel-side
-/// master designation lives on the file descriptor, not on this
-/// handle, so callers receive the raw `OwnedFd` after master has been
-/// taken — `MasterCard` itself is dropped immediately.
-struct MasterCard(std::fs::File);
-
-impl std::os::fd::AsFd for MasterCard {
-    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        self.0.as_fd()
-    }
-}
-impl DrmDeviceTrait for MasterCard {}
-impl ControlDevice for MasterCard {}
 
 /// Color formats we'll accept for scanout. ARGB2101010 first (preferred
 /// 10-bit), then 8-bit ARGB8888 / ABGR8888 as fallbacks. Matches anvil's
@@ -86,33 +71,6 @@ pub fn xrgb_le_to_color32f(bytes: [u8; 4]) -> Color32F {
         f32::from(bytes[0]) / 255.0,
         1.0,
     )
-}
-
-/// Open `path` for DRM access and acquire master via drm-rs's typed
-/// wrapper. Returns the device's `OwnedFd` so the caller can hand it
-/// to both smithay's `DrmDeviceFd::new` (which retries master
-/// acquisition idempotently — the second acquire fails with EBUSY,
-/// which smithay handles cleanly) and `GbmDevice::new` (via clone).
-///
-/// drm-master-probe Phases 0–3 validated that the master designation
-/// lives on the file descriptor and survives `setresuid` to the
-/// compositor user (halmasuit's privilege drop).
-///
-/// # Errors
-///
-/// Bubbles `open(2)` or `DRM_IOCTL_SET_MASTER` failures with context.
-pub fn open_and_set_master(path: &Path) -> io::Result<OwnedFd> {
-    let dev = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|e| io::Error::other(format!("open({}): {e}", path.display())))?;
-
-    let master = MasterCard(dev);
-    master
-        .acquire_master_lock()
-        .map_err(|e| io::Error::other(format!("DRM SET_MASTER on {}: {e}", path.display())))?;
-    Ok(master.0.into())
 }
 
 /// The full GLES + GBM + DrmCompositor stack wrapped around a single
@@ -156,7 +114,10 @@ impl DrmBackend {
 }
 
 /// Set up the full DRM/GBM/EGL/GLES/DrmCompositor stack on the device
-/// at `path`. Acquires master, picks the first connected connector +
+/// at `path`. The DRM fd is opened through the libseat `session`
+/// (seatd brokers it and owns DRM master — halmasuit never issues
+/// `SET_MASTER`; the improved privilege posture validated by
+/// drm-master-probe Phase 4). Picks the first connected connector +
 /// its preferred mode + first CRTC, builds a GBM allocator + EGL
 /// display + GLES renderer + DrmCompositor wrapping that surface,
 /// registers the DRM event source with calloop for vblank
@@ -185,6 +146,7 @@ impl DrmBackend {
     reason = "linear hardware-init sequence; ordering is load-bearing"
 )]
 pub fn setup_drm_backend<S, F>(
+    session: &mut LibSeatSession,
     path: &Path,
     loop_handle: &smithay::reexports::calloop::LoopHandle<'static, S>,
     drm_event_handler: F,
@@ -197,7 +159,11 @@ where
     S: 'static,
     F: FnMut(DrmEvent, &mut Option<smithay::backend::drm::DrmEventMetadata>, &mut S) + 'static,
 {
-    let owned_fd = open_and_set_master(path)?;
+    // seatd brokers the DRM fd (it holds master; we never SET_MASTER).
+    // O_CLOEXEC|O_NONBLOCK|O_RDWR matches the anvil udev pattern.
+    let owned_fd = session
+        .open(path, OFlags::RDWR | OFlags::CLOEXEC | OFlags::NONBLOCK)
+        .map_err(|e| io::Error::other(format!("libseat session.open({}): {e}", path.display())))?;
     let device_fd = DrmDeviceFd::new(DeviceFd::from(owned_fd));
 
     // DrmDevice + its event notifier. `drm` must be `mut` so we can
