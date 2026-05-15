@@ -17,6 +17,11 @@ members = [
     # renderer can paint its own clear color. See
     # tests/visual-standin.nix.
     "crates/halmasuit-visual-test-standin",
+    # Layer-shell test client — throwaway, used by
+    # tests/visual-halmasuit-layer.nix to verify halmasuit composites
+    # wl_clients via wlr-layer-shell. Replaced by halmasuit-splash in
+    # B.4.
+    "crates/halmasuit-layer-shell-test-client",
     "xtask",
 ]
 # cargo-fuzz subworkspace needs nightly rustc + libfuzzer-sys; isolated

@@ -1,0 +1,20 @@
+[package]
+name        = "halmasuit-layer-shell-test-client"
+description = "Test wl_client that binds wlr-layer-shell BACKGROUND and paints a solid color via wl_shm. Used by tests/visual-halmasuit-layer.nix to exercise halmasuit's B.3 compositing path. Not production code."
+
+version.workspace        = true
+edition.workspace        = true
+license.workspace        = true
+repository.workspace     = true
+authors.workspace        = true
+
+# Same rationale as halmasuit-visual-test-standin: built via nixpkgs's
+# pinned rustc, looser MSRV is fine.
+rust-version       = "1.87"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow                 = "1"
+smithay-client-toolkit = "0.20"

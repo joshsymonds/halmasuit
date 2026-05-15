@@ -35,6 +35,11 @@ smithay = { workspace = true, features = [
     "backend_drm",
     "backend_gbm",
     "renderer_gl",
+    # `desktop` gives us `LayerMap`, `WaylandSurfaceRenderElement`, and
+    # `render_elements_from_surface_tree` — the helpers for composing
+    # committed wl_clients into a frame. Required by B.3's wlr-layer-shell
+    # path; depended on transitively by B.5+ when we layer toplevels.
+    "desktop",
 ] }
 # calloop comes in two ways: (1) via smithay's reexport for general
 # event-loop use, (2) directly here for the `signals` feature smithay

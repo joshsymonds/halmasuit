@@ -106,7 +106,14 @@
             # libclang.so available; LIBCLANG_PATH points it at the right
             # one. Without this, `cargo build` panics inside clang-sys's
             # build script when it can't find libclang.
-            nativeBuildInputs = [ pkgs.llvmPackages.libclang ];
+            #
+            # pkg-config is needed by smithay-client-toolkit (and
+            # transitively xkbcommon-sys) at build time to find
+            # libxkbcommon's pkg-config metadata. halmasuit's
+            # buildRustPackage derivation already has it via its own
+            # nativeBuildInputs; the devShell needs it explicitly for
+            # `cargo build` in the worktree.
+            nativeBuildInputs = [ pkgs.llvmPackages.libclang pkgs.pkg-config ];
 
             shellHook = ''
               export CARGO_HOME="$PWD/.cargo-home"
@@ -267,6 +274,31 @@
             };
           };
 
+          # halmasuit-layer-shell-test-client — throwaway sctk-based
+          # wl_client that binds wlr-layer-shell BACKGROUND, paints a
+          # known solid color via wl_shm, holds. Used by
+          # tests/visual-halmasuit-layer.nix to verify halmasuit
+          # composites layer-shell clients. Retired once halmasuit-splash
+          # exists (B.4).
+          halmasuit-layer-shell-test-client = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-layer-shell-test-client";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [ "-p" "halmasuit-layer-shell-test-client" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [ pkgs.libxkbcommon pkgs.wayland ];
+            doCheck = false;
+            meta = {
+              description = "Layer-shell test client for halmasuit B.3 visual gate";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-layer-shell-test-client";
+            };
+          };
+
           # halmasuit-visual-test-standin — throwaway DRM dumb-buffer
           # paint used by tests/visual-standin.nix to prove the
           # headless-GL + golden capture pipeline works end-to-end
@@ -390,6 +422,14 @@
           halmasuit       = self.packages.x86_64-linux.halmasuit;
           halmasuit-spawn = self.packages.x86_64-linux.halmasuit-spawn;
           ssimulacra2-cli = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        visual-halmasuit-layer = import ./tests/visual-halmasuit-layer.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                        = self.packages.x86_64-linux.halmasuit;
+          halmasuit-spawn                  = self.packages.x86_64-linux.halmasuit-spawn;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          ssimulacra2-cli                  = self.packages.x86_64-linux.ssimulacra2-cli;
         };
       };
     };

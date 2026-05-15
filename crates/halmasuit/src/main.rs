@@ -36,6 +36,7 @@ use halmasuit_greetd::server::{
     Connection, PamSessionFactory, SpawnRequest, bind_socket, peer_credentials,
 };
 use halmasuit_introspect::{Event, Phase, ShutdownReason, emit};
+use smithay::desktop::layer_map_for_output;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
@@ -44,6 +45,9 @@ use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::shell::wlr_layer::{
+    Layer, LayerSurface, WlrLayerShellHandler, WlrLayerShellState,
+};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
@@ -75,10 +79,20 @@ struct HalmasuitState {
     // alive; nothing reads the field directly (delegate_output! handles
     // dispatch via the type), hence the leading underscore.
     _output_manager_state: OutputManagerState,
-    // `_output` keeps the synthesized output alive; real outputs come
-    // with the DRM backend.
-    _output: Output,
+    /// The smithay `Output` representing halmasuit's single display.
+    /// Constructed from the real DRM mode in the production path
+    /// (synthesized 1920×1080 only on the SKIP bypass). Read by the
+    /// `WlrLayerShellHandler` to route new layer surfaces to the
+    /// correct `LayerMap`, and by the commit handler to build render
+    /// elements from those layers.
+    output: Output,
     shm_state: ShmState,
+    /// wlr-layer-shell global state. New layer surfaces (BACKGROUND /
+    /// BOTTOM / TOP / OVERLAY) land in `new_layer_surface` and get
+    /// mapped into the per-output `LayerMap` (accessed via
+    /// `layer_map_for_output`). Composited in z-order during
+    /// `render_with_elements` from the commit-driven render path.
+    layer_shell_state: WlrLayerShellState,
 
     // ── greetd I/O ──────────────────────────────────────────────────────
     /// LoopHandle for inserting per-connection sources from inside
@@ -166,12 +180,113 @@ impl CompositorHandler for HalmasuitState {
             .compositor_state
     }
 
-    fn commit(&mut self, _surface: &WlSurface) {
-        // No-op until there's an output to composite to. Subsequent
-        // tasks (wl_output + DRM scanout) will route committed buffers
-        // through the scene graph here.
+    fn commit(&mut self, surface: &WlSurface) {
+        // Advance smithay's per-surface buffer tracking state. This
+        // is what makes committed shm buffers visible to the renderer
+        // when WaylandSurfaceRenderElement is built. Without this,
+        // render_elements_from_surface_tree sees no current buffer
+        // and the surface paints nothing.
+        smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
+
+        // wlr-layer-shell initial configure. The spec requires the
+        // initial configure to be sent in response to the client's
+        // first commit (which carries its anchor/exclusive-zone/size
+        // requests). `arrange` here therefore sees the committed
+        // anchor state — for a fully-anchored background that yields
+        // the full output size instead of the half-output fallback
+        // `arrange` uses for unanchored zero-size surfaces.
+        {
+            let mut map = layer_map_for_output(&self.output);
+            if let Some(layer) = map
+                .layer_for_surface(surface, smithay::desktop::WindowSurfaceType::TOPLEVEL)
+                .cloned()
+            {
+                let initial_configure_sent =
+                    smithay::wayland::compositor::with_states(surface, |states| {
+                        states
+                            .data_map
+                            .get::<smithay::wayland::shell::wlr_layer::LayerSurfaceData>()
+                            .is_some_and(|d| d.lock().unwrap().initial_configure_sent)
+                    });
+                map.arrange();
+                // Release the LayerMap lock before `send_configure` /
+                // the render path below: `render_layer_elements` calls
+                // `layer_map_for_output` again on the same output and
+                // would re-borrow this same map.
+                drop(map);
+                if !initial_configure_sent {
+                    layer.layer_surface().send_configure();
+                }
+            }
+        }
+
+        // Re-render the scene with the now-current buffers. For B.3
+        // the call is synchronous (one frame per commit) — fine for
+        // single-client low-frequency scenes. B.5+ adds frame_audit
+        // and a calloop-idle-scheduled damage-driven path.
+        if let Some(backend) = self.drm_backend.as_mut()
+            && let Err(e) = backend.render_layer_elements(&self.output, HALMASUIT_BRAND_CLEAR)
+        {
+            tracing::warn!(error = %e, "render_layer_elements on commit failed");
+        }
     }
 }
+
+impl WlrLayerShellHandler for HalmasuitState {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: LayerSurface,
+        _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+        layer: Layer,
+        namespace: String,
+    ) {
+        tracing::info!(
+            namespace = %namespace,
+            layer = ?layer,
+            "new layer surface"
+        );
+        // smithay distinguishes the wire-type `wlr_layer::LayerSurface`
+        // (raw protocol object) from `desktop::LayerSurface` (the
+        // scene-graph helper that `LayerMap` operates on). The
+        // desktop wrapper owns the namespace string. Map onto our
+        // single output's LayerMap; multi-output routing comes later
+        // and would dispatch on the `_output` arg.
+        //
+        // Do NOT send a configure here. The wlr-layer-shell spec
+        // mandates the initial configure be sent in response to the
+        // client's *initial commit* — that commit is what carries the
+        // client's anchor/size requests. Configuring now (before the
+        // client has committed `set_anchor`) makes `LayerMap::arrange`
+        // see an unanchored, zero-size surface and fall back to
+        // half-output dimensions. The initial configure is sent from
+        // the `commit` handler instead (see `ensure_layer_configured`).
+        let desktop_surface = smithay::desktop::LayerSurface::new(surface, namespace);
+        let mut map = layer_map_for_output(&self.output);
+        if let Err(e) = map.map_layer(&desktop_surface) {
+            tracing::warn!(error = ?e, "failed to map layer surface");
+        }
+    }
+
+    fn layer_destroyed(&mut self, surface: LayerSurface) {
+        let mut map = layer_map_for_output(&self.output);
+        // Find the desktop-wrapped layer with this underlying wire
+        // surface and unmap it. LayerMap doesn't expose a lookup-by-
+        // wire-surface helper, so we walk the layers and match by
+        // `layer_surface()` equality.
+        let to_remove: Option<smithay::desktop::LayerSurface> = map
+            .layers()
+            .find(|l| l.layer_surface() == &surface)
+            .cloned();
+        if let Some(layer) = to_remove {
+            map.unmap_layer(&layer);
+        }
+    }
+}
+smithay::delegate_layer_shell!(HalmasuitState);
 
 impl XdgShellHandler for HalmasuitState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -1135,6 +1250,7 @@ fn main() -> io::Result<()> {
     // which the spec mandates always be advertised. Additional formats
     // come with the renderer task.
     let shm_state = ShmState::new::<HalmasuitState>(&display_handle, std::iter::empty());
+    let layer_shell_state = WlrLayerShellState::new::<HalmasuitState>(&display_handle);
 
     let mut event_loop: EventLoop<HalmasuitState> =
         EventLoop::try_new().map_err(io::Error::other)?;
@@ -1199,6 +1315,27 @@ fn main() -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("bind wayland socket: {e}")))?;
     let socket_path = socket.socket_name().to_owned();
     tracing::info!(socket = ?socket_path, "wayland socket bound");
+
+    // Widen the socket perms from smithay's default 0700 to 0660 so
+    // the greeter (running as the configured greeter system user, in
+    // group `halmasuit-greeter` per the NixOS module) can `connect(2)`.
+    // The systemd unit's `Group=halmasuit-greeter` directive gives the
+    // socket file group ownership; this chmod opens it to the group.
+    // Same shape as the greetd socket bind in `halmasuit-greetd`'s
+    // `bind_socket` helper.
+    //
+    // `socket.socket_name()` returns just the basename (e.g.
+    // "wayland-0"); the actual file lives at $XDG_RUNTIME_DIR/<name>.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let xdg_runtime_dir =
+            std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/run/halmasuit".into());
+        let abs_socket_path = PathBuf::from(xdg_runtime_dir).join(&socket_path);
+        let perms = std::fs::Permissions::from_mode(0o660);
+        std::fs::set_permissions(&abs_socket_path, perms).map_err(|e| {
+            io::Error::other(format!("chmod 0660 {}: {e}", abs_socket_path.display()))
+        })?;
+    }
 
     // New-client handler: hand each accepted UnixStream to the Display
     // with a fresh per-client state.
@@ -1297,8 +1434,9 @@ fn main() -> io::Result<()> {
         seat_state,
         _seat: seat,
         _output_manager_state: output_manager_state,
-        _output: output,
+        output,
         shm_state,
+        layer_shell_state,
         loop_handle: loop_handle.clone(),
         connections: HashMap::new(),
         next_conn_id: 0,

@@ -334,25 +334,80 @@ impl DrmBackend {
     ///
     /// Returns an error if `render_frame` or `queue_frame` fail.
     pub fn render_one_frame(&mut self, clear_color: [u8; 4]) -> io::Result<bool> {
-        // No wl_clients yet; element type only needs to satisfy
-        // `RenderElement<GlesRenderer>` for the call to type-check. We
-        // pick a concrete type from smithay and pass an empty slice.
-        // (Texture render elements are the simplest concrete shape;
-        // B.3 will replace this with a layer-shell-aware element enum.)
-        type EmptyElement = smithay::backend::renderer::element::texture::TextureRenderElement<
-            smithay::backend::renderer::gles::GlesTexture,
-        >;
-        let elements: &[EmptyElement] = &[];
+        // Equivalent to calling `render_layer_elements` with no layer
+        // surfaces mapped — empty element list, just the clear color.
+        // Kept as a thin alias so the B.2 initial-render call site in
+        // main()'s startup still reads naturally.
+        use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+        let elements: &[WaylandSurfaceRenderElement<GlesRenderer>] = &[];
+        self.render_with_elements_inner(elements, clear_color)
+    }
 
+    /// Render a frame composed of layer-shell surfaces mapped onto
+    /// `output`'s LayerMap, on top of the brand clear color. Walks
+    /// the map in z-order (BACKGROUND, BOTTOM, TOP, OVERLAY) and
+    /// builds a `WaylandSurfaceRenderElement<GlesRenderer>` per
+    /// surface via `render_elements_from_surface_tree` — the renderer
+    /// lazily imports committed `wl_shm` buffers as `GlesTexture`s
+    /// during the draw.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `render_frame` or `queue_frame` fail.
+    pub fn render_layer_elements(
+        &mut self,
+        output: &smithay::output::Output,
+        clear_color: [u8; 4],
+    ) -> io::Result<bool> {
+        use smithay::backend::renderer::element::Kind;
+        use smithay::backend::renderer::element::surface::{
+            WaylandSurfaceRenderElement, render_elements_from_surface_tree,
+        };
+        use smithay::desktop::layer_map_for_output;
+        use smithay::utils::Scale;
+        use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
+
+        let map = layer_map_for_output(output);
+        let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+        for which in [
+            WlrLayer::Background,
+            WlrLayer::Bottom,
+            WlrLayer::Top,
+            WlrLayer::Overlay,
+        ] {
+            for layer in map.layers_on(which) {
+                let surface = layer.wl_surface();
+                let location: smithay::utils::Point<i32, smithay::utils::Physical> = (0, 0).into();
+                let scale = Scale::from(1.0);
+                let mut surface_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                    render_elements_from_surface_tree(
+                        &mut self.renderer,
+                        surface,
+                        location,
+                        scale,
+                        1.0,
+                        Kind::Unspecified,
+                    );
+                elements.append(&mut surface_elements);
+            }
+        }
+        drop(map);
+
+        self.render_with_elements_inner(&elements, clear_color)
+    }
+
+    fn render_with_elements_inner<E>(
+        &mut self,
+        elements: &[E],
+        clear_color: [u8; 4],
+    ) -> io::Result<bool>
+    where
+        E: smithay::backend::renderer::element::RenderElement<GlesRenderer>,
+    {
         let color = xrgb_le_to_color32f(clear_color);
         let render_res = self
             .compositor
-            .render_frame::<_, EmptyElement>(
-                &mut self.renderer,
-                elements,
-                color,
-                FrameFlags::DEFAULT,
-            )
+            .render_frame::<_, E>(&mut self.renderer, elements, color, FrameFlags::DEFAULT)
             .map_err(|e| io::Error::other(format!("render_frame: {e}")))?;
 
         if render_res.is_empty {
