@@ -175,6 +175,14 @@ struct HalmasuitState {
     /// unset OR the greeter slot has already been consumed by
     /// the kill-on-session-start path.
     greeter: Option<GreeterHandle>,
+
+    /// uid of the authenticated user session, recorded by
+    /// `start_session` once `halmasuit-spawn` has been confirmed. The
+    /// Wayland accept path authorises a connecting peer when its
+    /// SO_PEERCRED uid is `greeter_uid` (pre-auth) or this value
+    /// (post-auth); the session connects under its own uid, distinct
+    /// from the greeter's. `None` until a session spawn succeeds.
+    session_uid: Option<u32>,
 }
 
 /// Greeter identity post-spawn. The pidfd is the load-bearing
@@ -714,67 +722,43 @@ fn handle_connection_ready(
                                 uid: spawn.uid,
                                 gid: spawn.gid,
                             });
-                            // Kill the greeter before invoking the
-                            // session spawn. Per Epic #1: "the greeter
-                            // wl_client is killed before niri becomes
-                            // foreground." The greeter's Wayland
-                            // connection drops, halmasuit notices via
-                            // the per-client teardown, niri can take
-                            // the foreground slot. The SIGCHLD reaper
-                            // picks up the resulting zombie.
-                            if let Some(greeter) = state.greeter.take() {
-                                let pid = greeter.pid;
-                                // SIGKILL via pidfd: race-free wrt pid
-                                // reuse. If the greeter already exited
-                                // (e.g. crashed earlier and the SIGCHLD
-                                // reaper consumed the entry), this
-                                // returns ESRCH — we surface that as a
-                                // GreeterKillFailed event and proceed.
-                                match pidfd_send_signal(&greeter.pidfd, libc::SIGKILL) {
-                                    Ok(()) => {
-                                        emit(&Event::GreeterTerminated { pid });
-                                    }
-                                    Err(e) => {
-                                        let error = format!("{e}");
-                                        tracing::warn!(
-                                            %error,
-                                            greeter_pid = pid,
-                                            "pidfd_send_signal greeter SIGKILL failed; session proceeds"
-                                        );
-                                        emit(&Event::GreeterKillFailed { pid, error });
-                                    }
-                                }
-                            }
-                            // The greetd lifecycle has authorised a
-                            // session: the greeter is gone, the
-                            // session is being spawned. Foreground is
-                            // now Session — the splash stays beneath,
-                            // halmasuit's PID is unchanged (login-flash
-                            // invariant), and the session's
-                            // xdg_toplevel is composited + focused when
-                            // it maps (gated on this state, req 17).
-                            state.foreground = halmasuit_introspect::Foreground::Session;
-                            emit(&Event::ForegroundChanged {
-                                to: halmasuit_introspect::Foreground::Session,
-                            });
-                            match invoke_spawn(&state.spawn_bin, &spawn) {
-                                Ok(child) => {
-                                    tracing::info!(
-                                        spawn_pid = child.id(),
-                                        uid = spawn.uid,
-                                        "halmasuit-spawn launched"
-                                    );
-                                }
-                                Err(e) => {
-                                    // Logged but not fatal — the greeter
-                                    // can retry, and halmasuit itself is
-                                    // still running.
-                                    tracing::warn!(
-                                        error = %e,
-                                        spawn_bin = ?state.spawn_bin,
-                                        "failed to invoke halmasuit-spawn"
-                                    );
-                                }
+                            // Spawn FIRST, then kill the greeter — and
+                            // only if the spawn is confirmed (Epic #1
+                            // R3). The greeter is the recoverable
+                            // fallback: a spawn failure must leave it
+                            // alive (a dead greeter with no session is
+                            // the black screen this project exists to
+                            // eliminate). start_session records the
+                            // authenticated uid and SIGKILLs the greeter
+                            // on success (emitting GreeterTerminated /
+                            // GreeterKillFailed); on failure it retains
+                            // the live greeter and emits
+                            // SessionSpawnFailed. The SIGCHLD reaper
+                            // collects the resulting zombie.
+                            //
+                            // Foreground flips to Session ONLY on
+                            // success: on failure the greeter is still
+                            // alive, so foreground must stay Greeter —
+                            // flipping it would gate xdg_toplevel
+                            // compositing (req 17) onto a session that
+                            // does not exist.
+                            if start_session(
+                                &state.spawn_bin,
+                                &spawn,
+                                &mut state.greeter,
+                                &mut state.session_uid,
+                            )
+                            .is_ok()
+                            {
+                                // Greeter torn down, splash stays
+                                // beneath, halmasuit's PID is unchanged
+                                // (login-flash invariant); the session's
+                                // xdg_toplevel is composited + focused
+                                // when it maps (gated on this state).
+                                state.foreground = halmasuit_introspect::Foreground::Session;
+                                emit(&Event::ForegroundChanged {
+                                    to: halmasuit_introspect::Foreground::Session,
+                                });
                             }
                             connstate.close_after_drain = true;
                         }
@@ -1158,12 +1142,78 @@ fn pidfd_send_signal(pidfd: &std::os::fd::OwnedFd, sig: i32) -> io::Result<()> {
 /// until `waitpid` reports no more reapable children. Without this,
 /// dead halmasuit-spawn / greeter / session children accumulate as
 /// zombies and eventually exhaust the pid namespace.
-fn reap_zombie_children() {
+/// What a reaped child's pid means relative to the greeter lifecycle.
+#[derive(Debug, PartialEq, Eq)]
+enum ReapOutcome {
+    /// The greeter exited before authentication completed — the wedge
+    /// condition (no greeter client, no session, nothing else notices).
+    GreeterDiedPreAuth,
+    /// The greeter exited after a session spawn was confirmed —
+    /// `start_session` already SIGKILLed it and emitted
+    /// `GreeterTerminated`; the expected zombie.
+    GreeterDiedExpected,
+    /// A non-greeter child (halmasuit-spawn, the session, or an
+    /// already-cleared greeter slot).
+    Other,
+}
+
+/// Classify a reaped pid against the tracked greeter pid and the
+/// authentication state (`session_uid` is `Some` once `start_session`
+/// confirmed a spawn). Pure so the wedge logic is unit-testable
+/// without driving real children through `waitpid`.
+fn classify_reaped_child(
+    reaped_pid: u32,
+    greeter_pid: Option<u32>,
+    session_uid: Option<u32>,
+) -> ReapOutcome {
+    if greeter_pid != Some(reaped_pid) {
+        return ReapOutcome::Other;
+    }
+    if session_uid.is_none() {
+        ReapOutcome::GreeterDiedPreAuth
+    } else {
+        ReapOutcome::GreeterDiedExpected
+    }
+}
+
+/// Reap zombie children (coalesced SIGCHLD: one signal may cover
+/// several deaths — loop until `waitpid` drains). Beyond reaping,
+/// attribute each death: a greeter exit *before* authentication (R4)
+/// is surfaced as `GreeterDiedPreAuth` and the now-stale greeter
+/// handle cleared, instead of vanishing into a discarded status.
+fn reap_zombie_children(state: &mut HalmasuitState) {
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
     loop {
-        match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
+        let status = match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) | Err(_) => return,
-            Ok(status) => tracing::debug!(?status, "reaped child"),
+            Ok(status) => status,
+        };
+        let reaped_pid = match status {
+            WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _) => {
+                Some(pid.as_raw().cast_unsigned())
+            }
+            _ => None,
+        };
+        match reaped_pid.map(|pid| {
+            (
+                pid,
+                classify_reaped_child(
+                    pid,
+                    state.greeter.as_ref().map(|g| g.pid),
+                    state.session_uid,
+                ),
+            )
+        }) {
+            Some((pid, ReapOutcome::GreeterDiedPreAuth)) => {
+                state.greeter = None;
+                emit(&Event::GreeterDiedPreAuth { pid });
+                tracing::warn!(greeter_pid = pid, "greeter exited before authentication");
+            }
+            Some((pid, ReapOutcome::GreeterDiedExpected)) => {
+                state.greeter = None;
+                tracing::debug!(?status, greeter_pid = pid, "reaped greeter post-auth");
+            }
+            _ => tracing::debug!(?status, "reaped child"),
         }
     }
 }
@@ -1363,6 +1413,85 @@ fn invoke_spawn(spawn_bin: &Path, request: &SpawnRequest) -> io::Result<Child> {
     build_spawn_command(spawn_bin, request).spawn()
 }
 
+/// Whether a peer that just connected to the Wayland socket is
+/// authorised, given its SO_PEERCRED `peer_uid`.
+///
+/// Epic #1 R1. The socket is chmod 0660 to the `halmasuit-greeter`
+/// group so the greeter/session can `connect(2)` — but group
+/// membership is not identity. A peer is authorised iff its uid is
+/// the greeter uid (pre-auth, the only client) or the authenticated
+/// session uid (post-auth, recorded by [`start_session`]). The
+/// greeter uid stays valid post-auth because greeter teardown can
+/// race the session connect. Mirrors the greetd listener's uid check.
+fn wayland_peer_authorized(peer_uid: u32, greeter_uid: u32, session_uid: Option<u32>) -> bool {
+    peer_uid == greeter_uid || session_uid == Some(peer_uid)
+}
+
+/// Start the authenticated user session: invoke `halmasuit-spawn`,
+/// and *only if it succeeds* record the session uid and tear the
+/// greeter down.
+///
+/// Ordering is load-bearing (Epic #1 R3). Killing the greeter before
+/// invoking spawn meant a spawn failure left a dead greeter with no
+/// session — an unrecoverable black screen, the exact failure this
+/// project exists to eliminate. Here the greeter is the recoverable
+/// fallback: it is signalled strictly after the spawn is confirmed,
+/// so a spawn failure leaves the user at a live greeter they can
+/// retry from, and a `SessionSpawnFailed` event is emitted instead of
+/// `GreeterTerminated`.
+///
+/// `session_uid` is set before the greeter teardown so the Wayland
+/// accept path can authorise the session's own connection (which
+/// arrives under the authenticated uid, distinct from the greeter's)
+/// as soon as the session process exists.
+fn start_session(
+    spawn_bin: &Path,
+    request: &SpawnRequest,
+    greeter: &mut Option<GreeterHandle>,
+    session_uid: &mut Option<u32>,
+) -> io::Result<Child> {
+    let child = match invoke_spawn(spawn_bin, request) {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                spawn_bin = ?spawn_bin,
+                "failed to invoke halmasuit-spawn; greeter retained for retry"
+            );
+            emit(&Event::SessionSpawnFailed {
+                uid: request.uid,
+                error: format!("{e}"),
+            });
+            return Err(e);
+        }
+    };
+
+    *session_uid = Some(request.uid);
+    tracing::info!(
+        spawn_pid = child.id(),
+        uid = request.uid,
+        "halmasuit-spawn launched"
+    );
+
+    if let Some(greeter) = greeter.take() {
+        let pid = greeter.pid;
+        match pidfd_send_signal(&greeter.pidfd, libc::SIGKILL) {
+            Ok(()) => emit(&Event::GreeterTerminated { pid }),
+            Err(e) => {
+                let error = format!("{e}");
+                tracing::warn!(
+                    %error,
+                    greeter_pid = pid,
+                    "pidfd_send_signal greeter SIGKILL failed; session proceeds"
+                );
+                emit(&Event::GreeterKillFailed { pid, error });
+            }
+        }
+    }
+
+    Ok(child)
+}
+
 // ── Wayland event-loop integration ──────────────────────────────────────
 
 /// calloop callback for the wayland Display source. The Display is
@@ -1393,6 +1522,77 @@ smithay::delegate_xdg_shell!(HalmasuitState);
 smithay::delegate_seat!(HalmasuitState);
 smithay::delegate_output!(HalmasuitState);
 smithay::delegate_shm!(HalmasuitState);
+
+/// Run one main-loop iteration behind a fault boundary (Epic #1 R5).
+///
+/// `body` is the dispatch+flush step. A `?`-propagated `Err` or a
+/// panic in any calloop callback would otherwise unwind out of
+/// `main()` → non-zero exit → systemd `Restart=on-failure` → DRM
+/// master re-acquired → the visible flash this project exists to
+/// delete. So neither escapes: an `Err` is logged and the loop
+/// continues; a panic is caught and the loop continues.
+///
+/// `AssertUnwindSafe` is deliberate. The body borrows `&mut state`,
+/// which is not `UnwindSafe`, so a caught panic may leave compositor
+/// state inconsistent. Per R5 the no-flash invariant outranks a
+/// possibly-degraded session: staying alive degraded beats a
+/// guaranteed flash, and clean re-exec recovery is Phase B's job, not
+/// a crash-loop's. There is intentionally no retry cap that
+/// eventually exits — that would reintroduce the flash. An unbroken
+/// error loop is still not a flash.
+///
+/// The degraded-iteration log is rate-limited. calloop's dispatch
+/// timeout is an upper bound, not a floor: a persistently-ready
+/// faulted fd (e.g. a Wayland client fd stuck at HUP) returns from
+/// `dispatch` immediately every iteration, so the loop spins at CPU
+/// speed. Logging once per iteration would reproduce the prior
+/// broken-pipe pathology (~237k lines in ~535s). `consecutive_errors`
+/// (owned by the caller, reset on the first clean iteration) gates
+/// the log to the first few failures plus power-of-two boundaries —
+/// O(log n) lines for n failures — and emits a one-line recovery
+/// summary when the fault clears.
+fn run_loop_iteration(consecutive_errors: &mut u32, body: impl FnOnce() -> io::Result<()>) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(Ok(())) => {
+            if *consecutive_errors != 0 {
+                tracing::error!(
+                    suppressed = *consecutive_errors,
+                    "event-loop recovered after degraded iterations"
+                );
+                *consecutive_errors = 0;
+            }
+        }
+        Ok(Err(e)) => {
+            *consecutive_errors += 1;
+            if should_log_degraded(*consecutive_errors) {
+                tracing::error!(
+                    error = %e,
+                    consecutive = *consecutive_errors,
+                    "event-loop dispatch error; degrading in place — \
+                     process exit would re-acquire DRM master and flash"
+                );
+            }
+        }
+        Err(_panic) => {
+            *consecutive_errors += 1;
+            if should_log_degraded(*consecutive_errors) {
+                tracing::error!(
+                    consecutive = *consecutive_errors,
+                    "event-loop iteration panicked; degrading in place — \
+                     process exit would re-acquire DRM master and flash"
+                );
+            }
+        }
+    }
+}
+
+/// Whether the `n`-th consecutive degraded iteration should be logged.
+/// First five, then power-of-two boundaries: O(log n) lines for a
+/// persistent fault instead of one-per-iteration, while still
+/// surfacing the fault promptly and marking escalation.
+const fn should_log_degraded(n: u32) -> bool {
+    n <= 5 || n.is_power_of_two()
+}
 
 #[allow(
     clippy::too_many_lines,
@@ -1568,10 +1768,32 @@ fn main() -> io::Result<()> {
         })?;
     }
 
-    // New-client handler: hand each accepted UnixStream to the Display
-    // with a fresh per-client state.
+    // New-client handler: SO_PEERCRED-gate every accepted stream
+    // before handing it to the Display. The 0660 chmod above only
+    // restricts to the halmasuit-greeter group; this is the peer
+    // *identity* gate (greeter pre-auth / session post-auth) that
+    // stops a hostile in-group uid from connecting to wayland-0 to
+    // screenshot / inject. Mirrors the greetd listener's uid gate.
     loop_handle
         .insert_source(socket, |stream, (), state: &mut HalmasuitState| {
+            let creds = match peer_credentials(&stream) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "peer_credentials failed; dropping wayland connection");
+                    drop(stream);
+                    return;
+                }
+            };
+            if !wayland_peer_authorized(creds.uid, state.greeter_uid, state.session_uid) {
+                tracing::warn!(
+                    peer_uid = creds.uid,
+                    greeter_uid = state.greeter_uid,
+                    session_uid = ?state.session_uid,
+                    "rejected wayland connection from unauthorised uid",
+                );
+                drop(stream);
+                return;
+            }
             let client_data = Arc::new(ClientState {
                 compositor_state: CompositorClientState::default(),
             });
@@ -1589,7 +1811,7 @@ fn main() -> io::Result<()> {
         .insert_source(
             signals,
             |event, (), state: &mut HalmasuitState| match event.signal() {
-                Signal::SIGCHLD => reap_zombie_children(),
+                Signal::SIGCHLD => reap_zombie_children(state),
                 sig => {
                     let reason = match sig {
                         Signal::SIGTERM => ShutdownReason::SignalTerm,
@@ -1687,6 +1909,7 @@ fn main() -> io::Result<()> {
         drm_backend,
         _drm_token: drm_token,
         greeter,
+        session_uid: None,
     };
 
     // Kick off the render loop with one initial frame. The page-flip
@@ -1766,16 +1989,25 @@ fn main() -> io::Result<()> {
     // pending outgoing events to clients. flush_clients lives on the
     // DisplayHandle (cloned earlier) since Display itself is now owned
     // by the calloop source above.
+    // Consecutive failed-iteration counter for the R5 degrade-in-place
+    // log rate-limiter; reset on the first clean iteration.
+    let mut consecutive_errors = 0u32;
     while state.running {
-        event_loop
-            .dispatch(Some(Duration::from_millis(16)), &mut state)
-            .map_err(io::Error::other)?;
-        state
-            .display_handle
-            .flush_clients()
-            .map_err(io::Error::other)?;
+        run_loop_iteration(&mut consecutive_errors, || {
+            event_loop
+                .dispatch(Some(Duration::from_millis(16)), &mut state)
+                .map_err(io::Error::other)?;
+            state
+                .display_handle
+                .flush_clients()
+                .map_err(io::Error::other)?;
+            Ok(())
+        });
     }
 
+    // Reached only via the deliberate Shutdown path (`state.running`
+    // cleared in the SIGTERM/SIGINT closure): a clean exit 0, which
+    // systemd's `Restart=on-failure` correctly does NOT restart.
     Ok(())
 }
 
@@ -1840,6 +2072,217 @@ mod tests {
         let cmd = build_spawn_command(Path::new("/bin/true"), &req);
         let map: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert!(!map.contains_key(OsStr::new("MALFORMED_NO_EQUALS")));
+    }
+
+    // R4 port: the SIGCHLD reaper must distinguish which child died.
+    // Greeter exit pre-auth (session_uid still None) is the wedge
+    // condition that previously vanished into a discarded waitpid
+    // status.
+    #[test]
+    fn classify_greeter_death_pre_auth() {
+        assert_eq!(
+            classify_reaped_child(4242, Some(4242), None),
+            ReapOutcome::GreeterDiedPreAuth
+        );
+    }
+
+    #[test]
+    fn classify_greeter_death_expected_post_auth() {
+        assert_eq!(
+            classify_reaped_child(4242, Some(4242), Some(1000)),
+            ReapOutcome::GreeterDiedExpected
+        );
+    }
+
+    #[test]
+    fn classify_non_greeter_child_is_other() {
+        assert_eq!(
+            classify_reaped_child(99, Some(4242), None),
+            ReapOutcome::Other
+        );
+        assert_eq!(
+            classify_reaped_child(99, Some(4242), Some(1000)),
+            ReapOutcome::Other
+        );
+    }
+
+    #[test]
+    fn classify_with_no_greeter_tracked_is_other() {
+        assert_eq!(classify_reaped_child(4242, None, None), ReapOutcome::Other);
+    }
+
+    // R5 port: neither a dispatch Err nor a callback panic may escape
+    // the loop iteration — escaping = process exit = systemd restart =
+    // DRM re-acquire = the flash this project exists to delete.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn run_loop_iteration_ok_runs_body_and_returns() {
+        let ran = AtomicUsize::new(0);
+        let mut streak = 0u32;
+        run_loop_iteration(&mut streak, || {
+            ran.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert_eq!(streak, 0, "a clean iteration keeps the error streak at 0");
+    }
+
+    #[test]
+    fn run_loop_iteration_err_does_not_escape() {
+        let ran = AtomicUsize::new(0);
+        let mut streak = 0u32;
+        run_loop_iteration(&mut streak, || {
+            ran.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("dispatch blew up"))
+        });
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert_eq!(streak, 1, "an Err iteration increments the error streak");
+    }
+
+    #[test]
+    fn run_loop_iteration_panic_does_not_escape() {
+        let ran = AtomicUsize::new(0);
+        let mut streak = 0u32;
+        run_loop_iteration(&mut streak, || {
+            ran.fetch_add(1, Ordering::SeqCst);
+            panic!("calloop callback panicked");
+        });
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            streak, 1,
+            "a panicking iteration increments the error streak"
+        );
+    }
+
+    #[test]
+    fn run_loop_iteration_ok_resets_streak() {
+        // A recovered iteration zeroes the streak so the next fault
+        // burst logs from the start again (and emits a recovery line).
+        let mut streak = 7u32;
+        run_loop_iteration(&mut streak, || Ok(()));
+        assert_eq!(streak, 0, "recovery resets the consecutive-error streak");
+    }
+
+    #[test]
+    fn degraded_log_is_rate_limited_under_persistent_fault() {
+        // The R5 degrade-in-place path must NOT log once per iteration
+        // (a persistently-ready faulted fd spins with no per-iteration
+        // delay — that produced the prior ~237k-lines/535s pattern).
+        // Log the first few, then only on power-of-two boundaries, so
+        // N failures cost O(log N) lines, not O(N).
+        assert!(should_log_degraded(1));
+        assert!(should_log_degraded(5));
+        assert!(
+            !should_log_degraded(6),
+            "6 is suppressed (not <=5, not pow2)"
+        );
+        assert!(!should_log_degraded(7));
+        assert!(should_log_degraded(8), "powers of two still log (boundary)");
+        assert!(!should_log_degraded(1000));
+        assert!(should_log_degraded(1024));
+        // O(log N) bound: across 1..=1_000_000 failures, far fewer than
+        // the prior incident's hundreds-of-lines-per-second.
+        let logged = (1u32..=1_000_000)
+            .filter(|&n| should_log_degraded(n))
+            .count();
+        assert!(
+            logged < 30,
+            "expected O(log N) logged lines over 1e6 failures, got {logged}"
+        );
+    }
+
+    // R1 port: the Wayland accept path authorises a peer iff its
+    // SO_PEERCRED uid is the greeter uid (pre-auth) or the recorded
+    // session uid (post-auth). FVC only chmods the socket 0660 — group
+    // restriction, not peer identity; this closes that gap.
+    #[test]
+    fn wayland_peer_greeter_accepted_pre_auth() {
+        assert!(wayland_peer_authorized(1000, 1000, None));
+    }
+
+    #[test]
+    fn wayland_peer_session_accepted_post_auth() {
+        assert!(wayland_peer_authorized(1001, 1000, Some(1001)));
+    }
+
+    #[test]
+    fn wayland_peer_greeter_still_accepted_post_auth() {
+        assert!(wayland_peer_authorized(1000, 1000, Some(1001)));
+    }
+
+    #[test]
+    fn wayland_peer_unrelated_uid_rejected_pre_and_post_auth() {
+        assert!(!wayland_peer_authorized(1234, 1000, None));
+        assert!(!wayland_peer_authorized(1234, 1000, Some(1001)));
+    }
+
+    #[test]
+    fn wayland_peer_root_rejected() {
+        assert!(!wayland_peer_authorized(0, 1000, Some(1001)));
+        assert!(!wayland_peer_authorized(0, 1000, None));
+    }
+
+    // R2/R3 port: spawn must be invoked and confirmed BEFORE the
+    // greeter is killed. Spawn failure must leave the greeter running
+    // (recoverable) and emit SessionSpawnFailed, never GreeterTerminated.
+    #[test]
+    fn start_session_spawn_failure_retains_greeter_and_records_no_uid() {
+        let bin = Path::new("/nonexistent/halmasuit-spawn-does-not-exist");
+        let req = sample_request(); // uid 1000
+        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let mut greeter = Some(GreeterHandle {
+            pid: 4242,
+            pidfd: devnull.into(),
+        });
+        let mut session_uid: Option<u32> = None;
+
+        let result = start_session(bin, &req, &mut greeter, &mut session_uid);
+
+        assert!(result.is_err(), "spawn of a nonexistent bin must fail");
+        assert!(
+            greeter.is_some(),
+            "greeter MUST be retained when the session spawn fails"
+        );
+        assert_eq!(
+            session_uid, None,
+            "session_uid MUST NOT be recorded when the spawn fails"
+        );
+    }
+
+    #[test]
+    fn start_session_success_records_uid_then_kills_greeter() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let mut greeter_child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn greeter stand-in");
+        let pidfd = pidfd_open_for(greeter_child.id()).expect("pidfd_open greeter stand-in");
+        let mut greeter = Some(GreeterHandle {
+            pid: greeter_child.id(),
+            pidfd,
+        });
+        let mut session_uid: Option<u32> = None;
+        let req = sample_request(); // uid 1000
+
+        let result = start_session(Path::new("/bin/sh"), &req, &mut greeter, &mut session_uid);
+
+        let mut session_child = result.expect("spawn of /bin/sh must succeed");
+        assert_eq!(
+            session_uid,
+            Some(1000),
+            "authenticated uid MUST be recorded once the spawn is confirmed"
+        );
+        assert!(
+            greeter.is_none(),
+            "greeter MUST be taken (killed) after a confirmed spawn"
+        );
+
+        let _ = session_child.wait();
+        let _ = greeter_child.wait();
     }
 
     #[test]

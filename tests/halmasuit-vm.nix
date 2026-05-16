@@ -424,9 +424,16 @@ pkgs.testers.runNixOSTest {
     # Suite 3: Wayland globals reachable via a real Wayland client
     # ──────────────────────────────────────────────────────────────────
     with subtest("wayland globals"):
+        # Connect as halmasuit-greeter (uid 999): the Wayland socket is
+        # now SO_PEERCRED-gated to the greeter/session uids (R1), so a
+        # root probe is correctly rejected (threat-model row 4). The
+        # 0660 chmod admits the greeter group at the FS layer; R1 is
+        # the identity layer on top. Absolute wayland-info path —
+        # runuser does not inherit root's PATH.
         info = machine.succeed(
-            "XDG_RUNTIME_DIR=/run/halmasuit WAYLAND_DISPLAY=wayland-0 "
-            "timeout 5 wayland-info 2>&1"
+            "runuser -u halmasuit-greeter -- "
+            "env XDG_RUNTIME_DIR=/run/halmasuit WAYLAND_DISPLAY=wayland-0 "
+            "timeout 5 ${pkgs.wayland-utils}/bin/wayland-info 2>&1"
         )
         for required in ("wl_compositor", "xdg_wm_base", "wl_seat",
                          "wl_output", "wl_shm"):

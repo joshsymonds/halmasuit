@@ -33,6 +33,17 @@ use zeroize::Zeroizing;
 /// or refused to complete — close the connection.
 const MAX_READ_BUF: usize = MAX_MESSAGE_SIZE as usize + 4;
 
+/// Per-connection cap on accepted `CreateSession` builds over the
+/// connection's lifetime. libpam has no cancellation point, so each
+/// accepted build spawns a detached worker thread that runs to its
+/// own completion; a cancel/create loop on one connection would
+/// otherwise spawn unbounded sequential workers (MAX_GREETD_CONNECTIONS
+/// caps concurrent connections, not builds-over-time). A real greeter
+/// builds once per connection plus the occasional post-auth-failure
+/// retry; 16 is far above any human retry count and far below a
+/// thread-bomb. Adjust only with a documented reason.
+const MAX_SESSION_BUILDS_PER_CONNECTION: u32 = 16;
+
 // ── Peer credentials ────────────────────────────────────────────────────
 
 /// Credentials of the connecting peer, as reported by `SO_PEERCRED`.
@@ -315,6 +326,10 @@ pub struct Connection {
     read_buf: Zeroizing<Vec<u8>>,
     factory: Arc<dyn PamSessionFactory>,
     current_session: Option<Box<dyn PamSession + Send>>,
+    /// Count of accepted (Idle) `CreateSession` builds over this
+    /// connection's lifetime. Bounded by
+    /// [`MAX_SESSION_BUILDS_PER_CONNECTION`]; see that constant for why.
+    session_builds: u32,
 }
 
 impl Connection {
@@ -328,6 +343,7 @@ impl Connection {
             read_buf: Zeroizing::new(Vec::new()),
             factory,
             current_session: None,
+            session_builds: 0,
         }
     }
 
@@ -372,6 +388,17 @@ impl Connection {
             // the state machine returns DoubleCreate without touching
             // pam, so the current_session is preserved.
             if matches!(self.state, SessionState::Idle) {
+                // libpam has no cancellation point: each accepted build
+                // spawns a detached worker. Cap builds-over-lifetime so
+                // a cancel/create loop can't thread-bomb the compositor.
+                // Returning the error drives the existing caller
+                // close+log path (same as any other CodecError).
+                if self.session_builds >= MAX_SESSION_BUILDS_PER_CONNECTION {
+                    return Err(CodecError::SessionBuildLimitExceeded(
+                        MAX_SESSION_BUILDS_PER_CONNECTION,
+                    ));
+                }
+                self.session_builds += 1;
                 self.current_session = Some(self.factory.build(username));
             }
         }
@@ -771,6 +798,94 @@ mod tests {
             factory.builds(),
             1,
             "build must NOT fire on second CreateSession (DoubleCreate)"
+        );
+    }
+
+    // R6 port: libpam has no cancellation point, so each Idle
+    // CreateSession spawns a detached worker. A cancel/create loop on
+    // one connection must not spawn unbounded sequential workers — the
+    // per-connection build counter caps it and terminates the connection.
+    fn challenge_script() -> Vec<PamStep> {
+        vec![PamStep::Challenge {
+            kind: AuthMessageType::Secret,
+            prompt: "password:".into(),
+        }]
+    }
+
+    #[test]
+    fn connection_allows_session_builds_up_to_cap() {
+        let scripts = vec![challenge_script(); MAX_SESSION_BUILDS_PER_CONNECTION as usize];
+        let factory = Arc::new(ScriptedFactory::new(scripts));
+        let mut conn = Connection::new(Arc::clone(&factory) as Arc<dyn PamSessionFactory>);
+        let create = encode(&Request::CreateSession {
+            username: "alice".into(),
+        })
+        .unwrap();
+        let cancel = encode(&Request::CancelSession).unwrap();
+        for _ in 0..MAX_SESSION_BUILDS_PER_CONNECTION {
+            conn.process(&create).expect("create within cap");
+            conn.process(&cancel).expect("cancel back to Idle");
+        }
+        assert_eq!(
+            factory.builds(),
+            MAX_SESSION_BUILDS_PER_CONNECTION as usize,
+            "exactly cap builds, all accepted"
+        );
+    }
+
+    #[test]
+    fn connection_rejects_session_build_over_cap() {
+        let scripts = vec![challenge_script(); MAX_SESSION_BUILDS_PER_CONNECTION as usize + 1];
+        let factory = Arc::new(ScriptedFactory::new(scripts));
+        let mut conn = Connection::new(Arc::clone(&factory) as Arc<dyn PamSessionFactory>);
+        let create = encode(&Request::CreateSession {
+            username: "alice".into(),
+        })
+        .unwrap();
+        let cancel = encode(&Request::CancelSession).unwrap();
+        for _ in 0..MAX_SESSION_BUILDS_PER_CONNECTION {
+            conn.process(&create).expect("create within cap");
+            conn.process(&cancel).expect("cancel back to Idle");
+        }
+        let over = conn.process(&create);
+        assert!(
+            matches!(
+                over,
+                Err(CodecError::SessionBuildLimitExceeded(
+                    MAX_SESSION_BUILDS_PER_CONNECTION
+                ))
+            ),
+            "got: {over:?}"
+        );
+        assert_eq!(
+            factory.builds(),
+            MAX_SESSION_BUILDS_PER_CONNECTION as usize,
+            "the over-limit build must never have happened"
+        );
+    }
+
+    #[test]
+    fn double_create_does_not_consume_cap_budget() {
+        let scripts = vec![challenge_script(); MAX_SESSION_BUILDS_PER_CONNECTION as usize];
+        let factory = Arc::new(ScriptedFactory::new(scripts));
+        let mut conn = Connection::new(Arc::clone(&factory) as Arc<dyn PamSessionFactory>);
+        let create = encode(&Request::CreateSession {
+            username: "alice".into(),
+        })
+        .unwrap();
+        let cancel = encode(&Request::CancelSession).unwrap();
+        conn.process(&create).expect("idle create");
+        conn.process(&create).expect("double create (no rebuild)");
+        conn.process(&cancel).expect("cancel back to Idle");
+        assert_eq!(factory.builds(), 1, "double-create must not build");
+        for _ in 0..MAX_SESSION_BUILDS_PER_CONNECTION - 1 {
+            conn.process(&create).expect("create still within cap");
+            conn.process(&cancel).expect("cancel back to Idle");
+        }
+        assert_eq!(
+            factory.builds(),
+            MAX_SESSION_BUILDS_PER_CONNECTION as usize,
+            "cap counts accepted Idle builds only, not DoubleCreate"
         );
     }
 
