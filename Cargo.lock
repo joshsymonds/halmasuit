@@ -1059,6 +1059,16 @@ name = "halmasuit-protocols"
 version = "0.1.0"
 
 [[package]]
+name = "halmasuit-session-ipc"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
 name = "halmasuit-spawn"
 version = "0.1.0"
 dependencies = [

@@ -7,6 +7,9 @@ members = [
     "crates/halmasuit-greetd",
     "crates/halmasuit-pam",
     "crates/halmasuit-ipc",
+    # Pure wire contract for the compositor↔halmasuit-session PAM relay
+    # (Epic: unified session/pamd). Types + codec only.
+    "crates/halmasuit-session-ipc",
     "crates/halmasuit-cli",
     "crates/halmasuit-spawn",
     "crates/halmasuit-test",

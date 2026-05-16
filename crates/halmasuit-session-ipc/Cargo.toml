@@ -1,0 +1,24 @@
+[package]
+name        = "halmasuit-session-ipc"
+description = "Pure wire contract for the compositor↔halmasuit-session PAM-conversation relay. Types + codec only; no PAM, no process control, no sockets."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Wire types are defined locally, same clean-room posture as
+# halmasuit-greetd: serde drives the JSON shape and the wire_format_*
+# drift tests pin it so an accidental shape change fails CI.
+serde.workspace      = true
+serde_json.workspace = true
+thiserror.workspace  = true
+# Conversation-response secrets are wrapped so they zero on drop on
+# BOTH sides of the relay (Epic #1 R3/R11). No credential lingers in
+# heap after the message is consumed.
+zeroize.workspace    = true
