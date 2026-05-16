@@ -76,8 +76,11 @@
       # rustPlatform whose stdenv targets static musl, for
       # halmasuit-spawn only. The pinned rust-overlay toolchain is
       # reused (single source of truth with rustup) with the musl
-      # rust-std added; pkgsStatic supplies the musl/static stdenv that
-      # buildRustPackage's build+install hooks key off.
+      # rust-std added; a `pkgsCross.*` cross stdenv (see `crossPkgs`
+      # below) supplies the musl/static host stdenv that
+      # buildRustPackage's build+install hooks key off. (pkgsStatic
+      # was tried and rejected — it conflates build/host; see the
+      # `crossPkgs` comment.)
       rustPlatformStaticFor = system:
         let
           pkgs      = pkgsFor system;
@@ -331,8 +334,10 @@
             # RUSTFLAGS would also static-PIE the gnu *build-platform*
             # build scripts (libc/nix), which then SIGSEGV on the
             # builder.
-            "CARGO_TARGET_${pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] (muslRustTargetFor system))}_RUSTFLAGS" =
-              "-C target-feature=+crt-static";
+            env = {
+              "CARGO_TARGET_${pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] (muslRustTargetFor system))}_RUSTFLAGS" =
+                "-C target-feature=+crt-static";
+            };
             # Build-enforced hardening invariant: a statically linked
             # ELF has no PT_INTERP program header. If one appears, the
             # binary would dlopen NSS inside the privileged process —
