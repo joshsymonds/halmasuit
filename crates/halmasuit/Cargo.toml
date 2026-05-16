@@ -11,6 +11,22 @@ authors.workspace      = true
 [lints]
 workspace = true
 
+[features]
+# Test-only in-process frame analysis. Gates the per-frame GPU
+# readback + `analyze()` + `Event::FrameRendered` emission + (next
+# task) the `Snapshot()` D-Bus method. NOT in `default`: the readback
+# forces a GPU→CPU sync (~1-2ms/frame) and `Snapshot()` is an
+# arbitrary-file-write surface — neither belongs in the privileged
+# production compositor. The flake exposes `halmasuit` (this off) and
+# `halmasuit-debug` (this on); visual VM tests consume the latter.
+# `dep:zbus`/`dep:png` are the ONLY feature deps: zbus serves the
+# `org.halmasuit.Debug.Introspect.Snapshot` method, png encodes the
+# captured frame. Both optional, so production `cargo tree` lists
+# neither (Epic #1 req 7). Still no `img_hash`/`image`: luminance/
+# coverage are arithmetic and the perceptual hash is an in-house 8x8
+# average-hash.
+frame_audit = ["dep:zbus", "dep:png"]
+
 [dependencies]
 halmasuit-introspect = { path = "../halmasuit-introspect", version = "0.1" }
 # greetd-protocol server building blocks: Listener, Connection,
@@ -22,25 +38,57 @@ halmasuit-greetd     = { path = "../halmasuit-greetd",     version = "0.1" }
 halmasuit-pam        = { path = "../halmasuit-pam",        version = "0.1" }
 tracing.workspace            = true
 tracing-subscriber.workspace = true
-# smithay carries Wayland-server protocol state. `wayland_frontend` is
-# the minimum feature for the Wayland-server protocol surface.
-smithay = { workspace = true, features = ["wayland_frontend"] }
+# smithay features:
+# - `wayland_frontend`: Wayland-server protocol state.
+# - `backend_drm`: DrmDevice / DrmSurface / DrmCompositor — replaces the
+#   dumb-buffer scanout from B.1.
+# - `backend_gbm`: GbmDevice / GbmAllocator / GbmFramebufferExporter for
+#   GLES-rendered scanout buffers.
+# - `renderer_gl`: GlesRenderer (auto-enables `backend_egl` per smithay's
+#   Cargo.toml).
+smithay = { workspace = true, features = [
+    "wayland_frontend",
+    "backend_drm",
+    "backend_gbm",
+    "renderer_gl",
+    # `desktop` gives us `LayerMap`, `WaylandSurfaceRenderElement`, and
+    # `render_elements_from_surface_tree` — the helpers for composing
+    # committed wl_clients into a frame. Required by B.3's wlr-layer-shell
+    # path; depended on transitively by B.5+ when we layer toplevels.
+    "desktop",
+    # Epic layer E (input): seatd brokers the DRM fd (replacing
+    # self-SET_MASTER — validated by drm-master-probe Phase 4) and the
+    # libinput device fds. `backend_udev` is what enables `input/udev`
+    # (`Libinput::new_with_udev` / `udev_assign_seat`) — `backend_libinput`
+    # alone does not. Input/seat is CORE, not frame_audit-gated.
+    "backend_session_libseat",
+    "backend_libinput",
+    "backend_udev",
+] }
 # calloop comes in two ways: (1) via smithay's reexport for general
 # event-loop use, (2) directly here for the `signals` feature smithay
 # doesn't enable. Cargo unifies to one version with merged features.
 calloop.workspace            = true
 # nix features used by halmasuit:
 # - `user`: getuid, setresuid, setresgid for the privilege drop path
-# - `ioctl`: the `ioctl_none!` macro that generates the DRM_IOCTL_SET_MASTER wrapper
 # - `signal`: sigprocmask in the greeter pre_exec closure (the parent
 #   blocks SIGTERM/SIGINT for calloop's signalfd; the greeter child
 #   needs the default mask restored before execve)
 # - `process`: waitpid in the SIGCHLD reaper so dead greeter / session
 #   children don't accumulate as zombies
-nix = { workspace = true, features = ["user", "ioctl", "signal", "process"] }
+nix = { workspace = true, features = ["user", "signal", "process"] }
+# drm-rs types reach halmasuit via `smithay::reexports::drm` — same
+# version smithay itself uses (0.14 at the pinned rev), avoiding the
+# multi-version-of-drm problem (smithay's DrmDevice impls drm 0.14's
+# `ControlDevice`; a separate `drm = "0.15"` direct dep would expose a
+# different trait and method resolution would silently miss).
 # Linux capabilities for drop_privileges' CAP_KILL preservation —
 # halmasuit must retain signal authority over its greeter child
 # (uid 999) post-deprivilege to uid 998. Pure-Rust over libc.
+# frame_audit-only. `optional = true` keeps them out of the default
+# (production) dependency graph entirely; `frame_audit` turns them on.
+zbus = { workspace = true, optional = true }
+png  = { workspace = true, optional = true }
 caps.workspace = true
 # libc for raw syscall wrappers: pidfd_open / pidfd_send_signal
 # (the race-free signal path against the greeter), capset (single-

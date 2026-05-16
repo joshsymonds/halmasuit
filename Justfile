@@ -45,6 +45,61 @@ test-vm:
     echo
     echo "── login-flash ──"
     nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link
+    echo
+    echo "── halmasuit-input ──"
+    nix build .#checks.x86_64-linux.halmasuit-input -L --print-build-logs --no-link
+    echo
+    echo "── visual-halmasuit-clear ──"
+    nix build .#checks.x86_64-linux.visual-halmasuit-clear -L --print-build-logs --no-link
+    echo
+    echo "── visual-halmasuit-layer ──"
+    nix build .#checks.x86_64-linux.visual-halmasuit-layer -L --print-build-logs --no-link
+    echo
+    echo "── visual-halmasuit-splash ──"
+    nix build .#checks.x86_64-linux.visual-halmasuit-splash -L --print-build-logs --no-link
+    echo
+    echo "── visual-backdrop ──"
+    nix build .#checks.x86_64-linux.visual-backdrop -L --print-build-logs --no-link
+    echo
+    echo "── visual-halmasuit-toplevel ──"
+    nix build .#checks.x86_64-linux.visual-halmasuit-toplevel -L --print-build-logs --no-link
+    echo
+    echo "── visual-foreground ──"
+    nix build .#checks.x86_64-linux.visual-foreground -L --print-build-logs --no-link
+
+# Regenerate one or all visual-test goldens. Runs the named test
+# interactively (driverInteractive), with HALMASUIT_GOLDEN_REGEN=1 and
+# GOLDENS_DIR pointing at the source tree's tests/goldens so visual.py
+# writes the captured PNGs in-place instead of comparing.
+#
+# IMPORTANT: After regeneration, manually inspect each updated golden
+# before committing. A broken renderer that paints garbage will happily
+# overwrite a previously-good golden with garbage; the human in the
+# loop is the only check.
+#
+# Usage:
+#   just update-goldens visual-halmasuit-clear   # one named test
+#   just update-goldens visual-halmasuit-layer
+update-goldens name="visual-halmasuit-clear":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Regenerating goldens for: {{name}}"
+    echo "Source-tree goldens dir:  $(pwd)/tests/goldens"
+    echo
+    echo "Press Ctrl-C now to cancel; otherwise the captured PNG will"
+    echo "OVERWRITE the existing golden. Inspect the result before committing."
+    echo
+    read -p "Continue? [y/N] " -n 1 -r REPLY
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        exit 1
+    fi
+    HALMASUIT_GOLDEN_REGEN=1 \
+    GOLDENS_DIR="$(pwd)/tests/goldens" \
+    nix run .#checks.x86_64-linux.{{name}}.driver
+    echo
+    echo "Done. New golden(s) in $(pwd)/tests/goldens — inspect, then commit."
 
 # Phase 0 research probe: validate userspace DRM master persistence from
 # rootfs boot through multi-user.target. Headless gate; for visual
@@ -77,6 +132,15 @@ test-drm-probe-phase2:
 # the orphan-unit-with-SIGTERM-ignore-handler pattern.
 test-drm-probe-phase3:
     nix build .#checks.x86_64-linux.drm-master-probe-phase3 -L --print-build-logs --no-link
+
+# Phase 4 research probe: gate for epic layer E (#11). Validates that a
+# libseat/seatd-brokered session (DRM master + libinput fds +
+# session-active) survives setresuid to a non-root uid — the inversion
+# of Phases 0-3 (seatd brokers the fd instead of self-SET_MASTER).
+# Passing means halmasuit can adopt libseat without regressing the
+# privilege model; the conclusion is recorded in RESEARCH.md Phase 4.
+test-drm-probe-phase4:
+    nix build .#checks.x86_64-linux.drm-master-probe-phase4 -L --print-build-logs --no-link
 
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.

@@ -1,0 +1,457 @@
+// halmasuit-layer-shell-test-client — test wl_client for B.3.
+//
+// Connects to halmasuit's `wayland-0` socket, binds `wlr-layer-shell`
+// with role `Background`, creates an `wl_shm` buffer filled with a
+// known solid color (a recognizable green: `#16C44E`), commits it
+// fullscreen, then waits for SIGTERM. Used by
+// tests/visual-halmasuit-layer.nix to verify halmasuit composites
+// layer-shell clients into its scanout.
+//
+// Not production code. Patterned on smithay-client-toolkit's own
+// `layer.rs` example, simplified to:
+//   * single shm buffer (no dynamic resize after configure)
+//   * single layer role (Background)
+//   * single color (test fixture, not configurable)
+//   * exits on SIGTERM, not on close events
+
+#![deny(unsafe_code)]
+// reason: sctk's idiomatic State struct uses `registry_state`,
+// `output_state`, `compositor_state` field names; renaming them
+// would diverge from every sctk downstream example.
+#![allow(clippy::struct_field_names)]
+// reason: wayland buffer dimensions are u32 in the wire protocol but
+// i32 in sctk's create_buffer / damage_buffer APIs. Our test sizes
+// are bounded to 1920x1080 (well below i32::MAX); no wrap is
+// achievable in practice.
+#![allow(clippy::cast_possible_wrap)]
+
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
+use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+use smithay_client_toolkit::registry_handlers;
+use smithay_client_toolkit::seat::keyboard::{
+    KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers,
+};
+use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
+use smithay_client_toolkit::shell::WaylandSurface;
+use smithay_client_toolkit::shell::wlr_layer::{
+    Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
+    LayerSurfaceConfigure,
+};
+use smithay_client_toolkit::shm::slot::SlotPool;
+use smithay_client_toolkit::shm::{Shm, ShmHandler};
+use smithay_client_toolkit::{
+    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_registry,
+    delegate_seat, delegate_shm,
+};
+
+use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
+use smithay_client_toolkit::reexports::client::protocol::wl_keyboard;
+use smithay_client_toolkit::reexports::client::protocol::wl_output;
+use smithay_client_toolkit::reexports::client::protocol::wl_seat;
+use smithay_client_toolkit::reexports::client::protocol::wl_shm::Format;
+use smithay_client_toolkit::reexports::client::protocol::wl_surface;
+use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
+
+/// Default solid color: `#16C44E` (R=0x16, G=0xC4, B=0x4E), distinct
+/// from halmasuit's brand `#0a0014`. Stored ARGB8888 little-endian
+/// (sctk slot-pool default), bytes `[B, G, R, A]`.
+const DEFAULT_COLOR_BGRA: [u8; 4] = [0x4E, 0xC4, 0x16, 0xFF];
+
+/// Parse `#RRGGBB`/`RRGGBB` into ARGB8888-LE bytes `[B, G, R, 0xFF]`.
+fn parse_color(spec: &str) -> anyhow::Result<[u8; 4]> {
+    let hex = spec.strip_prefix('#').unwrap_or(spec);
+    anyhow::ensure!(hex.len() == 6, "color must be 6 hex digits, got {spec:?}");
+    let red = u8::from_str_radix(&hex[0..2], 16)?;
+    let green = u8::from_str_radix(&hex[2..4], 16)?;
+    let blue = u8::from_str_radix(&hex[4..6], 16)?;
+    Ok([blue, green, red, 0xFF])
+}
+
+/// Parse `WxH` into `(w, h)`.
+fn parse_size(spec: &str) -> anyhow::Result<(u32, u32)> {
+    let (ws, hs) = spec
+        .split_once('x')
+        .ok_or_else(|| anyhow::anyhow!("size must be WxH, got {spec:?}"))?;
+    Ok((ws.trim().parse()?, hs.trim().parse()?))
+}
+
+fn main() -> anyhow::Result<()> {
+    // Test fixture parametrisation (all optional; defaults reproduce
+    // the original fullscreen-green BACKGROUND client):
+    //   HALMASUIT_TESTCLIENT_LAYER  background|bottom|top|overlay
+    //   HALMASUIT_TESTCLIENT_COLOR  #RRGGBB
+    //   HALMASUIT_TESTCLIENT_SIZE   WxH  (omitted ⇒ fullscreen, anchored)
+    let layer = match std::env::var("HALMASUIT_TESTCLIENT_LAYER")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "" | "background" => Layer::Background,
+        "bottom" => Layer::Bottom,
+        "top" => Layer::Top,
+        "overlay" => Layer::Overlay,
+        other => anyhow::bail!("unknown HALMASUIT_TESTCLIENT_LAYER {other:?}"),
+    };
+    let color = match std::env::var("HALMASUIT_TESTCLIENT_COLOR") {
+        Ok(s) => parse_color(&s)?,
+        Err(_) => DEFAULT_COLOR_BGRA,
+    };
+    let fixed_size = match std::env::var("HALMASUIT_TESTCLIENT_SIZE") {
+        Ok(s) => Some(parse_size(&s)?),
+        Err(_) => None,
+    };
+
+    let conn =
+        Connection::connect_to_env().map_err(|e| anyhow::anyhow!("connect to wayland: {e}"))?;
+    let (globals, mut event_queue) = registry_queue_init(&conn)?;
+    let qh = event_queue.handle();
+
+    let compositor = CompositorState::bind(&globals, &qh)?;
+    let layer_shell = LayerShell::bind(&globals, &qh)?;
+    let shm = Shm::bind(&globals, &qh)?;
+
+    let surface = compositor.create_surface(&qh);
+    let layer_surface = layer_shell.create_layer_surface(
+        &qh,
+        surface,
+        layer,
+        Some("halmasuit-layer-shell-test-client"),
+        None, // any output
+    );
+    if let Some((w, h)) = fixed_size {
+        // Centered, fixed-size rectangle (no anchors) so the layer
+        // beneath shows around it — used for "greeter over splash".
+        layer_surface.set_anchor(Anchor::empty());
+        layer_surface.set_size(w, h);
+    } else {
+        // Fullscreen: anchored to all edges, halmasuit sizes it to
+        // the output mode.
+        layer_surface.set_anchor(Anchor::all());
+    }
+    // HALMASUIT_TESTCLIENT_KEYBOARD=1 → request exclusive keyboard
+    // focus so halmasuit's focus policy routes libinput keys here;
+    // the client logs every keysym it receives (the input VM test
+    // asserts on that). Default: no keyboard (the other scenes).
+    let want_keyboard = std::env::var("HALMASUIT_TESTCLIENT_KEYBOARD").is_ok();
+    layer_surface.set_keyboard_interactivity(if want_keyboard {
+        KeyboardInteractivity::Exclusive
+    } else {
+        KeyboardInteractivity::None
+    });
+    layer_surface.set_exclusive_zone(-1); // ignore exclusive zones
+    layer_surface.commit();
+
+    // SHM pool sized for 1920x1080xARGB; resized at configure time.
+    let pool = SlotPool::new(1920 * 1080 * 4, &shm)?;
+
+    let mut state = State {
+        registry_state: RegistryState::new(&globals),
+        output_state: OutputState::new(&globals, &qh),
+        seat_state: SeatState::new(&globals, &qh),
+        keyboard: None,
+        shm,
+        _compositor_state: compositor,
+        _layer_shell: layer_shell,
+        _layer_surface: layer_surface,
+        pool,
+        color,
+        configured: false,
+        width: 0,
+        height: 0,
+    };
+
+    eprintln!("layer-shell-test-client: bound, waiting for configure");
+
+    // Roundtrip-then-dispatch loop until configured + painted.
+    loop {
+        event_queue.blocking_dispatch(&mut state)?;
+    }
+}
+
+struct State {
+    registry_state: RegistryState,
+    output_state: OutputState,
+    seat_state: SeatState,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    shm: Shm,
+    /// Held for the surface's lifetime; the layer surface goes away if
+    /// the LayerShell global is dropped.
+    _compositor_state: CompositorState,
+    _layer_shell: LayerShell,
+    /// Held to keep the wayland proxy alive — sctk destroys the
+    /// surface when this is dropped. Not read; `configure` receives
+    /// its own `&LayerSurface`.
+    _layer_surface: LayerSurface,
+    pool: SlotPool,
+    color: [u8; 4],
+    configured: bool,
+    width: u32,
+    height: u32,
+}
+
+impl LayerShellHandler for State {
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
+        // halmasuit closed our layer surface. Exit so the test driver
+        // can see the close (rather than hanging until SIGTERM).
+        std::process::exit(0);
+    }
+
+    fn configure(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        layer: &LayerSurface,
+        configure: LayerSurfaceConfigure,
+        _serial: u32,
+    ) {
+        let (width, height) = configure.new_size;
+        // halmasuit's configure may pass (0, 0) meaning "client picks";
+        // pick the connector's preferred mode size in that case. We
+        // don't know it client-side, so fall back to 1280x800 (what
+        // virtio-gpu-pci reports in our test VMs).
+        let (w, h) = if width == 0 || height == 0 {
+            (1280, 800)
+        } else {
+            (width, height)
+        };
+        self.width = w;
+        self.height = h;
+        self.configured = true;
+        self.paint(layer);
+        eprintln!("layer-shell-test-client: painted {w}x{h}");
+    }
+}
+
+impl State {
+    fn paint(&mut self, layer: &LayerSurface) {
+        let stride = self.width as i32 * 4;
+        let height = self.height as i32;
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(self.width as i32, height, stride, Format::Argb8888)
+            .expect("create_buffer");
+        for pixel in canvas.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&self.color);
+        }
+        layer
+            .wl_surface()
+            .damage_buffer(0, 0, self.width as i32, height);
+        buffer.attach_to(layer.wl_surface()).expect("attach_to");
+        layer.commit();
+    }
+}
+
+impl CompositorHandler for State {
+    fn scale_factor_changed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _new_factor: i32,
+    ) {
+    }
+
+    fn transform_changed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _new_transform: wl_output::Transform,
+    ) {
+    }
+
+    fn frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _time: u32,
+    ) {
+    }
+
+    fn surface_enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _output: &wl_output::WlOutput,
+    ) {
+    }
+
+    fn surface_leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _output: &wl_output::WlOutput,
+    ) {
+    }
+}
+
+impl OutputHandler for State {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
+
+    fn new_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+
+    fn update_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+
+    fn output_destroyed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+}
+
+impl ShmHandler for State {
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm
+    }
+}
+
+impl SeatHandler for State {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            match self.seat_state.get_keyboard(qh, &seat, None) {
+                Ok(kb) => {
+                    eprintln!("layer-shell-test-client: keyboard capability acquired");
+                    self.keyboard = Some(kb);
+                }
+                Err(e) => eprintln!("layer-shell-test-client: get_keyboard failed: {e}"),
+            }
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Keyboard
+            && let Some(kb) = self.keyboard.take()
+        {
+            kb.release();
+        }
+    }
+}
+
+impl KeyboardHandler for State {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
+        eprintln!("layer-shell-test-client: keyboard enter");
+    }
+
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+    }
+
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        // The single line the input VM test asserts on. raw() is the
+        // xkb keysym (e.g. 0x61 for 'a').
+        eprintln!(
+            "layer-shell-test-client: key press keysym=0x{:x}",
+            event.keysym.raw()
+        );
+    }
+
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+    }
+
+    fn repeat_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        eprintln!(
+            "layer-shell-test-client: key repeat keysym=0x{:x}",
+            event.keysym.raw()
+        );
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: Modifiers,
+        _: RawModifiers,
+        _: u32,
+    ) {
+    }
+}
+
+impl ProvidesRegistryState for State {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+    registry_handlers![OutputState, SeatState];
+}
+
+delegate_compositor!(State);
+delegate_output!(State);
+delegate_seat!(State);
+delegate_keyboard!(State);
+delegate_shm!(State);
+delegate_layer!(State);
+delegate_registry!(State);

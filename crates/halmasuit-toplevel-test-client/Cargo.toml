@@ -1,0 +1,20 @@
+[package]
+name        = "halmasuit-toplevel-test-client"
+description = "Test wl_client that maps a fullscreen solid-colour xdg_toplevel via wl_shm. Exercises halmasuit's F1 xdg-shell compositing. Not production code."
+
+version.workspace        = true
+edition.workspace        = true
+license.workspace        = true
+repository.workspace     = true
+authors.workspace        = true
+
+# Throwaway test client: built via nixpkgs's pinned rustc, so a
+# looser MSRV than the workspace pin is fine.
+rust-version       = "1.87"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow                 = "1"
+smithay-client-toolkit = "0.20"

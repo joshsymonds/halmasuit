@@ -176,3 +176,71 @@ landing-target for v3 or later.
   problem to solve in v2 production, but it has nothing to do with
   whether the kernel-level boundary crossings work — which is what
   the probes prove.
+
+## Phase 4 — libseat/seatd session survival across `setresuid`
+
+**Question.** Epic layer E (`#11`) adopts libseat for input. The
+canonical smithay/anvil libseat pattern makes `Session::open()`
+REPLACE halmasuit's self-acquired `SET_MASTER`: seatd (a tiny root
+daemon) brokers the DRM + input fds and *owns* DRM master. This
+inverts the model Phases 0–3 validated. Does a seatd-brokered libseat
+session — DRM master, libinput device fds, session-active — survive a
+process's `setresuid` to a non-root uid?
+
+**Probe.** `drm-master-probe --features phase4` (`PROBE_PHASE=seatd`),
+`tests/drm-master-probe-phase4.nix`. Starts as root, `LibSeatSession::
+new()` (seatd backend, `LIBSEAT_BACKEND=seatd`), `session.open()` the
+DRM node, master-only modeset (`set_crtc`), libinput via
+`LibinputSessionInterface<LibSeatSession>` + `udev_assign_seat`, then a
+BARE `setresuid(0→1000)` (zero retained caps — strictly stricter than
+halmasuit's `CAP_KILL`-retaining drop, so a pass is a-fortiori valid
+for halmasuit), then re-assert: master-only `set_crtc` again, an
+injected keystroke through libinput, `session.is_active()`.
+
+**Result — PASS.** Post-`setresuid(→1000)`:
+`phase4 post-drop: master=OK input=OK active=true`. The master-only
+`set_crtc` succeeds on the seatd-brokered fd after the drop; an
+injected keystroke (`KeyCode(38)`) is delivered by libinput after the
+drop; the session stays active. seatd logged the client connecting as
+uid 0 and being added to seat0 *before* the drop; the brokered fds and
+the seatd socket connection are unaffected by the subsequent uid
+change (they are connection-/fd-scoped, not re-authorized per-op).
+
+**Key architectural finding for `#11`.** Under libseat, DRM master is
+held by **seatd**, NOT by the compositor. `/sys/kernel/debug/dri/0/
+clients` shows `seatd` as master (`y`); the compositor never appears
+as debugfs-master and never issues `SET_MASTER` itself. This is the
+intended, *improved* privilege posture: halmasuit no longer needs the
+DRM-master ioctl nor (for devices) its own root window — seatd is the
+only root component touching raw devices. The Phase-0–3
+"is-the-probe-PID-debugfs-master" assertion is therefore the WRONG
+check for the libseat model; the correct master proof is a master-only
+ioctl on the brokered fd succeeding (which it does, before and after
+the drop).
+
+**Directive for `#11` (production rewire).**
+- Replace `open_and_set_master()` with `LibSeatSession` +
+  `session.open()` for the DRM node; do NOT call drm-rs
+  `acquire_master_lock()` anymore (seatd owns master).
+- libinput via `LibinputSessionInterface<LibSeatSession>` +
+  `udev_assign_seat(session.seat())`; insert the
+  `LibSeatSessionNotifier` and `LibinputInputBackend` as calloop
+  sources.
+- halmasuit may keep starting as root (to reach the seatd socket and
+  to bind sockets under `/run/halmasuit`) and `setresuid` to the
+  compositor uid afterwards exactly as today — the libseat session
+  survives that drop. Force `LIBSEAT_BACKEND=seatd` (no logind
+  session exists for a system service; removes autodetect ambiguity).
+- NixOS module: `services.seatd.enable = true`. The compositor
+  connects to the seatd socket while still root, before the drop.
+- This does NOT regress the UID-floor / privilege split: seatd is the
+  sole root device broker; halmasuit gains no new privileged-open
+  surface and in fact sheds the `SET_MASTER` one. drm-master-probe
+  Phases 0–3 (self-master across `switch_root`) remain the validated
+  basis for the *initramfs* survival path; Phase 4 covers the
+  *rootfs* libseat model layer E actually uses.
+
+The lean Phases 0–3 probe closure is unchanged: Phase 4's
+smithay/libseat/libinput deps are behind the `phase4` cargo feature
+and only the separate `drm-master-probe-phase4` package/test build
+with it.

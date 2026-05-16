@@ -107,6 +107,116 @@ pub enum Event {
         /// `Display` form of the kernel error.
         error: String,
     },
+    /// halmasuit reached `SpawnRequest` (PAM succeeded, `StartSession`
+    /// received) but invoking `halmasuit-spawn` failed. The greeter is
+    /// deliberately left running and is NOT signalled — a live greeter
+    /// is a recoverable state the user can retry from; a dead greeter
+    /// with no session is the black screen the spawn-before-kill
+    /// ordering exists to prevent. No `GreeterTerminated` /
+    /// `GreeterKillFailed` accompanies this event because the greeter
+    /// was never touched on this path.
+    SessionSpawnFailed {
+        /// Resolved Linux uid the session would have run as.
+        uid: u32,
+        /// `Display` form of the spawn failure.
+        error: String,
+    },
+    /// The greeter process exited BEFORE authentication completed
+    /// (`session_uid` was still unset when the SIGCHLD reaper observed
+    /// the death). The unexpected-death path: distinct from
+    /// `GreeterTerminated` (the deliberate post-auth SIGKILL) and
+    /// `GreeterKillFailed` (that SIGKILL racing an already-exited
+    /// greeter). Emitted so a greeter crash/exit pre-auth surfaces as
+    /// an explicit event instead of silently wedging the compositor
+    /// with no greeter, no session, and a discarded waitpid status.
+    GreeterDiedPreAuth {
+        /// PID of the greeter that exited pre-auth.
+        pid: u32,
+    },
+    /// A composited frame was scanned out, with the test-only
+    /// `frame_audit` analysis of its pixels. The variant is defined
+    /// unconditionally so `halmasuit-introspect` (and its consumers'
+    /// JSON schema) stay feature-independent; only halmasuit's
+    /// *emission* of it is gated behind the `frame_audit` Cargo
+    /// feature (the analysis costs a GPU readback per frame, which is
+    /// unacceptable in the production binary — see Epic #1 req 6/7).
+    ///
+    /// Continuity invariants in `tests/visual-backdrop.nix` are
+    /// asserted over the stream of these events: after the first
+    /// background client commits, every frame must have
+    /// `mean_luminance >= 0.01` (no black frame) and, once a
+    /// BACKGROUND client has painted, `backdrop_coverage > 0.95`.
+    FrameRendered {
+        /// Monotonic per-process frame counter, starting at 0 on the
+        /// first composited frame.
+        frame_id: u64,
+        /// Mean Rec.709 perceptual luma over the whole frame,
+        /// normalized to `0.0..=1.0`. A black frame is `~0.0`.
+        mean_luminance: f64,
+        /// Fraction of pixels (`0.0..=1.0`) that differ from the brand
+        /// clear color `#0a0014` — i.e. the share of the frame a
+        /// wl_client actually painted over halmasuit's clear.
+        backdrop_coverage: f64,
+        /// 64-bit average-hash perceptual fingerprint of the frame
+        /// (8x8 luma downscale, thresholded at the mean). Lets tests
+        /// detect "the frame stopped changing" / gross content shifts
+        /// without pixel-exact comparison.
+        phash: u64,
+    },
+    /// The first time a wlr-layer-shell client of a given role
+    /// committed a buffer halmasuit composited. Emitted once per role
+    /// per process lifetime. Unconditional (NOT `frame_audit`-gated):
+    /// it is a cheap state-transition marker in the normal event
+    /// stream, like `GreeterSpawned`. The visual-continuity assertion
+    /// in `tests/visual-backdrop.nix` uses
+    /// `ClientFirstFrame { role: Background }` as the point from which
+    /// every subsequent `FrameRendered` must show full backdrop
+    /// coverage (Epic #1 req 11).
+    ClientFirstFrame {
+        /// Which layer-shell role first painted.
+        role: LayerRole,
+    },
+    /// The compositor's foreground client changed, driven by the
+    /// greetd lifecycle (NOT process/connection identity). `Greeter`
+    /// from startup; `Session` once `start_session` succeeds and the
+    /// greeter is torn down. Unconditional state-transition marker
+    /// (like `GreeterSpawned`); `tests/visual-foreground.nix` keys
+    /// the no-flash continuity assertion off the ordering of these
+    /// against the `FrameRendered` stream (Epic #1 req 17).
+    ForegroundChanged {
+        /// The new foreground.
+        to: Foreground,
+    },
+}
+
+/// Which client halmasuit treats as the foreground (composited above
+/// the splash background, keyboard focus target). Decided by the
+/// greetd lifecycle, never by which client connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Foreground {
+    /// The greeter is foreground (pre-auth).
+    Greeter,
+    /// The user session is foreground (post `start_session`).
+    Session,
+}
+
+/// wlr-layer-shell layer (mirrors `wlr_layer::Layer`).
+///
+/// Duplicated here so `halmasuit-introspect` needs no smithay
+/// dependency for one enum; halmasuit maps the smithay value onto
+/// this at the emission site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerRole {
+    /// Wallpaper plane — the persistent system background (splash).
+    Background,
+    /// Below normal windows.
+    Bottom,
+    /// Above normal windows.
+    Top,
+    /// Topmost — lockscreens, OSKs, notifications.
+    Overlay,
 }
 
 /// Compositor phases.
@@ -140,6 +250,15 @@ pub enum Phase {
     /// the master designation survives `setresuid`, so subsequent
     /// phases run as the compositor user with master still held.
     DrmMasterAcquired,
+    /// CRTC drive armed: a dumb buffer (or, after the GLES subtask,
+    /// a GBM-backed framebuffer) has been wrapped as a DRM framebuffer
+    /// and pushed via SETCRTC, so the chosen connector is now
+    /// scanning out halmasuit-owned pixels. Pre-client scanout shows
+    /// the brand clear color `#0a0014` — observable in tests as
+    /// evidence that halmasuit is alive but no wl_client has yet
+    /// committed a buffer. Emitted exactly once per process lifetime,
+    /// after `DrmMasterAcquired` and before any client connects.
+    ScanoutActive,
 }
 
 /// Reason a clean shutdown was initiated.
@@ -183,7 +302,7 @@ pub fn emit(event: &Event) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, Phase, ShutdownReason, emit};
+    use super::{Event, Foreground, LayerRole, Phase, ShutdownReason, emit};
     use serde_json::Value;
 
     fn round_trip(event: &Event) -> Value {
@@ -237,6 +356,15 @@ mod tests {
     }
 
     #[test]
+    fn event_phase_entered_scanout_active_serializes() {
+        let v = round_trip(&Event::PhaseEntered {
+            phase: Phase::ScanoutActive,
+        });
+        assert_eq!(v["event"], "phase_entered");
+        assert_eq!(v["phase"], "scanout_active");
+    }
+
+    #[test]
     fn event_shutdown_serializes_reason() {
         let v = round_trip(&Event::Shutdown {
             reason: ShutdownReason::SignalTerm,
@@ -277,6 +405,70 @@ mod tests {
         assert_eq!(v["event"], "greeter_kill_failed");
         assert_eq!(v["pid"], 1234);
         assert_eq!(v["error"], "No such process (os error 3)");
+    }
+
+    #[test]
+    fn event_session_spawn_failed_carries_uid_and_error() {
+        let v = round_trip(&Event::SessionSpawnFailed {
+            uid: 1000,
+            error: "No such file or directory (os error 2)".to_owned(),
+        });
+        assert_eq!(v["event"], "session_spawn_failed");
+        assert_eq!(v["uid"], 1000);
+        assert_eq!(v["error"], "No such file or directory (os error 2)");
+    }
+
+    #[test]
+    fn event_greeter_died_pre_auth_carries_pid() {
+        let v = round_trip(&Event::GreeterDiedPreAuth { pid: 4242 });
+        assert_eq!(v["event"], "greeter_died_pre_auth");
+        assert_eq!(v["pid"], 4242);
+    }
+
+    #[test]
+    fn event_frame_rendered_carries_audit_fields() {
+        let v = round_trip(&Event::FrameRendered {
+            frame_id: 42,
+            mean_luminance: 0.375,
+            backdrop_coverage: 0.987,
+            phash: 0xDEAD_BEEF_0000_1234,
+        });
+        assert_eq!(v["event"], "frame_rendered");
+        assert_eq!(v["frame_id"], 42);
+        assert_eq!(v["mean_luminance"], 0.375);
+        assert_eq!(v["backdrop_coverage"], 0.987);
+        assert_eq!(v["phash"], 0xDEAD_BEEF_0000_1234u64);
+    }
+
+    #[test]
+    fn event_foreground_changed_carries_target() {
+        let v = round_trip(&Event::ForegroundChanged {
+            to: Foreground::Greeter,
+        });
+        assert_eq!(v["event"], "foreground_changed");
+        assert_eq!(v["to"], "greeter");
+        assert_eq!(
+            round_trip(&Event::ForegroundChanged {
+                to: Foreground::Session
+            })["to"],
+            "session"
+        );
+    }
+
+    #[test]
+    fn event_client_first_frame_carries_role() {
+        let v = round_trip(&Event::ClientFirstFrame {
+            role: LayerRole::Background,
+        });
+        assert_eq!(v["event"], "client_first_frame");
+        assert_eq!(v["role"], "background");
+        for (role, name) in [
+            (LayerRole::Bottom, "bottom"),
+            (LayerRole::Top, "top"),
+            (LayerRole::Overlay, "overlay"),
+        ] {
+            assert_eq!(round_trip(&Event::ClientFirstFrame { role })["role"], name);
+        }
     }
 
     #[test]

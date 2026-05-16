@@ -116,6 +116,19 @@ in
       '';
     };
 
+    splashImage = lib.mkOption {
+      type        = lib.types.nullOr lib.types.path;
+      default     = null;
+      example     = lib.literalExpression ''./branding/wallpaper.png'';
+      description = ''
+        Absolute path to a PNG `halmasuit-splash` paints fullscreen as
+        the system background. When set, exported to halmasuit's unit
+        environment as `HALMASUIT_SPLASH_IMAGE`; `halmasuit-splash`
+        (run as a wlr-layer-shell BACKGROUND client of halmasuit)
+        reads it. `null` runs halmasuit with no splash configured.
+      '';
+    };
+
     pamService = lib.mkOption {
       type        = lib.types.str;
       default     = "halmasuit";
@@ -185,6 +198,52 @@ in
       }
     ];
 
+    # halmasuit's renderer is GLES + DrmCompositor. That requires Mesa
+    # + libglvnd available at runtime: libEGL.so.1 is `dlopen`ed by
+    # smithay via libloading, and Mesa's DRI driver (loaded as
+    # `dri_gbm.so` from `/run/opengl-driver/lib/gbm/`) is the actual
+    # software-rendering backend when LIBGL_ALWAYS_SOFTWARE=1 or the
+    # only backend when virtio-gpu-pci is the VM substrate.
+    # `hardware.graphics.enable` is NixOS's canonical setup for both.
+    hardware.graphics.enable = true;
+
+    # D-Bus system bus + policy for the test-only
+    # `org.halmasuit.Debug.Introspect` interface (the `Snapshot()`
+    # method, present only in the `frame_audit`/`halmasuit-debug`
+    # build). halmasuit's D-Bus server thread connects to the system
+    # bus BEFORE the in-process privilege drop, so it authenticates as
+    # root and requests the `org.halmasuit` name as root — hence the
+    # `user="root"` own-grant. The policy is completely inert for the
+    # production `halmasuit` package, which never links zbus and never
+    # requests the name; shipping it unconditionally keeps the module
+    # single-codepath. `services.dbus.enable` is required because the
+    # minimal VM-test images don't bring the system bus up otherwise.
+    # seatd: the root device broker libseat connects to. halmasuit
+    # acquires its DRM (and, layer E2, libinput) fds through a
+    # LibSeatSession instead of self-issuing SET_MASTER — the
+    # privilege posture validated by drm-master-probe Phase 4 (seatd
+    # owns master; halmasuit never does). Required for ALL halmasuit
+    # deployments now, not just a test.
+    services.seatd.enable = true;
+
+    services.dbus.enable = true;
+    services.dbus.packages = [
+      (pkgs.writeTextDir "share/dbus-1/system.d/org.halmasuit.conf" ''
+        <!DOCTYPE busconfig PUBLIC
+          "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+          "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+        <busconfig>
+          <policy user="root">
+            <allow own="org.halmasuit"/>
+          </policy>
+          <policy context="default">
+            <allow send_destination="org.halmasuit"/>
+            <allow receive_sender="org.halmasuit"/>
+          </policy>
+        </busconfig>
+      '')
+    ];
+
     # Default PAM service file — gives us unixAuth-backed pam_unix +
     # pam_env + pam_limits, which is what halmasuit-pam exercises in
     # the VM test and is the conventional starting stack for greeters.
@@ -211,10 +270,12 @@ in
     systemd.services.halmasuit = {
       description = "halmasuit — Linux system compositor";
       wantedBy    = [ "multi-user.target" ];
-      # `after` is intentionally narrow for Phase A: nothing else needs
-      # to be up. As DRM / Wayland / D-Bus integrations land, append the
-      # specific units they depend on (systemd-logind.service, etc.).
-      after       = [ "local-fs.target" ];
+      # seatd must be up before halmasuit so `LibSeatSession::new()`
+      # can reach the broker socket while halmasuit is still root
+      # (pre-privilege-drop). `requires` so a seatd failure fails
+      # halmasuit loudly rather than silently losing the GPU.
+      after       = [ "local-fs.target" "seatd.service" ];
+      requires    = [ "seatd.service" ];
 
       serviceConfig = {
         Type           = "simple";
@@ -295,10 +356,29 @@ in
         # declared above. halmasuit (deprivileged) execs this to
         # launch user sessions.
         HALMASUIT_SPAWN_BIN = "/run/wrappers/bin/halmasuit-spawn";
+        # Force Mesa to use llvmpipe (software rasterizer) until the
+        # epic's real-hardware shakedown subtask validates virgl /
+        # native GPU paths on gnomon. Deterministic, doesn't need
+        # virtio-gpu-gl or host EGL backend, and produces stable
+        # goldens.
+        LIBGL_ALWAYS_SOFTWARE = "1";
+        # NixOS routes runtime OpenGL through /run/opengl-driver/lib.
+        # halmasuit's binary has libglvnd's lib dir in RPATH (via the
+        # halmasuit derivation's postFixup) but Mesa's DRI driver
+        # (dri_gbm.so) still loads from the dlopen search path. The
+        # libglvnd dispatch also looks here for vendor JSON.
+        LD_LIBRARY_PATH = "/run/opengl-driver/lib";
+        # Force libseat's seatd backend. halmasuit runs as a system
+        # service with no logind session, so libseat's autodetect
+        # (logind → seatd → builtin) is ambiguous; pin it.
+        LIBSEAT_BACKEND = "seatd";
       } // lib.optionalAttrs (cfg.greeterCommand != null) {
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.
         HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
+      } // lib.optionalAttrs (cfg.splashImage != null) {
+        # Read by halmasuit-splash. See `services.halmasuit.splashImage`.
+        HALMASUIT_SPLASH_IMAGE = toString cfg.splashImage;
       };
     };
   };

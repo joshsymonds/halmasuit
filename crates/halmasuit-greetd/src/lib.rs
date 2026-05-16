@@ -451,6 +451,15 @@ pub enum CodecError {
     /// type, or the encode side couldn't serialize the message.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// The connection accepted more `CreateSession` builds over its
+    /// lifetime than the per-connection cap allows. libpam has no
+    /// cancellation point, so each accepted build spawns a detached
+    /// worker; a cancel/create loop would otherwise spawn unbounded
+    /// sequential workers. The caller closes the connection on this
+    /// error, exactly as for other [`CodecError`] variants.
+    #[error("session build limit {0} exceeded on this connection")]
+    SessionBuildLimitExceeded(u32),
 }
 
 /// Encode a `Request` or `Response` to wire bytes. The result is a

@@ -45,6 +45,11 @@ use drm::Device;
 use drm::buffer::DrmFourcc;
 use drm::control::{Device as ControlDevice, Mode, connector, crtc, framebuffer};
 
+// Phase 4 (libseat/seatd survival across setresuid). Behind the
+// `phase4` cargo feature so Phases 0–3 keep a lean DRM-only closure.
+#[cfg(feature = "phase4")]
+mod phase4;
+
 /// Minimal `Device` newtype wrapping a DRM device file.
 ///
 /// Matches the pattern from the upstream `drm-rs` `legacy_modeset` example:
@@ -646,6 +651,12 @@ fn run_initramfs_phase() -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // Phase 4 is selected explicitly and is rootfs-direct (no
+    // initramfs survival logic); dispatch before the Phase 0–3 path.
+    #[cfg(feature = "phase4")]
+    if std::env::var("PROBE_PHASE").as_deref() == Ok("seatd") {
+        return phase4::run();
+    }
     if Path::new("/etc/initrd-release").exists() {
         run_initramfs_phase()
     } else {

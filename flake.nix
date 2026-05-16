@@ -7,7 +7,13 @@
     # nix-config provides the dms-niri module — the same module gnomon uses
     # to bring up greetd + DankGreeter + niri + DMS. We import the module's
     # file path directly and supply the inputs it expects via specialArgs.
-    nix-config.url = "github:joshsymonds/nix-config";
+    # Pinned to `main`: layer G proves halmasuit hosts the user's ACTUAL
+    # forked stack (not upstream) — epic req 18, decided 2026-05-15. The
+    # user's DMS/niri integration work lives on `josh/integration` branches
+    # of the *DMS and niri repos*, consumed transitively via nix-config's
+    # own inputs (niri-flake / the joshsymonds/niri-quality-of-life niri
+    # branch ref) — not a nix-config branch.
+    nix-config.url = "github:joshsymonds/nix-config/main";
 
     # rust-toolchain.toml is the single source of truth for halmasuit's
     # toolchain. rust-overlay reads it so Nix builds compile with the same
@@ -127,21 +133,40 @@
 
             # Native libraries smithay links against. smithay's
             # `wayland_frontend` minimum pulls in libxkbcommon for keymap
-            # handling; later features (`backend_libinput`, `backend_drm`,
-            # `renderer_gl`) will add libinput, libgbm, libegl, libdrm.
+            # handling; `backend_gbm` + `renderer_gl` pull in libgbm
+            # (Mesa) at link time. libEGL is dynamically loaded at runtime
+            # via libloading; not a build-time link dep. libdrm comes
+            # transitively via drm-rs / gbm-sys.
             # libpam is for halmasuit-pam's FFI (pam-sys links against
             # libpam.so.0 via `links = "pam"` in its Cargo.toml).
             buildInputs = with pkgs; [
               libxkbcommon
               wayland
               pam
+              libgbm
+              libGL
+              # libseat.pc / libseat.so for drm-master-probe's `phase4`
+              # feature (libseat-sys). `just check` runs clippy
+              # `--all-features`, which enables phase4, so the devShell
+              # needs libseat at build time. Provided by seatd.
+              seatd
+              # libinput.pc for smithay's backend_libinput (input-sys)
+              # under the same feature.
+              libinput
             ];
 
             # bindgen (used transitively by pam-sys at build time) needs
             # libclang.so available; LIBCLANG_PATH points it at the right
             # one. Without this, `cargo build` panics inside clang-sys's
             # build script when it can't find libclang.
-            nativeBuildInputs = [ pkgs.llvmPackages.libclang ];
+            #
+            # pkg-config is needed by smithay-client-toolkit (and
+            # transitively xkbcommon-sys) at build time to find
+            # libxkbcommon's pkg-config metadata. halmasuit's
+            # buildRustPackage derivation already has it via its own
+            # nativeBuildInputs; the devShell needs it explicitly for
+            # `cargo build` in the worktree.
+            nativeBuildInputs = [ pkgs.llvmPackages.libclang pkgs.pkg-config ];
 
             shellHook = ''
               export CARGO_HOME="$PWD/.cargo-home"
@@ -191,12 +216,36 @@
             #   shellHook; rustPlatform.buildRustPackage has its own
             #   sandboxed env, so we duplicate the wiring here.
             nativeBuildInputs = [ pkgs.pkg-config pkgs.llvmPackages.libclang ];
-            # Runtime deps:
+            # Runtime + link deps:
             # - libxkbcommon: smithay needs it for keymap handling.
             # - wayland: smithay's protocol scanner.
             # - pam: pam-sys links against libpam.so.0 at runtime via
             #   `links = "pam"` in its Cargo.toml.
-            buildInputs       = [ pkgs.libxkbcommon pkgs.wayland pkgs.pam ];
+            # - libgbm: smithay's `backend_gbm` + `renderer_gl` link
+            #   against libgbm.so via gbm-sys at build time.
+            # - libGL (libglvnd): provides `libEGL.so.1` which smithay
+            #   dlopens at runtime via libloading. Adding it to
+            #   buildInputs ensures `rustPlatform.buildRustPackage`
+            #   sets RPATH so the dlopen succeeds without relying on
+            #   LD_LIBRARY_PATH propagation.
+            # - seatd: libseat-sys links libseat (smithay
+            #   backend_session_libseat) — seatd brokers DRM/input
+            #   fds; halmasuit no longer self-SET_MASTERs (epic E /
+            #   drm-master-probe Phase 4).
+            # - libinput + libxkbcommon: input-sys links them
+            #   (smithay backend_libinput/backend_udev; input-sys
+            #   hardcodes -lxkbcommon). udev: libudev for seat-scoped
+            #   device discovery.
+            buildInputs       = [
+              pkgs.libxkbcommon
+              pkgs.wayland
+              pkgs.pam
+              pkgs.libgbm
+              pkgs.libGL
+              pkgs.seatd
+              pkgs.libinput
+              pkgs.udev
+            ];
             # bindgen invokes clang directly (bypassing NIX_CFLAGS_COMPILE).
             # Mirror the shellHook so pam-sys's build.rs finds
             # <security/pam_appl.h> and its transitive <unistd.h>.
@@ -209,12 +258,36 @@
             # Nix sandbox doesn't permit that cleanly. `just check` is the
             # canonical gate; the NixOS VM test (next task) is the deployment-side gate.
             doCheck = false;
+            # smithay dlopens libEGL.so.1 (and libGL.so.1) at runtime via
+            # `libloading`. Because nothing in halmasuit's link graph
+            # actually references those libs, Nix's linker drops them from
+            # RPATH despite libGL being in buildInputs. Add libGL's lib
+            # dir to RPATH explicitly with patchelf so the runtime dlopen
+            # succeeds without LD_LIBRARY_PATH propagation.
+            postFixup = ''
+              patchelf --add-rpath "${pkgs.libGL}/lib" $out/bin/halmasuit
+            '';
             meta = {
               description = "halmasuit Linux system compositor (v2 Phase A spine)";
               license     = pkgs.lib.licenses.asl20;
               mainProgram = "halmasuit";
             };
           };
+
+          # halmasuit-debug — halmasuit built with the `frame_audit`
+          # Cargo feature: per-frame GPU readback + `analyze()` +
+          # `Event::FrameRendered` emission (and, next task, the
+          # `Snapshot()` D-Bus method). Visual VM tests consume THIS;
+          # the production `halmasuit` package has none of it (Epic #1
+          # req 7/14). Same derivation as `halmasuit` (all the
+          # EGL/pam/RPATH wiring is inherited) plus the feature flag;
+          # the binary is still named `halmasuit`, so the postFixup
+          # patchelf target and the NixOS module's ExecStart are
+          # unchanged.
+          halmasuit-debug = self.packages.${system}.halmasuit.overrideAttrs (old: {
+            pname = "halmasuit-debug";
+            cargoBuildFlags = old.cargoBuildFlags ++ [ "--features" "frame_audit" ];
+          });
 
           # halmasuit-vm-client — tiny greetd-protocol test client.
           # Shipped as a separate Nix package so VM tests can install
@@ -301,6 +374,149 @@
               license     = pkgs.lib.licenses.asl20;
             };
           };
+
+          # drm-master-probe-phase4 — the SAME probe built with the
+          # `phase4` cargo feature (libseat/seatd survival across
+          # setresuid). Separate package so the phase-0–3 tests keep
+          # the lean DRM-only closure (no smithay/libseat/libinput);
+          # mirrors the halmasuit/halmasuit-debug split. libseat-sys /
+          # input-sys link libseat/libinput via pkg-config.
+          drm-master-probe-phase4 = rustPlatform.buildRustPackage {
+            pname   = "drm-master-probe-phase4";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags   = [ "-p" "drm-master-probe" "--features" "phase4" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            # libseat (seatd), libudev (udev), libinput, and
+            # libxkbcommon (input-sys links it). Mirrors the devShell
+            # set that links `--features phase4` cleanly.
+            buildInputs       = [
+              pkgs.seatd
+              pkgs.libinput
+              pkgs.libxkbcommon
+              pkgs.udev
+              pkgs.libgbm
+            ];
+            doCheck = false; # the NixOS VM test (drm-master-probe-phase4) is the test
+            meta = {
+              description = "Phase 4 research probe — libseat/seatd session survival across setresuid";
+              license     = pkgs.lib.licenses.asl20;
+            };
+          };
+
+          # halmasuit-layer-shell-test-client — throwaway sctk-based
+          # wl_client that binds wlr-layer-shell BACKGROUND, paints a
+          # known solid color via wl_shm, holds. Used by
+          # tests/visual-halmasuit-layer.nix to verify halmasuit
+          # composites layer-shell clients. Retired once halmasuit-splash
+          # exists (B.4).
+          halmasuit-layer-shell-test-client = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-layer-shell-test-client";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [ "-p" "halmasuit-layer-shell-test-client" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [ pkgs.libxkbcommon pkgs.wayland ];
+            doCheck = false;
+            meta = {
+              description = "Layer-shell test client for halmasuit B.3 visual gate";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-layer-shell-test-client";
+            };
+          };
+
+          # halmasuit-toplevel-test-client — throwaway sctk xdg_toplevel
+          # client (fullscreen solid colour) exercising halmasuit's F1
+          # xdg-shell compositing path.
+          halmasuit-toplevel-test-client = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-toplevel-test-client";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [ "-p" "halmasuit-toplevel-test-client" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [ pkgs.libxkbcommon pkgs.wayland ];
+            doCheck = false;
+            meta = {
+              description = "xdg_toplevel test client for halmasuit F1 visual gate";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-toplevel-test-client";
+            };
+          };
+
+          # halmasuit-splash — the real system background wl_client.
+          # wgpu (GL backend) renders the HALMASUIT_SPLASH_IMAGE PNG
+          # fullscreen on a wlr-layer-shell BACKGROUND surface. wgpu
+          # and wayland-client(dlopen) dlopen libEGL/libGL/libwayland
+          # at runtime; like halmasuit those are dropped from RPATH
+          # because nothing link-references them, so re-add them with
+          # patchelf (same treatment as the halmasuit package).
+          halmasuit-splash = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-splash";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags   = [ "-p" "halmasuit-splash" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [
+              pkgs.libxkbcommon
+              pkgs.wayland
+              pkgs.libGL
+            ];
+            doCheck = false;
+            postFixup = ''
+              patchelf --add-rpath "${pkgs.libGL}/lib:${pkgs.wayland}/lib" \
+                $out/bin/halmasuit-splash
+            '';
+            meta = {
+              description = "halmasuit system background (wgpu PNG layer-shell BACKGROUND client)";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-splash";
+            };
+          };
+
+          # ssimulacra2_rs — pure-Rust port of the SSIMULACRA2
+          # perceptual image-diff metric. Used by visual VM tests as
+          # the golden-comparison engine. Chosen over the C++
+          # libjxl-tools ssimulacra2 (nixpkgs build is broken in our
+          # pin due to libhwy/gtest C++14 mismatch) and over Kornel's
+          # dssim (not in nixpkgs; would need its own custom
+          # derivation). buildNoDefaultFeatures = true skips the heavy
+          # video-decoder deps; we only compare PNGs.
+          #
+          # See PLAN.md / epic Task #1 Requirement #9 for the choice
+          # rationale.
+          ssimulacra2-cli = rustPlatform.buildRustPackage rec {
+            pname   = "ssimulacra2_rs";
+            version = "0.5.2";
+            src     = pkgs.fetchCrate {
+              inherit pname version;
+              hash = "sha256-p9NERnuLz1FLx/JBsWIEa6ZJg9zno2DIArn96igVBzQ=";
+            };
+            cargoHash = "sha256-c0rRiLYJSkLoOrOodnSvKWzCfEQz7Yxy2QKfPa5aVfw=";
+            buildNoDefaultFeatures = true;
+            doCheck = false;
+            meta = {
+              description = "Pure-Rust ssimulacra2 perceptual image-diff metric (CLI)";
+              homepage    = "https://github.com/rust-av/ssimulacra2_bin";
+              license     = pkgs.lib.licenses.bsd2;
+              mainProgram = "ssimulacra2_rs";
+            };
+          };
         });
 
       # NixOS modules halmasuit exports. Consumers (a user's nix-config, the
@@ -361,6 +577,79 @@
         drm-master-probe-phase3 = import ./tests/drm-master-probe-phase3.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
+        };
+        drm-master-probe-phase4 = import ./tests/drm-master-probe-phase4.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+        };
+        # Visual gates consume `halmasuit-debug` (frame_audit on): the
+        # capture path is the in-process `Snapshot()` D-Bus method,
+        # not QMP screendump. Structural tests above stay on the
+        # production `halmasuit` package.
+        visual-halmasuit-clear = import ./tests/visual-halmasuit-clear.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit       = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-spawn = self.packages.x86_64-linux.halmasuit-spawn;
+          ssimulacra2-cli = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        visual-halmasuit-layer = import ./tests/visual-halmasuit-layer.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                        = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-spawn                  = self.packages.x86_64-linux.halmasuit-spawn;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          ssimulacra2-cli                  = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        visual-halmasuit-splash = import ./tests/visual-halmasuit-splash.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit        = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-spawn  = self.packages.x86_64-linux.halmasuit-spawn;
+          halmasuit-splash = self.packages.x86_64-linux.halmasuit-splash;
+          ssimulacra2-cli  = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        visual-backdrop = import ./tests/visual-backdrop.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-spawn                   = self.packages.x86_64-linux.halmasuit-spawn;
+          halmasuit-splash                  = self.packages.x86_64-linux.halmasuit-splash;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Epic layer F1: real xdg_toplevel composited fullscreen
+        # over the splash background.
+        visual-halmasuit-toplevel = import ./tests/visual-halmasuit-toplevel.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                      = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-spawn                = self.packages.x86_64-linux.halmasuit-spawn;
+          halmasuit-splash               = self.packages.x86_64-linux.halmasuit-splash;
+          halmasuit-toplevel-test-client = self.packages.x86_64-linux.halmasuit-toplevel-test-client;
+          ssimulacra2-cli                = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Epic layer F2: greetd-driven greeter→session foreground
+        # swap; no-flash continuity across the REAL transition.
+        visual-foreground = import ./tests/visual-foreground.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-spawn                   = self.packages.x86_64-linux.halmasuit-spawn;
+          halmasuit-splash                  = self.packages.x86_64-linux.halmasuit-splash;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-toplevel-test-client    = self.packages.x86_64-linux.halmasuit-toplevel-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Epic layer E2: real keystroke → libinput → wl_seat →
+        # focused client. Production halmasuit (input is core).
+        halmasuit-input = import ./tests/halmasuit-input.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-spawn                   = self.packages.x86_64-linux.halmasuit-spawn;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
         };
       };
     };

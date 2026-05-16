@@ -13,6 +13,16 @@ members = [
     "crates/halmasuit-vm-client",
     # Research probe — not v2 production. See RESEARCH.md.
     "crates/drm-master-probe",
+    # Layer-shell test client — throwaway, used by
+    # tests/visual-halmasuit-layer.nix to verify halmasuit composites
+    # wl_clients via wlr-layer-shell.
+    "crates/halmasuit-layer-shell-test-client",
+    # halmasuit-splash — the real system background wl_client (wgpu,
+    # PNG-as-texture, layer-shell BACKGROUND). Epic layer C.
+    "crates/halmasuit-splash",
+    # Throwaway xdg_toplevel test client — exercises halmasuit's F1
+    # xdg-shell compositing path.
+    "crates/halmasuit-toplevel-test-client",
     "xtask",
 ]
 # cargo-fuzz subworkspace needs nightly rustc + libfuzzer-sys; isolated
@@ -62,6 +72,17 @@ serde_json         = "1"
 # Per-test tempdirs for integration tests that spawn binaries needing
 # XDG_RUNTIME_DIR or similar isolation.
 tempfile           = "3"
+# D-Bus for the test-only `org.halmasuit.Debug.Introspect.Snapshot`
+# method. zbus 5.x per CLAUDE.md. Default features only — that uses
+# the bundled `async-io` executor, NOT tokio and NOT glib (CLAUDE.md
+# forbids glib). Pulled in ONLY by halmasuit's `frame_audit` feature
+# (optional dep); the production binary never links it.
+zbus               = "5"
+# PNG encoder for `Snapshot()`. Deliberately the small `png` crate,
+# NOT the `image` crate — Epic #1 req 7 forbids `image` in the
+# production cargo-tree, and we keep it out of the debug tree too.
+# `frame_audit`-gated optional dep.
+png                = "0.17"
 # Smithay — Rust Wayland compositor toolkit. Pinned to niri's current
 # commit (matching their Cargo.toml workspace dep). default-features
 # disabled so each consumer crate picks only what it needs.
@@ -81,6 +102,30 @@ caps               = "0.5"
 # Property-based testing. halmasuit-spawn argv parser + the future greetd
 # state machine both lean on it for boundary-condition coverage.
 proptest           = "1"
+# halmasuit-splash (the system background wl_client) deps. NOT used by
+# the halmasuit compositor binary — these never enter halmasuit's
+# cargo-tree (Epic #1 req 7 is about halmasuit, not its sibling
+# clients). `image` here is fine for the same reason.
+# - wgpu: GPU surface + textured fullscreen quad. GL backend in-VM
+#   (Mesa/llvmpipe, already wired by nix/module.nix).
+# - raw-window-handle 0.6: bridge wayland-client's wl_surface/
+#   wl_display pointers into wgpu (matches wgpu 22's RWH major).
+# - image: decode the splash PNG. default features (incl. png).
+# - pollster: block_on for wgpu's async adapter/device init.
+wgpu               = "22"
+raw-window-handle  = "0.6"
+image              = { version = "0.25", default-features = false, features = ["png"] }
+pollster           = "0.3"
+# Direct wayland-client (in addition to sctk's re-export, same crate
+# via unification) ONLY to turn on the system libwayland backend:
+# `dlopen` → `wayland-backend/dlopen` → `client_system`, which is what
+# exposes the raw `wl_display`/`wl_surface` pointers wgpu's wayland
+# WSI needs. Without it sctk uses the pure-Rust backend (no C
+# pointers) and wgpu cannot create a surface.
+# `system` → wayland-backend/client_system (the sys ObjectId/Backend
+# that expose `as_ptr`/`display_ptr`); `dlopen` → load libwayland at
+# runtime instead of link-time (matches how Mesa/wgpu load it).
+wayland-client     = { version = "0.31", features = [ "dlopen", "system" ] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

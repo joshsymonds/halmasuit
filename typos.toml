@@ -2,7 +2,9 @@
 # https://github.com/crate-ci/typos
 
 [default]
-extend-ignore-identifiers-re = []
+# typos parses "PNGs" as the identifier "PN" + "Gs", so the `PN → ON`
+# rule mis-fires. Match the full token.
+extend-ignore-identifiers-re = ["^PNGs$"]
 
 [default.extend-words]
 # Project-specific allow list grows here when typos misfires.
@@ -11,6 +13,8 @@ halmasuit = "halmasuit"
 # typos thinks "Inh" should be "In".
 Inh = "Inh"
 CapInh = "CapInh"
+# Plural of PNG. typos rewrites "PNGs" → "PONs".
+PNGs = "PNGs"
 
 [files]
 extend-exclude = [

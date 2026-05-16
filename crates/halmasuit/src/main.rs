@@ -6,15 +6,22 @@
 // advertises foundational protocol globals: `wl_compositor`,
 // `wl_subcompositor`, `xdg_wm_base`, `wl_seat`, `wl_output`, `wl_shm`.
 // Connecting clients can create surfaces, top-levels, software buffers,
-// and discover inputs/outputs. Nothing renders yet (no scanout backend);
-// the advertised output is a synthesized 1920×1080@60Hz placeholder
-// until DRM lands. Additional globals (`linux-dmabuf-v1`,
-// `presentation-time`, `ext-session-lock-v1`, …) land in subsequent
-// tasks. See ARCHITECTURE.md.
+// and discover inputs/outputs. Scanout is via a dumb-buffer clear color
+// (`#0a0014` brand purple); the GLES + DrmCompositor renderer is a
+// subsequent subtask. The advertised wl_output stays at a synthesized
+// 1920×1080@60Hz placeholder until smithay's output state is wired to
+// real DRM mode info (also a subsequent subtask). Additional globals
+// (`linux-dmabuf-v1`, `presentation-time`, `ext-session-lock-v1`, …)
+// land later. See ARCHITECTURE.md.
+
+#[cfg(feature = "frame_audit")]
+mod dbus;
+mod drm;
+#[cfg(feature = "frame_audit")]
+mod frame_audit;
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -33,14 +40,24 @@ use halmasuit_greetd::server::{
     Connection, PamSessionFactory, SpawnRequest, bind_socket, peer_credentials,
 };
 use halmasuit_introspect::{Event, Phase, ShutdownReason, emit};
+use smithay::backend::input::{Event as InputEventTrait, InputEvent, KeyboardKeyEvent};
+use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
+use smithay::backend::session::Session;
+use smithay::backend::session::libseat::LibSeatSession;
+use smithay::desktop::layer_map_for_output;
+use smithay::input::keyboard::FilterResult;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
+use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::shell::wlr_layer::{
+    Layer, LayerSurface, WlrLayerShellHandler, WlrLayerShellState,
+};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
@@ -64,18 +81,48 @@ struct HalmasuitState {
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
     seat_state: SeatState<Self>,
-    // `_seat` is retained so the seat global stays registered for the
-    // lifetime of the compositor; capabilities are added when real
-    // input devices come online in a future task.
-    _seat: Seat<Self>,
+    /// The single `wl_seat` (keyboard + pointer). libinput events are
+    /// routed here and forwarded to the keyboard-focused client.
+    seat: Seat<Self>,
     // OutputManagerState exists to keep the xdg_output_manager global
     // alive; nothing reads the field directly (delegate_output! handles
     // dispatch via the type), hence the leading underscore.
     _output_manager_state: OutputManagerState,
-    // `_output` keeps the synthesized output alive; real outputs come
-    // with the DRM backend.
-    _output: Output,
+    /// The smithay `Output` representing halmasuit's single display.
+    /// Constructed from the real DRM mode in the production path
+    /// (synthesized 1920×1080 only on the SKIP bypass). Read by the
+    /// `WlrLayerShellHandler` to route new layer surfaces to the
+    /// correct `LayerMap`, and by the commit handler to build render
+    /// elements from those layers.
+    output: Output,
     shm_state: ShmState,
+    /// wlr-layer-shell global state. New layer surfaces (BACKGROUND /
+    /// BOTTOM / TOP / OVERLAY) land in `new_layer_surface` and get
+    /// mapped into the per-output `LayerMap` (accessed via
+    /// `layer_map_for_output`). Composited in z-order during
+    /// `render_with_elements` from the commit-driven render path.
+    layer_shell_state: WlrLayerShellState,
+    /// Layer roles for which `Event::ClientFirstFrame` has already
+    /// been emitted (emit-once-per-role). The visual-backdrop
+    /// continuity assertion keys off the first
+    /// `ClientFirstFrame { role: Background }`.
+    seen_layer_roles: std::collections::HashSet<halmasuit_introspect::LayerRole>,
+    /// The single fullscreen xdg_toplevel composited above the splash
+    /// (greeter/session). v1 is one output, no window management — at
+    /// most one toplevel is the foreground.
+    foreground_toplevel: Option<ToplevelSurface>,
+    /// Which client is the foreground, driven by the greetd lifecycle
+    /// (req 17): `Greeter` until `start_session` succeeds, then
+    /// `Session`. Gates keyboard focus (greeter layer vs session
+    /// toplevel) so focus follows the lifecycle, not connection order.
+    foreground: halmasuit_introspect::Foreground,
+    /// The libseat session brokering halmasuit's DRM (and, in E2, the
+    /// libinput) device fds. Retained for the process lifetime: if it
+    /// drops, seatd tears the session down and the brokered fds are
+    /// revoked. `None` only on the SKIP (no-DRM/dev) path. Epic
+    /// layer E; survival across the privilege drop validated by
+    /// drm-master-probe Phase 4.
+    _libseat_session: Option<LibSeatSession>,
 
     // ── greetd I/O ──────────────────────────────────────────────────────
     /// LoopHandle for inserting per-connection sources from inside
@@ -98,15 +145,24 @@ struct HalmasuitState {
     /// of the compositor; calloop drops the source on shutdown.
     _greetd_listener_token: Option<RegistrationToken>,
 
-    /// DRM master file descriptor. Acquired in `main()` while still
-    /// root via `DRM_IOCTL_SET_MASTER` and retained for the process
-    /// lifetime — the master designation lives on the FD and survives
-    /// `setresuid` to the compositor user (drm-master-probe Phase 1).
-    /// Holding this File pins the kernel-side master ownership; if it
-    /// were dropped, another DRM client could acquire master.
+    /// The GLES + GBM + DrmCompositor stack. Constructed in `main()`
+    /// while still root via [`drm::setup_drm_backend`]; the underlying
+    /// DRM fd's master designation survives the subsequent `setresuid`
+    /// to the compositor user (drm-master-probe Phase 1).
+    ///
+    /// Mutated from the calloop callback for `DrmEvent::VBlank` —
+    /// each vblank acks the previous frame and (currently) re-renders
+    /// the same brand clear color. Subsequent epic subtasks (B.3+)
+    /// will populate the element list with wl_clients.
+    ///
     /// `None` only when `HALMASUIT_SKIP_DRM_MASTER` was set (dev/test
     /// bypass); production deployments never see this.
-    _drm_master: Option<std::fs::File>,
+    drm_backend: Option<drm::DrmBackend>,
+
+    /// calloop registration of the DRM event source. Holding this
+    /// token keeps the page-flip event stream wired into the event
+    /// loop; dropping it would silently unregister vblank handling.
+    _drm_token: Option<RegistrationToken>,
 
     /// Greeter we spawned at startup, held as a pid + pidfd pair.
     /// The pidfd is the kernel-anchored signal target (race-free
@@ -119,6 +175,14 @@ struct HalmasuitState {
     /// unset OR the greeter slot has already been consumed by
     /// the kill-on-session-start path.
     greeter: Option<GreeterHandle>,
+
+    /// uid of the authenticated user session, recorded by
+    /// `start_session` once `halmasuit-spawn` has been confirmed. The
+    /// Wayland accept path authorises a connecting peer when its
+    /// SO_PEERCRED uid is `greeter_uid` (pre-auth) or this value
+    /// (post-auth); the session connects under its own uid, distinct
+    /// from the greeter's. `None` until a session spawn succeeds.
+    session_uid: Option<u32>,
 }
 
 /// Greeter identity post-spawn. The pidfd is the load-bearing
@@ -142,6 +206,44 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
+impl HalmasuitState {
+    /// Route one libinput event to the seat. Keyboard keys go to the
+    /// keyboard-focused client (focus is set by
+    /// [`Self::set_keyboard_focus`], driven by the layer-shell
+    /// keyboard-interactivity policy in the commit handler — layer F
+    /// replaces that with the greeter→session machine). Pointer
+    /// capability exists; full pointer routing (focus-follows,
+    /// cursor) is layer F's concern, so non-keyboard events are
+    /// accepted but not yet dispatched.
+    fn dispatch_libinput(&mut self, event: InputEvent<LibinputInputBackend>) {
+        if let InputEvent::Keyboard { event } = event {
+            let Some(keyboard) = self.seat.get_keyboard() else {
+                return;
+            };
+            let serial = SERIAL_COUNTER.next_serial();
+            let time = event.time_msec();
+            let code = event.key_code();
+            let key_state = event.state();
+            keyboard.input::<(), _>(self, code, key_state, serial, time, |_, _, _| {
+                FilterResult::Forward
+            });
+        }
+    }
+
+    /// Point keyboard focus at `surface` (or clear it). No-op if it is
+    /// already the focus, to avoid enter/leave churn.
+    fn set_keyboard_focus(&mut self, surface: Option<WlSurface>) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        if keyboard.current_focus() == surface {
+            return;
+        }
+        let serial = SERIAL_COUNTER.next_serial();
+        keyboard.set_focus(self, surface, serial);
+    }
+}
+
 impl CompositorHandler for HalmasuitState {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
@@ -154,12 +256,192 @@ impl CompositorHandler for HalmasuitState {
             .compositor_state
     }
 
-    fn commit(&mut self, _surface: &WlSurface) {
-        // No-op until there's an output to composite to. Subsequent
-        // tasks (wl_output + DRM scanout) will route committed buffers
-        // through the scene graph here.
+    fn commit(&mut self, surface: &WlSurface) {
+        // Advance smithay's per-surface buffer tracking state. This
+        // is what makes committed shm buffers visible to the renderer
+        // when WaylandSurfaceRenderElement is built. Without this,
+        // render_elements_from_surface_tree sees no current buffer
+        // and the surface paints nothing.
+        smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
+
+        // wlr-layer-shell initial configure. The spec requires the
+        // initial configure to be sent in response to the client's
+        // first commit (which carries its anchor/exclusive-zone/size
+        // requests). `arrange` here therefore sees the committed
+        // anchor state — for a fully-anchored background that yields
+        // the full output size instead of the half-output fallback
+        // `arrange` uses for unanchored zero-size surfaces.
+        {
+            let mut map = layer_map_for_output(&self.output);
+            if let Some(layer) = map
+                .layer_for_surface(surface, smithay::desktop::WindowSurfaceType::TOPLEVEL)
+                .cloned()
+            {
+                let initial_configure_sent =
+                    smithay::wayland::compositor::with_states(surface, |states| {
+                        states
+                            .data_map
+                            .get::<smithay::wayland::shell::wlr_layer::LayerSurfaceData>()
+                            .is_some_and(|d| d.lock().unwrap().initial_configure_sent)
+                    });
+                map.arrange();
+                // Release the LayerMap lock before `send_configure` /
+                // the render path below: `render_layer_elements` calls
+                // `layer_map_for_output` again on the same output and
+                // would re-borrow this same map.
+                drop(map);
+                if !initial_configure_sent {
+                    layer.layer_surface().send_configure();
+                }
+
+                // Emit `ClientFirstFrame { role }` once per layer
+                // role, the first time a surface of that role has a
+                // committed buffer halmasuit will composite. Drives
+                // the visual-backdrop continuity assertion (Epic #1
+                // req 11). Unconditional (not frame_audit-gated) — a
+                // cheap state-transition marker.
+                let has_buffer =
+                    smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
+                        s.buffer().is_some()
+                    })
+                    .unwrap_or(false);
+                if has_buffer {
+                    let role = match layer.layer() {
+                        Layer::Background => halmasuit_introspect::LayerRole::Background,
+                        Layer::Bottom => halmasuit_introspect::LayerRole::Bottom,
+                        Layer::Top => halmasuit_introspect::LayerRole::Top,
+                        Layer::Overlay => halmasuit_introspect::LayerRole::Overlay,
+                    };
+                    if self.seen_layer_roles.insert(role) {
+                        emit(&Event::ClientFirstFrame { role });
+                    }
+                    // Focus-follows-foreground (req 17): a
+                    // keyboard-interactive layer client (the greeter)
+                    // gets keyboard focus only while the foreground is
+                    // `Greeter`. After `start_session` the foreground
+                    // is `Session`, so a lingering/teardown greeter
+                    // layer never steals focus from the session.
+                    if self.foreground == halmasuit_introspect::Foreground::Greeter
+                        && layer.cached_state().keyboard_interactivity
+                            != smithay::wayland::shell::wlr_layer::KeyboardInteractivity::None
+                    {
+                        self.set_keyboard_focus(Some(surface.clone()));
+                    }
+                }
+            }
+        }
+
+        // Focus-follows-foreground (req 17): the session's
+        // xdg_toplevel gets keyboard focus on its first buffered
+        // commit, but only once the greetd lifecycle has put the
+        // foreground in `Session` (set in the SpawnRequest handler) —
+        // never on connection identity alone.
+        let fg_surface = self
+            .foreground_toplevel
+            .as_ref()
+            .map(|t| t.wl_surface().clone());
+        if self.foreground == halmasuit_introspect::Foreground::Session
+            && fg_surface.as_ref() == Some(surface)
+        {
+            let has_buffer =
+                smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
+                    s.buffer().is_some()
+                })
+                .unwrap_or(false);
+            if has_buffer {
+                self.set_keyboard_focus(Some(surface.clone()));
+            }
+        }
+
+        // Re-render the scene with the now-current buffers (synchronous
+        // one-frame-per-commit; fine for these low-frequency scenes).
+        // The foreground toplevel is composited above the layer
+        // background by `render_layer_elements`.
+        if let Some(backend) = self.drm_backend.as_mut()
+            && let Err(e) = backend.render_layer_elements(
+                &self.output,
+                fg_surface.as_ref(),
+                HALMASUIT_BRAND_CLEAR,
+            )
+        {
+            tracing::warn!(error = %e, "render_layer_elements on commit failed");
+        }
     }
 }
+
+impl WlrLayerShellHandler for HalmasuitState {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: LayerSurface,
+        _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+        layer: Layer,
+        namespace: String,
+    ) {
+        tracing::info!(
+            namespace = %namespace,
+            layer = ?layer,
+            "new layer surface"
+        );
+        // smithay distinguishes the wire-type `wlr_layer::LayerSurface`
+        // (raw protocol object) from `desktop::LayerSurface` (the
+        // scene-graph helper that `LayerMap` operates on). The
+        // desktop wrapper owns the namespace string. Map onto our
+        // single output's LayerMap; multi-output routing comes later
+        // and would dispatch on the `_output` arg.
+        //
+        // Do NOT send a configure here. The wlr-layer-shell spec
+        // mandates the initial configure be sent in response to the
+        // client's *initial commit* — that commit is what carries the
+        // client's anchor/size requests. Configuring now (before the
+        // client has committed `set_anchor`) makes `LayerMap::arrange`
+        // see an unanchored, zero-size surface and fall back to
+        // half-output dimensions. The initial configure is sent from
+        // the `commit` handler instead (see `ensure_layer_configured`).
+        let desktop_surface = smithay::desktop::LayerSurface::new(surface, namespace);
+        let mut map = layer_map_for_output(&self.output);
+        if let Err(e) = map.map_layer(&desktop_surface) {
+            tracing::warn!(error = ?e, "failed to map layer surface");
+        }
+    }
+
+    fn layer_destroyed(&mut self, surface: LayerSurface) {
+        let mut map = layer_map_for_output(&self.output);
+        // Find the desktop-wrapped layer with this underlying wire
+        // surface and unmap it. LayerMap doesn't expose a lookup-by-
+        // wire-surface helper, so we walk the layers and match by
+        // `layer_surface()` equality.
+        let to_remove: Option<smithay::desktop::LayerSurface> = map
+            .layers()
+            .find(|l| l.layer_surface() == &surface)
+            .cloned();
+        if let Some(layer) = to_remove {
+            map.unmap_layer(&layer);
+        }
+        // A client going away changes the scene: the layer beneath
+        // (e.g. the splash background) must be re-composited now, not
+        // only on the next surviving-client commit — otherwise the
+        // last frame (the departed client) stays on screen. This is
+        // also the no-flash requirement for the real greeter→session
+        // teardown (Epic #1 req 11/17). Drop the LayerMap lock first;
+        // render_layer_elements re-locks it for this output.
+        drop(map);
+        let fg = self
+            .foreground_toplevel
+            .as_ref()
+            .map(|t| t.wl_surface().clone());
+        if let Some(backend) = self.drm_backend.as_mut()
+            && let Err(e) =
+                backend.render_layer_elements(&self.output, fg.as_ref(), HALMASUIT_BRAND_CLEAR)
+        {
+            tracing::warn!(error = %e, "render_layer_elements on layer_destroyed failed");
+        }
+    }
+}
+smithay::delegate_layer_shell!(HalmasuitState);
 
 impl XdgShellHandler for HalmasuitState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -167,12 +449,39 @@ impl XdgShellHandler for HalmasuitState {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        // A client created an xdg_toplevel. Send a configure so the
-        // client knows it can proceed; real geometry comes when an
-        // output exists. For now: zero-size configure is a valid
-        // "compositor-decides" signal.
-        tracing::debug!("new xdg_toplevel");
+        // halmasuit hosts exactly one fullscreen toplevel above the
+        // splash (the greeter, then the session — F2 makes the swap
+        // greetd-driven). Configure it to the output mode, fullscreen
+        // + activated, so the client paints full-screen immediately.
+        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+        let (w, h): (i32, i32) = self
+            .output
+            .current_mode()
+            .map_or((1280, 800), |m| (m.size.w, m.size.h));
+        surface.with_pending_state(|state| {
+            state.size = Some((w, h).into());
+            state.states.set(xdg_toplevel::State::Activated);
+            state.states.set(xdg_toplevel::State::Fullscreen);
+        });
         surface.send_configure();
+        tracing::info!(w, h, "xdg_toplevel mapped as fullscreen foreground");
+        self.foreground_toplevel = Some(surface);
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        if self.foreground_toplevel.as_ref() == Some(&surface) {
+            self.foreground_toplevel = None;
+            // The foreground is gone — clear keyboard focus and
+            // re-composite so the layers beneath (splash) reappear
+            // immediately (no stale/black frame; req 11/17).
+            self.set_keyboard_focus(None);
+            if let Some(backend) = self.drm_backend.as_mut()
+                && let Err(e) =
+                    backend.render_layer_elements(&self.output, None, HALMASUIT_BRAND_CLEAR)
+            {
+                tracing::warn!(error = %e, "render on toplevel_destroyed failed");
+            }
+        }
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -413,55 +722,43 @@ fn handle_connection_ready(
                                 uid: spawn.uid,
                                 gid: spawn.gid,
                             });
-                            // Kill the greeter before invoking the
-                            // session spawn. Per Epic #1: "the greeter
-                            // wl_client is killed before niri becomes
-                            // foreground." The greeter's Wayland
-                            // connection drops, halmasuit notices via
-                            // the per-client teardown, niri can take
-                            // the foreground slot. The SIGCHLD reaper
-                            // picks up the resulting zombie.
-                            if let Some(greeter) = state.greeter.take() {
-                                let pid = greeter.pid;
-                                // SIGKILL via pidfd: race-free wrt pid
-                                // reuse. If the greeter already exited
-                                // (e.g. crashed earlier and the SIGCHLD
-                                // reaper consumed the entry), this
-                                // returns ESRCH — we surface that as a
-                                // GreeterKillFailed event and proceed.
-                                match pidfd_send_signal(&greeter.pidfd, libc::SIGKILL) {
-                                    Ok(()) => {
-                                        emit(&Event::GreeterTerminated { pid });
-                                    }
-                                    Err(e) => {
-                                        let error = format!("{e}");
-                                        tracing::warn!(
-                                            %error,
-                                            greeter_pid = pid,
-                                            "pidfd_send_signal greeter SIGKILL failed; session proceeds"
-                                        );
-                                        emit(&Event::GreeterKillFailed { pid, error });
-                                    }
-                                }
-                            }
-                            match invoke_spawn(&state.spawn_bin, &spawn) {
-                                Ok(child) => {
-                                    tracing::info!(
-                                        spawn_pid = child.id(),
-                                        uid = spawn.uid,
-                                        "halmasuit-spawn launched"
-                                    );
-                                }
-                                Err(e) => {
-                                    // Logged but not fatal — the greeter
-                                    // can retry, and halmasuit itself is
-                                    // still running.
-                                    tracing::warn!(
-                                        error = %e,
-                                        spawn_bin = ?state.spawn_bin,
-                                        "failed to invoke halmasuit-spawn"
-                                    );
-                                }
+                            // Spawn FIRST, then kill the greeter — and
+                            // only if the spawn is confirmed (Epic #1
+                            // R3). The greeter is the recoverable
+                            // fallback: a spawn failure must leave it
+                            // alive (a dead greeter with no session is
+                            // the black screen this project exists to
+                            // eliminate). start_session records the
+                            // authenticated uid and SIGKILLs the greeter
+                            // on success (emitting GreeterTerminated /
+                            // GreeterKillFailed); on failure it retains
+                            // the live greeter and emits
+                            // SessionSpawnFailed. The SIGCHLD reaper
+                            // collects the resulting zombie.
+                            //
+                            // Foreground flips to Session ONLY on
+                            // success: on failure the greeter is still
+                            // alive, so foreground must stay Greeter —
+                            // flipping it would gate xdg_toplevel
+                            // compositing (req 17) onto a session that
+                            // does not exist.
+                            if start_session(
+                                &state.spawn_bin,
+                                &spawn,
+                                &mut state.greeter,
+                                &mut state.session_uid,
+                            )
+                            .is_ok()
+                            {
+                                // Greeter torn down, splash stays
+                                // beneath, halmasuit's PID is unchanged
+                                // (login-flash invariant); the session's
+                                // xdg_toplevel is composited + focused
+                                // when it maps (gated on this state).
+                                state.foreground = halmasuit_introspect::Foreground::Session;
+                                emit(&Event::ForegroundChanged {
+                                    to: halmasuit_introspect::Foreground::Session,
+                                });
                             }
                             connstate.close_after_drain = true;
                         }
@@ -478,7 +775,13 @@ fn handle_connection_ready(
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     tracing::warn!(error = %e, id, "read failed on greetd connection");
+                    // Peer is gone; pending writes can never be delivered.
+                    // Clear so the close_after_drain predicate below fires
+                    // immediately instead of leaving the source registered
+                    // for a closed fd, which calloop would then keep firing
+                    // (POLLHUP) producing a tight error-log loop.
                     connstate.close_after_drain = true;
+                    connstate.write_buf.clear();
                     break;
                 }
             }
@@ -492,7 +795,10 @@ fn handle_connection_ready(
             }
             match stream_ref.write(&connstate.write_buf) {
                 Ok(0) => {
+                    // Peer closed write side with no progress; abandon the
+                    // remaining buffer rather than spinning on retries.
                     connstate.close_after_drain = true;
+                    connstate.write_buf.clear();
                     break;
                 }
                 Ok(n) => {
@@ -501,7 +807,14 @@ fn handle_connection_ready(
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     tracing::warn!(error = %e, id, "write failed on greetd connection");
+                    // Peer is gone; the buffered reply can't reach it.
+                    // Without clearing write_buf, the close_after_drain
+                    // predicate below stays false, the source stays
+                    // registered, calloop re-fires on POLLHUP/POLLERR, we
+                    // loop. Clear so this single warning fires once and
+                    // the connection is reaped on the next predicate check.
                     connstate.close_after_drain = true;
+                    connstate.write_buf.clear();
                     break;
                 }
             }
@@ -588,36 +901,28 @@ fn spawn_bin_from_env() -> PathBuf {
         .map_or_else(|| PathBuf::from("halmasuit-spawn"), PathBuf::from)
 }
 
-// DRM_IOCTL_SET_MASTER = _IO('d', 0x1e). Defined in <drm/drm.h>; the
-// macro below generates a Rust wrapper that ioctl(fd, 0x641e) — the
-// argument-less master-acquire ioctl. Used by `acquire_drm_master`.
-//
-// drm-master-probe Phases 0-3 empirically validated the syscall
-// mechanics (acquire on a freshly-opened card0 fd, survival across
-// setresuid, survival across switch_root + exec). This file is the
-// production wiring of the same call into halmasuit's main().
-nix::ioctl_none!(drm_set_master, b'd', 0x1e);
-
-/// Open `/dev/dri/card0` (or the device named by `HALMASUIT_DRM_DEVICE`)
-/// and call `DRM_IOCTL_SET_MASTER`. Returns the opened `File` (held by
-/// the caller for the process lifetime — the master designation lives
-/// on the FD), or `None` when `HALMASUIT_SKIP_DRM_MASTER` is set in
-/// the environment. The skip path is for ad-hoc dev launches and
-/// integration tests that spawn halmasuit on a host without DRM; the
-/// production NixOS module never sets it.
+/// Brand clear color rendered before any wl_client connects: `#0a0014`
+/// in XRGB8888 little-endian. Per the visual-compositor epic's
+/// IMMUTABLE Requirement #5, this distinguishes "halmasuit alive, no
+/// client yet" from "halmasuit broken / producing black" — every
+/// frame painted before halmasuit-splash connects is this exact color.
 ///
-/// # Errors
-/// Bubbles any `open(2)` or `ioctl(2)` failure with context. A
-/// production deployment that fails here fails the entire unit —
-/// running without DRM master defeats the architecture.
-fn acquire_drm_master() -> io::Result<Option<std::fs::File>> {
+/// Built via [`drm::xrgb_le`] so the byte ordering is unit-tested at
+/// build (see `drm::tests::xrgb_le_pins_byte_order`) — silent reverts
+/// to the wrong byte order, channel transpose, or `#000000` trip a
+/// fast unit test before the visual VM gate.
+const HALMASUIT_BRAND_CLEAR: [u8; 4] = drm::xrgb_le(0x0A, 0x00, 0x14);
+
+/// Resolve the DRM device path to use, honoring overrides and the
+/// `HALMASUIT_SKIP_DRM_MASTER` dev/test bypass. Returns `Ok(None)` only
+/// when the bypass is set under non-root euid (a tracked, warned-about
+/// dev launch); returns the path otherwise.
+///
+/// Fail-closed under euid 0 if the bypass is requested — the SKIP path
+/// disarms a core architectural invariant and must not be honored from
+/// the production systemd unit.
+fn drm_device_path_from_env() -> io::Result<Option<PathBuf>> {
     if std::env::var_os("HALMASUIT_SKIP_DRM_MASTER").is_some() {
-        // Fail-closed if running as root: production halmasuit always
-        // starts as root (the systemd unit has User= unset so it can
-        // bind sockets in /run/halmasuit and acquire DRM master). The
-        // SKIP bypass is for ad-hoc dev launches as a normal user.
-        // Honoring it under root would silently disarm the
-        // architecture's core requirement.
         if nix::unistd::geteuid().is_root() {
             return Err(io::Error::other(
                 "HALMASUIT_SKIP_DRM_MASTER is the dev/test bypass; refusing \
@@ -631,27 +936,10 @@ fn acquire_drm_master() -> io::Result<Option<std::fs::File>> {
         );
         return Ok(None);
     }
-    let path = std::env::var_os("HALMASUIT_DRM_DEVICE")
-        .map_or_else(|| PathBuf::from("/dev/dri/card0"), PathBuf::from);
-    let dev = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .map_err(|e| io::Error::other(format!("open({}): {e}", path.display())))?;
-    let raw = dev.as_raw_fd();
-    // SAFETY: `drm_set_master` is the nix-generated wrapper for
-    // ioctl(fd, DRM_IOCTL_SET_MASTER). `raw` is a valid kernel fd
-    // we just opened above; the ioctl takes no argument and
-    // performs no memory access beyond the fd. Failure is reported
-    // via `Err`. The only invariant is that the fd be valid, which
-    // is upheld by `dev` outliving this call.
-    #[expect(unsafe_code, reason = "raw ioctl through nix-generated wrapper")]
-    unsafe {
-        drm_set_master(raw).map_err(|e| {
-            io::Error::other(format!("DRM_IOCTL_SET_MASTER on {}: {e}", path.display()))
-        })?;
-    }
-    Ok(Some(dev))
+    Ok(Some(std::env::var_os("HALMASUIT_DRM_DEVICE").map_or_else(
+        || PathBuf::from("/dev/dri/card0"),
+        PathBuf::from,
+    )))
 }
 
 /// Resolve compositor uid from env. `HALMASUIT_COMPOSITOR_UID` is
@@ -854,12 +1142,78 @@ fn pidfd_send_signal(pidfd: &std::os::fd::OwnedFd, sig: i32) -> io::Result<()> {
 /// until `waitpid` reports no more reapable children. Without this,
 /// dead halmasuit-spawn / greeter / session children accumulate as
 /// zombies and eventually exhaust the pid namespace.
-fn reap_zombie_children() {
+/// What a reaped child's pid means relative to the greeter lifecycle.
+#[derive(Debug, PartialEq, Eq)]
+enum ReapOutcome {
+    /// The greeter exited before authentication completed — the wedge
+    /// condition (no greeter client, no session, nothing else notices).
+    GreeterDiedPreAuth,
+    /// The greeter exited after a session spawn was confirmed —
+    /// `start_session` already SIGKILLed it and emitted
+    /// `GreeterTerminated`; the expected zombie.
+    GreeterDiedExpected,
+    /// A non-greeter child (halmasuit-spawn, the session, or an
+    /// already-cleared greeter slot).
+    Other,
+}
+
+/// Classify a reaped pid against the tracked greeter pid and the
+/// authentication state (`session_uid` is `Some` once `start_session`
+/// confirmed a spawn). Pure so the wedge logic is unit-testable
+/// without driving real children through `waitpid`.
+fn classify_reaped_child(
+    reaped_pid: u32,
+    greeter_pid: Option<u32>,
+    session_uid: Option<u32>,
+) -> ReapOutcome {
+    if greeter_pid != Some(reaped_pid) {
+        return ReapOutcome::Other;
+    }
+    if session_uid.is_none() {
+        ReapOutcome::GreeterDiedPreAuth
+    } else {
+        ReapOutcome::GreeterDiedExpected
+    }
+}
+
+/// Reap zombie children (coalesced SIGCHLD: one signal may cover
+/// several deaths — loop until `waitpid` drains). Beyond reaping,
+/// attribute each death: a greeter exit *before* authentication (R4)
+/// is surfaced as `GreeterDiedPreAuth` and the now-stale greeter
+/// handle cleared, instead of vanishing into a discarded status.
+fn reap_zombie_children(state: &mut HalmasuitState) {
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
     loop {
-        match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
+        let status = match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) | Err(_) => return,
-            Ok(status) => tracing::debug!(?status, "reaped child"),
+            Ok(status) => status,
+        };
+        let reaped_pid = match status {
+            WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _) => {
+                Some(pid.as_raw().cast_unsigned())
+            }
+            _ => None,
+        };
+        match reaped_pid.map(|pid| {
+            (
+                pid,
+                classify_reaped_child(
+                    pid,
+                    state.greeter.as_ref().map(|g| g.pid),
+                    state.session_uid,
+                ),
+            )
+        }) {
+            Some((pid, ReapOutcome::GreeterDiedPreAuth)) => {
+                state.greeter = None;
+                emit(&Event::GreeterDiedPreAuth { pid });
+                tracing::warn!(greeter_pid = pid, "greeter exited before authentication");
+            }
+            Some((pid, ReapOutcome::GreeterDiedExpected)) => {
+                state.greeter = None;
+                tracing::debug!(?status, greeter_pid = pid, "reaped greeter post-auth");
+            }
+            _ => tracing::debug!(?status, "reaped child"),
         }
     }
 }
@@ -1059,6 +1413,85 @@ fn invoke_spawn(spawn_bin: &Path, request: &SpawnRequest) -> io::Result<Child> {
     build_spawn_command(spawn_bin, request).spawn()
 }
 
+/// Whether a peer that just connected to the Wayland socket is
+/// authorised, given its SO_PEERCRED `peer_uid`.
+///
+/// Epic #1 R1. The socket is chmod 0660 to the `halmasuit-greeter`
+/// group so the greeter/session can `connect(2)` — but group
+/// membership is not identity. A peer is authorised iff its uid is
+/// the greeter uid (pre-auth, the only client) or the authenticated
+/// session uid (post-auth, recorded by [`start_session`]). The
+/// greeter uid stays valid post-auth because greeter teardown can
+/// race the session connect. Mirrors the greetd listener's uid check.
+fn wayland_peer_authorized(peer_uid: u32, greeter_uid: u32, session_uid: Option<u32>) -> bool {
+    peer_uid == greeter_uid || session_uid == Some(peer_uid)
+}
+
+/// Start the authenticated user session: invoke `halmasuit-spawn`,
+/// and *only if it succeeds* record the session uid and tear the
+/// greeter down.
+///
+/// Ordering is load-bearing (Epic #1 R3). Killing the greeter before
+/// invoking spawn meant a spawn failure left a dead greeter with no
+/// session — an unrecoverable black screen, the exact failure this
+/// project exists to eliminate. Here the greeter is the recoverable
+/// fallback: it is signalled strictly after the spawn is confirmed,
+/// so a spawn failure leaves the user at a live greeter they can
+/// retry from, and a `SessionSpawnFailed` event is emitted instead of
+/// `GreeterTerminated`.
+///
+/// `session_uid` is set before the greeter teardown so the Wayland
+/// accept path can authorise the session's own connection (which
+/// arrives under the authenticated uid, distinct from the greeter's)
+/// as soon as the session process exists.
+fn start_session(
+    spawn_bin: &Path,
+    request: &SpawnRequest,
+    greeter: &mut Option<GreeterHandle>,
+    session_uid: &mut Option<u32>,
+) -> io::Result<Child> {
+    let child = match invoke_spawn(spawn_bin, request) {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                spawn_bin = ?spawn_bin,
+                "failed to invoke halmasuit-spawn; greeter retained for retry"
+            );
+            emit(&Event::SessionSpawnFailed {
+                uid: request.uid,
+                error: format!("{e}"),
+            });
+            return Err(e);
+        }
+    };
+
+    *session_uid = Some(request.uid);
+    tracing::info!(
+        spawn_pid = child.id(),
+        uid = request.uid,
+        "halmasuit-spawn launched"
+    );
+
+    if let Some(greeter) = greeter.take() {
+        let pid = greeter.pid;
+        match pidfd_send_signal(&greeter.pidfd, libc::SIGKILL) {
+            Ok(()) => emit(&Event::GreeterTerminated { pid }),
+            Err(e) => {
+                let error = format!("{e}");
+                tracing::warn!(
+                    %error,
+                    greeter_pid = pid,
+                    "pidfd_send_signal greeter SIGKILL failed; session proceeds"
+                );
+                emit(&Event::GreeterKillFailed { pid, error });
+            }
+        }
+    }
+
+    Ok(child)
+}
+
 // ── Wayland event-loop integration ──────────────────────────────────────
 
 /// calloop callback for the wayland Display source. The Display is
@@ -1090,6 +1523,77 @@ smithay::delegate_seat!(HalmasuitState);
 smithay::delegate_output!(HalmasuitState);
 smithay::delegate_shm!(HalmasuitState);
 
+/// Run one main-loop iteration behind a fault boundary (Epic #1 R5).
+///
+/// `body` is the dispatch+flush step. A `?`-propagated `Err` or a
+/// panic in any calloop callback would otherwise unwind out of
+/// `main()` → non-zero exit → systemd `Restart=on-failure` → DRM
+/// master re-acquired → the visible flash this project exists to
+/// delete. So neither escapes: an `Err` is logged and the loop
+/// continues; a panic is caught and the loop continues.
+///
+/// `AssertUnwindSafe` is deliberate. The body borrows `&mut state`,
+/// which is not `UnwindSafe`, so a caught panic may leave compositor
+/// state inconsistent. Per R5 the no-flash invariant outranks a
+/// possibly-degraded session: staying alive degraded beats a
+/// guaranteed flash, and clean re-exec recovery is Phase B's job, not
+/// a crash-loop's. There is intentionally no retry cap that
+/// eventually exits — that would reintroduce the flash. An unbroken
+/// error loop is still not a flash.
+///
+/// The degraded-iteration log is rate-limited. calloop's dispatch
+/// timeout is an upper bound, not a floor: a persistently-ready
+/// faulted fd (e.g. a Wayland client fd stuck at HUP) returns from
+/// `dispatch` immediately every iteration, so the loop spins at CPU
+/// speed. Logging once per iteration would reproduce the prior
+/// broken-pipe pathology (~237k lines in ~535s). `consecutive_errors`
+/// (owned by the caller, reset on the first clean iteration) gates
+/// the log to the first few failures plus power-of-two boundaries —
+/// O(log n) lines for n failures — and emits a one-line recovery
+/// summary when the fault clears.
+fn run_loop_iteration(consecutive_errors: &mut u32, body: impl FnOnce() -> io::Result<()>) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(Ok(())) => {
+            if *consecutive_errors != 0 {
+                tracing::error!(
+                    suppressed = *consecutive_errors,
+                    "event-loop recovered after degraded iterations"
+                );
+                *consecutive_errors = 0;
+            }
+        }
+        Ok(Err(e)) => {
+            *consecutive_errors += 1;
+            if should_log_degraded(*consecutive_errors) {
+                tracing::error!(
+                    error = %e,
+                    consecutive = *consecutive_errors,
+                    "event-loop dispatch error; degrading in place — \
+                     process exit would re-acquire DRM master and flash"
+                );
+            }
+        }
+        Err(_panic) => {
+            *consecutive_errors += 1;
+            if should_log_degraded(*consecutive_errors) {
+                tracing::error!(
+                    consecutive = *consecutive_errors,
+                    "event-loop iteration panicked; degrading in place — \
+                     process exit would re-acquire DRM master and flash"
+                );
+            }
+        }
+    }
+}
+
+/// Whether the `n`-th consecutive degraded iteration should be logged.
+/// First five, then power-of-two boundaries: O(log n) lines for a
+/// persistent fault instead of one-per-iteration, while still
+/// surfacing the fault promptly and marking escalation.
+const fn should_log_degraded(n: u32) -> bool {
+    n <= 5 || n.is_power_of_two()
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "main() is the wiring point — splitting smithay+greetd+calloop \
@@ -1109,18 +1613,12 @@ fn main() -> io::Result<()> {
         version: env!("CARGO_PKG_VERSION"),
     });
 
-    // DRM master FIRST, while we're still root. The master designation
-    // lives on the file descriptor and survives the in-process
-    // `setresuid` at the bottom of this function (drm-master-probe
-    // Phase 1). After this point, the FD is held by `HalmasuitState`
-    // for the process lifetime. Only emit the phase event when master
-    // was actually acquired — the SKIP path is dev/test only.
-    let drm_master = acquire_drm_master()?;
-    if drm_master.is_some() {
-        emit(&Event::PhaseEntered {
-            phase: Phase::DrmMasterAcquired,
-        });
-    }
+    // Resolve the DRM device path before anything else (the path may
+    // be `None` for the dev/test SKIP path). The actual DRM/GBM/EGL/GLES
+    // setup happens further down, after the calloop event loop is
+    // built — `setup_drm_backend` needs `loop_handle` to wire the
+    // page-flip event source.
+    let drm_device_path = drm_device_path_from_env()?;
 
     // Initialize the Wayland display + protocol state.
     let display: Display<HalmasuitState> = Display::new().map_err(io::Error::other)?;
@@ -1129,40 +1627,116 @@ fn main() -> io::Result<()> {
     let xdg_shell_state = XdgShellState::new::<HalmasuitState>(&display_handle);
 
     let mut seat_state = SeatState::new();
-    let seat = seat_state.new_wl_seat(&display_handle, "seat0".to_owned());
+    let mut seat = seat_state.new_wl_seat(&display_handle, "seat0".to_owned());
+    // Keyboard + pointer capabilities. Real events arrive via the
+    // libinput backend (inserted on the DRM path below) and are
+    // routed to the focused client. XkbConfig::default() is the
+    // system default layout; 200ms delay / 25Hz repeat is the
+    // conventional wlroots default.
+    seat.add_keyboard(smithay::input::keyboard::XkbConfig::default(), 200, 25)
+        .map_err(|e| io::Error::other(format!("seat.add_keyboard: {e}")))?;
+    seat.add_pointer();
 
     let output_manager_state =
         OutputManagerState::new_with_xdg_output::<HalmasuitState>(&display_handle);
-    // Synthesized placeholder output. Geometry is invented; the
-    // advertisement exists so clients can discover an output and
-    // proceed past their wl_registry phase. Real geometry lands when
-    // the DRM backend wires actual modes (subsequent task).
-    let output_mode = Mode {
-        size: (1920, 1080).into(),
-        refresh: 60_000, // 60 Hz, in mHz per the wl_output spec
-    };
-    let output = Output::new(
-        "output-0".to_owned(),
-        PhysicalProperties {
-            size: (480, 270).into(), // mm; ~96 DPI assumption
-            subpixel: Subpixel::Unknown,
-            make: "halmasuit".to_owned(),
-            model: "synthesized-1080p".to_owned(),
-            serial_number: String::new(),
-        },
-    );
-    output.create_global::<HalmasuitState>(&display_handle);
-    output.change_current_state(Some(output_mode), None, None, Some((0, 0).into()));
-    output.set_preferred(output_mode);
 
     // wl_shm. Empty formats iter requests just ARGB8888 + XRGB8888,
     // which the spec mandates always be advertised. Additional formats
     // come with the renderer task.
     let shm_state = ShmState::new::<HalmasuitState>(&display_handle, std::iter::empty());
+    let layer_shell_state = WlrLayerShellState::new::<HalmasuitState>(&display_handle);
 
     let mut event_loop: EventLoop<HalmasuitState> =
         EventLoop::try_new().map_err(io::Error::other)?;
     let loop_handle = event_loop.handle();
+
+    // Build the DRM backend if a device path was resolved. The real
+    // case (production) goes through `drm::setup_drm_backend` and
+    // returns the smithay `Output` backed by the actual connector
+    // mode. The SKIP case (dev/test, non-root) synthesizes a 1920x1080
+    // placeholder so wl_clients can still discover an output global.
+    let (drm_backend, drm_token, output, libseat_session) = if let Some(path) = &drm_device_path {
+        // Open the libseat session (seatd backend) while still root,
+        // BEFORE the privilege drop below. seatd brokers the DRM +
+        // input fds and owns DRM master; halmasuit never SET_MASTERs.
+        // drm-master-probe Phase 4 validated this session survives
+        // the subsequent setresuid.
+        let (mut session, libseat_notifier) = LibSeatSession::new().map_err(|e| {
+            io::Error::other(format!("LibSeatSession::new (is seatd reachable?): {e}"))
+        })?;
+        // Service libseat session (activate/pause) events. v1 in-VM:
+        // no VT switching (epic out-of-scope) — log only, but the
+        // source MUST be registered so libseat's event fd is drained.
+        loop_handle
+            .insert_source(
+                libseat_notifier,
+                |event, (), _state: &mut HalmasuitState| {
+                    tracing::info!(?event, "libseat session event");
+                },
+            )
+            .map_err(|e| io::Error::other(format!("insert libseat notifier: {e}")))?;
+        let (backend, token, real_output) = drm::setup_drm_backend(
+            &mut session,
+            path,
+            &loop_handle,
+            |event, _meta, state: &mut HalmasuitState| match event {
+                smithay::backend::drm::DrmEvent::VBlank(_crtc) => {
+                    if let Some(backend) = state.drm_backend.as_mut()
+                        && let Err(e) = backend.frame_submitted()
+                    {
+                        tracing::warn!(error = %e, "DRM frame_submitted failed");
+                    }
+                }
+                smithay::backend::drm::DrmEvent::Error(e) => {
+                    tracing::warn!(error = %e, "DRM device error");
+                }
+            },
+        )?;
+
+        // libinput, fed device fds through the SAME seatd session
+        // (validated surviving setresuid by drm-master-probe Phase 4).
+        // Events are routed to the keyboard-focused client.
+        let mut libinput = smithay::reexports::input::Libinput::new_with_udev(
+            LibinputSessionInterface::from(session.clone()),
+        );
+        libinput.udev_assign_seat(&session.seat()).map_err(|()| {
+            io::Error::other(format!("libinput udev_assign_seat({})", session.seat()))
+        })?;
+        loop_handle
+            .insert_source(
+                LibinputInputBackend::new(libinput),
+                |event, (), state: &mut HalmasuitState| state.dispatch_libinput(event),
+            )
+            .map_err(|e| io::Error::other(format!("insert libinput backend: {e}")))?;
+
+        real_output.create_global::<HalmasuitState>(&display_handle);
+        emit(&Event::PhaseEntered {
+            phase: Phase::DrmMasterAcquired,
+        });
+        (Some(backend), Some(token), real_output, Some(session))
+    } else {
+        // SKIP path: synthesized placeholder. Geometry is invented;
+        // the advertisement exists so clients can discover an output
+        // and proceed past their wl_registry phase.
+        let output_mode = Mode {
+            size: (1920, 1080).into(),
+            refresh: 60_000, // 60 Hz, in mHz per the wl_output spec
+        };
+        let synth = Output::new(
+            "output-0".to_owned(),
+            PhysicalProperties {
+                size: (480, 270).into(), // mm; ~96 DPI assumption
+                subpixel: Subpixel::Unknown,
+                make: "halmasuit".to_owned(),
+                model: "synthesized-1080p".to_owned(),
+                serial_number: String::new(),
+            },
+        );
+        synth.create_global::<HalmasuitState>(&display_handle);
+        synth.change_current_state(Some(output_mode), None, None, Some((0, 0).into()));
+        synth.set_preferred(output_mode);
+        (None, None, synth, None)
+    };
 
     // Bind the Wayland listening socket. smithay's ListeningSocketSource
     // places the socket at $XDG_RUNTIME_DIR/<name>; production halmasuit's
@@ -1173,10 +1747,53 @@ fn main() -> io::Result<()> {
     let socket_path = socket.socket_name().to_owned();
     tracing::info!(socket = ?socket_path, "wayland socket bound");
 
-    // New-client handler: hand each accepted UnixStream to the Display
-    // with a fresh per-client state.
+    // Widen the socket perms from smithay's default 0700 to 0660 so
+    // the greeter (running as the configured greeter system user, in
+    // group `halmasuit-greeter` per the NixOS module) can `connect(2)`.
+    // The systemd unit's `Group=halmasuit-greeter` directive gives the
+    // socket file group ownership; this chmod opens it to the group.
+    // Same shape as the greetd socket bind in `halmasuit-greetd`'s
+    // `bind_socket` helper.
+    //
+    // `socket.socket_name()` returns just the basename (e.g.
+    // "wayland-0"); the actual file lives at $XDG_RUNTIME_DIR/<name>.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let xdg_runtime_dir =
+            std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/run/halmasuit".into());
+        let abs_socket_path = PathBuf::from(xdg_runtime_dir).join(&socket_path);
+        let perms = std::fs::Permissions::from_mode(0o660);
+        std::fs::set_permissions(&abs_socket_path, perms).map_err(|e| {
+            io::Error::other(format!("chmod 0660 {}: {e}", abs_socket_path.display()))
+        })?;
+    }
+
+    // New-client handler: SO_PEERCRED-gate every accepted stream
+    // before handing it to the Display. The 0660 chmod above only
+    // restricts to the halmasuit-greeter group; this is the peer
+    // *identity* gate (greeter pre-auth / session post-auth) that
+    // stops a hostile in-group uid from connecting to wayland-0 to
+    // screenshot / inject. Mirrors the greetd listener's uid gate.
     loop_handle
         .insert_source(socket, |stream, (), state: &mut HalmasuitState| {
+            let creds = match peer_credentials(&stream) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "peer_credentials failed; dropping wayland connection");
+                    drop(stream);
+                    return;
+                }
+            };
+            if !wayland_peer_authorized(creds.uid, state.greeter_uid, state.session_uid) {
+                tracing::warn!(
+                    peer_uid = creds.uid,
+                    greeter_uid = state.greeter_uid,
+                    session_uid = ?state.session_uid,
+                    "rejected wayland connection from unauthorised uid",
+                );
+                drop(stream);
+                return;
+            }
             let client_data = Arc::new(ClientState {
                 compositor_state: CompositorClientState::default(),
             });
@@ -1194,7 +1811,7 @@ fn main() -> io::Result<()> {
         .insert_source(
             signals,
             |event, (), state: &mut HalmasuitState| match event.signal() {
-                Signal::SIGCHLD => reap_zombie_children(),
+                Signal::SIGCHLD => reap_zombie_children(state),
                 sig => {
                     let reason = match sig {
                         Signal::SIGTERM => ShutdownReason::SignalTerm,
@@ -1247,6 +1864,9 @@ fn main() -> io::Result<()> {
             Ok(handle) => {
                 tracing::info!(greeter_pid = handle.pid, greeter_cmd = %cmd.display(), "greeter spawned");
                 emit(&Event::GreeterSpawned { pid: handle.pid });
+                emit(&Event::ForegroundChanged {
+                    to: halmasuit_introspect::Foreground::Greeter,
+                });
                 Some(handle)
             }
             Err(e) => {
@@ -1268,10 +1888,15 @@ fn main() -> io::Result<()> {
         compositor_state,
         xdg_shell_state,
         seat_state,
-        _seat: seat,
+        seat,
         _output_manager_state: output_manager_state,
-        _output: output,
+        output,
         shm_state,
+        layer_shell_state,
+        seen_layer_roles: std::collections::HashSet::new(),
+        foreground_toplevel: None,
+        foreground: halmasuit_introspect::Foreground::Greeter,
+        _libseat_session: libseat_session,
         loop_handle: loop_handle.clone(),
         connections: HashMap::new(),
         next_conn_id: 0,
@@ -1281,9 +1906,49 @@ fn main() -> io::Result<()> {
         greeter_uid,
         spawn_bin: spawn_bin_from_env(),
         _greetd_listener_token: Some(greetd_listener_token),
-        _drm_master: drm_master,
+        drm_backend,
+        _drm_token: drm_token,
         greeter,
+        session_uid: None,
     };
+
+    // Kick off the render loop with one initial frame. The page-flip
+    // for this frame triggers the next vblank, which our DRM event
+    // handler observes (`frame_submitted`) — that's the keepalive for
+    // the render loop. Future damage events (B.3+ wl_client commits)
+    // will queue additional frames. For now the scene is just the
+    // brand clear color.
+    //
+    // `Phase::ScanoutActive` fires here, on the first successful
+    // `queue_frame` — moved from B.1's "post-SETCRTC" timing to
+    // "first pixel via GLES" per the epic's IMMUTABLE Requirement #5
+    // semantics. The SKIP-path state (no `drm_backend`) emits neither
+    // event.
+    if let Some(backend) = state.drm_backend.as_mut() {
+        let queued = backend.render_one_frame(&state.output, HALMASUIT_BRAND_CLEAR)?;
+        if queued {
+            emit(&Event::PhaseEntered {
+                phase: Phase::ScanoutActive,
+            });
+        } else {
+            tracing::warn!(
+                "initial render_frame produced no damage; ScanoutActive deferred until next vblank"
+            );
+        }
+    }
+
+    // frame_audit only: start the D-Bus `Snapshot()` server, handing
+    // it a clone of the render loop's snapshot slot. Started before
+    // the privilege drop below, so the background thread's bus
+    // connection authenticates as the current euid (root in
+    // production deploys); the connection persists across the
+    // subsequent setresuid. Best-effort — `serve` logs and the
+    // thread exits if the bus is unreachable. Absent entirely from
+    // the production binary.
+    #[cfg(feature = "frame_audit")]
+    if let Some(backend) = state.drm_backend.as_ref() {
+        dbus::serve(backend.snapshot_handle());
+    }
 
     // Privilege drop. The DRM master FD and both Unix sockets are
     // acquired above while we still have euid==0; everything from
@@ -1324,16 +1989,25 @@ fn main() -> io::Result<()> {
     // pending outgoing events to clients. flush_clients lives on the
     // DisplayHandle (cloned earlier) since Display itself is now owned
     // by the calloop source above.
+    // Consecutive failed-iteration counter for the R5 degrade-in-place
+    // log rate-limiter; reset on the first clean iteration.
+    let mut consecutive_errors = 0u32;
     while state.running {
-        event_loop
-            .dispatch(Some(Duration::from_millis(16)), &mut state)
-            .map_err(io::Error::other)?;
-        state
-            .display_handle
-            .flush_clients()
-            .map_err(io::Error::other)?;
+        run_loop_iteration(&mut consecutive_errors, || {
+            event_loop
+                .dispatch(Some(Duration::from_millis(16)), &mut state)
+                .map_err(io::Error::other)?;
+            state
+                .display_handle
+                .flush_clients()
+                .map_err(io::Error::other)?;
+            Ok(())
+        });
     }
 
+    // Reached only via the deliberate Shutdown path (`state.running`
+    // cleared in the SIGTERM/SIGINT closure): a clean exit 0, which
+    // systemd's `Restart=on-failure` correctly does NOT restart.
     Ok(())
 }
 
@@ -1398,6 +2072,217 @@ mod tests {
         let cmd = build_spawn_command(Path::new("/bin/true"), &req);
         let map: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert!(!map.contains_key(OsStr::new("MALFORMED_NO_EQUALS")));
+    }
+
+    // R4 port: the SIGCHLD reaper must distinguish which child died.
+    // Greeter exit pre-auth (session_uid still None) is the wedge
+    // condition that previously vanished into a discarded waitpid
+    // status.
+    #[test]
+    fn classify_greeter_death_pre_auth() {
+        assert_eq!(
+            classify_reaped_child(4242, Some(4242), None),
+            ReapOutcome::GreeterDiedPreAuth
+        );
+    }
+
+    #[test]
+    fn classify_greeter_death_expected_post_auth() {
+        assert_eq!(
+            classify_reaped_child(4242, Some(4242), Some(1000)),
+            ReapOutcome::GreeterDiedExpected
+        );
+    }
+
+    #[test]
+    fn classify_non_greeter_child_is_other() {
+        assert_eq!(
+            classify_reaped_child(99, Some(4242), None),
+            ReapOutcome::Other
+        );
+        assert_eq!(
+            classify_reaped_child(99, Some(4242), Some(1000)),
+            ReapOutcome::Other
+        );
+    }
+
+    #[test]
+    fn classify_with_no_greeter_tracked_is_other() {
+        assert_eq!(classify_reaped_child(4242, None, None), ReapOutcome::Other);
+    }
+
+    // R5 port: neither a dispatch Err nor a callback panic may escape
+    // the loop iteration — escaping = process exit = systemd restart =
+    // DRM re-acquire = the flash this project exists to delete.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn run_loop_iteration_ok_runs_body_and_returns() {
+        let ran = AtomicUsize::new(0);
+        let mut streak = 0u32;
+        run_loop_iteration(&mut streak, || {
+            ran.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert_eq!(streak, 0, "a clean iteration keeps the error streak at 0");
+    }
+
+    #[test]
+    fn run_loop_iteration_err_does_not_escape() {
+        let ran = AtomicUsize::new(0);
+        let mut streak = 0u32;
+        run_loop_iteration(&mut streak, || {
+            ran.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("dispatch blew up"))
+        });
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert_eq!(streak, 1, "an Err iteration increments the error streak");
+    }
+
+    #[test]
+    fn run_loop_iteration_panic_does_not_escape() {
+        let ran = AtomicUsize::new(0);
+        let mut streak = 0u32;
+        run_loop_iteration(&mut streak, || {
+            ran.fetch_add(1, Ordering::SeqCst);
+            panic!("calloop callback panicked");
+        });
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            streak, 1,
+            "a panicking iteration increments the error streak"
+        );
+    }
+
+    #[test]
+    fn run_loop_iteration_ok_resets_streak() {
+        // A recovered iteration zeroes the streak so the next fault
+        // burst logs from the start again (and emits a recovery line).
+        let mut streak = 7u32;
+        run_loop_iteration(&mut streak, || Ok(()));
+        assert_eq!(streak, 0, "recovery resets the consecutive-error streak");
+    }
+
+    #[test]
+    fn degraded_log_is_rate_limited_under_persistent_fault() {
+        // The R5 degrade-in-place path must NOT log once per iteration
+        // (a persistently-ready faulted fd spins with no per-iteration
+        // delay — that produced the prior ~237k-lines/535s pattern).
+        // Log the first few, then only on power-of-two boundaries, so
+        // N failures cost O(log N) lines, not O(N).
+        assert!(should_log_degraded(1));
+        assert!(should_log_degraded(5));
+        assert!(
+            !should_log_degraded(6),
+            "6 is suppressed (not <=5, not pow2)"
+        );
+        assert!(!should_log_degraded(7));
+        assert!(should_log_degraded(8), "powers of two still log (boundary)");
+        assert!(!should_log_degraded(1000));
+        assert!(should_log_degraded(1024));
+        // O(log N) bound: across 1..=1_000_000 failures, far fewer than
+        // the prior incident's hundreds-of-lines-per-second.
+        let logged = (1u32..=1_000_000)
+            .filter(|&n| should_log_degraded(n))
+            .count();
+        assert!(
+            logged < 30,
+            "expected O(log N) logged lines over 1e6 failures, got {logged}"
+        );
+    }
+
+    // R1 port: the Wayland accept path authorises a peer iff its
+    // SO_PEERCRED uid is the greeter uid (pre-auth) or the recorded
+    // session uid (post-auth). FVC only chmods the socket 0660 — group
+    // restriction, not peer identity; this closes that gap.
+    #[test]
+    fn wayland_peer_greeter_accepted_pre_auth() {
+        assert!(wayland_peer_authorized(1000, 1000, None));
+    }
+
+    #[test]
+    fn wayland_peer_session_accepted_post_auth() {
+        assert!(wayland_peer_authorized(1001, 1000, Some(1001)));
+    }
+
+    #[test]
+    fn wayland_peer_greeter_still_accepted_post_auth() {
+        assert!(wayland_peer_authorized(1000, 1000, Some(1001)));
+    }
+
+    #[test]
+    fn wayland_peer_unrelated_uid_rejected_pre_and_post_auth() {
+        assert!(!wayland_peer_authorized(1234, 1000, None));
+        assert!(!wayland_peer_authorized(1234, 1000, Some(1001)));
+    }
+
+    #[test]
+    fn wayland_peer_root_rejected() {
+        assert!(!wayland_peer_authorized(0, 1000, Some(1001)));
+        assert!(!wayland_peer_authorized(0, 1000, None));
+    }
+
+    // R2/R3 port: spawn must be invoked and confirmed BEFORE the
+    // greeter is killed. Spawn failure must leave the greeter running
+    // (recoverable) and emit SessionSpawnFailed, never GreeterTerminated.
+    #[test]
+    fn start_session_spawn_failure_retains_greeter_and_records_no_uid() {
+        let bin = Path::new("/nonexistent/halmasuit-spawn-does-not-exist");
+        let req = sample_request(); // uid 1000
+        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let mut greeter = Some(GreeterHandle {
+            pid: 4242,
+            pidfd: devnull.into(),
+        });
+        let mut session_uid: Option<u32> = None;
+
+        let result = start_session(bin, &req, &mut greeter, &mut session_uid);
+
+        assert!(result.is_err(), "spawn of a nonexistent bin must fail");
+        assert!(
+            greeter.is_some(),
+            "greeter MUST be retained when the session spawn fails"
+        );
+        assert_eq!(
+            session_uid, None,
+            "session_uid MUST NOT be recorded when the spawn fails"
+        );
+    }
+
+    #[test]
+    fn start_session_success_records_uid_then_kills_greeter() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let mut greeter_child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn greeter stand-in");
+        let pidfd = pidfd_open_for(greeter_child.id()).expect("pidfd_open greeter stand-in");
+        let mut greeter = Some(GreeterHandle {
+            pid: greeter_child.id(),
+            pidfd,
+        });
+        let mut session_uid: Option<u32> = None;
+        let req = sample_request(); // uid 1000
+
+        let result = start_session(Path::new("/bin/sh"), &req, &mut greeter, &mut session_uid);
+
+        let mut session_child = result.expect("spawn of /bin/sh must succeed");
+        assert_eq!(
+            session_uid,
+            Some(1000),
+            "authenticated uid MUST be recorded once the spawn is confirmed"
+        );
+        assert!(
+            greeter.is_none(),
+            "greeter MUST be taken (killed) after a confirmed spawn"
+        );
+
+        let _ = session_child.wait();
+        let _ = greeter_child.wait();
     }
 
     #[test]
