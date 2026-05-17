@@ -12,6 +12,8 @@ members = [
     "crates/halmasuit-session-ipc",
     # Privileged PAM-lifecycle broker (Epic: unified session/pamd).
     "crates/halmasuit-session",
+    # Test-only: real-PAM VM gate driver for halmasuit-session (R12).
+    "crates/halmasuit-session-pam-testdriver",
     "crates/halmasuit-cli",
     "crates/halmasuit-spawn",
     "crates/halmasuit-test",

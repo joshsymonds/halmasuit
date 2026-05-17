@@ -313,6 +313,36 @@
             };
           };
 
+          # halmasuit-session-pam-testdriver — test-only driver for the
+          # real-PAM gate (Epic #1 R12). Links pam-sys (via
+          # halmasuit-session) so it needs the same bindgen + libpam
+          # build wiring as `halmasuit` (clang for pam-sys's build.rs,
+          # pam headers, libpam.so.0 to link) — but NOT smithay's
+          # wayland/GL/seatd stack (halmasuit-session has none of it).
+          halmasuit-session-pam-testdriver = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-session-pam-testdriver";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags   = [ "-p" "halmasuit-session-pam-testdriver" ];
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.llvmPackages.libclang ];
+            buildInputs       = [ pkgs.pam ];
+            env = {
+              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+              BINDGEN_EXTRA_CLANG_ARGS =
+                "-I${pkgs.pam}/include -I${pkgs.glibc.dev}/include";
+            };
+            doCheck = false;
+            meta = {
+              description = "halmasuit-session real-PAM VM-gate driver (test-only)";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-session-pam-testdriver";
+            };
+          };
+
           # halmasuit-spawn — setuid-root privilege-drop helper. Shipped
           # as a separate Nix package so the production NixOS module can
           # wrap it with security.wrappers (setuid bit) and the VM test
@@ -566,6 +596,14 @@
           system          = "x86_64-linux";
           inherit nixpkgs;
           halmasuit-spawn = self.packages.x86_64-linux.halmasuit-spawn;
+        };
+        # Epic #1 R12: first real-PAM gate. run_pam_auth against the
+        # real libpam stack with the real test user — NO mock.
+        run-pam-auth = import ./tests/run-pam-auth.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit-session-pam-testdriver =
+            self.packages.x86_64-linux.halmasuit-session-pam-testdriver;
         };
         drm-master-probe = import ./tests/drm-master-probe.nix {
           system = "x86_64-linux";

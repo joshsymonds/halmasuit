@@ -43,6 +43,9 @@ test-vm:
     echo "── halmasuit-spawn ──"
     nix build .#checks.x86_64-linux.halmasuit-spawn -L --print-build-logs --no-link
     echo
+    echo "── run-pam-auth ──"
+    nix build .#checks.x86_64-linux.run-pam-auth -L --print-build-logs --no-link
+    echo
     echo "── login-flash ──"
     nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link
     echo

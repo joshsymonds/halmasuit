@@ -1,0 +1,27 @@
+[package]
+name        = "halmasuit-session-pam-testdriver"
+description = "Test-only driver: exercises halmasuit-session::run_pam_auth against REAL PAM in the run-pam-auth VM gate (Epic #1 R12). Plays the compositor/greeter wire side over a real SEQPACKET socketpair. Never shipped."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The real broker auth path under test — uses the real run_pam_auth +
+# real libpam (NO mock; Epic R12). The driver only plays the greeter
+# side of the SEQPACKET conversation.
+halmasuit-session     = { path = "../halmasuit-session", version = "0.1" }
+halmasuit-session-ipc = { path = "../halmasuit-session-ipc", version = "0.1" }
+# socketpair(AF_UNIX, SOCK_SEQPACKET) via nix's safe wrapper so the
+# driver stays #![forbid(unsafe_code)] (the only unsafe is in
+# halmasuit-session::pam_ffi).
+nix                   = { workspace = true, features = ["socket"] }
+
+[[bin]]
+name = "halmasuit-session-pam-testdriver"
+path = "src/main.rs"
