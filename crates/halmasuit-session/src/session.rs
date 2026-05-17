@@ -1,25 +1,37 @@
-//! The full one-handle PAM lifecycle (Epic R1) — the §0.2 reason
-//! for being: ONE `pam_handle_t` spanning auth→session so credential-
-//! passing modules (pam_mount/gnome-keyring/krb5) work.
+//! The full one-handle PAM lifecycle (Epic R1 + Amendment A1) — the
+//! §0.2 reason for being: ONE `pam_handle_t` spanning auth→session so
+//! credential-passing modules (pam_mount/gnome-keyring/krb5) work.
 //!
 //! `run_session` keeps the SAME `pam_ffi::Pam` from `pam_start`
 //! through `authenticate → acct_mgmt → get_user → setcred(ESTABLISH)
-//! → open_session →` (fork the non-setuid session leader, R7) `→
-//! wait → close_session → setcred(DELETE) →` (Drop) `pam_end`. The
-//! handle owner NEVER `execve`s (R1); the only exec is in the forked
+//! →` (Amendment A1.1: report `AuthOk`, then BLOCK reading the
+//! `StartSession` spec from the channel) `→` (A1.2: `pam_putenv` the
+//! session env into the handle) `→ open_session →` (A1.3: leader env
+//! is `pam_getenvlist`, allowlist-filtered — NEVER the raw greeter
+//! env) `→` (fork the non-setuid session leader, R7) `→ wait →
+//! close_session → setcred(DELETE) →` (Drop) `pam_end`. The handle
+//! owner NEVER `execve`s (R1); the only exec is in the forked
 //! `spawn_session_leader` child.
+//!
+//! The greetd sequencing (spec read AFTER `setcred(ESTABLISH)` and
+//! BEFORE `pam_open_session`) is derived from primary source: greetd
+//! `worker.rs` reads `Args{env,cmd}` between `setcred(ESTABLISH_CRED)`
+//! and `open_session` so the env reaches the handle before
+//! pam_systemd/logind register the session (Epic Amendment A1).
 //!
 //! `#![forbid(unsafe_code)]` — composes the safe `pam_ffi`/
 //! `session_leader`/`worker` APIs; the only unsafe (fork/pidfd/exec)
 //! stays quarantined in `worker`.
 //!
 //! Real one-handle auth→session is proven by the flagship pam_mount
-//! VM gate (next task / epic headline) — `open_session` needs host-ns
-//! root and Epic R12 forbids PAM mocks, so it is NOT unit-testable
-//! here. This module composes only already-tested+safe pieces; the
-//! lifecycle ORDERING is asserted by construction + the VM gate.
+//! VM gate (epic headline) and the new PAM-env-survives gate —
+//! `open_session`/`putenv`/`getenvlist` need host-ns root and Epic
+//! R12 forbids PAM mocks, so this is NOT unit-testable here. This
+//! module composes only already-tested+safe pieces; the lifecycle
+//! ORDERING is asserted by construction + the VM gates.
 #![forbid(unsafe_code)]
 
+use halmasuit_session_ipc::CompositorToBroker;
 use thiserror::Error;
 
 use crate::auth::{AuthError, run_auth_phase};
@@ -44,19 +56,28 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
     #[error("group capture failed: {0}")]
     Groups(String),
+    /// The greeter cancelled after auth, before sending a session spec
+    /// (`CompositorToBroker::Cancel`). Clean abort — the handle drops
+    /// (`pam_end`); no session was opened.
+    #[error("session cancelled by the greeter before StartSession")]
+    Aborted,
+    /// Where Amendment A1.1 requires a `StartSession`, the channel
+    /// produced a different `CompositorToBroker` frame. Fail closed.
+    #[error("protocol: expected StartSession after AuthOk, got a different frame")]
+    UnexpectedFrame,
 }
 
-/// Run the FULL one-handle lifecycle over `ch` (Epic R1).
+/// Run the FULL one-handle lifecycle over `ch` (Epic R1 + Amendment A1).
 ///
-/// `cmd`/`env`
-/// are the session program + environment (the greeter's StartSession;
-/// the wire frame that delivers them over `ch` lands with the R6
-/// broker accept loop — here they are parameters so the lifecycle is
-/// the focus). Identity is ALWAYS the PAM-resolved one (R8), never a
-/// caller/compositor-asserted value.
+/// The session program + environment are NOT parameters: they
+/// arrive as a `CompositorToBroker::StartSession` frame read on `ch`
+/// AFTER auth success (greetd sequencing). Identity is ALWAYS the
+/// PAM-resolved one (R8), never a caller/compositor-asserted value.
 ///
-/// Emits [`WorkerOutcome::SessionOpened`] once the session leader is
-/// running and [`WorkerOutcome::SessionEnded`] after teardown.
+/// Emits [`WorkerOutcome::AuthOk`] once auth + `setcred(ESTABLISH)`
+/// succeed and the spec is awaited, [`WorkerOutcome::SessionOpened`]
+/// once the session leader is running, and
+/// [`WorkerOutcome::SessionEnded`] after teardown.
 ///
 /// # Errors
 ///
@@ -66,8 +87,6 @@ pub fn run_session(
     ch: &SeqpacketChannel,
     service: &str,
     username: &str,
-    cmd: Vec<String>,
-    env: Vec<(String, String)>,
 ) -> Result<(), SessionError> {
     let mut responder = ChannelResponder::new(ch);
     let mut ctx = pam_ffi::ConvCtx {
@@ -79,9 +98,35 @@ pub fn run_session(
     let mut pam = pam_ffi::Pam::start(service, username, &mut ctx)?;
     let id = run_auth_phase(&mut pam)?;
 
-    // Session phase, SAME handle (R1). setcred(ESTABLISH) before
-    // open_session (greetd-canonical ordering).
+    // setcred(ESTABLISH) on the SAME handle, BEFORE the spec is read
+    // and BEFORE open_session (greetd worker.rs ordering: setcred at
+    // :145, recv Args at :157, open_session at :232).
     pam.set_cred_established()?;
+
+    // Amendment A1.1: report auth success, then BLOCK reading the
+    // session spec from the SAME channel. The broker parent forwards
+    // the greeter's StartSession down here (same relay path as a
+    // ConvResponse). The spec is NOT known up front.
+    ch.send(&WorkerOutcome::AuthOk {
+        username: id.username.clone(),
+        uid: id.uid,
+        gid: id.gid,
+    })?;
+    let cmd = match ch.recv::<CompositorToBroker>()? {
+        CompositorToBroker::StartSession { cmd, env } => {
+            // Amendment A1.2: push the StartSession env into the PAM
+            // handle BEFORE open_session so pam_systemd/logind (and
+            // pam_mount) register the session against the right env.
+            for (k, v) in &env {
+                pam.putenv(&format!("{k}={v}"))?;
+            }
+            cmd
+        }
+        CompositorToBroker::Cancel => return Err(SessionError::Aborted),
+        // BeginAuth / ConvResponse here is a protocol violation.
+        _ => return Err(SessionError::UnexpectedFrame),
+    };
+
     pam.open_session()?;
 
     // Supplementary groups pam_group/pam_systemd established on THIS
@@ -94,7 +139,15 @@ pub fn run_session(
         .map(|g| g.as_raw())
         .collect();
 
-    let spec = session_leader::validate(&id.username, id.uid, id.gid, cmd, env)?;
+    // Amendment A1.3: the leader's env is `pam_getenvlist` — the
+    // StartSession env this process putenv'd UNION whatever
+    // pam_env/pam_systemd/pam_mount added during setcred/open_session
+    // — allowlist-filtered by `validate` (the mandatory R11 LD_*
+    // defense). Passing the raw greeter env here would clobber the
+    // module-added vars: the forbidden env analogue of a blind
+    // initgroups.
+    let pam_env = pam.getenvlist()?;
+    let spec = session_leader::validate(&id.username, id.uid, id.gid, cmd, pam_env)?;
     let groups = session_leader::merged_groups(&id.username, id.gid, &established)?;
 
     ch.send(&WorkerOutcome::SessionOpened {

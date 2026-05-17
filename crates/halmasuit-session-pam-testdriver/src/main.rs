@@ -210,7 +210,9 @@ fn run_via_fork(service: &str, username: &str, password: &str) {
                 break 1;
             }
             Ok(ParentMessage::Outcome(
-                o @ (WorkerOutcome::SessionOpened { .. } | WorkerOutcome::SessionEnded { .. }),
+                o @ (WorkerOutcome::AuthOk { .. }
+                | WorkerOutcome::SessionOpened { .. }
+                | WorkerOutcome::SessionEnded { .. }),
             )) => {
                 // spawn_auth_worker is auth-only; a session-phase
                 // outcome here is a protocol violation, not success.

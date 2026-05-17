@@ -46,6 +46,20 @@ pub enum WorkerOutcome {
     /// Wire tag `worker_failure` — see [`WorkerOutcome::Success`].
     #[serde(rename = "worker_failure")]
     Failure { reason: String },
+    /// Amendment A1.1: auth + `setcred(ESTABLISH)` succeeded; the
+    /// handle owner is now BLOCKING for a `CompositorToBroker::
+    /// StartSession` frame on the same channel (greetd sequencing: the
+    /// spec is read after auth success and before `pam_open_session`).
+    /// `{username,uid,gid}` is the PAM-resolved identity (Epic R8) —
+    /// it lets the greeter present a session picker for that user.
+    /// Wire tag `worker_auth_ok` — disjoint from every conv /
+    /// session-phase / `CompositorToBroker` tag.
+    #[serde(rename = "worker_auth_ok")]
+    AuthOk {
+        username: String,
+        uid: u32,
+        gid: u32,
+    },
     /// Session phase (Epic R1): `pam_open_session` succeeded and the
     /// session leader is running. Wire tag `worker_session_opened` —
     /// disjoint from conv frames and the auth-phase tags.
@@ -288,14 +302,17 @@ pub fn spawn_auth_worker(
 
 /// Spawn the broker worker running the FULL one-handle lifecycle.
 ///
-/// (Epic R1): `crate::session::run_session` in the disposable fork —
-/// auth → setcred → open_session → fork-not-exec the session leader →
-/// wait → close_session → pam_end. Distinct from
-/// [`spawn_auth_worker`] (auth-only; the existing `run-pam-auth` gate
-/// keeps using that). On any error the child reports
-/// [`WorkerOutcome::Failure`]; success emits `SessionOpened` then
-/// `SessionEnded`. Real one-handle auth→session is proven by the
-/// flagship pam_mount VM gate (epic headline).
+/// (Epic R1 + Amendment A1): `crate::session::run_session` in the
+/// disposable fork — auth → setcred(ESTABLISH) → emit `AuthOk` and
+/// BLOCK reading the greeter's `StartSession` from the channel →
+/// `pam_putenv` env → open_session → fork-not-exec the session leader
+/// → wait → close_session → setcred(DELETE) → pam_end. The session
+/// program/env are NOT parameters (Amendment A1.1: read post-auth
+/// from the channel). Distinct from [`spawn_auth_worker`] (auth-only;
+/// the existing `run-pam-auth` gate keeps using that). On any error
+/// the child reports [`WorkerOutcome::Failure`]; success emits
+/// `AuthOk` → `SessionOpened` → `SessionEnded`. Real one-handle
+/// auth→session is proven by the flagship pam_mount VM gate.
 ///
 /// # Errors
 ///
@@ -303,13 +320,11 @@ pub fn spawn_auth_worker(
 pub fn spawn_session_worker(
     service: &str,
     username: &str,
-    cmd: Vec<String>,
-    env: Vec<(String, String)>,
 ) -> io::Result<(WorkerHandle, SeqpacketChannel)> {
     let service = service.to_owned();
     let username = username.to_owned();
     spawn_worker(move |chan| {
-        if let Err(e) = crate::session::run_session(&chan, &service, &username, cmd, env) {
+        if let Err(e) = crate::session::run_session(&chan, &service, &username) {
             let _ = chan.send(&WorkerOutcome::Failure {
                 reason: e.to_string(),
             });
@@ -649,6 +664,31 @@ mod tests {
         );
         assert!(!prompt.contains("worker_session_opened"));
         assert!(!prompt.contains("worker_session_ended"));
+
+        // Amendment A1.1: the pre-open_session "auth OK, send me the
+        // session spec" frame keeps the disjoint-tag discipline.
+        let authok = body(
+            &encode(&WorkerOutcome::AuthOk {
+                username: "u".into(),
+                uid: 1,
+                gid: 2,
+            })
+            .unwrap(),
+        );
+        assert!(
+            authok.contains(r#""type":"worker_auth_ok""#),
+            "got {authok}"
+        );
+        assert!(!prompt.contains("worker_auth_ok"));
+        // And it is disjoint from every CompositorToBroker tag too —
+        // the parent forwards a CompositorToBroker::StartSession down
+        // the SAME channel right after this frame.
+        for c2b_tag in ["begin_auth", "conv_response", "start_session", "cancel"] {
+            assert!(
+                !authok.contains(c2b_tag),
+                "worker_auth_ok collides with C2B tag {c2b_tag}: {authok}"
+            );
+        }
     }
 
     #[test]

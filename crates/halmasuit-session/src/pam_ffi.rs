@@ -31,8 +31,8 @@ use halmasuit_session_ipc::{BrokerToCompositor, Secret};
 use pam_sys::{
     PAM_BUF_ERR, PAM_CONV_ERR, PAM_DELETE_CRED, PAM_ESTABLISH_CRED, PAM_RUSER, PAM_SUCCESS,
     PAM_TTY, PAM_USER, pam_acct_mgmt, pam_authenticate, pam_close_session, pam_conv, pam_end,
-    pam_get_item, pam_handle_t, pam_message, pam_open_session, pam_response, pam_set_item,
-    pam_setcred, pam_start,
+    pam_get_item, pam_getenvlist, pam_handle_t, pam_message, pam_open_session, pam_putenv,
+    pam_response, pam_set_item, pam_setcred, pam_start,
 };
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -67,9 +67,28 @@ pub enum PamError {
     /// `pam_close_session` returned a non-success status.
     #[error("pam_close_session failed: status {0}")]
     CloseSession(c_int),
+    /// `pam_putenv` returned a non-success status (Amendment A1.2:
+    /// the StartSession env is pushed into the handle BEFORE
+    /// `pam_open_session` so pam_systemd/logind register correct env).
+    #[error("pam_putenv failed: status {0}")]
+    PutEnv(c_int),
+    /// `pam_getenvlist` returned NULL (libpam allocation failure).
+    /// A successful empty environment is a non-NULL array whose
+    /// first element is NULL — that is `Ok(vec![])`, not this error.
+    #[error("pam_getenvlist returned NULL")]
+    GetEnv,
     /// A string argument contained an interior NUL.
     #[error("argument contained NUL byte")]
     Nul(#[from] NulError),
+}
+
+/// Split a libpam `NAME=VALUE` entry (the `pam_getenvlist` form) into
+/// its pair. The name is everything up to the FIRST `=`; the value is
+/// the verbatim remainder (which may itself contain `=`). Returns
+/// `None` if there is no `=` (libpam never emits that — fail closed).
+fn split_env_pair(entry: &str) -> Option<(String, String)> {
+    let eq = entry.find('=')?;
+    Some((entry[..eq].to_owned(), entry[eq + 1..].to_owned()))
 }
 
 /// The conversation responder declined or failed for a prompt; the
@@ -408,6 +427,93 @@ impl<'c> Pam<'c> {
         } else {
             Err(PamError::SetCred(status))
         }
+    }
+
+    /// `pam_putenv` one `NAME=VALUE` entry into the handle's PAM
+    /// environment (Amendment A1.2). Called for each StartSession env
+    /// entry AFTER `set_cred_established` and STRICTLY BEFORE
+    /// `open_session`, so pam_systemd/logind register the session
+    /// against the correct environment (greetd `worker.rs` ordering).
+    ///
+    /// # Errors
+    /// [`PamError::Nul`] for an interior NUL; [`PamError::PutEnv`] on a
+    /// non-success libpam status.
+    pub fn putenv(&mut self, name_value: &str) -> Result<(), PamError> {
+        let cstr = CString::new(name_value)?;
+        #[expect(
+            unsafe_code,
+            reason = "FFI: pam_putenv copies the NAME=VALUE string; cstr \
+                      covers the call; handle owned by self."
+        )]
+        let status = unsafe { pam_putenv(self.handle, cstr.as_ptr()) };
+        if status == PAM_SUCCESS as c_int {
+            Ok(())
+        } else {
+            Err(PamError::PutEnv(status))
+        }
+    }
+
+    /// Read the handle's PAM environment via `pam_getenvlist`
+    /// (Amendment A1.3). This is the MERGE point: it returns the
+    /// StartSession env this process `putenv`'d UNION whatever
+    /// pam_env/pam_systemd/pam_mount added during
+    /// `setcred`/`open_session`. The caller allowlist-filters it for
+    /// the session leader's `execve` env — a blind "use the raw
+    /// StartSession env" would clobber the module-added vars, the
+    /// forbidden env analogue of a blind `initgroups`.
+    ///
+    /// libpam `malloc`s the array and each string; this frees both
+    /// (the documented application responsibility).
+    ///
+    /// # Errors
+    /// [`PamError::GetEnv`] if libpam returned NULL (allocation
+    /// failure). An empty environment is `Ok(vec![])`.
+    pub fn getenvlist(&self) -> Result<Vec<(String, String)>, PamError> {
+        #[expect(
+            unsafe_code,
+            reason = "FFI: pam_getenvlist; handle owned by self; returns a \
+                      libpam-malloc'd NULL-terminated char** the app owns."
+        )]
+        let list = unsafe { pam_getenvlist(self.handle) };
+        if list.is_null() {
+            return Err(PamError::GetEnv);
+        }
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        loop {
+            // SAFETY: `list` is a libpam-malloc'd NULL-terminated array
+            // of C strings; walk until the NULL sentinel, indexing
+            // in-bounds by construction.
+            #[expect(
+                unsafe_code,
+                reason = "walking libpam's NULL-terminated char** until the \
+                          sentinel; each entry NUL-terminated."
+            )]
+            let entry = unsafe { *list.add(i) };
+            if entry.is_null() {
+                break;
+            }
+            // SAFETY: non-NULL libpam-owned NUL-terminated C string.
+            #[expect(unsafe_code, reason = "libpam-owned NUL-terminated env string.")]
+            let s = unsafe { CStr::from_ptr(entry) }
+                .to_string_lossy()
+                .into_owned();
+            if let Some(pair) = split_env_pair(&s) {
+                out.push(pair);
+            }
+            // SAFETY: free the libpam-malloc'd string (app owns it).
+            #[expect(unsafe_code, reason = "free libpam-malloc'd env string (app-owned).")]
+            unsafe {
+                libc::free(entry.cast::<c_void>());
+            }
+            i += 1;
+        }
+        // SAFETY: free the libpam-malloc'd array itself (app owns it).
+        #[expect(unsafe_code, reason = "free libpam-malloc'd env array (app-owned).")]
+        unsafe {
+            libc::free(list.cast::<c_void>());
+        }
+        Ok(out)
     }
 
     /// Run `pam_open_session` on the SAME handle (Epic R1).
@@ -855,6 +961,29 @@ mod tests {
             libc::free(resp.cast::<c_void>());
         }
         peer_thread.join().unwrap();
+    }
+
+    #[test]
+    fn split_env_pair_splits_on_first_eq_only() {
+        // pam_getenvlist yields `NAME=VALUE`; the value may contain
+        // further `=` (e.g. base64, DBUS addresses). Name is up to the
+        // FIRST `=`, value is the verbatim remainder.
+        assert_eq!(
+            split_env_pair("PATH=/usr/bin:/bin"),
+            Some(("PATH".to_owned(), "/usr/bin:/bin".to_owned()))
+        );
+        assert_eq!(
+            split_env_pair("DBUS=unix:abstract=/tmp/x,guid=ab"),
+            Some(("DBUS".to_owned(), "unix:abstract=/tmp/x,guid=ab".to_owned()))
+        );
+        // Empty value is well-formed (VAR=).
+        assert_eq!(
+            split_env_pair("EMPTY="),
+            Some(("EMPTY".to_owned(), String::new()))
+        );
+        // No `=` at all: libpam never emits this; fail closed (None).
+        assert_eq!(split_env_pair("BOGUS"), None);
+        assert_eq!(split_env_pair(""), None);
     }
 
     #[test]
