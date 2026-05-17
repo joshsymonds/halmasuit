@@ -20,6 +20,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+use halmasuit_session_ipc::SessionOutcome;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::run_pam_auth;
@@ -70,10 +71,14 @@ pub enum WorkerOutcome {
         gid: u32,
     },
     /// Session phase (Epic R1): the session leader exited and
-    /// `pam_close_session` ran. `code` is the leader's exit/signal
-    /// status. Wire tag `worker_session_ended`.
+    /// `pam_close_session` ran. `outcome` preserves the leader's
+    /// `WaitStatus` crash-vs-clean distinction (Amendment A5.2 — GDM
+    /// `SESSION_EXITED`/`SESSION_DIED`; NOT collapsed to a bare code)
+    /// so the broker can relay a faithful
+    /// `BrokerToCompositor::SessionEnded`. Wire tag
+    /// `worker_session_ended`.
     #[serde(rename = "worker_session_ended")]
-    SessionEnded { code: i32 },
+    SessionEnded { outcome: SessionOutcome },
 }
 
 /// One datagram read by the broker parent from the worker channel.
@@ -706,7 +711,12 @@ mod tests {
             })
             .unwrap(),
         );
-        let ended = body(&encode(&WorkerOutcome::SessionEnded { code: 0 }).unwrap());
+        let ended = body(
+            &encode(&WorkerOutcome::SessionEnded {
+                outcome: SessionOutcome::Exited { code: 0 },
+            })
+            .unwrap(),
+        );
         assert!(
             opened.contains(r#""type":"worker_session_opened""#),
             "got {opened}"

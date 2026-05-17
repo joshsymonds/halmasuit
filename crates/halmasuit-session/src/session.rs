@@ -31,7 +31,7 @@
 //! ORDERING is asserted by construction + the VM gates.
 #![forbid(unsafe_code)]
 
-use halmasuit_session_ipc::CompositorToBroker;
+use halmasuit_session_ipc::{CompositorToBroker, SessionOutcome};
 use thiserror::Error;
 
 use crate::auth::{AuthError, run_auth_phase};
@@ -166,12 +166,17 @@ pub fn run_session(
     pam.close_session()?;
     pam.set_cred_deleted()?;
 
-    let code = match status {
-        nix::sys::wait::WaitStatus::Exited(_, c) => c,
-        nix::sys::wait::WaitStatus::Signaled(_, s, _) => 128 + s as i32,
-        _ => -1,
+    // Preserve the leader's crash-vs-clean distinction to the wire
+    // (Amendment A5.2). `handle.wait()` blocked until termination, so
+    // status is Exited/Signaled; `_` is unreachable-defensive.
+    let outcome = match status {
+        nix::sys::wait::WaitStatus::Exited(_, c) => SessionOutcome::Exited { code: c },
+        nix::sys::wait::WaitStatus::Signaled(_, s, _) => {
+            SessionOutcome::Signaled { signal: s as i32 }
+        }
+        _ => SessionOutcome::Exited { code: -1 },
     };
-    ch.send(&WorkerOutcome::SessionEnded { code })?;
+    ch.send(&WorkerOutcome::SessionEnded { outcome })?;
     Ok(())
     // `pam` drops here → pam_end. Handle closed LAST (R1).
 }

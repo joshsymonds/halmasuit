@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction, RegistrationToken};
-use halmasuit_session_ipc::{BrokerToCompositor, CompositorToBroker};
+use halmasuit_session_ipc::{BrokerToCompositor, CompositorToBroker, SessionOutcome};
 use thiserror::Error;
 
 use crate::slot::{AuthSlot, SlotError};
@@ -68,8 +68,10 @@ pub(crate) const fn should_idle_exit(has_active_conn: bool, idle_window_elapsed:
 /// How one accepted connection's lifecycle ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Disposition {
-    /// The session ran and the leader exited with this status code.
-    Completed { code: i32 },
+    /// The session ran; `outcome` is the leader's crash-vs-clean
+    /// `WaitStatus` (relayed to the greeter as
+    /// [`BrokerToCompositor::SessionEnded`], Amendment A5.2).
+    Completed { outcome: SessionOutcome },
     /// PAM rejected the attempt (no session opened); `reason` was
     /// relayed to the greeter as [`BrokerToCompositor::Failure`].
     AuthFailed { reason: String },
@@ -179,14 +181,21 @@ impl Relay {
                 self.phase = RelayPhase::AwaitGreeterStartSession;
                 Ok(RelayStep::Continue)
             }
-            // Session is live; nothing to relay — keep awaiting the end.
+            // Amendment A5: forward the session-lifecycle outcome to
+            // the greeter as a one-way BrokerToCompositor frame (the
+            // compositor never emits these). SessionOpened is the
+            // authorization key of the two-key flash-free swap; the
+            // visible swap is gated compositor-side on the first
+            // session-client frame (a later R3 step), not here.
             ParentMessage::Outcome(WorkerOutcome::SessionOpened { .. }) => {
+                compositor.send(&BrokerToCompositor::SessionOpened)?;
                 self.phase = RelayPhase::SessionRunning;
                 Ok(RelayStep::Continue)
             }
-            ParentMessage::Outcome(WorkerOutcome::SessionEnded { code }) => {
+            ParentMessage::Outcome(WorkerOutcome::SessionEnded { outcome }) => {
+                compositor.send(&BrokerToCompositor::SessionEnded { outcome })?;
                 let _ = slot.reap_current();
-                Ok(RelayStep::Finished(Disposition::Completed { code }))
+                Ok(RelayStep::Finished(Disposition::Completed { outcome }))
             }
             ParentMessage::Outcome(WorkerOutcome::Failure { reason }) => {
                 compositor.send(&BrokerToCompositor::Failure {
@@ -591,7 +600,9 @@ mod tests {
     use crate::slot::AuthSlot;
     use crate::transport::SeqpacketChannel;
     use crate::worker::{WorkerOutcome, spawn_worker};
-    use halmasuit_session_ipc::{BrokerToCompositor, CompositorToBroker, PromptStyle, Secret};
+    use halmasuit_session_ipc::{
+        BrokerToCompositor, CompositorToBroker, PromptStyle, Secret, SessionOutcome,
+    };
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
     use std::thread;
     use std::time::Duration;
@@ -641,7 +652,10 @@ mod tests {
                     gid: 1000,
                 })
                 .unwrap();
-                w.send(&WorkerOutcome::SessionEnded { code: 0 }).unwrap();
+                w.send(&WorkerOutcome::SessionEnded {
+                    outcome: SessionOutcome::Exited { code: 0 },
+                })
+                .unwrap();
             })
         })
         .unwrap();
@@ -678,10 +692,101 @@ mod tests {
                     env: vec![],
                 })
                 .unwrap();
+            // Amendment A5: the broker forwards the lifecycle frames
+            // one-way; the greeter (compositor) consumes them.
+            assert_eq!(
+                greeter.recv::<BrokerToCompositor>().unwrap(),
+                BrokerToCompositor::SessionOpened
+            );
+            assert_eq!(
+                greeter.recv::<BrokerToCompositor>().unwrap(),
+                BrokerToCompositor::SessionEnded {
+                    outcome: SessionOutcome::Exited { code: 0 },
+                }
+            );
         });
 
         let disp = relay(&mut slot, &broker_end).expect("relay ok");
-        assert_eq!(disp, Disposition::Completed { code: 0 });
+        assert_eq!(
+            disp,
+            Disposition::Completed {
+                outcome: SessionOutcome::Exited { code: 0 }
+            }
+        );
+        assert!(slot.current().is_none(), "slot reaped after SessionEnded");
+        gt.join().unwrap();
+    }
+
+    /// Amendment A5: the broker FORWARDS the session-lifecycle outcomes
+    /// to the greeter as one-way `BrokerToCompositor::SessionOpened` /
+    /// `SessionEnded{outcome}` frames (crash-vs-clean preserved). The
+    /// compositor is a pure sink — it never sends a lifecycle frame.
+    /// Scripted-worker socketpair (NOT a PAM mock — Epic R12).
+    #[test]
+    fn relay_emits_session_lifecycle_frames_to_greeter() {
+        let mut slot = AuthSlot::new(GREETER, 5, Duration::from_secs(10));
+        slot.create(GREETER, || {
+            spawn_worker(|w| {
+                w.send(&WorkerOutcome::AuthOk {
+                    username: "alice".into(),
+                    uid: 1000,
+                    gid: 1000,
+                })
+                .unwrap();
+                let spec: CompositorToBroker = w.recv().unwrap();
+                assert!(matches!(spec, CompositorToBroker::StartSession { .. }));
+                w.send(&WorkerOutcome::SessionOpened {
+                    username: "alice".into(),
+                    uid: 1000,
+                    gid: 1000,
+                })
+                .unwrap();
+                // Signalled exit → crash-vs-clean must survive to the
+                // wire frame (GDM SESSION_DIED; not collapsed).
+                w.send(&WorkerOutcome::SessionEnded {
+                    outcome: SessionOutcome::Signaled { signal: 9 },
+                })
+                .unwrap();
+            })
+        })
+        .unwrap();
+
+        let (greeter, broker_end) = pair();
+        let gt = thread::spawn(move || {
+            let s: BrokerToCompositor = greeter.recv().unwrap();
+            assert_eq!(
+                s,
+                BrokerToCompositor::Success {
+                    username: "alice".into(),
+                    uid: 1000,
+                    gid: 1000,
+                }
+            );
+            greeter
+                .send(&CompositorToBroker::StartSession {
+                    cmd: vec!["/bin/sh".into()],
+                    env: vec![],
+                })
+                .unwrap();
+            assert_eq!(
+                greeter.recv::<BrokerToCompositor>().unwrap(),
+                BrokerToCompositor::SessionOpened
+            );
+            assert_eq!(
+                greeter.recv::<BrokerToCompositor>().unwrap(),
+                BrokerToCompositor::SessionEnded {
+                    outcome: SessionOutcome::Signaled { signal: 9 },
+                }
+            );
+        });
+
+        let disp = relay(&mut slot, &broker_end).expect("relay ok");
+        assert_eq!(
+            disp,
+            Disposition::Completed {
+                outcome: SessionOutcome::Signaled { signal: 9 }
+            }
+        );
         assert!(slot.current().is_none(), "slot reaped after SessionEnded");
         gt.join().unwrap();
     }
@@ -827,7 +932,10 @@ mod tests {
                 .unwrap();
                 let r: CompositorToBroker = w.recv().unwrap();
                 assert!(matches!(r, CompositorToBroker::ConvResponse { .. }));
-                w.send(&WorkerOutcome::SessionEnded { code: 0 }).unwrap();
+                w.send(&WorkerOutcome::SessionEnded {
+                    outcome: SessionOutcome::Exited { code: 0 },
+                })
+                .unwrap();
             })
         })
         .unwrap();
@@ -841,6 +949,14 @@ mod tests {
                     response: Secret::new("pw".into()),
                 })
                 .unwrap();
+            // Amendment A5: drain the one-way SessionEnded frame so
+            // the broker's send completes (and validate it).
+            assert_eq!(
+                greeter.recv::<BrokerToCompositor>().unwrap(),
+                BrokerToCompositor::SessionEnded {
+                    outcome: SessionOutcome::Exited { code: 0 },
+                }
+            );
         });
 
         let mut r = Relay::new();
@@ -860,7 +976,9 @@ mod tests {
         // worker SessionEnded → terminal, reaped.
         assert_eq!(
             r.on_worker_readable(&mut slot, &broker_end).unwrap(),
-            RelayStep::Finished(Disposition::Completed { code: 0 })
+            RelayStep::Finished(Disposition::Completed {
+                outcome: SessionOutcome::Exited { code: 0 }
+            })
         );
         assert!(slot.current().is_none(), "reaped after SessionEnded");
         gt.join().unwrap();
