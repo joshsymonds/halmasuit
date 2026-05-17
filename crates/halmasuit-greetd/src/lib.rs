@@ -25,12 +25,21 @@
 //! > round completed with `PamStep::Success`. This is ARCHITECTURE.md
 //! > threat model row 2.
 //!
-//! PAM itself is abstracted as a trait ([`PamSession`]). The concrete
-//! implementation (pam-sys / pam-client / bindgen) lands in a follow-up
-//! task. I/O integration (socket binding, length-prefixed JSON codec,
-//! halmasuit event-loop hookup) is yet another task. This crate is
-//! pure logic; everything observable from outside is covered by unit
-//! + property tests.
+//! # Fully sans-IO (Amendment A7)
+//!
+//! This crate performs NO PAM call and NO socket I/O. It is the pure
+//! protocol brain. When a PAM round is required [`SessionState`] EMITS
+//! [`Action::Pam`] and SUSPENDS; the compositor episode loop — which
+//! owns both the greeter fd and the privileged broker fd as calloop
+//! sources — runs exactly one broker round-trip and RESUMES the state
+//! machine by feeding the resulting [`PamStep`] back via
+//! [`SessionState::on_pam_result`] / [`server::Connection::resume_pam`].
+//! libpam links in exactly one crate (`halmasuit-session`, the
+//! privileged broker); `halmasuit-greetd` links none and never blocks.
+//! This is the canonical sans-IO shape (h11 `NEED_DATA` /
+//! rustls `process_new_packets`); a synchronous `step()` that hides a
+//! send-then-blocking-recv is the named anti-pattern. Everything
+//! observable from outside is covered by unit + property tests.
 
 #![forbid(unsafe_code)]
 
@@ -113,33 +122,41 @@ pub enum AuthMessageType {
 
 /// Compositor-side state of an in-flight greetd session.
 ///
-/// Transitions are driven by [`SessionState::handle`]. The PAM-success
+/// Transitions are driven by [`SessionState::on_request`] (a greeter
+/// `Request`) and [`SessionState::on_pam_result`] (the broker's
+/// [`PamStep`], fed back after a suspended PAM round). The PAM-success
 /// invariant is enforced by match arms: `StartSession` is only accepted
-/// in [`SessionState::AuthSuccess`], which can only be reached via a
-/// PAM step that returned [`PamStep::Success`].
+/// in [`SessionState::AuthSuccess`], which is reachable only via an
+/// `on_pam_result` that returned [`PamStep::Success`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SessionState {
     /// No session in flight. Ready to accept `CreateSession`.
     #[default]
     Idle,
-    /// `CreateSession` received; PAM has issued a challenge that the
-    /// greeter must answer via `PostAuthMessageResponse`.
+    /// A PAM round has been emitted; the conversation is SUSPENDED
+    /// awaiting the broker's [`PamStep`] via [`Self::on_pam_result`].
+    /// Holds the client-supplied `CreateSession` name purely as the
+    /// in-flight label for a subsequent `Challenge` echo — NEVER the
+    /// spawn identity (that is PAM's resolved name from `Success`).
+    AuthPending { username: String },
+    /// PAM issued a challenge; the greeter must answer via
+    /// `PostAuthMessageResponse`.
     Authenticating { username: String },
     /// PAM completed successfully. `StartSession` is now valid. The
     /// `username`, uid, and gid all come from PAM's post-auth canonical
     /// name (`pam_get_user` → `pwent` lookup), NOT the pre-auth
     /// client-supplied `CreateSession` string. All three are handed to
-    /// `halmasuit-spawn` together so its `initgroups(3)` resolves the
-    /// same identity the uid/gid came from.
+    /// the broker together so its `initgroups(3)` resolves the same
+    /// identity the uid/gid came from.
     AuthSuccess {
         username: String,
         uid: u32,
         gid: u32,
     },
-    /// `StartSession` received; the I/O layer is responsible for
-    /// invoking `halmasuit-spawn` with these arguments. From the state
-    /// machine's perspective, no more wire requests are accepted in
-    /// this state — the session ends when the spawned child exits.
+    /// `StartSession` received; the I/O layer forwards the
+    /// [`server::SpawnRequest`] to the broker. From the state machine's
+    /// perspective, no more wire requests are accepted in this state —
+    /// the session ends when the spawned child exits.
     Spawning {
         username: String,
         uid: u32,
@@ -149,26 +166,18 @@ pub enum SessionState {
     },
 }
 
-/// One round of the PAM conversation.
+/// One round of the PAM conversation, fed back into the suspended state
+/// machine by the I/O layer after it completed a broker round-trip.
 ///
-/// The state machine drives PAM forward by calling [`PamSession::step`]
-/// after each greeter response; the concrete impl translates between
-/// greetd's text-based response model and `pam_authenticate`'s
-/// conversation callbacks.
-pub trait PamSession {
-    /// Drive PAM by one round.
-    ///
-    /// `response` is `None` for the initial step (right after
-    /// `CreateSession`) and `Some(text)` for subsequent rounds (in
-    /// response to `PostAuthMessageResponse`).
-    fn step(&mut self, response: Option<String>) -> PamStep;
-}
-
-/// Outcome of one [`PamSession::step`] call.
+/// `halmasuit-greetd` never produces a `PamStep` itself — it is the
+/// resume payload. The compositor's `BrokerRelay` (Amendment A6/A7)
+/// translates broker wire frames into `PamStep` and back; greetd stays
+/// ignorant of the broker wire format and of libpam.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PamStep {
     /// PAM wants the user to answer a challenge. The state machine
-    /// translates this into a `Response::AuthMessage` for the greeter.
+    /// translates this into a `Response::AuthMessage` for the greeter
+    /// and parks in [`SessionState::Authenticating`].
     Challenge {
         kind: AuthMessageType,
         prompt: String,
@@ -179,8 +188,8 @@ pub enum PamStep {
     /// `username` is PAM's canonical name (`pam_get_user` after the
     /// stack ran), NOT the client-supplied `CreateSession` string. It
     /// is the name the uid/gid were resolved from, so it is also the
-    /// name `initgroups(3)` must use in `halmasuit-spawn` — carrying
-    /// the pre-auth client string there instead would let a
+    /// name `initgroups(3)` must use in the broker — carrying the
+    /// pre-auth client string there instead would let a
     /// username-rewriting PAM stack pair one user's uid with another
     /// user's supplementary groups.
     Success {
@@ -192,6 +201,30 @@ pub enum PamStep {
     /// machine returns to [`SessionState::Idle`] after sending the
     /// error to the greeter.
     Failure { reason: String },
+}
+
+/// What the I/O layer must do in response to a greeter `Request`.
+///
+/// `halmasuit-greetd` is fully sans-IO (Amendment A7): it performs no
+/// PAM call and no socket I/O. When a PAM round is required it EMITS
+/// [`Action::Pam`] and SUSPENDS; the compositor episode loop (which
+/// owns both the greeter fd and the privileged broker fd) runs exactly
+/// one broker round-trip and feeds the resulting [`PamStep`] back via
+/// [`SessionState::on_pam_result`] / [`server::Connection::resume_pam`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Send this `Response` to the greeter. Non-terminal.
+    Reply(Response),
+    /// SUSPEND. Drive exactly one PAM round with `response` (`None` =
+    /// the initial round right after `CreateSession`; `Some` = the
+    /// answer to the last `Challenge`). Resume with the broker's
+    /// [`PamStep`].
+    Pam { response: Option<String> },
+    /// PAM completed and the greeter sent `StartSession`. The I/O layer
+    /// sends `Response::Success` to the greeter, forwards this as
+    /// `StartSession` to the broker, then closes the greeter
+    /// connection.
+    Spawn(server::SpawnRequest),
 }
 
 /// State-machine errors.
@@ -238,15 +271,18 @@ impl StateMachineError {
 }
 
 impl SessionState {
-    /// Apply a `Request` to the current state, calling PAM as needed.
+    /// Apply a greeter `Request` to the current state.
     ///
-    /// Returns the outbound `Response` (which the I/O layer serializes
-    /// and writes to the greeter socket) or a `StateMachineError`
-    /// (which the I/O layer translates via [`StateMachineError::to_response`]).
+    /// Returns an [`Action`] the I/O layer must carry out, or a
+    /// [`StateMachineError`] for a protocol violation (the I/O layer
+    /// translates that via [`StateMachineError::to_response`] and keeps
+    /// the connection open — the greeter may retry).
     ///
-    /// On `Ok(Response)`, `self` is mutated to the new state. On
-    /// `Err(...)`, `self` is **unchanged** — the protocol violation
-    /// doesn't advance the state machine.
+    /// On `Ok`, `self` is mutated to the new state. On `Err`, `self` is
+    /// **unchanged** — the violation does not advance the machine.
+    /// This call performs NO I/O and NO PAM work: a PAM round is
+    /// requested by returning [`Action::Pam`] and suspending in
+    /// [`SessionState::AuthPending`].
     #[allow(
         clippy::match_same_arms,
         reason = "match arms are organized by (state, request) — \
@@ -255,15 +291,12 @@ impl SessionState {
                   explicitly. Collapsing arms with `|` would obscure \
                   which transitions are forbidden in which states."
     )]
-    pub fn handle(
-        &mut self,
-        request: Request,
-        pam: &mut dyn PamSession,
-    ) -> Result<Response, StateMachineError> {
+    pub fn on_request(&mut self, request: Request) -> Result<Action, StateMachineError> {
         match (&*self, request) {
             // ── Idle ────────────────────────────────────────────────────
             (Self::Idle, Request::CreateSession { username }) => {
-                Ok(self.advance_pam(username, pam))
+                *self = Self::AuthPending { username };
+                Ok(Action::Pam { response: None })
             }
             (Self::Idle, Request::StartSession { .. }) => Err(StateMachineError::StartBeforeAuth),
             (Self::Idle, Request::PostAuthMessageResponse { .. }) => {
@@ -271,13 +304,33 @@ impl SessionState {
             }
             (Self::Idle, Request::CancelSession) => Err(StateMachineError::CancelWithoutSession),
 
+            // ── AuthPending ─────────────────────────────────────────────
+            // SUSPENDED awaiting on_pam_result. A well-behaved greeter
+            // sends nothing until it sees the next Response; Cancel is
+            // the one permitted abort.
+            (Self::AuthPending { .. }, Request::CancelSession) => {
+                *self = Self::Idle;
+                Ok(Action::Reply(Response::Success))
+            }
+            (Self::AuthPending { .. }, Request::CreateSession { .. }) => {
+                Err(StateMachineError::DoubleCreate)
+            }
+            (Self::AuthPending { .. }, Request::StartSession { .. }) => {
+                Err(StateMachineError::StartBeforeAuth)
+            }
+            (Self::AuthPending { .. }, Request::PostAuthMessageResponse { .. }) => {
+                Err(StateMachineError::ResponseWithoutPendingChallenge)
+            }
+
             // ── Authenticating ──────────────────────────────────────────
-            (Self::Authenticating { .. }, Request::PostAuthMessageResponse { response }) => {
-                Ok(self.advance_pam_with_response(response, pam))
+            (Self::Authenticating { username }, Request::PostAuthMessageResponse { response }) => {
+                let username = username.clone();
+                *self = Self::AuthPending { username };
+                Ok(Action::Pam { response })
             }
             (Self::Authenticating { .. }, Request::CancelSession) => {
                 *self = Self::Idle;
-                Ok(Response::Success)
+                Ok(Action::Reply(Response::Success))
             }
             (Self::Authenticating { .. }, Request::CreateSession { .. }) => {
                 Err(StateMachineError::DoubleCreate)
@@ -288,21 +341,25 @@ impl SessionState {
 
             // ── AuthSuccess ─────────────────────────────────────────────
             (Self::AuthSuccess { username, uid, gid }, Request::StartSession { cmd, env }) => {
-                let username = username.clone();
-                let uid = *uid;
-                let gid = *gid;
+                let spawn = server::SpawnRequest {
+                    username: username.clone(),
+                    uid: *uid,
+                    gid: *gid,
+                    cmd: cmd.clone(),
+                    env: env.clone(),
+                };
                 *self = Self::Spawning {
-                    username,
-                    uid,
-                    gid,
+                    username: spawn.username.clone(),
+                    uid: spawn.uid,
+                    gid: spawn.gid,
                     cmd,
                     env,
                 };
-                Ok(Response::Success)
+                Ok(Action::Spawn(spawn))
             }
             (Self::AuthSuccess { .. }, Request::CancelSession) => {
                 *self = Self::Idle;
-                Ok(Response::Success)
+                Ok(Action::Reply(Response::Success))
             }
             (Self::AuthSuccess { .. }, Request::CreateSession { .. }) => {
                 Err(StateMachineError::DoubleCreate)
@@ -321,82 +378,65 @@ impl SessionState {
         }
     }
 
-    fn advance_pam(&mut self, username: String, pam: &mut dyn PamSession) -> Response {
-        // No intermediate `*self = Authenticating { ... }` write here —
-        // `translate_pam_step` unconditionally overwrites `*self` in
-        // every arm (Challenge → Authenticating, Success → AuthSuccess,
-        // Failure → Idle). The previous intermediate write was dead.
-        translate_pam_step(self, pam.step(None), username)
-    }
-
-    fn advance_pam_with_response(
-        &mut self,
-        response: Option<String>,
-        pam: &mut dyn PamSession,
-    ) -> Response {
-        let Self::Authenticating { username } = self else {
-            unreachable!("advance_pam_with_response called outside Authenticating");
+    /// Resume the suspended conversation with the broker's PAM result.
+    ///
+    /// Only meaningful in [`SessionState::AuthPending`] — the
+    /// [`server::Connection`] layer guarantees that by tracking the
+    /// suspend. If called in any other state this is a driver-contract
+    /// violation; we fail closed with a generic protocol error rather
+    /// than panicking.
+    pub fn on_pam_result(&mut self, step: PamStep) -> Response {
+        let Self::AuthPending { username } = std::mem::take(self) else {
+            *self = Self::Idle;
+            return Response::Error {
+                error_type: ErrorType::Error,
+                description: "pam result fed while not awaiting a PAM round".into(),
+            };
         };
-        let username = username.clone();
-        translate_pam_step(self, pam.step(response), username)
-    }
-}
-
-/// Forwards `step` to the inner trait object so callers can pass a
-/// `Box<dyn PamSession + Send>` (or `&mut Box<...>`) where the state
-/// machine expects something that implements `PamSession`.
-impl PamSession for Box<dyn PamSession + Send> {
-    fn step(&mut self, response: Option<String>) -> PamStep {
-        (**self).step(response)
-    }
-}
-
-fn translate_pam_step(state: &mut SessionState, step: PamStep, username: String) -> Response {
-    match step {
-        PamStep::Challenge { kind, prompt } => {
-            *state = SessionState::Authenticating { username };
-            Response::AuthMessage {
-                auth_message_type: kind,
-                auth_message: prompt,
+        match step {
+            PamStep::Challenge { kind, prompt } => {
+                *self = Self::Authenticating { username };
+                Response::AuthMessage {
+                    auth_message_type: kind,
+                    auth_message: prompt,
+                }
             }
-        }
-        PamStep::Success {
-            username: resolved,
-            uid,
-            gid,
-        } => {
-            // Use PAM's canonical name, not the client-supplied
-            // `username` (which only feeds the in-flight
-            // `Authenticating` echo above). uid/gid were resolved from
-            // `resolved`; the supplementary-group lookup downstream in
-            // `halmasuit-spawn` must use the same name or it can pair
-            // one identity's uid with another's groups.
-            *state = SessionState::AuthSuccess {
+            PamStep::Success {
                 username: resolved,
                 uid,
                 gid,
-            };
-            Response::Success
-        }
-        PamStep::Failure { reason } => {
-            *state = SessionState::Idle;
-            // Cap the description length so a misbehaving PamSession
-            // implementation can't produce a reason longer than the
-            // wire-format MAX_MESSAGE_SIZE and silently wedge the
-            // greeter (encode would fail; the I/O layer would close
-            // the connection). 4 KiB is plenty for any reasonable
-            // PAM error message.
-            let description = truncate_description(reason);
-            Response::Error {
-                error_type: ErrorType::AuthError,
-                description,
+            } => {
+                // Use PAM's canonical name, not the client-supplied
+                // `username` (which only fed the in-flight
+                // `Authenticating` echo). uid/gid were resolved from
+                // `resolved`; the supplementary-group lookup downstream
+                // in the broker must use the same name or it can pair
+                // one identity's uid with another's groups.
+                *self = Self::AuthSuccess {
+                    username: resolved,
+                    uid,
+                    gid,
+                };
+                Response::Success
+            }
+            PamStep::Failure { reason } => {
+                *self = Self::Idle;
+                // Cap the description length so a misbehaving broker
+                // can't produce a reason longer than the wire-format
+                // MAX_MESSAGE_SIZE and silently wedge the greeter
+                // (encode would fail; the I/O layer would close the
+                // connection). 4 KiB is plenty for any PAM error.
+                Response::Error {
+                    error_type: ErrorType::AuthError,
+                    description: truncate_description(reason),
+                }
             }
         }
     }
 }
 
 /// Upper bound on `Response::Error::description` chosen well below
-/// [`MAX_MESSAGE_SIZE`] so a PamSession that produces a pathologically
+/// [`MAX_MESSAGE_SIZE`] so a broker that produces a pathologically
 /// long reason can't make a Response that fails to encode. Truncates
 /// at a UTF-8 char boundary to keep the resulting string valid.
 const MAX_ERROR_DESCRIPTION: usize = 4 * 1024;
@@ -426,11 +466,10 @@ fn truncate_description(mut reason: String) -> String {
 // that's little-endian in practice. Cross-architecture connections
 // aren't expected (greeter and daemon both run on the same host).
 //
-// These functions are pure — no I/O. The socket loop layer (next
-// task) reads bytes from a Unix socket, buffers them, and calls
-// `try_decode` in a loop until it returns `None` (not enough bytes
-// yet). On the write side it calls `encode` and hands the bytes to
-// the socket.
+// These functions are pure — no I/O. The socket loop layer reads bytes
+// from a Unix socket, buffers them, and calls `try_decode` in a loop
+// until it returns `None` (not enough bytes yet). On the write side it
+// calls `encode` and hands the bytes to the socket.
 
 /// Maximum permitted message body size (1 MiB). Rejected before we
 /// allocate a body buffer — defends against a malicious peer pushing
@@ -451,15 +490,6 @@ pub enum CodecError {
     /// type, or the encode side couldn't serialize the message.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-
-    /// The connection accepted more `CreateSession` builds over its
-    /// lifetime than the per-connection cap allows. libpam has no
-    /// cancellation point, so each accepted build spawns a detached
-    /// worker; a cancel/create loop would otherwise spawn unbounded
-    /// sequential workers. The caller closes the connection on this
-    /// error, exactly as for other [`CodecError`] variants.
-    #[error("session build limit {0} exceeded on this connection")]
-    SessionBuildLimitExceeded(u32),
 }
 
 /// Encode a `Request` or `Response` to wire bytes. The result is a
@@ -520,72 +550,47 @@ pub fn try_decode<T: serde::de::DeserializeOwned>(
     Ok(Some((msg, needed)))
 }
 
-/// Test-only helpers shared across this crate's tests modules. Both
-/// `mod tests` in lib.rs and `mod tests` in server.rs need a scripted
-/// PamSession; keeping the impl in one place prevents drift between
-/// them.
-#[cfg(test)]
-pub(crate) mod test_helpers {
-    use super::{PamSession, PamStep};
-    use std::collections::VecDeque;
-
-    /// PamSession that returns scripted [`PamStep`]s in order, then
-    /// `PamStep::Failure` once the script is exhausted.
-    pub struct ScriptedPam {
-        steps: VecDeque<PamStep>,
-    }
-
-    impl ScriptedPam {
-        pub fn new(steps: Vec<PamStep>) -> Self {
-            Self {
-                steps: steps.into(),
-            }
-        }
-        pub fn empty() -> Self {
-            Self {
-                steps: VecDeque::new(),
-            }
-        }
-    }
-
-    impl PamSession for ScriptedPam {
-        fn step(&mut self, _response: Option<String>) -> PamStep {
-            self.steps.pop_front().unwrap_or_else(|| PamStep::Failure {
-                reason: "scripted PAM exhausted".into(),
-            })
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::test_helpers::ScriptedPam;
     use super::*;
     use proptest::prelude::*;
+
+    // ── helpers ─────────────────────────────────────────────────────────
+
+    /// Drive `CreateSession` → suspended PAM round, asserting the
+    /// emitted action, and return the state ready for `on_pam_result`.
+    fn created(username: &str) -> SessionState {
+        let mut state = SessionState::default();
+        let action = state
+            .on_request(Request::CreateSession {
+                username: username.into(),
+            })
+            .unwrap();
+        assert_eq!(action, Action::Pam { response: None });
+        assert_eq!(
+            state,
+            SessionState::AuthPending {
+                username: username.into()
+            }
+        );
+        state
+    }
 
     // ── happy-path single-round ─────────────────────────────────────────
 
     #[test]
     fn create_then_immediate_success() {
-        let mut state = SessionState::default();
         // PAM canonicalizes "alice" → "alice.canonical" (a
         // username-rewriting stack, e.g. pam_username/pam_mapfile).
         // AuthSuccess must carry PAM's resolved name, NOT the
-        // client-supplied CreateSession string — that name is what
-        // halmasuit-spawn hands to initgroups(3). (F1 regression.)
-        let mut pam = ScriptedPam::new(vec![PamStep::Success {
+        // client-supplied CreateSession string — that name is what the
+        // broker hands to initgroups(3). (F1 regression.)
+        let mut state = created("alice");
+        let response = state.on_pam_result(PamStep::Success {
             username: "alice.canonical".into(),
             uid: 1000,
             gid: 1000,
-        }]);
-        let response = state
-            .handle(
-                Request::CreateSession {
-                    username: "alice".into(),
-                },
-                &mut pam,
-            )
-            .unwrap();
+        });
         assert_eq!(response, Response::Success);
         assert_eq!(
             state,
@@ -599,26 +604,11 @@ mod tests {
 
     #[test]
     fn create_challenge_response_success() {
-        let mut state = SessionState::default();
-        let mut pam = ScriptedPam::new(vec![
-            PamStep::Challenge {
-                kind: AuthMessageType::Secret,
-                prompt: "password:".into(),
-            },
-            PamStep::Success {
-                username: "alice".into(),
-                uid: 1000,
-                gid: 1000,
-            },
-        ]);
-        let r1 = state
-            .handle(
-                Request::CreateSession {
-                    username: "alice".into(),
-                },
-                &mut pam,
-            )
-            .unwrap();
+        let mut state = created("alice");
+        let r1 = state.on_pam_result(PamStep::Challenge {
+            kind: AuthMessageType::Secret,
+            prompt: "password:".into(),
+        });
         assert_eq!(
             r1,
             Response::AuthMessage {
@@ -626,32 +616,40 @@ mod tests {
                 auth_message: "password:".into(),
             }
         );
-        let r2 = state
-            .handle(
-                Request::PostAuthMessageResponse {
-                    response: Some("hunter2".into()),
-                },
-                &mut pam,
-            )
+        assert_eq!(
+            state,
+            SessionState::Authenticating {
+                username: "alice".into()
+            }
+        );
+
+        // greeter answers the challenge → another suspended PAM round.
+        let action = state
+            .on_request(Request::PostAuthMessageResponse {
+                response: Some("hunter2".into()),
+            })
             .unwrap();
+        assert_eq!(
+            action,
+            Action::Pam {
+                response: Some("hunter2".into())
+            }
+        );
+        let r2 = state.on_pam_result(PamStep::Success {
+            username: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+        });
         assert_eq!(r2, Response::Success);
         assert!(matches!(state, SessionState::AuthSuccess { .. }));
     }
 
     #[test]
     fn auth_failure_returns_to_idle() {
-        let mut state = SessionState::default();
-        let mut pam = ScriptedPam::new(vec![PamStep::Failure {
+        let mut state = created("alice");
+        let r = state.on_pam_result(PamStep::Failure {
             reason: "bad password".into(),
-        }]);
-        let r = state
-            .handle(
-                Request::CreateSession {
-                    username: "alice".into(),
-                },
-                &mut pam,
-            )
-            .unwrap();
+        });
         assert_eq!(
             r,
             Response::Error {
@@ -669,17 +667,22 @@ mod tests {
             uid: 1000,
             gid: 1000,
         };
-        let mut pam = ScriptedPam::empty();
-        let r = state
-            .handle(
-                Request::StartSession {
-                    cmd: vec!["niri".into()],
-                    env: vec!["XDG_SESSION_TYPE=wayland".into()],
-                },
-                &mut pam,
-            )
+        let action = state
+            .on_request(Request::StartSession {
+                cmd: vec!["niri".into()],
+                env: vec!["XDG_SESSION_TYPE=wayland".into()],
+            })
             .unwrap();
-        assert_eq!(r, Response::Success);
+        assert_eq!(
+            action,
+            Action::Spawn(server::SpawnRequest {
+                username: "alice".into(),
+                uid: 1000,
+                gid: 1000,
+                cmd: vec!["niri".into()],
+                env: vec!["XDG_SESSION_TYPE=wayland".into()],
+            })
+        );
         assert_eq!(
             state,
             SessionState::Spawning {
@@ -697,18 +700,34 @@ mod tests {
     #[test]
     fn start_session_in_idle_refused() {
         let mut state = SessionState::Idle;
-        let mut pam = ScriptedPam::empty();
         let err = state
-            .handle(
-                Request::StartSession {
-                    cmd: vec!["niri".into()],
-                    env: vec![],
-                },
-                &mut pam,
-            )
+            .on_request(Request::StartSession {
+                cmd: vec!["niri".into()],
+                env: vec![],
+            })
             .unwrap_err();
         assert_eq!(err, StateMachineError::StartBeforeAuth);
         assert_eq!(state, SessionState::Idle);
+    }
+
+    #[test]
+    fn start_session_in_auth_pending_refused() {
+        // A PAM round is in flight — StartSession must NOT slip past
+        // the row-2 gate just because the machine is mid-conversation.
+        let mut state = created("alice");
+        let err = state
+            .on_request(Request::StartSession {
+                cmd: vec!["niri".into()],
+                env: vec![],
+            })
+            .unwrap_err();
+        assert_eq!(err, StateMachineError::StartBeforeAuth);
+        assert_eq!(
+            state,
+            SessionState::AuthPending {
+                username: "alice".into()
+            }
+        );
     }
 
     #[test]
@@ -716,15 +735,11 @@ mod tests {
         let mut state = SessionState::Authenticating {
             username: "alice".into(),
         };
-        let mut pam = ScriptedPam::empty();
         let err = state
-            .handle(
-                Request::StartSession {
-                    cmd: vec!["niri".into()],
-                    env: vec![],
-                },
-                &mut pam,
-            )
+            .on_request(Request::StartSession {
+                cmd: vec!["niri".into()],
+                env: vec![],
+            })
             .unwrap_err();
         assert_eq!(err, StateMachineError::StartBeforeAuth);
     }
@@ -734,14 +749,10 @@ mod tests {
         let mut state = SessionState::Authenticating {
             username: "alice".into(),
         };
-        let mut pam = ScriptedPam::empty();
         let err = state
-            .handle(
-                Request::CreateSession {
-                    username: "bob".into(),
-                },
-                &mut pam,
-            )
+            .on_request(Request::CreateSession {
+                username: "bob".into(),
+            })
             .unwrap_err();
         assert_eq!(err, StateMachineError::DoubleCreate);
     }
@@ -749,14 +760,10 @@ mod tests {
     #[test]
     fn response_in_idle_refused() {
         let mut state = SessionState::Idle;
-        let mut pam = ScriptedPam::empty();
         let err = state
-            .handle(
-                Request::PostAuthMessageResponse {
-                    response: Some("hunter2".into()),
-                },
-                &mut pam,
-            )
+            .on_request(Request::PostAuthMessageResponse {
+                response: Some("hunter2".into()),
+            })
             .unwrap_err();
         assert_eq!(err, StateMachineError::ResponseWithoutPendingChallenge);
     }
@@ -764,9 +771,16 @@ mod tests {
     #[test]
     fn cancel_in_idle_refused() {
         let mut state = SessionState::Idle;
-        let mut pam = ScriptedPam::empty();
-        let err = state.handle(Request::CancelSession, &mut pam).unwrap_err();
+        let err = state.on_request(Request::CancelSession).unwrap_err();
         assert_eq!(err, StateMachineError::CancelWithoutSession);
+    }
+
+    #[test]
+    fn cancel_from_auth_pending_returns_to_idle() {
+        let mut state = created("alice");
+        let action = state.on_request(Request::CancelSession).unwrap();
+        assert_eq!(action, Action::Reply(Response::Success));
+        assert_eq!(state, SessionState::Idle);
     }
 
     #[test]
@@ -774,9 +788,8 @@ mod tests {
         let mut state = SessionState::Authenticating {
             username: "alice".into(),
         };
-        let mut pam = ScriptedPam::empty();
-        let r = state.handle(Request::CancelSession, &mut pam).unwrap();
-        assert_eq!(r, Response::Success);
+        let action = state.on_request(Request::CancelSession).unwrap();
+        assert_eq!(action, Action::Reply(Response::Success));
         assert_eq!(state, SessionState::Idle);
     }
 
@@ -787,9 +800,28 @@ mod tests {
             uid: 1000,
             gid: 1000,
         };
-        let mut pam = ScriptedPam::empty();
-        let r = state.handle(Request::CancelSession, &mut pam).unwrap();
-        assert_eq!(r, Response::Success);
+        let action = state.on_request(Request::CancelSession).unwrap();
+        assert_eq!(action, Action::Reply(Response::Success));
+        assert_eq!(state, SessionState::Idle);
+    }
+
+    #[test]
+    fn pam_result_outside_auth_pending_fails_closed() {
+        // Driver-contract violation: on_pam_result must only be called
+        // while suspended. It must NOT panic and must NOT advance auth.
+        let mut state = SessionState::Idle;
+        let r = state.on_pam_result(PamStep::Success {
+            username: "root".into(),
+            uid: 0,
+            gid: 0,
+        });
+        assert!(matches!(
+            r,
+            Response::Error {
+                error_type: ErrorType::Error,
+                ..
+            }
+        ));
         assert_eq!(state, SessionState::Idle);
     }
 
@@ -805,6 +837,31 @@ mod tests {
                 error_type: ErrorType::Error,
                 description: "start_session received before PAM success".into(),
             }
+        );
+    }
+
+    #[test]
+    fn on_pam_result_truncates_oversized_failure_reason() {
+        // A misbehaving broker could feed back an enormous reason
+        // string; on_pam_result caps it so the resulting Response::Error
+        // stays well below MAX_MESSAGE_SIZE and never fails to encode.
+        let mut state = created("alice");
+        let huge_reason: String = "z".repeat(MAX_MESSAGE_SIZE as usize);
+        let resp = state.on_pam_result(PamStep::Failure {
+            reason: huge_reason,
+        });
+        let Response::Error { description, .. } = resp else {
+            panic!("expected Error response");
+        };
+        assert!(
+            description.len() < MAX_MESSAGE_SIZE as usize,
+            "description {} exceeded MAX_MESSAGE_SIZE",
+            description.len()
+        );
+        assert!(
+            description.ends_with(" [truncated]"),
+            "expected truncation marker, got tail: {:?}",
+            &description[description.len().saturating_sub(20)..]
         );
     }
 
@@ -1084,38 +1141,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn translate_pam_step_truncates_oversized_failure_reason() {
-        // A misbehaving PamSession could return an enormous reason
-        // string; translate_pam_step caps it so the resulting
-        // Response::Error stays well below MAX_MESSAGE_SIZE and never
-        // fails to encode.
-        let mut state = SessionState::Authenticating {
-            username: "alice".into(),
-        };
-        let huge_reason: String = "z".repeat(MAX_MESSAGE_SIZE as usize);
-        let resp = translate_pam_step(
-            &mut state,
-            PamStep::Failure {
-                reason: huge_reason,
-            },
-            "alice".into(),
-        );
-        let Response::Error { description, .. } = resp else {
-            panic!("expected Error response");
-        };
-        assert!(
-            description.len() < MAX_MESSAGE_SIZE as usize,
-            "description {} exceeded MAX_MESSAGE_SIZE",
-            description.len()
-        );
-        assert!(
-            description.ends_with(" [truncated]"),
-            "expected truncation marker, got tail: {:?}",
-            &description[description.len().saturating_sub(20)..]
-        );
-    }
-
     // ── property tests ──────────────────────────────────────────────────
 
     fn arb_request() -> impl Strategy<Value = Request> {
@@ -1131,79 +1156,116 @@ mod tests {
         ]
     }
 
-    struct AlwaysSucceedPam;
-    impl PamSession for AlwaysSucceedPam {
-        fn step(&mut self, _response: Option<String>) -> PamStep {
-            PamStep::Success {
-                username: "resolved".into(),
-                uid: 1000,
-                gid: 1000,
-            }
-        }
-    }
-
-    struct EndlessChallengePam;
-    impl PamSession for EndlessChallengePam {
-        fn step(&mut self, _response: Option<String>) -> PamStep {
-            PamStep::Challenge {
-                kind: AuthMessageType::Secret,
-                prompt: "again:".into(),
-            }
+    /// Resolve an [`Action::Pam`] suspend by feeding a scripted
+    /// [`PamStep`] back, mirroring what the compositor episode loop
+    /// does after one broker round-trip. `pam` decides the result.
+    fn settle(state: &mut SessionState, action: &Action, pam: impl Fn() -> PamStep) {
+        if let Action::Pam { .. } = action {
+            let _ = state.on_pam_result(pam());
         }
     }
 
     proptest! {
-        /// The invariant: `StartSession` only succeeds from `AuthSuccess`.
+        /// The invariant: `StartSession` only succeeds from
+        /// `AuthSuccess`. PAM is scripted to always succeed (the most
+        /// permissive adversary for this property) and is fed back via
+        /// `on_pam_result`, exactly as the sans-IO driver would.
         #[test]
         fn start_session_requires_auth_success(
             sequence in prop::collection::vec(arb_request(), 0..20),
         ) {
             let mut state = SessionState::default();
-            let mut pam = AlwaysSucceedPam;
             for req in sequence {
                 let is_start = matches!(req, Request::StartSession { .. });
                 let pre_state = state.clone();
-                let result = state.handle(req, &mut pam);
-                if is_start && result.is_ok() {
+                let result = state.on_request(req);
+                if is_start && let Ok(Action::Spawn(_)) = result {
                     prop_assert!(
                         matches!(pre_state, SessionState::AuthSuccess { .. }),
-                        "start_session succeeded from pre-state {:?}", pre_state
+                        "start_session spawned from pre-state {:?}", pre_state
                     );
+                }
+                if let Ok(action) = &result {
+                    settle(&mut state, action, || PamStep::Success {
+                        username: "resolved".into(),
+                        uid: 1000,
+                        gid: 1000,
+                    });
                 }
             }
         }
 
-        /// Adversarial sequences must never panic the state machine.
+        /// Adversarial sequences must never panic the state machine,
+        /// with arbitrary PAM outcomes interleaved.
         #[test]
         fn garbage_sequences_do_not_panic(
             sequence in prop::collection::vec(arb_request(), 0..50),
+            fail_flags in prop::collection::vec(any::<bool>(), 50),
         ) {
             let mut state = SessionState::default();
-            let mut pam = AlwaysSucceedPam;
-            for req in sequence {
-                let _ = state.handle(req, &mut pam);
+            for (i, req) in sequence.into_iter().enumerate() {
+                if let Ok(action) = state.on_request(req) {
+                    settle(&mut state, &action, || {
+                        if fail_flags[i] {
+                            PamStep::Failure { reason: "no".into() }
+                        } else {
+                            PamStep::Challenge {
+                                kind: AuthMessageType::Secret,
+                                prompt: "again:".into(),
+                            }
+                        }
+                    });
+                }
             }
         }
 
-        /// Endless challenges keep state in Authenticating.
+        /// Endless challenges never reach AuthSuccess/Spawning: the
+        /// machine ping-pongs Authenticating ⇄ AuthPending forever and
+        /// `StartSession` can never be honored.
         #[test]
-        fn endless_challenges_stay_in_authenticating(
+        fn endless_challenges_never_authorize_spawn(
             responses in prop::collection::vec(prop::option::of(".*"), 1..10),
         ) {
             let mut state = SessionState::default();
-            let mut pam = EndlessChallengePam;
-            state.handle(
-                Request::CreateSession { username: "alice".into() },
-                &mut pam,
-            ).unwrap();
+            let a = state.on_request(Request::CreateSession {
+                username: "alice".into(),
+            }).unwrap();
+            prop_assert_eq!(a, Action::Pam { response: None });
+            state.on_pam_result(PamStep::Challenge {
+                kind: AuthMessageType::Secret,
+                prompt: "again:".into(),
+            });
+            prop_assert!(
+                matches!(state, SessionState::Authenticating { .. }),
+                "expected Authenticating after first challenge"
+            );
             for resp in responses {
-                state.handle(
+                let action = state.on_request(
                     Request::PostAuthMessageResponse { response: resp },
-                    &mut pam,
                 ).unwrap();
                 prop_assert!(
+                    matches!(action, Action::Pam { .. }),
+                    "answering a challenge must request another PAM round"
+                );
+                prop_assert!(
+                    matches!(state, SessionState::AuthPending { .. }),
+                    "must suspend in AuthPending awaiting the PAM result"
+                );
+                // A spawn attempt here is rejected — never authorized.
+                let mut probe = state.clone();
+                prop_assert_eq!(
+                    probe.on_request(Request::StartSession {
+                        cmd: vec![], env: vec![],
+                    }),
+                    Err(StateMachineError::StartBeforeAuth)
+                );
+                state.on_pam_result(PamStep::Challenge {
+                    kind: AuthMessageType::Secret,
+                    prompt: "again:".into(),
+                });
+                prop_assert!(
                     matches!(state, SessionState::Authenticating { .. }),
-                    "state should remain Authenticating, got {:?}", state
+                    "endless challenge keeps the machine in Authenticating"
                 );
             }
         }

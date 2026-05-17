@@ -7,23 +7,27 @@
 //!   authorize the connecting greeter. Removes the socket file on
 //!   drop so a restart can re-bind.
 //! - [`Connection`] — per-connection driver. Owns a buffered read
-//!   buffer, a [`SessionState`], and an optional in-flight
-//!   `Box<dyn PamSession + Send>` built on demand via a
-//!   [`PamSessionFactory`]. Feed bytes via [`Connection::process`];
-//!   it decodes complete messages, advances the state machine, and
-//!   returns reply bytes plus (on the terminal `Spawning` transition)
-//!   a [`SpawnRequest`] for halmasuit-spawn.
+//!   buffer and a [`SessionState`]. It is **fully sans-IO**
+//!   (Amendment A7): it never calls PAM and never touches the broker
+//!   socket. The compositor episode loop feeds it greeter bytes via
+//!   [`Connection::feed_greeter`]; when a PAM round is required the
+//!   call returns [`Demand::Pam`] and the connection SUSPENDS. The
+//!   episode loop runs one broker round-trip and RESUMES the
+//!   connection via [`Connection::resume_pam`]. Broker EOF is fed in
+//!   via [`Connection::broker_closed`] (fail-closed).
 //!
-//! Neither layer touches an event loop. The halmasuit binary wires
-//! these into calloop in a separate task.
+//! Neither layer touches an event loop. The compositor wires these
+//! into calloop, multiplexing the greeter fd and the privileged broker
+//! fd as two non-blocking sources (Amendment A7) so the render loop
+//! never blocks on a privileged-peer round-trip.
 
 use crate::{
-    CodecError, MAX_MESSAGE_SIZE, PamSession, Request, Response, SessionState, encode, try_decode,
+    Action, CodecError, MAX_MESSAGE_SIZE, PamStep, Request, Response, SessionState, encode,
+    try_decode,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use zeroize::Zeroizing;
 
 /// Hard cap on `Connection::read_buf` length. A full message body is
@@ -33,16 +37,9 @@ use zeroize::Zeroizing;
 /// or refused to complete — close the connection.
 const MAX_READ_BUF: usize = MAX_MESSAGE_SIZE as usize + 4;
 
-/// Per-connection cap on accepted `CreateSession` builds over the
-/// connection's lifetime. libpam has no cancellation point, so each
-/// accepted build spawns a detached worker thread that runs to its
-/// own completion; a cancel/create loop on one connection would
-/// otherwise spawn unbounded sequential workers (MAX_GREETD_CONNECTIONS
-/// caps concurrent connections, not builds-over-time). A real greeter
-/// builds once per connection plus the occasional post-auth-failure
-/// retry; 16 is far above any human retry count and far below a
-/// thread-bomb. Adjust only with a documented reason.
-const MAX_SESSION_BUILDS_PER_CONNECTION: u32 = 16;
+// greetd is sans-IO and owns no PAM session: it builds nothing and
+// rate-limits nothing. System-wide auth-churn bounding is the
+// privileged broker's `AuthSlot` concern (Epic R5/R10), not greetd's.
 
 // ── Peer credentials ────────────────────────────────────────────────────
 
@@ -256,22 +253,16 @@ fn peer_creds(stream: &UnixStream) -> std::io::Result<PeerCredentials> {
     })
 }
 
-// ── PamSessionFactory + Connection ──────────────────────────────────────
+// ── Connection ──────────────────────────────────────────────────────────
 
-/// Builds a fresh PAM session for each `CreateSession` request.
+/// Surfaced via [`Demand::Spawn`] when the state machine reaches
+/// `SessionState::Spawning`.
 ///
-/// Production: a factory closes over the PAM service name and
-/// returns a fresh `halmasuit_pam::PamThread`. Tests: a factory
-/// returns a scripted mock.
-pub trait PamSessionFactory: Send + Sync {
-    /// Build a new session for `username`. The returned object is
-    /// consumed by [`Connection`] for one auth round; if the greeter
-    /// cancels and creates again, a fresh session is built.
-    fn build(&self, username: &str) -> Box<dyn PamSession + Send>;
-}
-
-/// Once a session reaches `SessionState::Spawning`, the I/O layer
-/// hands this off to halmasuit-spawn (after closing the connection).
+/// The episode/IO layer (which owns the privileged broker channel —
+/// Amendment A6) forwards it to the broker as
+/// `CompositorToBroker::StartSession`; the broker forks-then-drops the
+/// session leader (Epic R7). greetd itself never spawns anything and
+/// never holds the broker socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnRequest {
     pub username: String,
@@ -281,74 +272,109 @@ pub struct SpawnRequest {
     pub env: Vec<String>,
 }
 
-/// Result of feeding bytes into [`Connection::process`].
-#[derive(Debug, Default)]
-pub struct ProcessOutput {
-    /// Bytes to write back to the peer (concatenated for all complete
-    /// messages parsed this call; empty if nothing parsed yet).
-    pub reply: Vec<u8>,
-    /// Populated when the state machine reached `Spawning` during
-    /// this call. The caller should write `reply`, close the
-    /// connection, and invoke halmasuit-spawn with these arguments.
-    pub spawn: Option<SpawnRequest>,
-    /// Caller should close the connection after writing `reply`.
-    /// Set on `Spawning` (auth complete) and on terminal codec
-    /// errors handled by the caller.
-    pub close: bool,
+/// What the I/O layer must do after feeding input into a
+/// [`Connection`]. The `reply` bytes in the accompanying [`Outcome`]
+/// are always written to the greeter first, regardless of the demand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Demand {
+    /// Nothing more is needed this turn. Keep reading the greeter fd;
+    /// no broker action is pending.
+    Continue,
+    /// SUSPENDED: a PAM round is required. The I/O layer must run
+    /// exactly one broker round-trip with this conversation `response`
+    /// (`None` for the initial round) and feed the resulting
+    /// [`PamStep`] back via [`Connection::resume_pam`]. Until then it
+    /// must NOT feed more greeter bytes — the greetd protocol is
+    /// strict request/response, so a well-behaved greeter sends
+    /// nothing while suspended.
+    Pam { response: Option<String> },
+    /// Terminal: PAM completed and the greeter asked to start the
+    /// session. Forward this as `StartSession` to the broker, then
+    /// close the greeter connection.
+    Spawn(SpawnRequest),
+    /// Terminal: close the connection after writing `reply`.
+    Close,
 }
 
-/// Per-connection driver.
+/// The result of feeding input into a [`Connection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    /// Bytes to write back to the greeter (concatenated for every
+    /// complete message processed this call; empty if none).
+    pub reply: Vec<u8>,
+    /// What the I/O layer must do next. See [`Demand`].
+    pub demand: Demand,
+}
+
+/// Per-connection driver. **Fully sans-IO** (Amendment A7).
 ///
 /// # Buffer bound
 ///
 /// `read_buf` is capped at [`MAX_READ_BUF`] (`MAX_MESSAGE_SIZE + 4`).
 /// If a peer pushes more than that without producing a decodable
-/// message, [`Self::process`] returns
+/// message, [`Self::feed_greeter`] returns
 /// [`CodecError::OversizedMessage`] and the caller should close the
-/// connection. The buffer's backing memory is also wrapped in
-/// [`Zeroizing`] so plaintext credentials are wiped when `Connection`
-/// drops (greetd `PostAuthMessageResponse` bodies carry passwords).
+/// connection. The buffer's backing memory is wrapped in [`Zeroizing`]
+/// so plaintext credentials are wiped when `Connection` drops (greetd
+/// `PostAuthMessageResponse` bodies carry passwords).
+///
+/// # Suspend/resume contract
+///
+/// After a call returns [`Demand::Pam`] the connection is SUSPENDED:
+/// the driver must run exactly one broker round-trip and call
+/// [`Self::resume_pam`] before feeding any more greeter bytes. Feeding
+/// greeter bytes while suspended is a driver/peer-contract violation
+/// and fails the connection closed.
 ///
 /// # Idle-timeout responsibility
 ///
-/// `Connection` has no internal timer. A peer can `connect()` and
-/// stop sending; the connection sits idle forever. The I/O layer
-/// (calloop integration in the halmasuit binary) MUST close
-/// connections that go silent mid-message — `halmasuit-greetd` does
-/// not impose any deadline of its own.
+/// `Connection` has no internal timer. A peer can `connect()` and stop
+/// sending; the connection sits idle forever. The I/O layer (calloop
+/// integration in the compositor) MUST close connections that go
+/// silent mid-message — `halmasuit-greetd` imposes no deadline.
 pub struct Connection {
     state: SessionState,
     // Zeroizing wipes the backing memory on drop, covering credential
     // residue in PostAuthMessageResponse bodies that haven't been
     // consumed yet (the consumed bytes are deserialized into the
-    // Request enum and move on to PamSession::step, which has its
-    // own Zeroizing on the receiving end).
+    // Request enum and relayed onward, where they meet the broker
+    // side's own Zeroizing).
     read_buf: Zeroizing<Vec<u8>>,
-    factory: Arc<dyn PamSessionFactory>,
-    current_session: Option<Box<dyn PamSession + Send>>,
-    /// Count of accepted (Idle) `CreateSession` builds over this
-    /// connection's lifetime. Bounded by
-    /// [`MAX_SESSION_BUILDS_PER_CONNECTION`]; see that constant for why.
-    session_builds: u32,
+    /// `true` between emitting [`Demand::Pam`] and the matching
+    /// [`Self::resume_pam`]. While set, no greeter bytes are processed.
+    awaiting_pam: bool,
+    /// Terminal latch. Once set every entry point returns
+    /// [`Demand::Close`] with no further state changes.
+    closed: bool,
+}
+
+impl Default for Connection {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Connection {
-    /// Build a fresh connection driver. No I/O is performed here;
-    /// the connection is `Idle` and ready to receive its first
+    /// Build a fresh connection driver. No I/O, no PAM session — the
+    /// connection is `Idle` and ready to receive its first
     /// `CreateSession`.
     #[must_use]
-    pub fn new(factory: Arc<dyn PamSessionFactory>) -> Self {
+    pub fn new() -> Self {
         Self {
             state: SessionState::default(),
             read_buf: Zeroizing::new(Vec::new()),
-            factory,
-            current_session: None,
-            session_builds: 0,
+            awaiting_pam: false,
+            closed: false,
         }
     }
 
     /// Append `new_bytes` to the read buffer and process every
-    /// complete message that's now decodable.
+    /// complete greeter message that's now decodable, advancing the
+    /// state machine with NO I/O.
+    ///
+    /// Returns the bytes to write back to the greeter plus a
+    /// [`Demand`] telling the I/O layer what to do next (suspend for a
+    /// PAM round, forward a spawn, close, or keep reading).
     ///
     /// # Errors
     ///
@@ -357,7 +383,28 @@ impl Connection {
     /// already; the explicit cap is defense-in-depth). Other
     /// [`CodecError`] variants on framing or JSON errors. The caller
     /// should close the connection on any error.
-    pub fn process(&mut self, new_bytes: &[u8]) -> Result<ProcessOutput, CodecError> {
+    pub fn feed_greeter(&mut self, new_bytes: &[u8]) -> Result<Outcome, CodecError> {
+        if self.closed {
+            return Ok(Outcome {
+                reply: Vec::new(),
+                demand: Demand::Close,
+            });
+        }
+        if self.awaiting_pam {
+            // A PAM round is in flight; the greeter must wait for the
+            // Response it will produce. The greetd protocol is strict
+            // request/response, so unsolicited bytes here mean a
+            // buggy/hostile greeter — fail closed.
+            self.closed = true;
+            let reply = encode(&Response::Error {
+                error_type: crate::ErrorType::Error,
+                description: "greeter sent data while a PAM round was in flight".into(),
+            })?;
+            return Ok(Outcome {
+                reply,
+                demand: Demand::Close,
+            });
+        }
         self.read_buf.extend_from_slice(new_bytes);
         if self.read_buf.len() > MAX_READ_BUF {
             return Err(CodecError::OversizedMessage(
@@ -365,117 +412,149 @@ impl Connection {
                 MAX_MESSAGE_SIZE,
             ));
         }
-        let mut out = ProcessOutput::default();
-        while let Some((req, consumed)) = try_decode::<Request>(&self.read_buf)? {
-            self.handle_request(req, &mut out)?;
-            self.read_buf.drain(..consumed);
-            if out.close {
-                break;
-            }
+        self.drive()
+    }
+
+    /// Resume a suspended connection with the broker's PAM result.
+    ///
+    /// Call this exactly once after a [`Demand::Pam`], with the
+    /// [`PamStep`] obtained from one broker round-trip. The state
+    /// machine resumes, the greeter sees the resulting `Response`, and
+    /// any greeter bytes that were already buffered are then drained.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError`] if encoding the resulting `Response` fails or a
+    /// buffered message can't be decoded. Calling this without an
+    /// outstanding PAM round fails the connection closed.
+    pub fn resume_pam(&mut self, step: PamStep) -> Result<Outcome, CodecError> {
+        if self.closed {
+            return Ok(Outcome {
+                reply: Vec::new(),
+                demand: Demand::Close,
+            });
         }
+        if !self.awaiting_pam {
+            self.closed = true;
+            let reply = encode(&Response::Error {
+                error_type: crate::ErrorType::Error,
+                description: "resume_pam called without an outstanding PAM round".into(),
+            })?;
+            return Ok(Outcome {
+                reply,
+                demand: Demand::Close,
+            });
+        }
+        self.awaiting_pam = false;
+        let resp = self.state.on_pam_result(step);
+        let mut reply = encode(&resp)?;
+        // Auth failure is NOT terminal for the connection: the state
+        // machine is back in Idle and a well-behaved greeter starts
+        // over with a fresh CreateSession on the same connection
+        // (greetd protocol). Success/AuthMessage are likewise
+        // non-terminal. So in every case continue draining whatever
+        // the greeter has already buffered.
+        let mut out = self.drive()?;
+        let mut all = std::mem::take(&mut reply);
+        all.extend(out.reply);
+        out.reply = all;
         Ok(out)
     }
 
-    fn handle_request(&mut self, req: Request, out: &mut ProcessOutput) -> Result<(), CodecError> {
-        // CreateSession (re)builds the per-session PamSession. Any
-        // earlier in-flight session is dropped — the state machine
-        // refuses double-create via DoubleCreate, but we still need
-        // the factory's output to give the state machine something
-        // to call step() on for the new username.
-        if let Request::CreateSession { username } = &req {
-            // Only rebuild when the state machine will actually accept
-            // CreateSession (i.e. when we're in Idle). In other states
-            // the state machine returns DoubleCreate without touching
-            // pam, so the current_session is preserved.
-            if matches!(self.state, SessionState::Idle) {
-                // libpam has no cancellation point: each accepted build
-                // spawns a detached worker. Cap builds-over-lifetime so
-                // a cancel/create loop can't thread-bomb the compositor.
-                // Returning the error drives the existing caller
-                // close+log path (same as any other CodecError).
-                if self.session_builds >= MAX_SESSION_BUILDS_PER_CONNECTION {
-                    return Err(CodecError::SessionBuildLimitExceeded(
-                        MAX_SESSION_BUILDS_PER_CONNECTION,
-                    ));
+    /// Feed in broker-side EOF / connection loss. Fail closed: the
+    /// privileged peer is SIGKILL-able by design (Epic R5 / Amendment
+    /// A7.4), so its disappearance is an ordinary source event, not a
+    /// crash. Tell the greeter auth failed and close. Infallible — a
+    /// fixed short `Response` always encodes.
+    pub fn broker_closed(&mut self) -> Outcome {
+        if self.closed {
+            return Outcome {
+                reply: Vec::new(),
+                demand: Demand::Close,
+            };
+        }
+        self.closed = true;
+        self.awaiting_pam = false;
+        let reply = if matches!(self.state, SessionState::Spawning { .. }) {
+            // Already past auth: the session leader is launched and the
+            // greeter conversation is over — nothing to tell it.
+            Vec::new()
+        } else {
+            self.state = SessionState::Idle;
+            encode(&Response::Error {
+                error_type: crate::ErrorType::AuthError,
+                description: "broker connection closed".into(),
+            })
+            .unwrap_or_default()
+        };
+        Outcome {
+            reply,
+            demand: Demand::Close,
+        }
+    }
+
+    /// Decode and apply buffered greeter requests until the buffer is
+    /// exhausted or the connection suspends/terminates. No I/O.
+    fn drive(&mut self) -> Result<Outcome, CodecError> {
+        let mut reply = Vec::new();
+        loop {
+            if self.closed {
+                return Ok(Outcome {
+                    reply,
+                    demand: Demand::Close,
+                });
+            }
+            let Some((req, consumed)) = try_decode::<Request>(&self.read_buf)? else {
+                return Ok(Outcome {
+                    reply,
+                    demand: Demand::Continue,
+                });
+            };
+            match self.state.on_request(req) {
+                Ok(Action::Reply(r)) => {
+                    append_encoded(&r, &mut reply)?;
+                    self.read_buf.drain(..consumed);
                 }
-                self.session_builds += 1;
-                self.current_session = Some(self.factory.build(username));
+                Ok(Action::Pam { response }) => {
+                    self.read_buf.drain(..consumed);
+                    self.awaiting_pam = true;
+                    return Ok(Outcome {
+                        reply,
+                        demand: Demand::Pam { response },
+                    });
+                }
+                Ok(Action::Spawn(spawn)) => {
+                    // greetd acks StartSession before the leader runs.
+                    append_encoded(&Response::Success, &mut reply)?;
+                    self.read_buf.drain(..consumed);
+                    self.closed = true;
+                    return Ok(Outcome {
+                        reply,
+                        demand: Demand::Spawn(spawn),
+                    });
+                }
+                Err(sm_err) => {
+                    // Protocol violation: surface as a wire error but
+                    // keep the connection open (the greeter may retry).
+                    append_encoded(&sm_err.to_response(), &mut reply)?;
+                    self.read_buf.drain(..consumed);
+                }
             }
         }
-
-        // We need *some* PamSession to satisfy the state machine's
-        // signature even though several (state, request) pairs return
-        // an error without invoking it. Use a tiny NullPam for those
-        // cases; the state machine guarantees it's never called.
-        let response = match self.current_session.as_mut() {
-            Some(session) => self.state.handle(req, session.as_mut()),
-            None => self.state.handle(req, &mut NullPam),
-        };
-
-        match response {
-            Ok(resp) => append_encoded(&resp, out)?,
-            Err(sm_err) => append_encoded(&sm_err.to_response(), out)?,
-        }
-
-        // After handling, inspect the state. Spawning is terminal for
-        // this connection: surface the spawn parameters, drop any
-        // PAM session, close.
-        if let SessionState::Spawning {
-            username,
-            uid,
-            gid,
-            cmd,
-            env,
-        } = &self.state
-        {
-            out.spawn = Some(SpawnRequest {
-                username: username.clone(),
-                uid: *uid,
-                gid: *gid,
-                cmd: cmd.clone(),
-                env: env.clone(),
-            });
-            self.current_session = None;
-            out.close = true;
-        } else if matches!(self.state, SessionState::Idle) {
-            // CancelSession or auth-failure dropped us back to Idle —
-            // discard the now-finished PAM session.
-            self.current_session = None;
-        }
-        Ok(())
     }
 }
 
-fn append_encoded(resp: &Response, out: &mut ProcessOutput) -> Result<(), CodecError> {
+fn append_encoded(resp: &Response, reply: &mut Vec<u8>) -> Result<(), CodecError> {
     // PamStep::Failure's reason has already been truncated by
-    // translate_pam_step to keep Response::Error::description below
+    // on_pam_result to keep Response::Error::description below
     // MAX_MESSAGE_SIZE, so OversizedMessage shouldn't fire here. If
     // serde_json fails (it can't for our type — no non-string Map
     // keys), or a future change introduces a path that could produce
     // an oversize Response, we propagate the error so the I/O layer
     // closes the connection rather than silently dropping the reply.
     let bytes = encode(resp)?;
-    out.reply.extend(bytes);
+    reply.extend(bytes);
     Ok(())
-}
-
-// ── NullPam ─────────────────────────────────────────────────────────────
-//
-// Placeholder PAM session used when the state machine refuses a
-// request before it would call step(). The state machine's
-// (Idle, StartSession) → StartBeforeAuth path, for example, never
-// touches pam — so passing this NullPam is safe. If it ever IS
-// called the state machine has a bug; we return Failure rather than
-// panic to keep the protocol responsive.
-
-struct NullPam;
-
-impl PamSession for NullPam {
-    fn step(&mut self, _response: Option<String>) -> crate::PamStep {
-        crate::PamStep::Failure {
-            reason: "no PAM session active (state machine bug)".into(),
-        }
-    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -483,11 +562,9 @@ impl PamSession for NullPam {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::ScriptedPam;
-    use crate::{AuthMessageType, ErrorType, PamStep};
+    use crate::{AuthMessageType, ErrorType};
     use std::io::{Read, Write};
     use std::os::unix::fs::FileTypeExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     // Listener tests ─────────────────────────────────────────────────────
@@ -530,36 +607,13 @@ mod tests {
     }
 
     // Connection tests ───────────────────────────────────────────────────
-
-    /// A test-only factory that hands out scripted PamSessions. Each
-    /// `build` pops the next script off the front of `scripts`;
-    /// `build_count` records how many sessions were handed out so
-    /// tests can assert exact build counts.
-    struct ScriptedFactory {
-        scripts: std::sync::Mutex<std::collections::VecDeque<Vec<PamStep>>>,
-        build_count: AtomicUsize,
-    }
-
-    impl ScriptedFactory {
-        fn new(scripts: Vec<Vec<PamStep>>) -> Self {
-            Self {
-                scripts: std::sync::Mutex::new(scripts.into()),
-                build_count: AtomicUsize::new(0),
-            }
-        }
-
-        fn builds(&self) -> usize {
-            self.build_count.load(Ordering::SeqCst)
-        }
-    }
-
-    impl PamSessionFactory for ScriptedFactory {
-        fn build(&self, _username: &str) -> Box<dyn PamSession + Send> {
-            self.build_count.fetch_add(1, Ordering::SeqCst);
-            let next = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
-            Box::new(ScriptedPam::new(next))
-        }
-    }
+    //
+    // Amendment A7: `Connection` is fully sans-IO. The PAM result is
+    // supplied directly as a `PamStep` (what the compositor's
+    // `BrokerRelay` would yield after one broker round-trip); there is
+    // no `PamSession` trait, no factory, no per-connection build cap
+    // (R10 — the broker's AuthSlot churn throttle bounds churn
+    // system-wide).
 
     fn drain_responses(bytes: &[u8]) -> Vec<Response> {
         let mut out = Vec::new();
@@ -572,57 +626,116 @@ mod tests {
     }
 
     #[test]
-    fn connection_happy_path_create_then_start() {
+    fn connection_happy_path_create_resume_start() {
         // The client requests "alice"; PAM canonicalizes to
-        // "alice.canonical". The SpawnRequest — and thus
-        // halmasuit-spawn's initgroups(3) — must carry PAM's resolved
-        // name end-to-end, not the pre-auth client string. (F1.)
-        let factory = Arc::new(ScriptedFactory::new(vec![vec![PamStep::Success {
-            username: "alice.canonical".into(),
-            uid: 1000,
-            gid: 1000,
-        }]]));
-        let mut conn = Connection::new(factory);
+        // "alice.canonical". The SpawnRequest — and thus the broker's
+        // initgroups(3) — must carry PAM's resolved name end-to-end,
+        // not the pre-auth client string. (F1.)
+        let mut conn = Connection::new();
 
-        // greeter → daemon: CreateSession
+        // greeter → daemon: CreateSession ⇒ suspend for a PAM round.
         let create = encode(&Request::CreateSession {
             username: "alice".into(),
         })
         .unwrap();
-        let out1 = conn.process(&create).expect("process create");
-        let r1 = drain_responses(&out1.reply);
-        assert_eq!(r1, vec![Response::Success]);
-        assert!(out1.spawn.is_none());
-        assert!(!out1.close);
+        let o1 = conn.feed_greeter(&create).expect("feed create");
+        assert!(o1.reply.is_empty(), "no reply until PAM resolves");
+        assert_eq!(o1.demand, Demand::Pam { response: None });
 
-        // greeter → daemon: StartSession
+        // broker round-trip resolves immediately with Success.
+        let o2 = conn
+            .resume_pam(PamStep::Success {
+                username: "alice.canonical".into(),
+                uid: 1000,
+                gid: 1000,
+            })
+            .expect("resume success");
+        assert_eq!(drain_responses(&o2.reply), vec![Response::Success]);
+        assert_eq!(o2.demand, Demand::Continue);
+
+        // greeter → daemon: StartSession ⇒ spawn + close.
         let start = encode(&Request::StartSession {
             cmd: vec!["niri".into()],
             env: vec!["XDG_SESSION_TYPE=wayland".into()],
         })
         .unwrap();
-        let out2 = conn.process(&start).expect("process start");
-        let r2 = drain_responses(&out2.reply);
-        assert_eq!(r2, vec![Response::Success]);
-        assert!(out2.close, "Spawning should set close=true");
-        let spawn = out2.spawn.expect("spawn populated");
-        assert_eq!(spawn.username, "alice.canonical");
-        assert_eq!(spawn.uid, 1000);
-        assert_eq!(spawn.gid, 1000);
-        assert_eq!(spawn.cmd, vec!["niri".to_string()]);
-        assert_eq!(spawn.env, vec!["XDG_SESSION_TYPE=wayland".to_string()]);
+        let o3 = conn.feed_greeter(&start).expect("feed start");
+        assert_eq!(drain_responses(&o3.reply), vec![Response::Success]);
+        match o3.demand {
+            Demand::Spawn(spawn) => {
+                assert_eq!(spawn.username, "alice.canonical");
+                assert_eq!(spawn.uid, 1000);
+                assert_eq!(spawn.gid, 1000);
+                assert_eq!(spawn.cmd, vec!["niri".to_string()]);
+                assert_eq!(spawn.env, vec!["XDG_SESSION_TYPE=wayland".to_string()]);
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+
+        // Terminal: any further feed is Close.
+        let o4 = conn.feed_greeter(&start).expect("post-spawn feed");
+        assert_eq!(o4.demand, Demand::Close);
+    }
+
+    #[test]
+    fn connection_drives_challenge_response_flow() {
+        let mut conn = Connection::new();
+
+        let create = encode(&Request::CreateSession {
+            username: "alice".into(),
+        })
+        .unwrap();
+        let o1 = conn.feed_greeter(&create).unwrap();
+        assert_eq!(o1.demand, Demand::Pam { response: None });
+
+        let o2 = conn
+            .resume_pam(PamStep::Challenge {
+                kind: AuthMessageType::Secret,
+                prompt: "password:".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            drain_responses(&o2.reply),
+            vec![Response::AuthMessage {
+                auth_message_type: AuthMessageType::Secret,
+                auth_message: "password:".into(),
+            }]
+        );
+        assert_eq!(o2.demand, Demand::Continue);
+
+        let pmr = encode(&Request::PostAuthMessageResponse {
+            response: Some("hunter2".into()),
+        })
+        .unwrap();
+        let o3 = conn.feed_greeter(&pmr).unwrap();
+        assert!(o3.reply.is_empty());
+        assert_eq!(
+            o3.demand,
+            Demand::Pam {
+                response: Some("hunter2".into())
+            }
+        );
+
+        let o4 = conn
+            .resume_pam(PamStep::Success {
+                username: "alice".into(),
+                uid: 1000,
+                gid: 1000,
+            })
+            .unwrap();
+        assert_eq!(drain_responses(&o4.reply), vec![Response::Success]);
+        assert_eq!(o4.demand, Demand::Continue);
     }
 
     #[test]
     fn connection_rejects_start_in_idle() {
-        let factory = Arc::new(ScriptedFactory::new(vec![]));
-        let mut conn = Connection::new(factory);
+        let mut conn = Connection::new();
         let start = encode(&Request::StartSession {
             cmd: vec!["niri".into()],
             env: vec![],
         })
         .unwrap();
-        let out = conn.process(&start).expect("process");
+        let out = conn.feed_greeter(&start).expect("feed");
         let resps = drain_responses(&out.reply);
         assert_eq!(resps.len(), 1);
         match &resps[0] {
@@ -635,75 +748,140 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
-        assert!(!out.close);
-        assert!(out.spawn.is_none());
+        // Protocol error keeps the connection open for a retry.
+        assert_eq!(out.demand, Demand::Continue);
     }
 
     #[test]
     fn connection_handles_partial_messages() {
-        // Feed CreateSession bytes one at a time. No reply until the
-        // last byte arrives; then a single Success.
-        let factory = Arc::new(ScriptedFactory::new(vec![vec![PamStep::Success {
-            username: "alice".into(),
-            uid: 1000,
-            gid: 1000,
-        }]]));
-        let mut conn = Connection::new(factory);
-
+        // Feed CreateSession bytes one at a time. No reply / no demand
+        // change until the last byte arrives; then suspend for PAM.
+        let mut conn = Connection::new();
         let full = encode(&Request::CreateSession {
             username: "alice".into(),
         })
         .unwrap();
-        let mut accumulated_reply = Vec::new();
         for byte in &full[..full.len() - 1] {
-            let out = conn.process(&[*byte]).expect("partial process");
-            accumulated_reply.extend(out.reply);
+            let out = conn.feed_greeter(&[*byte]).expect("partial feed");
+            assert!(out.reply.is_empty(), "no reply before last byte");
+            assert_eq!(out.demand, Demand::Continue);
         }
-        assert!(accumulated_reply.is_empty(), "no reply before last byte");
-
-        let out = conn.process(&[full[full.len() - 1]]).expect("final byte");
-        accumulated_reply.extend(out.reply);
-
-        let resps = drain_responses(&accumulated_reply);
-        assert_eq!(resps, vec![Response::Success]);
+        let out = conn
+            .feed_greeter(&[full[full.len() - 1]])
+            .expect("final byte");
+        assert!(out.reply.is_empty());
+        assert_eq!(out.demand, Demand::Pam { response: None });
     }
 
     #[test]
-    fn connection_drives_challenge_response_flow() {
-        let factory = Arc::new(ScriptedFactory::new(vec![vec![
-            PamStep::Challenge {
-                kind: AuthMessageType::Secret,
-                prompt: "password:".into(),
-            },
-            PamStep::Success {
-                username: "alice".into(),
-                uid: 1000,
-                gid: 1000,
-            },
-        ]]));
-        let mut conn = Connection::new(factory);
+    fn connection_rejects_oversized_read_buf() {
+        let mut conn = Connection::new();
+        // Push past MAX_READ_BUF without ever completing a message.
+        let oversize: Vec<u8> = vec![0; MAX_READ_BUF + 1];
+        let r = conn.feed_greeter(&oversize);
+        assert!(
+            matches!(r, Err(CodecError::OversizedMessage(_, _))),
+            "got: {r:?}"
+        );
+    }
 
+    #[test]
+    fn connection_broker_eof_fails_closed() {
+        // CreateSession suspends for PAM; the broker dies before it
+        // answers. greetd must fail the auth closed (Amendment A7.4).
+        let mut conn = Connection::new();
         let create = encode(&Request::CreateSession {
             username: "alice".into(),
         })
         .unwrap();
-        let out1 = conn.process(&create).unwrap();
-        let r1 = drain_responses(&out1.reply);
-        assert_eq!(
-            r1,
-            vec![Response::AuthMessage {
-                auth_message_type: AuthMessageType::Secret,
-                auth_message: "password:".into(),
-            }]
-        );
+        let o1 = conn.feed_greeter(&create).unwrap();
+        assert_eq!(o1.demand, Demand::Pam { response: None });
 
-        let pmr = encode(&Request::PostAuthMessageResponse {
-            response: Some("hunter2".into()),
+        let o2 = conn.broker_closed();
+        assert_eq!(o2.demand, Demand::Close);
+        match &drain_responses(&o2.reply)[..] {
+            [
+                Response::Error {
+                    error_type,
+                    description,
+                },
+            ] => {
+                assert!(matches!(error_type, ErrorType::AuthError));
+                assert!(description.contains("broker"));
+            }
+            other => panic!("expected one AuthError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connection_feed_while_awaiting_pam_fails_closed() {
+        // The greeter must wait for the Response a PAM round produces.
+        // Unsolicited bytes while suspended fail the connection closed.
+        let mut conn = Connection::new();
+        let create = encode(&Request::CreateSession {
+            username: "alice".into(),
         })
         .unwrap();
-        let out2 = conn.process(&pmr).unwrap();
-        let r2 = drain_responses(&out2.reply);
-        assert_eq!(r2, vec![Response::Success]);
+        assert_eq!(
+            conn.feed_greeter(&create).unwrap().demand,
+            Demand::Pam { response: None }
+        );
+        let out = conn.feed_greeter(&create).expect("second feed");
+        assert_eq!(out.demand, Demand::Close);
+        match &drain_responses(&out.reply)[..] {
+            [Response::Error { error_type, .. }] => {
+                assert!(matches!(error_type, ErrorType::Error));
+            }
+            other => panic!("expected one protocol Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connection_resume_without_outstanding_round_fails_closed() {
+        let mut conn = Connection::new();
+        let out = conn
+            .resume_pam(PamStep::Success {
+                username: "root".into(),
+                uid: 0,
+                gid: 0,
+            })
+            .expect("resume");
+        assert_eq!(out.demand, Demand::Close);
+        match &drain_responses(&out.reply)[..] {
+            [Response::Error { error_type, .. }] => {
+                assert!(matches!(error_type, ErrorType::Error));
+            }
+            other => panic!("expected one protocol Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connection_auth_failure_keeps_connection_open() {
+        // A failed PAM round returns an AuthError but does NOT close —
+        // the greeter may CreateSession again on the same connection.
+        let mut conn = Connection::new();
+        let create = encode(&Request::CreateSession {
+            username: "alice".into(),
+        })
+        .unwrap();
+        conn.feed_greeter(&create).unwrap();
+        let o = conn
+            .resume_pam(PamStep::Failure {
+                reason: "bad password".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            drain_responses(&o.reply),
+            vec![Response::Error {
+                error_type: ErrorType::AuthError,
+                description: "bad password".into(),
+            }]
+        );
+        assert_eq!(o.demand, Demand::Continue);
+
+        // Retry works: a fresh CreateSession suspends for PAM again.
+        let o2 = conn.feed_greeter(&create).unwrap();
+        assert_eq!(o2.demand, Demand::Pam { response: None });
     }
 
     // ── New tests covering review-improvement behaviors ─────────────────
@@ -780,152 +958,19 @@ mod tests {
     }
 
     #[test]
-    fn connection_factory_built_once_per_accepted_create() {
-        // First CreateSession in Idle → build called once.
-        // Second CreateSession in Authenticating → DoubleCreate, no rebuild.
-        let factory = Arc::new(ScriptedFactory::new(vec![vec![PamStep::Challenge {
-            kind: AuthMessageType::Secret,
-            prompt: "password:".into(),
-        }]]));
-        let mut conn = Connection::new(Arc::clone(&factory) as Arc<dyn PamSessionFactory>);
-
-        let create_alice = encode(&Request::CreateSession {
-            username: "alice".into(),
-        })
-        .unwrap();
-        conn.process(&create_alice).unwrap();
-        assert_eq!(factory.builds(), 1, "build should fire on Idle→Auth");
-
-        let create_bob = encode(&Request::CreateSession {
-            username: "bob".into(),
-        })
-        .unwrap();
-        let _ = conn.process(&create_bob).unwrap();
-        assert_eq!(
-            factory.builds(),
-            1,
-            "build must NOT fire on second CreateSession (DoubleCreate)"
-        );
-    }
-
-    // R6 port: libpam has no cancellation point, so each Idle
-    // CreateSession spawns a detached worker. A cancel/create loop on
-    // one connection must not spawn unbounded sequential workers — the
-    // per-connection build counter caps it and terminates the connection.
-    fn challenge_script() -> Vec<PamStep> {
-        vec![PamStep::Challenge {
-            kind: AuthMessageType::Secret,
-            prompt: "password:".into(),
-        }]
-    }
-
-    #[test]
-    fn connection_allows_session_builds_up_to_cap() {
-        let scripts = vec![challenge_script(); MAX_SESSION_BUILDS_PER_CONNECTION as usize];
-        let factory = Arc::new(ScriptedFactory::new(scripts));
-        let mut conn = Connection::new(Arc::clone(&factory) as Arc<dyn PamSessionFactory>);
-        let create = encode(&Request::CreateSession {
-            username: "alice".into(),
-        })
-        .unwrap();
-        let cancel = encode(&Request::CancelSession).unwrap();
-        for _ in 0..MAX_SESSION_BUILDS_PER_CONNECTION {
-            conn.process(&create).expect("create within cap");
-            conn.process(&cancel).expect("cancel back to Idle");
-        }
-        assert_eq!(
-            factory.builds(),
-            MAX_SESSION_BUILDS_PER_CONNECTION as usize,
-            "exactly cap builds, all accepted"
-        );
-    }
-
-    #[test]
-    fn connection_rejects_session_build_over_cap() {
-        let scripts = vec![challenge_script(); MAX_SESSION_BUILDS_PER_CONNECTION as usize + 1];
-        let factory = Arc::new(ScriptedFactory::new(scripts));
-        let mut conn = Connection::new(Arc::clone(&factory) as Arc<dyn PamSessionFactory>);
-        let create = encode(&Request::CreateSession {
-            username: "alice".into(),
-        })
-        .unwrap();
-        let cancel = encode(&Request::CancelSession).unwrap();
-        for _ in 0..MAX_SESSION_BUILDS_PER_CONNECTION {
-            conn.process(&create).expect("create within cap");
-            conn.process(&cancel).expect("cancel back to Idle");
-        }
-        let over = conn.process(&create);
-        assert!(
-            matches!(
-                over,
-                Err(CodecError::SessionBuildLimitExceeded(
-                    MAX_SESSION_BUILDS_PER_CONNECTION
-                ))
-            ),
-            "got: {over:?}"
-        );
-        assert_eq!(
-            factory.builds(),
-            MAX_SESSION_BUILDS_PER_CONNECTION as usize,
-            "the over-limit build must never have happened"
-        );
-    }
-
-    #[test]
-    fn double_create_does_not_consume_cap_budget() {
-        let scripts = vec![challenge_script(); MAX_SESSION_BUILDS_PER_CONNECTION as usize];
-        let factory = Arc::new(ScriptedFactory::new(scripts));
-        let mut conn = Connection::new(Arc::clone(&factory) as Arc<dyn PamSessionFactory>);
-        let create = encode(&Request::CreateSession {
-            username: "alice".into(),
-        })
-        .unwrap();
-        let cancel = encode(&Request::CancelSession).unwrap();
-        conn.process(&create).expect("idle create");
-        conn.process(&create).expect("double create (no rebuild)");
-        conn.process(&cancel).expect("cancel back to Idle");
-        assert_eq!(factory.builds(), 1, "double-create must not build");
-        for _ in 0..MAX_SESSION_BUILDS_PER_CONNECTION - 1 {
-            conn.process(&create).expect("create still within cap");
-            conn.process(&cancel).expect("cancel back to Idle");
-        }
-        assert_eq!(
-            factory.builds(),
-            MAX_SESSION_BUILDS_PER_CONNECTION as usize,
-            "cap counts accepted Idle builds only, not DoubleCreate"
-        );
-    }
-
-    #[test]
-    fn connection_rejects_oversized_read_buf() {
-        let factory = Arc::new(ScriptedFactory::new(vec![]));
-        let mut conn = Connection::new(factory);
-        // Push past MAX_READ_BUF without ever completing a message.
-        // The length-prefix check in try_decode will reject the
-        // pathological-length prefix; the explicit buf cap in
-        // Connection::process is the defense-in-depth layer.
-        let oversize: Vec<u8> = vec![0; MAX_READ_BUF + 1];
-        let r = conn.process(&oversize);
-        assert!(
-            matches!(r, Err(CodecError::OversizedMessage(_, _))),
-            "got: {r:?}"
-        );
-    }
-
-    #[test]
     fn append_encoded_propagates_oversized_response() {
-        let mut out = ProcessOutput::default();
+        let mut reply = Vec::new();
         let huge = "x".repeat(MAX_MESSAGE_SIZE as usize + 1);
         let resp = Response::Error {
             error_type: ErrorType::Error,
             description: huge,
         };
-        let r = append_encoded(&resp, &mut out);
+        let r = append_encoded(&resp, &mut reply);
         assert!(
             matches!(r, Err(CodecError::OversizedMessage(_, _))),
             "got: {r:?}"
         );
-        assert!(out.reply.is_empty(), "no bytes should have been appended");
+        assert!(reply.is_empty(), "no bytes should have been appended");
     }
 
     // Spot-check: a UnixStream pair can drive bytes both directions.
@@ -947,13 +992,12 @@ mod tests {
 
         let (mut server_side, _creds) = l.accept_with_creds().unwrap();
 
-        let factory: Arc<dyn PamSessionFactory> = Arc::new(ScriptedFactory::new(vec![]));
-        let mut conn = Connection::new(factory);
+        let mut conn = Connection::new();
 
         // Read what the client sent, feed into Connection.
         let mut buf = [0u8; 256];
         let n = server_side.read(&mut buf).unwrap();
-        let out = conn.process(&buf[..n]).unwrap();
+        let out = conn.feed_greeter(&buf[..n]).unwrap();
         server_side.write_all(&out.reply).unwrap();
 
         let echoed = client_thread.join().unwrap();
