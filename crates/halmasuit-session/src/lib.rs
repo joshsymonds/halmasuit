@@ -10,18 +10,28 @@
 //!   module-level `#![forbid(unsafe_code)]` (all syscalls via `nix`).
 //! - `conv` — pure libpam-conversation ↔ frame mapping; hard
 //!   module-level `#![forbid(unsafe_code)]`.
-//! - `pam_ffi` — the ONLY `unsafe` surface: the libpam FFI shim. Every
-//!   unsafe block carries `#[expect(unsafe_code, reason = "…")]`, so the
-//!   workspace `unsafe_code = "warn"` lint (denied under `clippy -D
-//!   warnings`) flags any stray or unjustified `unsafe` anywhere in the
-//!   crate — the same quarantine idiom as `halmasuit-pam`.
+//! - `responder` / `auth` — pure composition; hard module-level
+//!   `#![forbid(unsafe_code)]`.
+//! - `pam_ffi` — unsafe surface #1: the libpam FFI shim.
+//! - `worker` — unsafe surface #2: the ephemeral `fork`/pidfd auth
+//!   child (Epic R4).
+//!
+//! The TWO unsafe modules (`pam_ffi`, `worker`) carry NO module
+//! `#![forbid]`; every unsafe block in them has
+//! `#[expect(unsafe_code, reason = "…")]`, so the workspace
+//! `unsafe_code = "warn"` lint (denied under `clippy -D warnings`)
+//! flags any stray or unjustified `unsafe` anywhere in the crate —
+//! the same quarantine idiom as `halmasuit-pam`. Everything else
+//! stays hard-`forbid`.
 
 pub mod auth;
 pub mod conv;
 pub mod pam_ffi;
 pub mod responder;
 pub mod transport;
+pub mod worker;
 
 pub use auth::{AuthError, ResolvedIdentity, run_pam_auth};
 pub use responder::ChannelResponder;
 pub use transport::{SeqpacketChannel, TransportError, peer_uid};
+pub use worker::{WorkerHandle, WorkerOutcome, spawn_auth_worker};
