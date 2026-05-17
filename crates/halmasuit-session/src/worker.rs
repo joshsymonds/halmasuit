@@ -168,7 +168,7 @@ const RLIMIT_CPU_SECS: u64 = 30;
 /// # Errors
 ///
 /// Any errno from `socketpair`/`fork`/`pidfd_open`.
-fn spawn_worker<F>(child_main: F) -> io::Result<(WorkerHandle, SeqpacketChannel)>
+pub(crate) fn spawn_worker<F>(child_main: F) -> io::Result<(WorkerHandle, SeqpacketChannel)>
 where
     F: FnOnce(SeqpacketChannel),
 {
