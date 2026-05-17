@@ -14,6 +14,7 @@
 // (`linux-dmabuf-v1`, `presentation-time`, `ext-session-lock-v1`, …)
 // land later. See ARCHITECTURE.md.
 
+mod broker_relay;
 #[cfg(feature = "frame_audit")]
 mod dbus;
 mod drm;

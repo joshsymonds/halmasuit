@@ -126,7 +126,32 @@ pub enum CompositorToBroker {
     Cancel,
 }
 
+/// How a launched user session ended (Amendment A5.2).
+///
+/// Crash-vs-clean is preserved (the GDM `SESSION_EXITED` /
+/// `SESSION_DIED` distinction; deliberately NOT collapsed the way
+/// greetd collapses it) so the compositor can pick the right revert
+/// UX/policy. Carries NO pid: the compositor is never the leader's
+/// parent and never reaps or signals it (Epic R9 / Amendment A5.4) —
+/// the broker is the sole reaper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum SessionOutcome {
+    /// The session leader exited with this status code.
+    Exited { code: i32 },
+    /// The session leader was terminated by this signal number.
+    Signaled { signal: i32 },
+}
+
 /// `halmasuit-session` broker → compositor (relay).
+///
+/// The session-lifecycle variants ([`Self::SessionOpened`],
+/// [`Self::SessionEnded`]) are Amendment A5: they exist ONLY here,
+/// never in [`CompositorToBroker`]. Trust is strictly one-way —
+/// the privileged broker is the sole emitter; the unprivileged
+/// compositor is a pure sink and has no frame that asserts session
+/// lifecycle (structurally prevents a compromised greeter/client from
+/// forging a force-logout or a "session ready" post-login phish).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrokerToCompositor {
@@ -144,6 +169,21 @@ pub enum BrokerToCompositor {
     /// PAM rejected the attempt. `reason` is a human string for the
     /// greeter; it carries no identity.
     Failure { reason: String },
+    /// The broker forked the session leader and it has `execve`'d
+    /// (Amendment A5.2). This is the AUTHORIZATION half of the two-key
+    /// flash-free swap: it names the session as live, but the
+    /// compositor still gates the *visible* greeter→session swap on
+    /// its own observation of the session client's first non-empty
+    /// frame (A5.3 — swapping on this frame alone reintroduces the
+    /// flash). Carries no pid (A5.4).
+    SessionOpened,
+    /// The session leader ended; the broker — its parent and the sole
+    /// reaper — `waitpid`'d it before `pam_close_session` (Epic R7/R9,
+    /// Amendment A5.4/A5.5). `outcome` distinguishes clean exit vs
+    /// signal so the compositor can pick the revert UX. The compositor
+    /// reverts to the greeter on this OR on the session client's
+    /// Wayland disconnect, whichever is first.
+    SessionEnded { outcome: SessionOutcome },
 }
 
 /// Hard ceiling on a single framed message. Mirrors `halmasuit-greetd`'s
@@ -390,6 +430,8 @@ mod tests {
             "conv_prompt",
             "success",
             "failure",
+            "session_opened",
+            "session_ended",
             "worker_success",
             "worker_failure",
         ] {
@@ -401,6 +443,75 @@ mod tests {
             assert!(
                 matches!(as_c2b, Err(CodecError::Json(_))),
                 "tag {tag:?} must not decode as CompositorToBroker, got {as_c2b:?}"
+            );
+        }
+    }
+
+    // ── Amendment A5: broker→compositor session-lifecycle frames ─────
+    //
+    // One-way: these live ONLY in BrokerToCompositor. The compositor is
+    // a pure lifecycle sink (A5.1) — there is no CompositorToBroker
+    // lifecycle variant and a session_* datagram must NOT decode as
+    // CompositorToBroker. Outcome distinguishes clean exit vs signal
+    // (A5.2, GDM SESSION_EXITED/SESSION_DIED); no pid is carried (A5.4
+    // — the compositor never reaps/​signals the leader).
+
+    #[test]
+    fn wire_format_session_opened() {
+        let json = r#"{"type":"session_opened"}"#;
+        let parsed: BrokerToCompositor = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, BrokerToCompositor::SessionOpened);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn wire_format_session_ended_exited() {
+        let json = r#"{"type":"session_ended","outcome":{"result":"exited","code":0}}"#;
+        let parsed: BrokerToCompositor = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed,
+            BrokerToCompositor::SessionEnded {
+                outcome: SessionOutcome::Exited { code: 0 },
+            }
+        );
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn wire_format_session_ended_signaled() {
+        let json = r#"{"type":"session_ended","outcome":{"result":"signaled","signal":9}}"#;
+        let parsed: BrokerToCompositor = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed,
+            BrokerToCompositor::SessionEnded {
+                outcome: SessionOutcome::Signaled { signal: 9 },
+            }
+        );
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn session_lifecycle_is_broker_to_compositor_only() {
+        // A5.1 one-way invariant: a session_opened / session_ended
+        // datagram MUST NOT decode as any CompositorToBroker variant
+        // (the compositor never *emits* lifecycle; the type only
+        // deserializes broker→compositor). This is the structural
+        // anti-forge guarantee — there is no frame the unprivileged
+        // compositor can send that asserts session lifecycle.
+        for frame in [
+            BrokerToCompositor::SessionOpened,
+            BrokerToCompositor::SessionEnded {
+                outcome: SessionOutcome::Exited { code: 0 },
+            },
+            BrokerToCompositor::SessionEnded {
+                outcome: SessionOutcome::Signaled { signal: 15 },
+            },
+        ] {
+            let bytes = encode(&frame).unwrap();
+            let as_c2b: Result<Option<(CompositorToBroker, usize)>, _> = try_decode(&bytes);
+            assert!(
+                matches!(as_c2b, Err(CodecError::Json(_))),
+                "lifecycle frame must not decode as CompositorToBroker, got {as_c2b:?}"
             );
         }
     }
@@ -445,6 +556,13 @@ mod tests {
             },
             BrokerToCompositor::Failure {
                 reason: "denied".into(),
+            },
+            BrokerToCompositor::SessionOpened,
+            BrokerToCompositor::SessionEnded {
+                outcome: SessionOutcome::Exited { code: 0 },
+            },
+            BrokerToCompositor::SessionEnded {
+                outcome: SessionOutcome::Signaled { signal: 9 },
             },
         ] {
             let bytes = encode(&msg).unwrap();
