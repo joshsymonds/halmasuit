@@ -205,6 +205,73 @@ OWASP MaxStartups/CWE-770/NIST-800-63B). Full detail in memory
    `halmasuit-spawn` stays microscopic + untouched unless deliberately
    scoped.
 
+### 0.8 Epic close-out scope decision (2026-05-17, user-directed) — R10/R14/R15 deferred to the G-layer epic
+
+The §0 epic was executed (Amendments A1 — greetd session-spec
+sequencing + pam_putenv/getenvlist-merge; A2 — single calloop
+event-loop broker with idle-exit, evict-old reachable). The
+privilege-separated `halmasuit-session` broker is **built, deployed
+(socket-activated host-ns unit), and VM-proven end-to-end**, including
+the flagship gate: REAL `pam_mount` decrypts+mounts a LUKS `$HOME`
+at `pam_open_session` using the auth-phase password recovered from the
+SAME `pam_handle_t` — the §0.2 one-handle claim, empirically validated
+against the very module whose silent cross-handle failure motivated
+the epic. Gates: `run-pam-auth`, `session-r5r6`, `session-onehandle`
+(all real PAM, no mocks).
+
+**Decision (Option 1):** the R14/R15/R10 close-gate DELETIONS —
+delete `crates/halmasuit-pam`, delete the setuid
+`crates/halmasuit-spawn`, remove `halmasuit-greetd`'s
+`MAX_SESSION_BUILDS_PER_CONNECTION` — are **DEFERRED to the successor
+G-layer / compositor-integration epic**, NOT done in this epic.
+
+Why: each close-gate is written "atomically with the broker becoming
+the **live** path." The broker becomes the live path only when the
+**compositor relays to it**, and that compositor→broker wiring is
+out of scope here (it belongs to §6 / the visual G-layer). Today
+`halmasuit-pam` + the setuid `halmasuit-spawn` are still the *only
+working* auth/session path for the compositor, `login-flash`, and the
+compositor VM tests. Deleting them now is NOT "atomic with the
+replacement landing" (no consumer of the broker exists yet) — it would
+simply break the compositor with nothing replacing it. The R10/R14/R15
+discipline ("correct + load-bearing until the replacement lands;
+deleted atomically, never before, never left behind after") therefore
+*requires* deferral until the consumer exists.
+
+**Plan / expectation carried forward (the successor epic MUST honor):**
+
+1. The successor (compositor→broker integration, the G-layer epic)
+   wires the unprivileged compositor to relay greeter conversation
+   frames to the `halmasuit-session` socket (the R3 relay; the broker
+   already speaks the frozen `halmasuit-session-ipc` contract). This
+   is the step that makes the broker the **live** path.
+2. ONLY THEN, atomically in that epic: delete `crates/halmasuit-pam`
+   (R14 close-gate — `cargo tree -p halmasuit` shows no `pam-sys`),
+   delete `crates/halmasuit-spawn` + its `security.wrappers` entry
+   (R15 close-gate — no world-exec setuid spawn helper anywhere),
+   and remove `halmasuit-greetd`'s `MAX_SESSION_BUILDS_PER_CONNECTION`
+   (R10 — its replacement, the `AuthSlot` churn throttle, already
+   shipped in this epic; the cap stays load-bearing for the still-live
+   in-compositor path until that path is deleted).
+3. The R14/R15/R10 close-gate ASSERTIONS (no two crates link libpam;
+   no setuid spawn inode; cap removed) move to the successor epic's
+   success criteria and are NOT preconditions for closing THIS epic.
+   This epic closes on: the broker built + the three real-PAM VM
+   gates green + `just check`/`just test-vm` green + R13 docs
+   describing the new privileged surface (broker + fork-then-drop
+   child; the setuid helper documented as *scheduled for deletion by
+   the successor epic*, not yet deleted) + `gambit:review`.
+4. R9's "extend the compositor's SIGCHLD reaper" clause is likewise
+   superseded by the broker (out-of-process, `AuthSlot`-owned
+   pidfd-kill+`waitpid` reap); R13 records this. The compositor-side
+   reaper goes away with `halmasuit-pam` in the successor epic.
+
+This is recorded in the epic Task as **Amendment A3** so the
+execution contract matches; epic #1's R14/R15 "CANNOT be marked
+complete while…" close-gates are amended to "deferred to the
+successor epic" by A3. Do NOT re-litigate Option 1 absent the
+compositor→broker integration being pulled into this epic's scope.
+
 ---
 
 ---
