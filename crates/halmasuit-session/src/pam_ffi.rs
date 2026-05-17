@@ -29,10 +29,10 @@ use std::{panic, ptr};
 
 use halmasuit_session_ipc::{BrokerToCompositor, Secret};
 use pam_sys::{
-    PAM_BUF_ERR, PAM_CONV_ERR, PAM_ESTABLISH_CRED, PAM_RUSER, PAM_SUCCESS, PAM_TTY, PAM_USER,
-    pam_acct_mgmt, pam_authenticate, pam_close_session, pam_conv, pam_end, pam_get_item,
-    pam_handle_t, pam_message, pam_open_session, pam_response, pam_set_item, pam_setcred,
-    pam_start,
+    PAM_BUF_ERR, PAM_CONV_ERR, PAM_DELETE_CRED, PAM_ESTABLISH_CRED, PAM_RUSER, PAM_SUCCESS,
+    PAM_TTY, PAM_USER, pam_acct_mgmt, pam_authenticate, pam_close_session, pam_conv, pam_end,
+    pam_get_item, pam_handle_t, pam_message, pam_open_session, pam_response, pam_set_item,
+    pam_setcred, pam_start,
 };
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -453,6 +453,27 @@ impl<'c> Pam<'c> {
             Ok(())
         } else {
             Err(PamError::CloseSession(status))
+        }
+    }
+
+    /// Run `pam_setcred(PAM_DELETE_CRED)` on the SAME handle at logout
+    /// (Epic R7): AFTER `close_session`, BEFORE `Drop`'s `pam_end`.
+    /// Tears down the credentials `set_cred_established` set (keyring,
+    /// supplementary groups). Reuses [`PamError::SetCred`].
+    ///
+    /// # Errors
+    /// [`PamError::SetCred`] on a non-success status.
+    pub fn set_cred_deleted(&mut self) -> Result<(), PamError> {
+        #[expect(
+            unsafe_code,
+            reason = "FFI: pam_setcred(PAM_DELETE_CRED); handle owned by self."
+        )]
+        let status = unsafe { pam_setcred(self.handle, PAM_DELETE_CRED as c_int) };
+        self.last_status = status;
+        if status == PAM_SUCCESS as c_int {
+            Ok(())
+        } else {
+            Err(PamError::SetCred(status))
         }
     }
 

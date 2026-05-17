@@ -209,6 +209,15 @@ fn run_via_fork(service: &str, username: &str, password: &str) {
                 eprintln!("ERR {reason}");
                 break 1;
             }
+            Ok(ParentMessage::Outcome(
+                o @ (WorkerOutcome::SessionOpened { .. } | WorkerOutcome::SessionEnded { .. }),
+            )) => {
+                // spawn_auth_worker is auth-only; a session-phase
+                // outcome here is a protocol violation, not success.
+                eprintln!("ERR auth-only worker emitted session-phase outcome: {o:?}");
+                let _ = handle.kill();
+                break 1;
+            }
             Err(_) => {
                 eprintln!("ERR worker channel closed before an outcome");
                 break 1;

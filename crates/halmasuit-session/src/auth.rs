@@ -88,6 +88,21 @@ pub fn run_pam_auth(
         responder: &mut responder,
     };
     let mut pam = pam_ffi::Pam::start(service, username, &mut ctx)?;
+    run_auth_phase(&mut pam)
+    // `pam` drops here → pam_end (auth-only path; the session
+    // lifecycle keeps the SAME handle alive — see `crate::session`).
+}
+
+/// The auth phase on an already-`start`ed handle (Epic R1): the steps
+/// that BOTH the auth-only path ([`run_pam_auth`]) and the full
+/// session lifecycle (`crate::session::run_session`) share, so the
+/// one-handle invariant has a single implementation.
+///
+/// # Errors
+///
+/// [`AuthError::Pam`] on any libpam step; [`AuthError::AccountLookup`]
+/// if the PAM-resolved name has no pwent.
+pub(crate) fn run_auth_phase(pam: &mut pam_ffi::Pam<'_>) -> Result<ResolvedIdentity, AuthError> {
     pam.authenticate()?;
     pam.acct_mgmt()?;
     let resolved = pam.get_user()?;

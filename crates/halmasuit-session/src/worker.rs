@@ -46,6 +46,20 @@ pub enum WorkerOutcome {
     /// Wire tag `worker_failure` — see [`WorkerOutcome::Success`].
     #[serde(rename = "worker_failure")]
     Failure { reason: String },
+    /// Session phase (Epic R1): `pam_open_session` succeeded and the
+    /// session leader is running. Wire tag `worker_session_opened` —
+    /// disjoint from conv frames and the auth-phase tags.
+    #[serde(rename = "worker_session_opened")]
+    SessionOpened {
+        username: String,
+        uid: u32,
+        gid: u32,
+    },
+    /// Session phase (Epic R1): the session leader exited and
+    /// `pam_close_session` ran. `code` is the leader's exit/signal
+    /// status. Wire tag `worker_session_ended`.
+    #[serde(rename = "worker_session_ended")]
+    SessionEnded { code: i32 },
 }
 
 /// One datagram read by the broker parent from the worker channel.
@@ -269,6 +283,37 @@ pub fn spawn_auth_worker(
             },
         };
         let _ = chan.send(&outcome);
+    })
+}
+
+/// Spawn the broker worker running the FULL one-handle lifecycle.
+///
+/// (Epic R1): `crate::session::run_session` in the disposable fork —
+/// auth → setcred → open_session → fork-not-exec the session leader →
+/// wait → close_session → pam_end. Distinct from
+/// [`spawn_auth_worker`] (auth-only; the existing `run-pam-auth` gate
+/// keeps using that). On any error the child reports
+/// [`WorkerOutcome::Failure`]; success emits `SessionOpened` then
+/// `SessionEnded`. Real one-handle auth→session is proven by the
+/// flagship pam_mount VM gate (epic headline).
+///
+/// # Errors
+///
+/// Any errno from the underlying `spawn_worker`.
+pub fn spawn_session_worker(
+    service: &str,
+    username: &str,
+    cmd: Vec<String>,
+    env: Vec<(String, String)>,
+) -> io::Result<(WorkerHandle, SeqpacketChannel)> {
+    let service = service.to_owned();
+    let username = username.to_owned();
+    spawn_worker(move |chan| {
+        if let Err(e) = crate::session::run_session(&chan, &service, &username, cmd, env) {
+            let _ = chan.send(&WorkerOutcome::Failure {
+                reason: e.to_string(),
+            });
+        }
     })
 }
 
@@ -582,6 +627,28 @@ mod tests {
         assert!(prompt.contains(r#""type":"conv_prompt""#));
         assert!(!prompt.contains("worker_success"));
         assert!(!prompt.contains("worker_failure"));
+
+        // Session-phase frames (Epic R1 lifecycle) keep the same
+        // disjoint-tag discipline so ParentMessage stays unambiguous.
+        let opened = body(
+            &encode(&WorkerOutcome::SessionOpened {
+                username: "u".into(),
+                uid: 1,
+                gid: 2,
+            })
+            .unwrap(),
+        );
+        let ended = body(&encode(&WorkerOutcome::SessionEnded { code: 0 }).unwrap());
+        assert!(
+            opened.contains(r#""type":"worker_session_opened""#),
+            "got {opened}"
+        );
+        assert!(
+            ended.contains(r#""type":"worker_session_ended""#),
+            "got {ended}"
+        );
+        assert!(!prompt.contains("worker_session_opened"));
+        assert!(!prompt.contains("worker_session_ended"));
     }
 
     #[test]
