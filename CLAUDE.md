@@ -39,23 +39,56 @@ Do not relax them without explicit user direction:
   wrapper inverts its exit code on purpose. Do not "fix" the failure by
   weakening the assertion, skipping the test, or making it conditional.
   An unexpected pass is a CI error, not a success.
-- **`halmasuit-spawn` must stay microscopic** (~80 lines target,
-  `#![forbid(unsafe_code)]`, statically linked, no env propagation
-  outside the explicit allowlist, no file I/O except opening
-  `XDG_RUNTIME_DIR`). Every change to this crate is a security-review
-  event — surface diffs prominently rather than burying them.
-- **UID floor in `halmasuit-spawn` is load-bearing.** Refuse any
-  `target_uid < UID_MIN` (typically 1000). This is what makes a
-  compromised halmasuit *not* a root compromise. Removing it turns the
-  privilege split into security theater. See ARCHITECTURE.md threat
-  model row 11.
+- **The privileged surface is the `halmasuit-session` broker.** It
+  owns ONE `pam_handle_t` for the whole lifecycle (auth → setcred →
+  open_session → … → close_session → pam_end), runs `pam_authenticate`
+  in an ephemeral SIGKILL-able `setrlimit`-bounded privileged fork,
+  and launches the session by forking once and dropping privileges in
+  a **non-setuid child** (it is already root — greetd/OpenSSH/GDM/su
+  shape). It is a single socket-activated unit with no standing root
+  when idle. `unsafe` is confined to its `pam_ffi`/`worker` modules;
+  every change to this crate's privileged boundary is a
+  security-review event — surface diffs prominently. See
+  ARCHITECTURE.md "Authentication and session lifecycle" and
+  `HANDOFF.md` §0.8.
+- **`halmasuit-spawn` + `halmasuit-pam` are the INTERIM in-compositor
+  path, scheduled for deletion by the successor (compositor→broker /
+  G-layer) epic** — atomically when the compositor relays to the
+  broker (the broker is built + VM-proven but not yet the *live*
+  compositor path; deleting them now would break the compositor with
+  no replacement). Until then they stay load-bearing: `halmasuit-spawn`
+  must stay microscopic (~80 lines, `#![forbid(unsafe_code)]`,
+  statically linked, env allowlist only, no file I/O except
+  `XDG_RUNTIME_DIR`); every change to it is a security-review event.
+  Do NOT delete them, the `security.wrappers` entry, or
+  `halmasuit-greetd`'s `MAX_SESSION_BUILDS_PER_CONNECTION` in this
+  epic; do NOT add any *new* setuid spawn path or second libpam
+  consumer (HANDOFF §0.8).
+- **UID floor is load-bearing — enforced by the broker (and the
+  interim `halmasuit-spawn`).** Refuse any `uid`/`gid < UID_MIN`
+  (typically 1000); reject `(uid_t)-1`/overflow. The broker
+  independently re-derives identity from PAM (`pam_get_user` → pwent)
+  and never trusts a compositor-asserted identity (`SO_PEERCRED`
+  authenticates the peer, never authorizes the action). This is what
+  makes a compromised halmasuit *not* a root compromise. Removing it
+  is security theater. See ARCHITECTURE.md threat model row 11.
+- **One `pam_handle_t`, never split, owner never `execve`s between
+  auth and session.** No two-handle / cross-process-handle design
+  (pam_mount/keyring/krb5 silently break — locked `$HOME`, no error).
+  No blind `initgroups`/env-replace in the session leader (clobbers
+  pam_group/pam_systemd/pam_mount/pam_env — must `getgrouplist`- and
+  `pam_getenvlist`-MERGE).
 - **No `start_session` path that bypasses PAM success.** The greetd
   state machine in `halmasuit-greetd` enforces this; never add a code
   path that side-steps it.
+- **No PAM in the compositor's address space.** libpam links in
+  exactly one crate (`halmasuit-session`); the compositor relays only
+  length-bounded conversation frames.
 - **No mocking PAM in VM / integration tests.** Real PAM, real users.
   Unit tests inside `halmasuit-greetd` may mock individual modules.
-- **No running halmasuit as root.** Compositor runs as the `compositor`
-  system user. Only `halmasuit-spawn` is privileged.
+- **No running the compositor as root.** halmasuit runs as the
+  `compositor` system user and holds no handle. The broker is the
+  privileged process; it idle-exits (no standing root daemon).
 - **No trusting Wayland client PIDs from message contents.** Always
   `SO_PEERCRED` on the socket.
 - **No credential material kept past PAM completion.** `zeroize`
@@ -153,5 +186,11 @@ inversion in place.
 - `tests/login-flash.nix` — the canonical v1 deliverable; reading it
   end-to-end is the fastest way to understand the project's testing
   posture.
-- `crates/halmasuit-spawn/src/main.rs` — the comment block at the top
-  is the spec for v2's setuid helper.
+- `crates/halmasuit-session/src/broker.rs` — the module doc is the
+  authoritative description of the privileged PAM/session lifecycle
+  (one handle, killable auth fork, fork-then-drop leader, slot-owned
+  reaping). `HANDOFF.md` §0.8 is the canonical epic close-out /
+  deferral record.
+- `crates/halmasuit-spawn/src/main.rs` — the interim in-compositor
+  setuid helper (scheduled for deletion by the successor epic;
+  superseded by the broker's non-setuid fork-then-drop child).

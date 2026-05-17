@@ -88,8 +88,11 @@ Halmasuit is intentionally thin. It owns three things only:
    inner window management, no shell, no taskbar, no anything else a
    normal compositor does — those live in niri.
 3. **Phase transitions.** Internal state machine that swaps which
-   `wl_client` is foreground, and the orchestration (PAM, halmasuit-spawn,
-   logind D-Bus calls) needed to make that swap happen.
+   `wl_client` is foreground, and the orchestration needed to make
+   that swap happen: the greetd state machine, relaying the PAM
+   conversation to the privileged `halmasuit-session` broker (libpam
+   never runs in the compositor's address space — see "Authentication
+   and session lifecycle"), and the logind D-Bus calls.
 
 Everything else is a `wl_client` of halmasuit, including the splash, the
 greeter, the lock screen, the user session, the LUKS prompt, and the
@@ -212,8 +215,9 @@ GREETER                DankGreeter / regreet / …     halmasuit-greetd
                        (as 'greeter' user)            (in-process)
 
 SESSION                niri                          (none — niri owns
-                       (as authenticated user          everything in-session
-                        via halmasuit-spawn)           via its own protocols)
+                       (as authenticated user,         everything in-session
+                        launched by the                via its own protocols)
+                        halmasuit-session broker)
 
 LOCKED                 ext-session-lock-v1 client    (lock client itself
                        (swaylock / hyprlock / …)      drives re-auth via PAM
@@ -265,10 +269,16 @@ Transitions:
   as the `greeter` user. As the greeter's first surface commit arrives,
   halmasuit crossfades from the splash buffer to the greeter surface (~250
   ms alpha blend).
-- **`GREETER → SESSION`**: triggered by PAM success inside halmasuit-greetd.
-  halmasuit kills the greeter `wl_client`, invokes `halmasuit-spawn` to
-  exec niri as the authenticated user, and composites niri's surface in
-  the greeter's place. No DRM activity; halmasuit's mastery is unchanged.
+- **`GREETER → SESSION`**: triggered by PAM success in the privileged
+  `halmasuit-session` broker (the compositor relays the conversation;
+  libpam never runs in the compositor). halmasuit kills the greeter
+  `wl_client`; the broker — already root, holding the one
+  `pam_handle_t` for the whole lifecycle — forks once and the
+  non-setuid child drops privileges and execs niri as the
+  authenticated user, while the broker parent keeps the handle open
+  for `pam_close_session` at logout. halmasuit composites niri's
+  surface in the greeter's place. No DRM activity; halmasuit's mastery
+  is unchanged.
 - **`SESSION ↔ LOCKED`**: triggered by `loginctl lock-session` (D-Bus
   signal halmasuit subscribes to), by an explicit `halmasuit msg lock`,
   or by an idle timeout the session configures. halmasuit spawns the
@@ -342,8 +352,8 @@ threshold across any transition.
 │             ├─ PHASE greeter        DankGreeter / regreet / …        │
 │             │                       (as 'greeter' user)              │
 │             ├─ PHASE session        niri                             │
-│             │                       (as authenticated user, exec'd  │
-│             │                        via halmasuit-spawn)            │
+│             │                       (as authenticated user, launched │
+│             │                        by the halmasuit-session broker)│
 │             ├─ PHASE locked         ext-session-lock-v1 client       │
 │             └─ PHASE shutdown       halmasuit-splash                  │
 └──────────────────────────────────────────────────────────────────────┘
@@ -411,7 +421,7 @@ its own `wl_client` process.
 - fsck repair decisions (`e2fsck` / `xfs_repair` / etc. do them)
 - Polkit authorization logic (`polkitd` does it)
 - logind's session management (logind does it)
-- PAM authentication (PAM does it; halmasuit calls into libpam in-process for the greeter wrap; emergency and lock-screen adapters call PAM in their own process)
+- PAM authentication (PAM does it; for the greeter wrap, libpam runs in the privileged out-of-process `halmasuit-session` broker — never in the compositor's address space — and the compositor only relays the conversation; emergency and lock-screen adapters call PAM in their own process)
 
 Halmasuit absorbs only the *frontend* of each — the surface through which
 the user interacts. The backend stays where it lives.
@@ -432,13 +442,18 @@ reimplementation from the public protocol spec at
 is a suite of canonical-payload roundtrip tests that pin the JSON
 shape against payloads from that spec — if upstream changes the
 format, the tests break and we notice. What halmasuit-greetd owns
-beyond the wire types is the daemon-side logic: the state machine,
-PAM glue, and the integration points that swap halmasuit's foreground
-`wl_client` when auth succeeds. Reusing greetd-the-daemon itself as
-a library is also not feasible: its privilege model (run as root,
-`execve` the user session) is incompatible with halmasuit's (run as
-`compositor` user, never exec, delegate UID switching to
-`halmasuit-spawn`).
+beyond the wire types is the daemon-side logic: the greetd state
+machine and the integration points that swap halmasuit's foreground
+`wl_client` when auth succeeds. It holds no `pam_handle_t` and links
+no libpam — it relays the conversation to the privileged
+`halmasuit-session` broker. Reusing greetd-the-daemon itself as a
+library is also not feasible: its privilege model (run as root,
+`execve` the user session from the handle-owning process) is
+incompatible with halmasuit's split — the compositor is unprivileged
+and holds no handle, and the privileged broker that does own the
+handle never `execve`s from it (it forks once and the non-setuid
+child drops privileges; PAM treats an exec from the session-opening
+process as logout).
 
 Flow:
 
@@ -449,15 +464,41 @@ Flow:
 2. Greeter binary renders its UI as a Wayland client of halmasuit.
 3. User submits credentials. Greeter sends `create_session { username }`
    over the greetd socket.
-4. Halmasuit invokes PAM in-process via FFI to libpam. PAM challenges
-   flow back to the greeter via `auth_message` and return through
-   `post_auth_message_response`.
-5. On PAM success, the greeter sends `start_session { cmd: ["niri"] }`.
-6. Halmasuit terminates the greeter, invokes `halmasuit-spawn` (the
-   setuid privilege-drop helper), niri is execed as the authenticated
-   user.
+4. Halmasuit relays the conversation to the privileged
+   `halmasuit-session` broker, which runs libpam in an ephemeral,
+   SIGKILL-able, `setrlimit`-bounded privileged fork (the compositor
+   holds no `pam_handle_t` and links no libpam). PAM challenges flow
+   back to the greeter via `auth_message`, the responses return
+   through `post_auth_message_response`, and the compositor passes
+   only the serialized conversation frames in each direction.
+5. On PAM success, the greeter sends `start_session { cmd: ["niri"] }`,
+   which the compositor forwards to the broker.
+6. Halmasuit terminates the greeter. The broker — already root,
+   holding the *same* `pam_handle_t` through
+   `pam_setcred`/`pam_open_session` — `fork`s once; the non-setuid
+   child drops privileges in-process (setresgid → `getgrouplist`-MERGE
+   of the PAM-established groups → setresuid → re-verify →
+   `PR_SET_NO_NEW_PRIVS` → `execve` with the `pam_getenvlist`-MERGED
+   environment) and execs niri as the authenticated user. The broker
+   parent keeps the handle open, `waitpid`s the leader, and runs
+   `pam_close_session` → `pam_setcred(PAM_DELETE_CRED)` → `pam_end`
+   at logout.
 7. Halmasuit's Wayland server now hosts niri as its sole foreground
    client.
+
+> **Status (2026-05; epic §0 / [`HANDOFF.md`](HANDOFF.md) §0.8).**
+> The privilege-separated `halmasuit-session` broker described in
+> steps 4–6 is **built, deployed (a socket-activated host-namespace
+> systemd unit), and VM-proven end-to-end** (real `pam_unix` +
+> `pam_mount` gates, no mocks). Wiring the *unprivileged compositor*
+> to relay to it is the successor (compositor→broker / G-layer)
+> epic. Until that wiring lands, the compositor's interim live path
+> still runs PAM in-process (`crates/halmasuit-pam`) and launches the
+> session via the setuid `halmasuit-spawn` helper; both are
+> **scheduled for deletion by that successor epic, atomically with the
+> broker becoming the live path** — not before (deleting them now
+> would break the compositor with no replacement consumer). See
+> "Authentication and session lifecycle" and `HANDOFF.md` §0.8.
 
 DMS patch needed: roughly twenty lines in the `dms-greeter` launcher
 script to skip its nested-niri spawn when `WAYLAND_DISPLAY` is already
@@ -577,72 +618,173 @@ privileges. Anything that fits inside those constraints is in scope.
   no FS access beyond its own cache dir). Same posture as greetd's
   greeter user. Sees keystrokes (Wayland input) including typed
   passwords; relays auth via greetd protocol to halmasuit.
-- **`halmasuit-spawn`** is a small setuid-root helper (~80 lines,
-  `#![forbid(unsafe_code)]`, statically linked, no env propagation except
-  an explicit allowlist, no file I/O except opening `XDG_RUNTIME_DIR`).
-  Its only job is to drop privileges to a target UID/GID and exec a
-  command. Audited like sudo's pre-fork core.
+- **`halmasuit-session`** is the minimal privileged broker. It runs in
+  the host mount namespace, owns the single `pam_handle_t` for the
+  whole lifecycle, ends as root for `pam_open_session`, and is a
+  single socket-activated systemd unit (no standing root daemon — it
+  idle-exits and PID 1 re-activates it on demand). It is the **only**
+  privileged code path for greeter auth/session. There is no setuid
+  binary in this path: the broker is already root, so it `fork`s once
+  and the **non-setuid child** drops privileges in-process and execs
+  the session leader; the broker parent keeps the handle for
+  `pam_close_session`. The relocated privilege-drop discipline is a
+  single fuzzable function (no `unsafe` outside the quarantined
+  `pam_ffi`/`worker` modules; credential buffers `Zeroize`d the moment
+  PAM completes).
 - **niri** runs as the authenticated user. Inherits the Wayland socket
   via `WAYLAND_DISPLAY` env. Renders its scene to a single Wayland
   surface that halmasuit composites onto the display.
 
-The privilege-drop sequence inside `halmasuit-spawn`:
+The privilege-drop sequence in the broker's non-setuid session-leader
+child (straight-line, every syscall return-checked; the child
+`_exit`s — never returns/`?` — on any failure so it cannot re-enter
+the root parent):
 
 ```
-assert target_uid >= UID_MIN (typically 1000)
+assert EUID == 0 (broker is root; child has not dropped yet)
+assert target_uid >= UID_MIN (typically 1000); reject (uid_t)-1 / overflow
 assert target_gid >= UID_MIN
+pwent (uid, gid, user) cross-check
 setresgid(target_gid, target_gid, target_gid)
-setgroups(target_supplementary_groups)
+setgroups( getgrouplist-MERGE of the PAM-established supplementary set )
 setresuid(target_uid, target_uid, target_uid)
+re-verify getresuid/getresgid all equal the target
 prctl(PR_SET_NO_NEW_PRIVS)
-execve(cmd, sanitized_argv, sanitized_envp)
+reset the signal mask
+execve(cmd, sanitized_argv, pam_getenvlist-MERGED env)   # absolute path, no PATH search
 ```
 
-No intervening syscalls touch user-controlled state between privilege
-drop and exec.
+No intervening syscalls touch user-controlled state between the first
+`setres*` and `execve`. The supplementary groups are a `getgrouplist`
+**MERGE** with the PAM-established set, never a blind `initgroups`
+(which would clobber groups added by `pam_group`/`pam_systemd`/
+`pam_mount`); the environment is `pam_getenvlist()` **MERGED** with a
+fixed allowlist, never the raw greeter-supplied env (the same clobber
+hazard for `pam_env`-class modules).
 
 The UID-floor refusal is what makes the privilege split *not* security
-theater. A compromised halmasuit can invoke `halmasuit-spawn` — that is
-in the threat model and not preventable. What the floor prevents is
-using spawn to escalate to root or any other system user. With the floor
-in place, the worst-case outcome of full code execution in halmasuit is
-"spawn arbitrary commands as the currently-logged-in user," not "system
-compromise" — reboot to recovery and the persistent damage is in
-`$HOME`, not in `/`. Removing the floor turns the split into theater.
+theater. A compromised compositor can ask the broker to start a
+session — that is in the threat model and not preventable. What the
+floor prevents is using that to escalate to root or any other system
+user: the broker independently re-derives identity from PAM
+(`pam_get_user` → pwent) and enforces uid **and** gid ≥ `UID_MIN`,
+rejecting `(uid_t)-1`/negative/overflow (the CVE-2019-14287 class),
+never trusting a compositor-asserted identity (`SO_PEERCRED`
+authenticates the peer, it never authorizes the action). With the
+floor in place, the worst-case outcome of full code execution in
+halmasuit is "drive a session for a legitimate non-system user," not
+"system compromise" — the persistent damage is in `$HOME`, not in
+`/`. Removing the floor turns the split into theater.
 
 ---
 
-## Authentication flow
+## Authentication and session lifecycle
 
-PAM happens in-process in halmasuit. Halmasuit registers a PAM service
-file (`halmasuit`) via the NixOS module. The `compositor` user is granted
-permission to authenticate other users via `pam_unix` or whatever modules
-are configured in the system PAM config.
+PAM runs **out of process**, in the privileged `halmasuit-session`
+broker — never in the compositor's address space (co-tenanting
+credentials and `dlopen`'d PAM modules with the Mesa/smithay RCE
+surface is the exact privsep violation OpenSSH/GDM exist to avoid).
+The NixOS module registers the `halmasuit` PAM service file and the
+broker's socket-activated unit; the compositor links no libpam and
+holds no `pam_handle_t`.
 
-State machine (in `halmasuit-greetd` crate):
+The architecture is the OpenSSH/GDM privilege-separation topology,
+specialized to a process-continuous system compositor. Three tiers:
+
+- **(C) Compositor — unprivileged relay.** Holds no handle, no
+  credential material, no host-ns privilege; `dlopen`s no PAM module.
+  Between the greeter and the broker it passes only serialized,
+  length-bounded conversation frames (the greetd state machine in
+  `halmasuit-greetd` is the wire/lifecycle layer; it links no libpam).
+- **(B) `halmasuit-session` — privileged host-ns broker.** Owns one
+  `pam_handle_t` for the **entire** lifecycle: `pam_start` →
+  `pam_authenticate` → `pam_acct_mgmt` → `pam_setcred(ESTABLISH)` →
+  `pam_open_session` → … → `pam_close_session` →
+  `pam_setcred(DELETE)` → `pam_end`. The handle is never split across
+  processes and the owner never `execve`s between auth and session
+  (PAM treats that as logout). The blocking `pam_authenticate` runs in
+  an **ephemeral, SIGKILL-able, `setrlimit`-bounded privileged fork**
+  driven over a `SOCK_SEQPACKET` socketpair (SIGKILL directly, no
+  SIGTERM grace — it is blocked in libpam with no cancellation point).
+  The broker is one calloop **event-loop** process multiplexing the
+  listener fd, the in-flight worker, and signals — so a reconnect can
+  **evict** the in-flight attempt — and **idle-exits** so no standing
+  root process exists when nothing is in flight (PID 1's retained
+  socket re-activates it losslessly). A single global slot
+  (system-wide one-seat) with evict-old gated to the `SO_PEERCRED`
+  greeter peer plus a churn throttle.
+- **(A) Session leader — fork-then-drop in a non-setuid child.** After
+  `pam_open_session` the root broker `fork`s once; the child becomes
+  the leader and drops privileges in-process (the sequence in "Process
+  model and UID handoff"); the broker parent stays root, holds the
+  handle, `waitpid`s the child, then `pam_close_session` →
+  `pam_setcred(DELETE_CRED)` → `pam_end`.
+
+**Session-spec sequencing (greetd model).** After
+`pam_setcred(ESTABLISH)` and the auth-success report, and **before**
+`pam_open_session`, the handle owner does one blocking IPC read for
+the `start_session` spec (`cmd` + `env`), `pam_putenv`s that env into
+the handle, *then* opens the session — so `pam_systemd`/logind and
+`pam_mount` register the session against the correct environment. The
+leader's `execve` environment is `pam_getenvlist()` MERGED with the
+fixed allowlist (the env analogue of the mandatory
+`getgrouplist`-MERGE). This intervening non-PAM I/O between `setcred`
+and `open_session` is PAM-legal and is greetd's exact ordering.
+
+State machine (the wire/relay layer, in `halmasuit-greetd`):
 
 ```
 IDLE
   ↓ create_session { username }
 SESSION_CREATED(id)
-  ↓ pam_authenticate() — issues challenges to greeter
+  ↓ broker: pam_authenticate() in the killable fork — challenges relayed to greeter
   ↓ post_auth_message_response → … → PAM result
 AUTH_SUCCESS(id, uid, gid)    AUTH_FAILED(id) → IDLE
-  ↓ start_session { cmd }
-SPAWNING
-  ↓ halmasuit-spawn → execve
+  ↓ start_session { cmd }     (broker: putenv → open_session → fork-then-drop child)
 SESSION_RUNNING
-  ↓ session exits
+  ↓ session exits             (broker parent: close_session → setcred(DELETE) → pam_end)
 IDLE
 ```
 
 Explicitly state-machine-checked: `start_session` is only valid in
-`AUTH_SUCCESS`, never in `IDLE` or `SESSION_CREATED`. Property tests
-exercise the transitions; cargo-fuzz fuzzes the wire decoder.
+`AUTH_SUCCESS`, never in `IDLE` or `SESSION_CREATED`; there is no path
+to a running session that bypasses a real
+`pam_authenticate`+`pam_acct_mgmt` success. Property tests exercise
+the transitions; cargo-fuzz fuzzes the wire decoder.
 
-Credential material (challenge strings, password responses) is zeroed
-via the `zeroize` crate as soon as PAM completes. Halmasuit retains only
-the authenticated UID and username — non-sensitive metadata.
+**Teardown / reaping.** The broker's slot owns the worker's
+`WorkerHandle{pid,pidfd}`; kill is via `pidfd_send_signal` (`ESRCH`
+treated as benign), reap is a synchronous `waitpid` at every
+connection-terminal point — success, auth-fail, greeter-cancel,
+out-of-phase, and the transport-error path (worker died mid-relay) —
+so no transient zombie lingers. The pure `#![forbid(unsafe_code)]`
+protocol crate stays pid-unaware; there is no `Drop`-based reaping and
+no second `waitid(P_PIDFD)` reaper. The earlier design's
+"extend-the-compositor's-SIGCHLD-reaper" idea is **superseded** by
+this out-of-process slot-owned reaping and no longer applies (it
+disappears with the in-compositor PAM path in the successor epic).
+
+Credential material (challenge strings, password responses) is
+`Zeroize`d the moment PAM completes; nothing sensitive outlives the
+PAM transaction. Identity is PAM-derived and independently
+re-verified by the broker (`pam_get_user` → pwent, UID/GID floor,
+pwent cross-check) — never the pre-auth client-supplied string.
+
+> **Status (2026-05; [`HANDOFF.md`](HANDOFF.md) §0.8).** This broker
+> is built, deployed (socket-activated host-ns unit), and VM-proven
+> end-to-end with real PAM and no mocks: `run-pam-auth` (auth in the
+> killable fork), `session-r5r6` (evict-old reachable from the event
+> loop + no-standing-root idle-exit + lossless re-activation), and the
+> flagship `session-onehandle` (real `pam_mount` decrypts+mounts a
+> LUKS `$HOME` at `pam_open_session` using the auth-phase password
+> recovered from the **same** `pam_handle_t` — a split handle would
+> silently fail this). Wiring the unprivileged compositor to relay to
+> the broker is the successor (compositor→broker / G-layer) epic;
+> until it lands the compositor's interim live path is the
+> in-process `crates/halmasuit-pam` + setuid `halmasuit-spawn`, both
+> **scheduled for deletion by that successor epic, atomically with the
+> broker becoming the live path** (HANDOFF §0.8 is the canonical
+> close-out record).
 
 ---
 
@@ -754,14 +896,14 @@ Attackers, in order of likelihood:
 | 2 | Greeter client sends `start_session` without completing PAM | Explicit state machine in `halmasuit-greetd`. `start_session` requires a session_id only obtainable via successful PAM. Property-tested + fuzzed. |
 | 3 | Compromised greeter exfiltrates passwords | Same risk class as greetd today; structural property of GUI password entry. Defense in depth: greeter runs as `greeter` user with no FS access beyond cache dir, no setuid, no PAM ability of its own. A keylogger-as-greeter has no escalation path. |
 | 4 | Second Wayland client connects during greeter phase to screenshot/inject input | Halmasuit enforces single-foreground-client. Wayland socket SO_PEERCRED check; reject any connection outside the spawned greeter/session process tree. |
-| 5 | TOCTOU during privilege drop in `halmasuit-spawn` | UID/GID passed as integers via argv. No path lookups in the helper. Privilege-drop syscalls execute in lockstep with no intervening user-controlled-state syscalls. Standard sudo hardening. |
-| 6 | Bug in `halmasuit-spawn` itself → privilege escalation | Helper is microscopic (~80 lines), `#![forbid(unsafe_code)]`, statically linked, no env propagation except allowlist, no file I/O except `XDG_RUNTIME_DIR` open. Audited on every change. |
+| 5 | TOCTOU during the broker's privilege drop | Identity is PAM-derived (`pam_get_user` → pwent), re-verified by the broker. The drop runs in the broker's already-single-threaded ephemeral worker child, straight-line with no intervening user-controlled-state syscalls between the first `setres*` and `execve`, and `getresuid`/`getresgid` re-verify the drop before exec. Standard sudo/OpenSSH hardening. |
+| 6 | Bug in the privileged broker → privilege escalation | The privilege-drop+exec is a single fuzzable function (cargo-fuzz targets the function); `unsafe` is confined to the quarantined `pam_ffi`/`worker` modules, everything else is `#![forbid(unsafe_code)]`. The broker is a single socket-activated unit with no standing root when idle, audited on every change (a CLAUDE.md security-review event). |
 | 7 | Credential material lingers in halmasuit memory after auth | `zeroize` crate clears PAM challenge/response buffers immediately after auth completes. Only authenticated UID is retained. |
 | 8 | DRM master takeover by another process | The kernel enforces single-master-per-DRM-node: once halmasuit calls `DRM_IOCTL_SET_MASTER`, any other process's `SET_MASTER` returns `EACCES` until halmasuit closes the fd or calls `DROP_MASTER`. logind, if it tries to broker the device for another caller post-boot, will be denied the same way. Halmasuit takes master directly (no logind brokerage) — confirmed by [`RESEARCH.md`](RESEARCH.md). |
 | 9 | D-Bus method abuse — random user calls `RestartInnerWM` | polkit rules shipped with the NixOS module. Privileged methods require `wheel` group or interactive authentication. |
 | 10 | Lock-screen bypass | Lock screen is an `ext-session-lock-v1` client. Halmasuit refuses to release the lock until the client demonstrates a successful PAM round-trip. Same flow as greeter, in-session. |
-| 11 | Compromised halmasuit invokes `halmasuit-spawn` with `target_uid=0` (or any system UID) to escalate to root | **UID floor**: spawn refuses any `target_uid < UID_MIN` (typically 1000); same for `target_gid`. A compromised compositor can still invoke spawn for legitimate session UIDs but cannot reach root or other system users. Worst case bounded to session-as-currently-logged-in-user. **This is the load-bearing security property of the privilege split** — without it, the split is theater. |
-| 12 | Compromised halmasuit uses retained `CAP_KILL` to denial-of-service system services | halmasuit retains `CAP_KILL` in its effective set so it can SIGKILL the greeter on session start (the greeter runs under a different uid, and `kill(2)` requires either EUID match or `CAP_KILL`). `CAP_KILL` bypasses the EUID match check and lets the holder signal any process system-wide. A compromised compositor could SIGKILL `init`, `sshd`, or another user's session — a DoS primitive, not full RCE. Mitigations: `CAP_KILL` is the *only* capability halmasuit retains post-drop (`CapPrm=CapEff={CAP_KILL}`, `CapBnd={CAP_SETUID, CAP_SETGID}` for the spawn handoff, everything else cleared); the compositor cannot ptrace, write `/proc/*/mem`, load kernel modules, or open `/dev/mem`. The privilege split's primary defense is that halmasuit-the-process is unprivileged enough to bound a compromise to "DoS the system" rather than "own the system." |
+| 11 | Compromised halmasuit asks the broker to start a session as uid 0 / a system uid / `(uid_t)-1` | **UID floor**: the broker independently re-derives identity from PAM (`pam_get_user` → pwent) and refuses any `uid`/`gid < UID_MIN` (typically 1000), rejecting `(uid_t)-1`/negative/overflow (CVE-2019-14287 class) and a pwent (uid,gid,user) mismatch — *before* the group/uid drop. It never trusts a compositor-asserted "PAM succeeded for uid N" (`SO_PEERCRED` authenticates the peer, never authorizes the action). Worst case bounded to a session as a legitimate non-system user. **This is the load-bearing security property of the privilege split** — without it, the split is theater. |
+| 12 | Compromised halmasuit uses retained `CAP_KILL` to denial-of-service system services | halmasuit retains `CAP_KILL` in its effective set so it can SIGKILL the greeter on session start (the greeter runs under a different uid, and `kill(2)` requires either EUID match or `CAP_KILL`). `CAP_KILL` bypasses the EUID match check and lets the holder signal any process system-wide. A compromised compositor could SIGKILL `init`, `sshd`, or another user's session — a DoS primitive, not full RCE. Mitigations: `CAP_KILL` is the *only* capability halmasuit retains post-drop (`CapPrm=CapEff={CAP_KILL}`, everything else cleared); the compositor cannot ptrace, write `/proc/*/mem`, load kernel modules, or open `/dev/mem`. (The interim in-compositor path additionally carries `CapBnd={CAP_SETUID, CAP_SETGID}` for the setuid-`halmasuit-spawn` handoff; that bounding set is removed together with the setuid helper when the broker becomes the live path — successor epic, HANDOFF §0.8. The broker itself is already root in the host ns and needs no such handoff.) The privilege split's primary defense is that halmasuit-the-process is unprivileged enough to bound a compromise to "DoS the system" rather than "own the system." |
 
 ### Initramfs phase: temporary root
 
@@ -796,8 +938,11 @@ What v2 does to keep this short:
 Halmasuit's posture is **strictly better** than greetd's. greetd-the-daemon
 runs as **root** — full compromise of greetd is full compromise of the
 system, with no privilege boundary to fall back on. halmasuit factors
-that privilege into one ~80-line setuid helper (`halmasuit-spawn`) and
-runs the compositor itself with exactly one retained capability:
+that privilege into the minimal `halmasuit-session` broker — a single
+socket-activated unit with **no standing root process when idle**, a
+single fuzzable privilege-drop function, libpam confined to its own
+address space behind a length-bounded frame relay — and runs the
+compositor itself unprivileged with exactly one retained capability:
 `CAP_KILL` in the effective set (for the greeter-kill on session
 start; see threat model row 12 for the bounded blast radius). No
 DAC bypass, no `ptrace` of arbitrary processes, no `/dev/mem`, no
@@ -809,14 +954,15 @@ DAC bypass, no `ptrace` of arbitrary processes, no `/dev/mem`, no
   In a root greetd or root halmasuit, the same bug class is a
   kernel-attack primitive — root can `ptrace` arbitrary processes, write
   `/proc/*/mem`, open `/dev/mem`, `init_module`, etc.
-- **Full-RCE bound.** Even on full code-execution in halmasuit, the UID
-  floor in `halmasuit-spawn` (row 11 above) caps the blast radius at the
-  currently-logged-in user. greetd has no equivalent cap because it *is*
-  root.
-- **Audit ratio.** The privileged surface goes from "all of greetd plus
-  its deps" to ~80 lines of `#![forbid(unsafe_code)]`, statically-linked
-  Rust. That fits on a whiteboard and is reviewable by eye on every
-  commit.
+- **Full-RCE bound.** Even on full code-execution in halmasuit, the
+  broker's independently re-derived UID floor (row 11 above) caps the
+  blast radius at a legitimate non-system user. greetd has no
+  equivalent cap because it *is* root.
+- **Audit ratio.** The privileged surface goes from "all of greetd
+  plus its deps, as root, forever" to one socket-activated broker that
+  is not even running when idle, whose privilege-drop is a single
+  fuzzable function and whose `unsafe` is confined to the quarantined
+  `pam_ffi`/`worker` modules.
 
 The pattern is standard split-privilege design, the same one OpenSSH
 uses (privileged `sshd` + unprivileged per-connection child) and the
@@ -824,9 +970,9 @@ same one Windows uses (privileged `winlogon`/`lsass` + DWM running as a
 virtual service account, not SYSTEM). The privilege isn't hidden — it's
 **factored**.
 
-`halmasuit-spawn`, the Wayland socket peer-credential check, and the
-greetd state machine are the three things that must have fuzz tests and
-property tests from v1 onwards.
+The broker's privilege-drop function, the Wayland/broker socket
+peer-credential checks, and the greetd state machine are the things
+that must have fuzz tests and property tests.
 
 ---
 
@@ -885,14 +1031,17 @@ halmasuit/
 │   ├── halmasuit/              # compositor binary (v2) — links every lib below
 │   ├── halmasuit-kms/          # DRM/KMS direct-scanout core, modeset, primary plane (v2)
 │   ├── halmasuit-protocols/    # Wayland XML + wayland-rs codegen (v2)
-│   ├── halmasuit-greetd/       # greetd wire-protocol server, in-process state machine + PAM (v2)
+│   ├── halmasuit-greetd/       # greetd wire-protocol server + state machine; relays to the broker, links no libpam (v2)
+│   ├── halmasuit-session/      # privileged host-ns PAM/session broker — one pam_handle_t whole lifecycle, killable auth fork, fork-then-drop session leader (epic §0; built + VM-proven)
+│   ├── halmasuit-session-ipc/  # frozen SOCK_SEQPACKET compositor↔broker wire contract (pure, no_std-friendly)
+│   ├── halmasuit-pam/          # INTERIM in-compositor PAM (the model the broker replaces); scheduled for deletion by the successor compositor→broker epic — HANDOFF §0.8
 │   ├── halmasuit-splash/       # GPU-accelerated splash wl_client (Vulkan via wgpu/ash, shader-driven). Used during INITRAMFS / ROOTFS / LOCKED-backdrop / SHUTDOWN phases (v2). See "Visual identity" section. (v2)
 │   ├── halmasuit-luks/         # systemd password-agent wl_client adapter (v2)
 │   ├── halmasuit-fsck/         # systemd-fsckd progress wl_client adapter (v2)
 │   ├── halmasuit-emergency/    # emergency-shell wl_client adapter (v2)
 │   ├── halmasuit-ipc/          # JSON-RPC control plane types (v2)
 │   ├── halmasuit-cli/          # halmasuit msg CLI (v2)
-│   ├── halmasuit-spawn/        # setuid privilege-drop helper (v2)
+│   ├── halmasuit-spawn/        # INTERIM setuid privilege-drop helper for the in-compositor path; the broker's non-setuid fork-then-drop child supersedes it — scheduled for deletion by the successor epic, HANDOFF §0.8
 │   └── halmasuit-test/         # NixOS test harness helpers (v1: live)
 ├── protocols/                  # vendored Wayland XML (v2)
 ├── nix/
@@ -1048,17 +1197,27 @@ Scope:
 - `halmasuit-luks`: systemd password-agent adapter `wl_client`.
   Required for any encrypted-rootfs system to boot through halmasuit
   without dropping to a TTY prompt.
-- `halmasuit-greetd`: greetd wire-protocol server, PAM in-process,
-  state machine.
-- `halmasuit-spawn`: setuid privilege-drop helper. ~80 lines,
-  `#![forbid(unsafe_code)]`.
+- `halmasuit-greetd`: greetd wire-protocol server + state machine
+  (links no libpam; relays to the broker).
+- `halmasuit-session`: the privileged host-ns PAM/session broker —
+  one `pam_handle_t` for the whole lifecycle, ephemeral killable auth
+  fork, non-setuid fork-then-drop session leader, socket-activated
+  with idle-exit (epic §0; built + VM-proven). Wiring the compositor
+  to relay to it is the successor (compositor→broker / G-layer) epic;
+  until then `halmasuit-pam` + setuid `halmasuit-spawn` remain the
+  interim live compositor path, scheduled for deletion by that
+  successor epic (HANDOFF §0.8).
 - D-Bus integration (logind subscriptions + `org.halmasuit.Compositor1`
   server). After re-exec to rootfs only; not in initramfs.
 - NixOS module that wires halmasuit into both initramfs
   (`boot.initrd.systemd.services.halmasuit`) and rootfs
   (`systemd.services.halmasuit`); replaces both Plymouth and greetd;
-  installs `halmasuit-spawn` setuid; installs PAM service file `halmasuit`;
-  configures `compositor` and `greeter` system users.
+  installs the socket-activated `halmasuit-session` broker unit and
+  the PAM service file `halmasuit`; configures `compositor` and
+  `greeter` system users. (The interim in-compositor path also
+  installs `halmasuit-spawn` setuid; that and `halmasuit-pam` are
+  removed by the successor epic when the broker becomes live —
+  HANDOFF §0.8.)
 - DankGreeter launcher patch (~20 lines).
 - New VM test: `tests/full-boot-flash.nix` — frame-capture from kernel
   handoff through to `SESSION` phase, asserts no all-black frame and no
@@ -1167,12 +1326,32 @@ These exist so the scope cannot creep without an explicit decision.
 
 Things we will not do regardless of pressure:
 
-- **NO running halmasuit as root.** Compositor runs as `compositor` user;
-  setuid `halmasuit-spawn` is the only privileged code path, and it is
-  microscopic and audited.
-- **NO inheriting environment from the caller** in `halmasuit-spawn`.
-  Explicit env allowlist; everything else dropped.
-- **NO `unsafe` in `halmasuit-spawn`.** `#![forbid(unsafe_code)]`.
+- **NO running halmasuit (the compositor) as root.** It runs as the
+  `compositor` user and holds no `pam_handle_t`. The only privileged
+  greeter-auth code path is the `halmasuit-session` broker — a single
+  socket-activated unit with no standing root when idle, audited on
+  every change (a CLAUDE.md security-review event). No PAM in the
+  compositor's address space (co-tenanting credentials + `dlopen`'d
+  modules with the RCE surface is the privsep violation this deletes).
+- **NO setuid binary in the broker's session-launch path.** The
+  broker is already root and forks-then-drops in a **non-setuid**
+  child (greetd/OpenSSH/GDM/login/su all do this); a world-exec
+  setuid-root inode is the PwnKit / CVE-2019-14287 / CVE-2021-3156 /
+  CVE-2023-22809 attack class. (The interim in-compositor path's
+  setuid `halmasuit-spawn` is the *only* permitted exception and is
+  scheduled for deletion by the successor epic — HANDOFF §0.8; no
+  *new* setuid spawn path may be added.)
+- **NO inheriting environment / blind `initgroups` in the
+  session-leader child.** Env is `pam_getenvlist()` MERGED with a
+  fixed allowlist; supplementary groups are a `getgrouplist` MERGE
+  with the PAM-established set — never a blind replace (it clobbers
+  `pam_env`/`pam_group`/`pam_mount`/`pam_systemd` state).
+- **NO splitting `pam_handle_t` across processes / two-handle
+  design.** `pam_set_data`/`PAM_AUTHTOK` are process-local heap;
+  pam_mount/gnome-keyring/krb5 silently break across a split (locked
+  `$HOME`, no error). One handle, one address space, whole lifecycle.
+- **NO `unsafe` outside the broker's quarantined `pam_ffi`/`worker`
+  modules.** Everything else is `#![forbid(unsafe_code)]`.
 - **NO trusting Wayland client PIDs from message contents.** Always use
   SO_PEERCRED on the socket connection.
 - **NO `start_session` permitted without prior PAM success.** State
@@ -1204,16 +1383,20 @@ These are explicit "we know this needs deciding, just not yet":
    the conversation-message style enum and hide the `pam_conv` pointer
    we need to wire to a channel; `pam-client` is also MPL-2.0 which is
    the same license-posture problem we just paid to avoid. greetd
-   itself uses `pam-sys` directly, validating the path. Implementation
-   pattern (per upstream greetd `src/pam/session.rs`): worker thread
-   per PAM session, two `mpsc::sync_channel`s (challenge-out,
-   response-in). `pam_authenticate` blocks on the conv callback;
-   `PamSession::step` is the channel-driven adapter that bridges the
-   blocking C call to our state machine's round-by-round model.
-   Pitfalls noted for the implementation task: `catch_unwind` inside
-   the `extern "C"` conv (panic-across-FFI is UB), `zeroize` response
-   buffers on the conv thread after `strdup`, set `PAM_RUSER`/`PAM_TTY`
-   before `authenticate`, handle `PAM_NEW_AUTHTOK_REQD` distinctly.
+   itself uses `pam-sys` directly, validating the path. The libpam FFI
+   lives in **exactly one** crate, `halmasuit-session` (the broker);
+   its `unsafe` is quarantined to the `pam_ffi`/`worker` modules. The
+   implementation is the OpenSSH/GDM shape, NOT a per-PAM-session
+   thread inside the compositor: the broker holds one `pam_handle_t`
+   for the whole lifecycle and runs the blocking `pam_authenticate` in
+   an ephemeral, SIGKILL-able, `setrlimit`-bounded privileged **fork**
+   driven over a `SOCK_SEQPACKET` socketpair; the `extern "C"` conv
+   trampoline marshals challenges to and responses from that channel.
+   Pitfalls (carried into the broker FFI, with origin attribution to
+   the earlier in-process implementation): `catch_unwind` inside the
+   `extern "C"` conv (panic-across-FFI is UB), `zeroize` response
+   buffers immediately after `strdup`, set the PAM items before
+   `authenticate`, handle `PAM_NEW_AUTHTOK_REQD` distinctly.
 2. ~~**smithay revision** (v2).~~ **RESOLVED: pinned to niri's current
    git revision** (`ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef`) in
    workspace `Cargo.toml`. Re-evaluate the pin opportunistically when
