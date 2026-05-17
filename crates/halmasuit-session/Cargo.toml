@@ -1,0 +1,24 @@
+[package]
+name        = "halmasuit-session"
+description = "Privileged PAM-lifecycle broker for halmasuit (unified session/pamd epic). This slice: SOCK_SEQPACKET framed transport + SO_PEERCRED peer primitive. No PAM yet."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The frozen wire contract this transport carries.
+halmasuit-session-ipc = { path = "../halmasuit-session-ipc", version = "0.1" }
+# socketpair / send / recv / getsockopt(SO_PEERCRED) and getuid, all
+# via nix's safe wrappers so this crate stays #![forbid(unsafe_code)]
+# (same posture as halmasuit-greetd's SO_PEERCRED path).
+nix                  = { workspace = true, features = ["socket", "user"] }
+thiserror.workspace  = true
+# Trait bounds for the generic framed send/recv (same as the codec in
+# halmasuit-session-ipc). Pure data traits — no I/O.
+serde.workspace      = true

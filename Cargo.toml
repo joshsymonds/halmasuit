@@ -10,6 +10,8 @@ members = [
     # Pure wire contract for the compositor↔halmasuit-session PAM relay
     # (Epic: unified session/pamd). Types + codec only.
     "crates/halmasuit-session-ipc",
+    # Privileged PAM-lifecycle broker (Epic: unified session/pamd).
+    "crates/halmasuit-session",
     "crates/halmasuit-cli",
     "crates/halmasuit-spawn",
     "crates/halmasuit-test",

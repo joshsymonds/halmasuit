@@ -1059,6 +1059,16 @@ name = "halmasuit-protocols"
 version = "0.1.0"
 
 [[package]]
+name = "halmasuit-session"
+version = "0.1.0"
+dependencies = [
+ "halmasuit-session-ipc",
+ "nix 0.30.1",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "halmasuit-session-ipc"
 version = "0.1.0"
 dependencies = [
