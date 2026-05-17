@@ -16,10 +16,12 @@
 //!   warnings`) flags any stray or unjustified `unsafe` anywhere in the
 //!   crate — the same quarantine idiom as `halmasuit-pam`.
 
+pub mod auth;
 pub mod conv;
 pub mod pam_ffi;
 pub mod responder;
 pub mod transport;
 
+pub use auth::{AuthError, ResolvedIdentity, run_pam_auth};
 pub use responder::ChannelResponder;
 pub use transport::{SeqpacketChannel, TransportError, peer_uid};
