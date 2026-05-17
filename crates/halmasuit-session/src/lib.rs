@@ -13,6 +13,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod conv;
+
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use halmasuit_session_ipc::{CodecError, MAX_MESSAGE_SIZE, encode, try_decode};
