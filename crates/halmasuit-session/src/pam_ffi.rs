@@ -29,9 +29,10 @@ use std::{panic, ptr};
 
 use halmasuit_session_ipc::{BrokerToCompositor, Secret};
 use pam_sys::{
-    PAM_BUF_ERR, PAM_CONV_ERR, PAM_RUSER, PAM_SUCCESS, PAM_TTY, PAM_USER, pam_acct_mgmt,
-    pam_authenticate, pam_conv, pam_end, pam_get_item, pam_handle_t, pam_message, pam_response,
-    pam_set_item, pam_start,
+    PAM_BUF_ERR, PAM_CONV_ERR, PAM_ESTABLISH_CRED, PAM_RUSER, PAM_SUCCESS, PAM_TTY, PAM_USER,
+    pam_acct_mgmt, pam_authenticate, pam_close_session, pam_conv, pam_end, pam_get_item,
+    pam_handle_t, pam_message, pam_open_session, pam_response, pam_set_item, pam_setcred,
+    pam_start,
 };
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -57,6 +58,15 @@ pub enum PamError {
     /// `pam_get_item(PAM_USER)` failed or returned non-UTF-8.
     #[error("pam_get_item(PAM_USER) failed: status {0}")]
     GetUser(c_int),
+    /// `pam_setcred(PAM_ESTABLISH_CRED)` returned a non-success status.
+    #[error("pam_setcred failed: status {0}")]
+    SetCred(c_int),
+    /// `pam_open_session` returned a non-success status.
+    #[error("pam_open_session failed: status {0}")]
+    OpenSession(c_int),
+    /// `pam_close_session` returned a non-success status.
+    #[error("pam_close_session failed: status {0}")]
+    CloseSession(c_int),
     /// A string argument contained an interior NUL.
     #[error("argument contained NUL byte")]
     Nul(#[from] NulError),
@@ -375,6 +385,74 @@ impl<'c> Pam<'c> {
             Ok(())
         } else {
             Err(PamError::AcctMgmt(status))
+        }
+    }
+
+    /// Run `pam_setcred(PAM_ESTABLISH_CRED)` — establish credentials
+    /// (kernel keyring keys, supplementary groups, etc.) on the SAME
+    /// handle before `open_session` (Epic R1). The greetd-canonical
+    /// ordering: authenticate → acct_mgmt → setcred(ESTABLISH) →
+    /// open_session.
+    ///
+    /// # Errors
+    /// [`PamError::SetCred`] on a non-success status.
+    pub fn set_cred_established(&mut self) -> Result<(), PamError> {
+        #[expect(
+            unsafe_code,
+            reason = "FFI: pam_setcred(PAM_ESTABLISH_CRED); handle owned by self."
+        )]
+        let status = unsafe { pam_setcred(self.handle, PAM_ESTABLISH_CRED as c_int) };
+        self.last_status = status;
+        if status == PAM_SUCCESS as c_int {
+            Ok(())
+        } else {
+            Err(PamError::SetCred(status))
+        }
+    }
+
+    /// Run `pam_open_session` on the SAME handle (Epic R1).
+    ///
+    /// Requires host-ns root (Epic R2/R6): pam_systemd creates
+    /// `/run/user/$UID` and the logind session; pam_mount mounts
+    /// `$HOME`. After this the broker `fork`s (NOT `execve` — Epic
+    /// R1/R7) the privilege-dropped session leader; the handle stays
+    /// in the broker parent to `close_session` at logout. First real
+    /// exercise is the credential-passing VM gate (Epic R12 — never
+    /// mocked).
+    ///
+    /// # Errors
+    /// [`PamError::OpenSession`] on a non-success status.
+    pub fn open_session(&mut self) -> Result<(), PamError> {
+        #[expect(
+            unsafe_code,
+            reason = "FFI: pam_open_session; handle owned by self, flags=0."
+        )]
+        let status = unsafe { pam_open_session(self.handle, 0) };
+        self.last_status = status;
+        if status == PAM_SUCCESS as c_int {
+            Ok(())
+        } else {
+            Err(PamError::OpenSession(status))
+        }
+    }
+
+    /// Run `pam_close_session` on the SAME handle at logout (Epic R1),
+    /// before `Drop` runs `pam_end`. Unmounts `$HOME` (pam_mount),
+    /// tells logind the session ended (pam_systemd) — host-ns root.
+    ///
+    /// # Errors
+    /// [`PamError::CloseSession`] on a non-success status.
+    pub fn close_session(&mut self) -> Result<(), PamError> {
+        #[expect(
+            unsafe_code,
+            reason = "FFI: pam_close_session; handle owned by self, flags=0."
+        )]
+        let status = unsafe { pam_close_session(self.handle, 0) };
+        self.last_status = status;
+        if status == PAM_SUCCESS as c_int {
+            Ok(())
+        } else {
+            Err(PamError::CloseSession(status))
         }
     }
 
@@ -756,5 +834,26 @@ mod tests {
             libc::free(resp.cast::<c_void>());
         }
         peer_thread.join().unwrap();
+    }
+
+    #[test]
+    fn session_phase_pam_errors_display_status_not_credentials() {
+        // The session-phase variants exist and Display the call name +
+        // status only — never anything credential-ish. Their real
+        // libpam exercise (host-ns root) is the R7/credential-passing
+        // VM gate (Epic R12 forbids mocking PAM here).
+        for (e, needle) in [
+            (PamError::SetCred(7), "pam_setcred"),
+            (PamError::OpenSession(9), "pam_open_session"),
+            (PamError::CloseSession(3), "pam_close_session"),
+        ] {
+            let shown = e.to_string();
+            assert!(shown.contains(needle), "got {shown:?}");
+            assert!(
+                !shown.to_lowercase().contains("password")
+                    && !shown.to_lowercase().contains("secret"),
+                "error must not leak credentials: {shown:?}"
+            );
+        }
     }
 }
