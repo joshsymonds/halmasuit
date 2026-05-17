@@ -9,6 +9,21 @@
 //! `#![forbid(unsafe_code)]`; the only unsafe in the crate stays in
 //! `pam_ffi`/`worker`.
 //!
+//! R9 teardown note (for R13's ARCHITECTURE.md/CLAUDE.md rewrite):
+//! the Epic-R9 clause "extend the COMPOSITOR's existing single
+//! SIGCHLD `waitpid(WNOHANG)` reaper with a `PamWorker` `ReapOutcome`
+//! variant" is SUPERSEDED by this out-of-process broker and is N/A
+//! here. The compositor neither spawns nor reaps the PAM worker; the
+//! broker's `AuthSlot` owns `WorkerHandle{pid,pidfd}` and reaps it
+//! synchronously (pidfd-kill + `waitpid`) at every connection-terminal
+//! point — success/auth-fail (`reap_current`), greeter-cancel /
+//! out-of-phase (`cancel_current`), and transport-error (the R9
+//! invariant added below in `relay`/`BrokerLoop::step`). No second
+//! SIGCHLD/`waitid(P_PIDFD)` reaper exists (R9 anti-pattern); reaping
+//! stays slot-owned and synchronous. The superseded compositor-reaper
+//! extension goes away with `halmasuit-pam` in the successor
+//! (compositor→broker) epic (Amendment A3).
+//!
 //! The relay is strictly turn-based, mirroring the PAM conversation:
 //! the worker prompts and the broker pumps the answer back, then the
 //! worker reports `AuthOk` and BLOCKS for the greeter's
@@ -251,14 +266,28 @@ pub(crate) fn relay(
     loop {
         let step = match r.phase() {
             RelayPhase::AwaitWorker | RelayPhase::SessionRunning => {
-                r.on_worker_readable(slot, compositor)?
+                r.on_worker_readable(slot, compositor)
             }
             RelayPhase::AwaitGreeterConvResponse | RelayPhase::AwaitGreeterStartSession => {
-                r.on_greeter_readable(slot, compositor)?
+                r.on_greeter_readable(slot, compositor)
             }
         };
-        if let RelayStep::Finished(d) = step {
-            return Ok(d);
+        match step {
+            Ok(RelayStep::Continue) => {}
+            Ok(RelayStep::Finished(d)) => return Ok(d),
+            Err(e) => {
+                // R9 invariant: the connection ended for ANY reason ⇒
+                // the slot worker is reaped exactly once before we
+                // return (no transient zombie lingering to the next
+                // create-evict or the ≤30s idle-exit). Idempotent: the
+                // out-of-phase/unexpected-frame paths already
+                // `cancel_current()` (so `take()` is `None` here — no
+                // second wait); the transport-error `?` paths
+                // (worker/greeter `recv`/`send` failed mid-relay) did
+                // NOT — this reaps those.
+                let _ = slot.cancel_current();
+                return Err(e);
+            }
         }
     }
 }
@@ -351,8 +380,15 @@ impl BrokerLoop {
             }
             Err(e) => {
                 tracing_log(&format!("connection error: {e}"));
-                // The relay already cancel/reaped the worker on its
-                // error paths; just drop the loop sources.
+                // R9 invariant: connection ended for ANY reason ⇒ slot
+                // worker reaped exactly once, here, before the sources
+                // are dropped — no transient zombie until the next
+                // create-evict or the idle-exit. Idempotent: the
+                // out-of-phase/unexpected-frame relay paths already
+                // `cancel_current()` (`take()` → `None`, no second
+                // wait); the transport-error `recv`/`send` paths did
+                // NOT — this reaps those. Then drop the loop sources.
+                let _ = slot.cancel_current();
                 self.drop_active();
             }
         }
@@ -713,6 +749,40 @@ mod tests {
             "cancelled worker SIGKILLed + reaped, slot cleared"
         );
         gt.join().unwrap();
+    }
+
+    #[test]
+    fn relay_worker_dies_mid_relay_is_reaped_no_zombie() {
+        // R9 closure: a worker that exits abruptly mid-relay (drops
+        // its channel) makes the broker's next recv error. The
+        // connection ends for a transport reason — the slot worker
+        // MUST still be reaped exactly once, with no transient zombie
+        // lingering until the next create-evict or the ≤30s
+        // idle-exit. Scripted-worker socketpair, NOT a PAM mock
+        // (Epic R12 — process-supervision testing is not PAM mocking).
+        let mut slot = AuthSlot::new(GREETER, 5, Duration::from_secs(10));
+        slot.create(GREETER, || {
+            spawn_worker(|_w| {
+                // Return immediately → _exit(0), dropping the worker
+                // channel end. The broker's first recv sees the peer
+                // closed (TransportError::Closed) — the worker-died-
+                // mid-relay path.
+            })
+        })
+        .unwrap();
+        assert!(slot.current().is_some());
+
+        let (_greeter, broker_end) = pair();
+        let r = relay(&mut slot, &broker_end);
+        assert!(
+            matches!(r, Err(BrokerError::Transport(_))),
+            "worker death mid-relay surfaces as a transport error: {r:?}"
+        );
+        assert!(
+            slot.current().is_none(),
+            "R9: the dead worker was reaped on the transport-error \
+             path (no transient zombie)"
+        );
     }
 
     #[test]

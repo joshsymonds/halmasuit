@@ -29,8 +29,8 @@
 #  - R7/R11 getgrouplist-MERGE: the broker process carries the
 #    supplementary group `shadow` (the unit's `SupplementaryGroups=`),
 #    which is NOT a /etc/group membership of `test`. It reaches the
-#    privilege-dropped leader ONLY if `merged_groups` UNIONed the
-#    broker's established supplementary set; a blind `initgroups(test)`
+#    privilege-dropped leader ONLY if `merged_groups` took the UNION
+#    of the broker's established supplementary set; a blind `initgroups(test)`
 #    would yield only test's static groups and DROP `shadow` — the
 #    exact anti-pattern R7/R11 forbids.
 #  - R8 (identity is PAM-resolved test/1000/1000) and R6 (clean
@@ -259,8 +259,8 @@ pkgs.testers.runNixOSTest {
 
     # ── R7/R11 getgrouplist-MERGE: `shadow` (the broker unit's
     #    SupplementaryGroups=, NOT a /etc/group membership of `test`)
-    #    reached the privilege-dropped leader → merged_groups UNIONed
-    #    the broker's established supplementary set. A blind
+    #    reached the privilege-dropped leader → merged_groups took the
+    #    UNION of the broker's established supplementary set. A blind
     #    initgroups(test) would yield only test/wheel/video/input and
     #    DROP `shadow` — the exact anti-pattern R7/R11 forbids.
     machine.succeed("grep -qw shadow /tmp/oh/leader-id")
