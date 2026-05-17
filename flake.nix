@@ -313,6 +313,35 @@
             };
           };
 
+          # halmasuit-session — the socket-activated privileged
+          # PAM-lifecycle broker (Epic #1 R6). Links pam-sys (the SOLE
+          # libpam surface, R14) so it needs the same bindgen + libpam
+          # wiring as the testdriver, but none of smithay's
+          # wayland/GL/seatd stack.
+          halmasuit-session = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-session";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags   = [ "-p" "halmasuit-session" "--bin" "halmasuit-session" ];
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.llvmPackages.libclang ];
+            buildInputs       = [ pkgs.pam ];
+            env = {
+              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+              BINDGEN_EXTRA_CLANG_ARGS =
+                "-I${pkgs.pam}/include -I${pkgs.glibc.dev}/include";
+            };
+            doCheck = false;
+            meta = {
+              description = "halmasuit socket-activated privileged PAM-lifecycle broker";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-session";
+            };
+          };
+
           # halmasuit-session-pam-testdriver — test-only driver for the
           # real-PAM gate (Epic #1 R12). Links pam-sys (via
           # halmasuit-session) so it needs the same bindgen + libpam

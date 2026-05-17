@@ -11,6 +11,13 @@ authors.workspace      = true
 [lints]
 workspace = true
 
+# The socket-activated privileged broker binary (Epic R6). The library
+# is the API surface + the sole libpam/unsafe quarantine; this bin is
+# pure composition (#![forbid(unsafe_code)] in the file).
+[[bin]]
+name = "halmasuit-session"
+path = "src/bin/halmasuit-session.rs"
+
 [dependencies]
 # The frozen wire contract this transport carries.
 halmasuit-session-ipc = { path = "../halmasuit-session-ipc", version = "0.1" }

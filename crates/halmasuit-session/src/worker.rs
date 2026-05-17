@@ -189,6 +189,35 @@ fn pidfd_send_signal(pidfd: &OwnedFd, sig: i32) -> io::Result<()> {
 /// (HANDOFF §0.4: failure cost stays delegated to the PAM stack).
 const RLIMIT_CPU_SECS: u64 = 30;
 
+/// Accept ONE connection on the systemd-passed `SOCK_SEQPACKET`
+/// listening fd (Epic R6 socket activation) and wrap it as a
+/// [`SeqpacketChannel`].
+///
+/// `listener_fd` is the inherited activation fd
+/// (`SD_LISTEN_FDS_START`); systemd already did `socket`/`bind`/
+/// `listen`, so this only `accept(2)`s. The accepted fd is adopted
+/// into an `OwnedFd` here — the single `unsafe` socket activation
+/// needs — kept in this already-quarantined module so the binary
+/// stays `#![forbid(unsafe_code)]`.
+///
+/// # Errors
+///
+/// Any errno from `accept(2)`.
+pub fn accept_seqpacket(listener_fd: std::os::fd::RawFd) -> io::Result<SeqpacketChannel> {
+    let accepted = nix::sys::socket::accept(listener_fd).map_err(io::Error::from)?;
+    // SAFETY: `accepted` is a fresh fd just returned by accept(2);
+    // nothing else owns it. Adopting it into OwnedFd gives it RAII
+    // close — the same idiom as the pidfd adoption above.
+    #[expect(
+        unsafe_code,
+        reason = "adopt the fresh accept(2) fd into OwnedFd (RAII close); \
+                  nothing else holds it. Quarantined here so the bin and \
+                  transport stay #![forbid(unsafe_code)]."
+    )]
+    let owned = unsafe { OwnedFd::from_raw_fd(accepted) };
+    Ok(SeqpacketChannel::new(owned))
+}
+
 /// Fork a disposable child running `child_main` on its SEQPACKET end;
 /// return the parent's handle + channel end. The generic seam lets the
 /// worker's own tests exercise fork/kill/reap with a non-PAM payload
