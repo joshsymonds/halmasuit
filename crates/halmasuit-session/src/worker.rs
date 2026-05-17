@@ -71,6 +71,7 @@ pub enum ParentMessage {
 /// SIGKILL via pidfd (race-free wrt pid reuse — memory
 /// `project-pidfd-over-raw-kill`); there is deliberately NO SIGTERM
 /// path (Epic R4: SIGKILL direct, no grace).
+#[derive(Debug)]
 pub struct WorkerHandle {
     pub pid: u32,
     pidfd: OwnedFd,
@@ -271,6 +272,144 @@ pub fn spawn_auth_worker(
     })
 }
 
+/// The Design-A session leader (Epic R7).
+///
+/// The already-root broker `fork()`s; the NON-setuid child does the
+/// straight-line privilege drop + `execve`; the parent gets a
+/// [`WorkerHandle`] (it waits, then runs `pam_close_session` on the
+/// still-held handle). EUID==0 gate FIRST — refuses a non-root caller
+/// before any fork. Discipline relocated from `halmasuit-spawn`
+/// (deleted at epic close, R15); supplementary groups are MERGED by
+/// the caller via [`crate::session_leader::merged_groups`] (R7/R11) —
+/// NEVER a blind `initgroups`.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::PermissionDenied`] if EUID != 0 (NO fork performed);
+/// [`io::ErrorKind::InvalidInput`] on an empty command / interior NUL
+/// in an arg or env entry; any errno from `fork`/`pidfd_open`. The
+/// CHILD never returns through this `Result` — on ANY drop/exec
+/// failure it `libc::_exit`s (never `?`/return — that would re-enter
+/// the root parent with duplicated state; Epic R7 anti-pattern).
+pub fn spawn_session_leader(
+    spec: &crate::session_leader::SessionSpec,
+    groups: &[u32],
+) -> io::Result<WorkerHandle> {
+    use std::ffi::CString;
+
+    use nix::unistd::{Gid, Uid};
+
+    // EUID==0 gate FIRST — before any fork (Epic R7/R11). The broker
+    // is root in the host ns; nothing else may drive a session launch.
+    if !nix::unistd::geteuid().is_root() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "spawn_session_leader requires EUID==0 (the broker is root in the host ns)",
+        ));
+    }
+
+    // Build everything BEFORE the fork so the privileged window
+    // between the first setres* and execve has ZERO allocations (Epic
+    // R7/R11). CString::new fails closed on interior NUL.
+    let to_c = |s: &str| -> io::Result<CString> {
+        CString::new(s).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "interior NUL in session arg/env",
+            )
+        })
+    };
+    let first = spec
+        .cmd
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty session command"))?;
+    let path = to_c(first)?;
+    let argv: Vec<CString> = spec
+        .cmd
+        .iter()
+        .map(|s| to_c(s))
+        .collect::<io::Result<_>>()?;
+    let envv: Vec<CString> = spec
+        .env
+        .iter()
+        .map(|(k, v)| to_c(&format!("{k}={v}")))
+        .collect::<io::Result<_>>()?;
+    let gids: Vec<Gid> = groups.iter().map(|&g| Gid::from_raw(g)).collect();
+    let uid = Uid::from_raw(spec.uid);
+    let gid = Gid::from_raw(spec.gid);
+
+    // SAFETY: fork(2). The child path is straight-line, every syscall
+    // return checked, and ends in libc::_exit on ANY failure — it
+    // NEVER returns into Rust (a `?`/return would re-enter the root
+    // parent with duplicated state, Epic R7). All argv/env/gids are
+    // already built (no alloc between the first setres* and execve).
+    // The parent records the pid + opens a pidfd before returning
+    // (R9 ordering).
+    #[expect(
+        unsafe_code,
+        reason = "fork(2) for the Design-A session leader (Epic R7)"
+    )]
+    let fork = unsafe { nix::unistd::fork() }.map_err(io::Error::from)?;
+
+    match fork {
+        nix::unistd::ForkResult::Child => {
+            // Distinct exit codes for post-mortem. NEVER `?`/return.
+            let die = |code: i32| -> ! {
+                // SAFETY: _exit is async-signal-safe; the child must
+                // not run atexit/Drop nor return into the parent.
+                #[expect(unsafe_code, reason = "child _exit on drop/exec failure (Epic R7)")]
+                unsafe {
+                    libc::_exit(code)
+                }
+            };
+            if nix::unistd::setsid().is_err() {
+                die(81);
+            }
+            if nix::unistd::setresgid(gid, gid, gid).is_err() {
+                die(82);
+            }
+            // MERGED groups (R7/R11) — caller passed
+            // session_leader::merged_groups; never blind initgroups.
+            if nix::unistd::setgroups(&gids).is_err() {
+                die(83);
+            }
+            if nix::unistd::setresuid(uid, uid, uid).is_err() {
+                die(84);
+            }
+            // Re-verify the drop actually happened — a successful
+            // setres* does NOT guarantee it (Epic R7).
+            match nix::unistd::getresuid() {
+                Ok(r) if r.real == uid && r.effective == uid && r.saved == uid => {}
+                _ => die(85),
+            }
+            match nix::unistd::getresgid() {
+                Ok(r) if r.real == gid && r.effective == gid && r.saved == gid => {}
+                _ => die(86),
+            }
+            if nix::sys::prctl::set_no_new_privs().is_err() {
+                die(87);
+            }
+            // memory project-pre-exec-signal-mask: empty the inherited
+            // block mask so the session is signal-deliverable.
+            let _ = nix::sys::signal::sigprocmask(
+                nix::sys::signal::SigmaskHow::SIG_SETMASK,
+                Some(&nix::sys::signal::SigSet::empty()),
+                None,
+            );
+            match nix::unistd::execve(path.as_c_str(), &argv, &envv) {
+                Ok(_) => unreachable!("execve returns Infallible on success"),
+                Err(_) => die(127),
+            }
+        }
+        nix::unistd::ForkResult::Parent { child } => {
+            let pid = u32::try_from(child.as_raw())
+                .map_err(|_| io::Error::other("child pid out of range"))?;
+            let pidfd = pidfd_open_for(pid)?;
+            Ok(WorkerHandle { pid, pidfd })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,5 +607,33 @@ mod tests {
         let bytes = encode(&outcome).unwrap();
         let (pm, _): (ParentMessage, usize) = try_decode(&bytes).unwrap().unwrap();
         assert_eq!(pm, ParentMessage::Outcome(outcome));
+    }
+
+    #[test]
+    fn spawn_session_leader_refuses_when_not_root() {
+        use crate::session_leader::SessionSpec;
+
+        // The EUID==0 gate is the directly unit-testable security
+        // check (Epic R7/R11). The real privileged drop+exec is the
+        // later one-handle-lifecycle + flagship pam_mount VM gate.
+        // If this ever runs as root, skip — we must NOT actually
+        // fork+exec a session here (root path = the VM gate).
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let spec = SessionSpec {
+            username: "nobody".into(),
+            uid: 65534,
+            gid: 65534,
+            cmd: vec!["/bin/true".into()],
+            env: vec![],
+        };
+        let r = spawn_session_leader(&spec, &[65534]);
+        let e = r.expect_err("must refuse when EUID != 0 (no fork)");
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "EUID==0 gate must reject non-root before any fork: {e:?}"
+        );
     }
 }

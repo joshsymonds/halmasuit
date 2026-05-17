@@ -38,4 +38,6 @@ pub use responder::ChannelResponder;
 pub use session_leader::{SessionSpec, SpecError, merged_groups, sanitize_env, validate};
 pub use slot::{AuthSlot, SlotError};
 pub use transport::{SeqpacketChannel, TransportError, peer_uid};
-pub use worker::{ParentMessage, WorkerHandle, WorkerOutcome, spawn_auth_worker};
+pub use worker::{
+    ParentMessage, WorkerHandle, WorkerOutcome, spawn_auth_worker, spawn_session_leader,
+};
