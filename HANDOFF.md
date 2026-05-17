@@ -428,6 +428,92 @@ Recorded in epic Task #1 as **Amendment A6**. DO NOT reintroduce a
 per-auth/`PamSession`-object that owns the broker fd, nor
 dup/Rc/Arc multi-ownership of that socket.
 
+### 0.11 Compositor↔broker auth must not block the render loop — fully sans-IO (2026-05-17, user-directed) — Amendment A7
+
+R3 step 3 surfaced a fork the requirements/A6 did not pin: A6 fixed
+socket *ownership* (episode owns it; auth driver borrows). It did NOT
+fix the *I/O integration*: greetd's `PamSession::step` is a
+SYNCHRONOUS contract, so `BrokerAuthDriver::step` does a BLOCKING
+`recv` on the privileged broker socket — and that recv is reached
+from `handle_connection_ready` on the SAME single calloop
+`EventLoop` that owns the DRM `VBlank`/render source. That stalls the
+continuously-presenting compositor on a privileged-peer round-trip —
+against the project's defining no-flash invariant. Resolved like
+A1/A2/A5/A6: three independent BLIND primary-source agents, different
+angles (privsep login daemons greetd-daemon/GDM/LightDM event-loop ↔
+auth integration; the sans-IO suspend/resume doctrine +
+h11/h2/quinn-proto/rustls; continuous-display robustness + the
+kernel recv/timeout/EOF semantics + Mir/USC/gamescope/wlroots/calloop
+source). **Unanimous, strong convergence — and it OVERTURNED the
+"brief blocking recv is probably fine" lean.**
+
+**Decision (Amendment A7):**
+
+A7.1 — **The compositor calloop thread NEVER does a blocking `recv`
+on the broker socket — not brief, not with a timeout.** A recv
+timeout only trades an unbounded stall for a bounded multi-vblank
+stall; it does not classify peer state and adds an
+`SO_RCVTIMEO`/`EINTR` hazard. Mir hit exactly this (synchronous
+protocol IPC on the compositor thread, ~1 ms/op measured); the
+upstream fix branch was literally named
+`no-ipc-on-compositor-threads` (Launchpad #1395421). libwayland/
+wlroots/**calloop** all enforce "one poll point; every fd a
+non-blocking source."
+
+A7.2 — **The broker SEQPACKET fd is a per-greeter-connection calloop
+source** (set non-blocking, exactly like the greetd listener already
+is). Episode-owned (A6). Readable → ONE non-blocking framed recv →
+feed the relay → resume the greetd state machine. The auth
+conversation is driven by the loop multiplexing {greeter fd, broker
+fd}, never by a blocking call.
+
+A7.3 — **greetd's PAM boundary becomes fully sans-IO
+(emit/suspend/resume).** `Connection`/`SessionState` no longer take a
+blocking `&mut dyn PamSession`. When a PAM round is needed the state
+machine EMITS the outbound broker frame and SUSPENDS (returns a
+"awaiting broker response" signal + the bytes to send to the broker);
+the compositor episode loop owns BOTH the greeter fd and the broker
+fd as sources and shuttles bytes; the state machine RESUMES when the
+broker response is fed in. This is the canonical sans-IO shape
+(h11 `NEED_DATA` / h2 `receive_data`+`data_to_send` / quinn-proto
+`handle_event`+`poll_transmit` / rustls `read_tls`+
+`process_new_packets`); a synchronous `step()` that does send +
+blocking recv internally is the explicitly-named sans-IO
+anti-pattern ("httplib baked socket calls into the parser"). This
+SUPERSEDES the A6-era greetd seam (synchronous fed
+`process(&mut dyn PamSession)`): A6 relocated ownership, A7 makes the
+effect itself non-blocking. The factory/cap removal already done
+stands; the `process` *contract* goes further.
+
+A7.4 — **Killable-peer-as-source-event.** The broker is evicted/
+SIGKILLed BY DESIGN (R5). Under A7 peer death is a readable→EOF
+event on the broker source → existing `WireError::Closed` →
+fail-closed greetd auth failure, handled identically to any other
+source event (NOT a blocking-recv return value). This makes the
+unprivileged render loop structurally robust against a slow / wedged
+/ killed PRIVILEGED peer — the lower-risk, more auditable shape.
+
+A7.5 — **`BrokerAuthDriver`'s synchronous `PamSession::step`
+(send + blocking recv) is REMOVED.** `BrokerRelay` (#27, already a
+pure phase machine) is retained as the pure translation, driven by
+the two calloop sources; `BrokerRelay::poison` (the fail-closed
+latch) is retained. greetd/GDM/LightDM are unanimous: multiplex
+where there's other work (the compositor — rendering), block only in
+the dedicated worker that has nothing else to do (the broker's
+ephemeral auth fork — already correct).
+
+A7.6 — Consequences (tasks adapt): #30 is rescoped to the sans-IO
+greetd boundary; the A6-era greetd `process(&mut dyn PamSession)`
+seam is superseded by the emit/suspend/resume contract; #29's
+`BrokerAuthDriver` is removed (its job moves into the loop-driven
+relay). The no-flash invariant is now STRUCTURALLY protected — the
+compositor cannot stall on the broker.
+
+Recorded in epic Task #1 as **Amendment A7**. DO NOT put a blocking
+`recv`/`send`-then-`recv` on the compositor render/calloop thread for
+broker IPC, with or without a timeout; DO NOT re-introduce a
+synchronous blocking `PamSession::step` effect.
+
 ---
 
 ---
