@@ -57,12 +57,163 @@ pub enum BrokerError {
     WorkerGone,
 }
 
-/// Relay ONE full lifecycle between the greeter (`compositor`) and the
-/// in-flight worker held by `slot` (Amendment A1 frame routing).
-///
-/// Strictly turn-based, mirroring the PAM conversation. The worker
-/// channel is re-borrowed from `slot` per step so a `Cancel` can take
-/// `&mut slot` to SIGKILL the worker.
+/// Which side the relay is waiting on next (Amendment A2: the relay is
+/// a step-driven state machine the calloop loop pumps on FD readiness,
+/// NOT a blocking loop that owns the thread).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayPhase {
+    /// Expect a `ParentMessage` from the in-flight worker.
+    AwaitWorker,
+    /// Sent `ConvPrompt` to the greeter; expect `ConvResponse`/`Cancel`.
+    AwaitGreeterConvResponse,
+    /// Sent `Success` to the greeter (A1.1); expect
+    /// `StartSession`/`Cancel`.
+    AwaitGreeterStartSession,
+    /// `SessionOpened` seen; the leader runs — expect `SessionEnded`
+    /// from the worker (the worker side is still the next read).
+    SessionRunning,
+}
+
+/// Outcome of one relay step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RelayStep {
+    /// More frames to relay; keep the sources armed.
+    Continue,
+    /// Terminal: the connection's lifecycle ended this way.
+    Finished(Disposition),
+}
+
+/// The step-driven relay state machine (Amendment A1 frame routing,
+/// Amendment A2 shape). One channel action per call; the worker
+/// channel is re-borrowed from `slot` each step so a greeter `Cancel`
+/// can take `&mut slot` to SIGKILL the worker.
+#[derive(Debug)]
+pub(crate) struct Relay {
+    phase: RelayPhase,
+}
+
+impl Relay {
+    pub(crate) const fn new() -> Self {
+        Self {
+            phase: RelayPhase::AwaitWorker,
+        }
+    }
+
+    pub(crate) const fn phase(&self) -> RelayPhase {
+        self.phase
+    }
+
+    /// Drive one step from the WORKER side (call when the worker
+    /// channel is readable). Valid in `AwaitWorker`/`SessionRunning`;
+    /// a readiness in a greeter-await phase is an out-of-phase
+    /// protocol violation (fail closed).
+    ///
+    /// # Errors
+    /// [`BrokerError`] on transport failure / out-of-phase frame /
+    /// vanished worker.
+    pub(crate) fn on_worker_readable(
+        &mut self,
+        slot: &mut AuthSlot,
+        compositor: &SeqpacketChannel,
+    ) -> Result<RelayStep, BrokerError> {
+        if !matches!(
+            self.phase,
+            RelayPhase::AwaitWorker | RelayPhase::SessionRunning
+        ) {
+            let _ = slot.cancel_current();
+            return Err(BrokerError::UnexpectedFrame);
+        }
+        let pm: ParentMessage = slot
+            .current()
+            .ok_or(BrokerError::WorkerGone)?
+            .channel()
+            .recv()?;
+        match pm {
+            ParentMessage::Conv(prompt @ BrokerToCompositor::ConvPrompt { .. }) => {
+                compositor.send(&prompt)?;
+                self.phase = RelayPhase::AwaitGreeterConvResponse;
+                Ok(RelayStep::Continue)
+            }
+            ParentMessage::Outcome(WorkerOutcome::AuthOk { username, uid, gid }) => {
+                // R8: identity is the worker's PAM-resolved one.
+                compositor.send(&BrokerToCompositor::Success { username, uid, gid })?;
+                self.phase = RelayPhase::AwaitGreeterStartSession;
+                Ok(RelayStep::Continue)
+            }
+            // Session is live; nothing to relay — keep awaiting the end.
+            ParentMessage::Outcome(WorkerOutcome::SessionOpened { .. }) => {
+                self.phase = RelayPhase::SessionRunning;
+                Ok(RelayStep::Continue)
+            }
+            ParentMessage::Outcome(WorkerOutcome::SessionEnded { code }) => {
+                let _ = slot.reap_current();
+                Ok(RelayStep::Finished(Disposition::Completed { code }))
+            }
+            ParentMessage::Outcome(WorkerOutcome::Failure { reason }) => {
+                compositor.send(&BrokerToCompositor::Failure {
+                    reason: reason.clone(),
+                })?;
+                let _ = slot.reap_current();
+                Ok(RelayStep::Finished(Disposition::AuthFailed { reason }))
+            }
+            // Out of phase: the worker only ever relays a ConvPrompt
+            // (Success/Failure on the BrokerToCompositor side are
+            // broker→greeter only); and `Success` is the auth-only
+            // worker variant `spawn_session_worker` never emits.
+            ParentMessage::Conv(_) | ParentMessage::Outcome(WorkerOutcome::Success { .. }) => {
+                let _ = slot.cancel_current();
+                Err(BrokerError::UnexpectedFrame)
+            }
+        }
+    }
+
+    /// Drive one step from the GREETER side (call when the compositor
+    /// channel is readable). Valid only in the greeter-await phases;
+    /// a readiness otherwise is out-of-phase (fail closed).
+    ///
+    /// # Errors
+    /// [`BrokerError`] on transport failure / out-of-phase frame /
+    /// vanished worker.
+    pub(crate) fn on_greeter_readable(
+        &mut self,
+        slot: &mut AuthSlot,
+        compositor: &SeqpacketChannel,
+    ) -> Result<RelayStep, BrokerError> {
+        let expect_start = match self.phase {
+            RelayPhase::AwaitGreeterConvResponse => false,
+            RelayPhase::AwaitGreeterStartSession => true,
+            RelayPhase::AwaitWorker | RelayPhase::SessionRunning => {
+                let _ = slot.cancel_current();
+                return Err(BrokerError::UnexpectedFrame);
+            }
+        };
+        let frame = compositor.recv::<CompositorToBroker>()?;
+        match (&frame, expect_start) {
+            (CompositorToBroker::ConvResponse { .. }, false)
+            | (CompositorToBroker::StartSession { .. }, true) => {
+                slot.current()
+                    .ok_or(BrokerError::WorkerGone)?
+                    .channel()
+                    .send(&frame)?;
+                self.phase = RelayPhase::AwaitWorker;
+                Ok(RelayStep::Continue)
+            }
+            (CompositorToBroker::Cancel, _) => {
+                let _ = slot.cancel_current();
+                Ok(RelayStep::Finished(Disposition::Cancelled))
+            }
+            _ => {
+                let _ = slot.cancel_current();
+                Err(BrokerError::UnexpectedFrame)
+            }
+        }
+    }
+}
+
+/// Blocking driver over [`Relay`] — turn-based, used by
+/// [`handle_connection`] and the relay tests. The Amendment-A2 calloop
+/// loop (next task) calls the step methods directly from FD callbacks
+/// and DELETES this driver + the serial binary loop (no shim then).
 ///
 /// # Errors
 ///
@@ -72,75 +223,18 @@ pub(crate) fn relay(
     slot: &mut AuthSlot,
     compositor: &SeqpacketChannel,
 ) -> Result<Disposition, BrokerError> {
+    let mut r = Relay::new();
     loop {
-        let pm: ParentMessage = slot
-            .current()
-            .ok_or(BrokerError::WorkerGone)?
-            .channel()
-            .recv()?;
-        match pm {
-            ParentMessage::Conv(prompt @ BrokerToCompositor::ConvPrompt { .. }) => {
-                compositor.send(&prompt)?;
-                match compositor.recv::<CompositorToBroker>()? {
-                    resp @ CompositorToBroker::ConvResponse { .. } => {
-                        slot.current()
-                            .ok_or(BrokerError::WorkerGone)?
-                            .channel()
-                            .send(&resp)?;
-                    }
-                    CompositorToBroker::Cancel => {
-                        let _ = slot.cancel_current();
-                        return Ok(Disposition::Cancelled);
-                    }
-                    _ => {
-                        let _ = slot.cancel_current();
-                        return Err(BrokerError::UnexpectedFrame);
-                    }
-                }
+        let step = match r.phase() {
+            RelayPhase::AwaitWorker | RelayPhase::SessionRunning => {
+                r.on_worker_readable(slot, compositor)?
             }
-            ParentMessage::Outcome(WorkerOutcome::AuthOk { username, uid, gid }) => {
-                // R8: identity is the worker's PAM-resolved one.
-                compositor.send(&BrokerToCompositor::Success { username, uid, gid })?;
-                // Amendment A1.1: the greeter now sends the session
-                // spec; forward it verbatim to the blocked worker.
-                match compositor.recv::<CompositorToBroker>()? {
-                    start @ CompositorToBroker::StartSession { .. } => {
-                        slot.current()
-                            .ok_or(BrokerError::WorkerGone)?
-                            .channel()
-                            .send(&start)?;
-                    }
-                    CompositorToBroker::Cancel => {
-                        let _ = slot.cancel_current();
-                        return Ok(Disposition::Cancelled);
-                    }
-                    _ => {
-                        let _ = slot.cancel_current();
-                        return Err(BrokerError::UnexpectedFrame);
-                    }
-                }
+            RelayPhase::AwaitGreeterConvResponse | RelayPhase::AwaitGreeterStartSession => {
+                r.on_greeter_readable(slot, compositor)?
             }
-            // Session is live; nothing to relay — wait for the end.
-            ParentMessage::Outcome(WorkerOutcome::SessionOpened { .. }) => {}
-            ParentMessage::Outcome(WorkerOutcome::SessionEnded { code }) => {
-                let _ = slot.reap_current();
-                return Ok(Disposition::Completed { code });
-            }
-            ParentMessage::Outcome(WorkerOutcome::Failure { reason }) => {
-                compositor.send(&BrokerToCompositor::Failure {
-                    reason: reason.clone(),
-                })?;
-                let _ = slot.reap_current();
-                return Ok(Disposition::AuthFailed { reason });
-            }
-            // Out of phase: the worker only ever relays a ConvPrompt
-            // (Success/Failure on the BrokerToCompositor side are
-            // broker→greeter only); and `Success` is the auth-only
-            // worker variant `spawn_session_worker` never emits.
-            ParentMessage::Conv(_) | ParentMessage::Outcome(WorkerOutcome::Success { .. }) => {
-                let _ = slot.cancel_current();
-                return Err(BrokerError::UnexpectedFrame);
-            }
+        };
+        if let RelayStep::Finished(d) = step {
+            return Ok(d);
         }
     }
 }
@@ -362,5 +456,130 @@ mod tests {
         );
         assert!(slot.current().is_none(), "no worker spawned");
         gt.join().unwrap();
+    }
+
+    // ── Amendment A2: the step-driven state machine ──────────────────
+    // Same scripted-worker socketpair harness (NOT a PAM mock — R12);
+    // these drive the step methods directly, the shape the calloop
+    // event loop will call them in.
+
+    #[test]
+    fn step_machine_conv_then_response_then_end_transitions_phases() {
+        let mut slot = AuthSlot::new(GREETER, 5, Duration::from_secs(10));
+        slot.create(GREETER, || {
+            spawn_worker(|w| {
+                w.send(&BrokerToCompositor::ConvPrompt {
+                    style: PromptStyle::Secret,
+                    message: "PW: ".into(),
+                })
+                .unwrap();
+                let r: CompositorToBroker = w.recv().unwrap();
+                assert!(matches!(r, CompositorToBroker::ConvResponse { .. }));
+                w.send(&WorkerOutcome::SessionEnded { code: 0 }).unwrap();
+            })
+        })
+        .unwrap();
+
+        let (greeter, broker_end) = pair();
+        let gt = thread::spawn(move || {
+            let p: BrokerToCompositor = greeter.recv().unwrap();
+            assert!(matches!(p, BrokerToCompositor::ConvPrompt { .. }));
+            greeter
+                .send(&CompositorToBroker::ConvResponse {
+                    response: Secret::new("pw".into()),
+                })
+                .unwrap();
+        });
+
+        let mut r = Relay::new();
+        assert_eq!(r.phase(), RelayPhase::AwaitWorker);
+        // worker prompt → forwarded to greeter; await its response.
+        assert_eq!(
+            r.on_worker_readable(&mut slot, &broker_end).unwrap(),
+            RelayStep::Continue
+        );
+        assert_eq!(r.phase(), RelayPhase::AwaitGreeterConvResponse);
+        // greeter response → forwarded to worker; back to await worker.
+        assert_eq!(
+            r.on_greeter_readable(&mut slot, &broker_end).unwrap(),
+            RelayStep::Continue
+        );
+        assert_eq!(r.phase(), RelayPhase::AwaitWorker);
+        // worker SessionEnded → terminal, reaped.
+        assert_eq!(
+            r.on_worker_readable(&mut slot, &broker_end).unwrap(),
+            RelayStep::Finished(Disposition::Completed { code: 0 })
+        );
+        assert!(slot.current().is_none(), "reaped after SessionEnded");
+        gt.join().unwrap();
+    }
+
+    #[test]
+    fn step_machine_greeter_cancel_at_conv_finishes_cancelled() {
+        let mut slot = AuthSlot::new(GREETER, 5, Duration::from_secs(10));
+        slot.create(GREETER, || {
+            spawn_worker(|w| {
+                w.send(&BrokerToCompositor::ConvPrompt {
+                    style: PromptStyle::Secret,
+                    message: "PW: ".into(),
+                })
+                .unwrap();
+                let _: Result<CompositorToBroker, _> = w.recv();
+                loop {
+                    std::thread::park();
+                }
+            })
+        })
+        .unwrap();
+
+        let (greeter, broker_end) = pair();
+        let gt = thread::spawn(move || {
+            let _p: BrokerToCompositor = greeter.recv().unwrap();
+            greeter.send(&CompositorToBroker::Cancel).unwrap();
+        });
+
+        let mut r = Relay::new();
+        assert_eq!(
+            r.on_worker_readable(&mut slot, &broker_end).unwrap(),
+            RelayStep::Continue
+        );
+        assert_eq!(r.phase(), RelayPhase::AwaitGreeterConvResponse);
+        assert_eq!(
+            r.on_greeter_readable(&mut slot, &broker_end).unwrap(),
+            RelayStep::Finished(Disposition::Cancelled)
+        );
+        assert!(
+            slot.current().is_none(),
+            "greeter Cancel SIGKILLed + reaped the worker"
+        );
+        gt.join().unwrap();
+    }
+
+    #[test]
+    fn step_machine_out_of_phase_worker_frame_fails_closed() {
+        let mut slot = AuthSlot::new(GREETER, 5, Duration::from_secs(10));
+        slot.create(GREETER, || {
+            spawn_worker(|w| {
+                // `Success` is the auth-only variant; the full
+                // lifecycle worker never emits it — out of phase.
+                w.send(&WorkerOutcome::Success {
+                    username: "x".into(),
+                    uid: 1,
+                    gid: 2,
+                })
+                .unwrap();
+            })
+        })
+        .unwrap();
+        let (_greeter, broker_end) = pair();
+        let mut r = Relay::new();
+        assert!(matches!(
+            r.on_worker_readable(&mut slot, &broker_end),
+            Err(BrokerError::UnexpectedFrame)
+        ));
+        assert!(
+            slot.current().is_none(),
+            "out-of-phase frame fails closed: worker cancelled + reaped"
+        );
     }
 }
