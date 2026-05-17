@@ -1,19 +1,23 @@
-# Epic #1 R12 + R4 — the real-PAM gate.
+# Epic #1 R12 + R4 + R5 — the real-PAM gate.
 #
 # Proves halmasuit-session authenticates against the REAL libpam stack
 # with the REAL test user, end-to-end over a real SOCK_SEQPACKET
-# socketpair, in BOTH paths: in-process `run_pam_auth` and through the
-# ephemeral SIGKILL-able privileged fork `spawn_auth_worker` (R4). NO
-# mock, NO PAM bypass (CLAUDE.md hard rule). The driver calls the real
-# code; the testScript only inspects its parseable output.
+# socketpair. NO mock, NO PAM bypass (CLAUDE.md hard rule). The driver
+# calls the real code; the testScript only inspects its parseable
+# output.
 #
 # Asserts:
 #   1. Correct password → identity whose username/uid/gid come from
 #      PAM's resolved name's pwent (Epic R8): test/1000/1000 — both
-#      in-process and via the fork.
+#      in-process (`run_pam_auth`) and through the ephemeral
+#      SIGKILL-able privileged fork (`spawn_auth_worker`, R4).
 #   2. Wrong password → fail closed (non-zero, bounded by the driver's
 #      watchdog, no hang, no panic) — both paths.
 #   3. Via the fork: the worker child is reaped, no orphan survives.
+#   4. R5 evict-old: a REAL in-flight auth (blocked in
+#      pam_authenticate) is evicted by an authorized greeter create —
+#      SIGKILL (no SIGTERM) + reap + fresh auth succeeds; a
+#      non-greeter peer cannot evict (in-flight untouched); no orphan.
 
 {
   system,
@@ -100,11 +104,36 @@ pkgs.testers.runNixOSTest {
     )
     machine.fail("pgrep -f halmasuit-session-pam-testdriver")
 
+    # ── Epic R5: evict a REAL in-flight auth via AuthSlot ──
+    # Worker #1 is a real spawn_auth_worker blocked in real
+    # pam_authenticate; a non-greeter peer cannot evict it; an
+    # authorized greeter create SIGKILLs+reaps it (R4, no SIGTERM);
+    # a fresh real auth then succeeds; the fresh worker is reaped.
+    out = machine.succeed(
+        "halmasuit-session-pam-testdriver halmasuit-pam-test test /tmp/pw --evict-demo"
+    )
+    assert "EVICT_DEMO unauthorized_refused inflight_untouched=true" in out, (
+        f"evict-demo: non-greeter must not evict the real in-flight worker: {out!r}"
+    )
+    assert "evicted_sigkill=true pid_changed=true" in out, (
+        f"evict-demo: authorized evict must SIGKILL the real in-flight "
+        f"worker and install a fresh one: {out!r}"
+    )
+    assert "OK user=test uid=1000 gid=1000" in out, (
+        f"evict-demo: post-evict fresh real auth must succeed (R8): {out!r}"
+    )
+    assert "fresh_reaped_ok=true" in out, (
+        f"evict-demo: the fresh worker must be reaped: {out!r}"
+    )
+    machine.fail("pgrep -f halmasuit-session-pam-testdriver")
+
     print(
         "run-pam-auth: REAL pam_unix succeeded for test (uid=1000 "
-        "gid=1000, identity from pam_get_user) BOTH in-process and "
-        "through the ephemeral privileged fork (R4); wrong password "
-        "rejected fail-closed; worker child reaped, no orphan."
+        "gid=1000, identity from pam_get_user) in-process AND through "
+        "the ephemeral privileged fork (R4); wrong password rejected "
+        "fail-closed; AuthSlot evicted a REAL in-flight auth via "
+        "SIGKILL with the non-greeter refused and the fresh auth "
+        "succeeding (R5); no orphan worker survives."
     )
   '';
 }

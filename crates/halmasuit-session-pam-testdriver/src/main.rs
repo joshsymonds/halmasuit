@@ -22,10 +22,13 @@ use std::time::Duration;
 use std::{env, fs, process, thread};
 
 use halmasuit_session::{
-    ParentMessage, SeqpacketChannel, WorkerOutcome, run_pam_auth, spawn_auth_worker,
+    AuthSlot, ParentMessage, SeqpacketChannel, SlotError, WorkerOutcome, run_pam_auth,
+    spawn_auth_worker,
 };
 use halmasuit_session_ipc::{BrokerToCompositor, CompositorToBroker, Secret};
+use nix::sys::signal::Signal;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+use nix::sys::wait::WaitStatus;
 
 fn spawn_watchdog() {
     thread::spawn(|| {
@@ -38,10 +41,11 @@ fn spawn_watchdog() {
 fn main() {
     let args: Vec<String> = env::args().collect();
     let via_fork = args.iter().any(|a| a == "--via-fork");
+    let evict_demo = args.iter().any(|a| a == "--evict-demo");
     let positional: Vec<&String> = args[1..].iter().filter(|a| !a.starts_with("--")).collect();
     if positional.len() != 3 {
         eprintln!(
-            "usage: {} <service> <username> <password-file> [--via-fork]",
+            "usage: {} <service> <username> <password-file> [--via-fork|--evict-demo]",
             args[0]
         );
         process::exit(64);
@@ -51,11 +55,119 @@ fn main() {
     let raw = fs::read_to_string(positional[2]).expect("read password file");
     let password = raw.strip_suffix('\n').unwrap_or(&raw).to_owned();
 
-    if via_fork {
+    if evict_demo {
+        run_evict_demo(&service, &username, &password);
+    } else if via_fork {
         run_via_fork(&service, &username, &password);
     } else {
         run_in_process(&service, &username, password);
     }
+}
+
+/// Epic R5 path: a real in-flight `spawn_auth_worker` (blocked in real
+/// `pam_authenticate`) is evicted via `AuthSlot`. Proves: a non-greeter
+/// peer cannot evict (in-flight untouched); an authorized greeter
+/// create SIGKILLs+reaps the real in-flight worker (R4, no SIGTERM);
+/// a fresh real auth then succeeds; the worker is reaped (no orphan).
+fn run_evict_demo(service: &str, username: &str, password: &str) {
+    const GREETER: u32 = 1000; // the VM test user's uid
+    const NON_GREETER: u32 = 9999;
+
+    let mut slot = AuthSlot::with_defaults(GREETER);
+
+    // In-flight #1: a REAL worker. Both spawn_auth_worker forks happen
+    // BEFORE the watchdog thread (single-threaded fork discipline).
+    slot.create(GREETER, || spawn_auth_worker(service, username))
+        .expect("authorized create #1");
+    let pid1 = slot.current().expect("inflight #1").pid;
+
+    // Drive #1 just far enough to be genuinely blocked in real
+    // pam_authenticate: read its first ConvPrompt and DO NOT answer.
+    match slot.current().unwrap().channel().recv::<ParentMessage>() {
+        Ok(ParentMessage::Conv(BrokerToCompositor::ConvPrompt { .. })) => {}
+        other => {
+            eprintln!("ERR worker #1 did not reach a conv prompt: {other:?}");
+            let _ = slot.reap_current();
+            process::exit(1);
+        }
+    }
+
+    // A non-greeter peer must NOT be able to evict the real in-flight
+    // worker. spawn_auth_worker is NOT called (gate rejects first).
+    match slot.create(NON_GREETER, || spawn_auth_worker(service, username)) {
+        Err(SlotError::Unauthorized) => {}
+        other => {
+            eprintln!("ERR non-greeter evict not refused: {other:?}");
+            let _ = slot.reap_current();
+            process::exit(1);
+        }
+    }
+    let unchanged = slot.current().unwrap().pid == pid1;
+    println!("EVICT_DEMO unauthorized_refused inflight_untouched={unchanged}");
+
+    // Authorized greeter create EVICTS the real in-flight worker:
+    // SIGKILL (R4 — no SIGTERM) + reap, then a fresh worker.
+    let evicted = slot
+        .create(GREETER, || spawn_auth_worker(service, username))
+        .expect("authorized evict create #2");
+    let killed = matches!(evicted, Some(WaitStatus::Signaled(_, Signal::SIGKILL, _)));
+    let pid2 = slot.current().expect("inflight #2").pid;
+    println!(
+        "EVICT_DEMO evicted_sigkill={killed} pid_changed={} evicted={evicted:?}",
+        pid2 != pid1
+    );
+
+    spawn_watchdog();
+
+    // Drive the fresh worker #2 to a real success.
+    let outcome = {
+        let chan = slot.current().unwrap().channel();
+        loop {
+            match chan.recv::<ParentMessage>() {
+                Ok(ParentMessage::Conv(BrokerToCompositor::ConvPrompt { .. })) => {
+                    if chan
+                        .send(&CompositorToBroker::ConvResponse {
+                            response: Secret::new(password.to_owned()),
+                        })
+                        .is_err()
+                    {
+                        eprintln!("ERR channel closed answering #2");
+                        break None;
+                    }
+                }
+                Ok(ParentMessage::Conv(other)) => {
+                    eprintln!("ERR unexpected conv from #2: {other:?}");
+                    break None;
+                }
+                Ok(ParentMessage::Outcome(o)) => break Some(o),
+                Err(_) => {
+                    eprintln!("ERR #2 channel closed before outcome");
+                    break None;
+                }
+            }
+        }
+    };
+
+    let ok = matches!(
+        &outcome,
+        Some(WorkerOutcome::Success { username, uid, gid })
+            if username == "test" && *uid == 1000 && *gid == 1000
+    );
+    if let Some(WorkerOutcome::Success { username, uid, gid }) = &outcome {
+        println!("OK user={username} uid={uid} gid={gid}");
+    } else {
+        eprintln!("ERR fresh auth did not succeed: {outcome:?}");
+    }
+
+    // Reap the fresh worker — no orphan must survive.
+    let reaped = slot.reap_current();
+    let reaped_ok = matches!(reaped, Some(Ok(WaitStatus::Exited(_, 0))));
+    println!("EVICT_DEMO fresh_reaped_ok={reaped_ok} reaped={reaped:?}");
+
+    if killed && unchanged && ok && reaped_ok {
+        process::exit(0);
+    }
+    process::exit(1);
 }
 
 /// Epic R4 path: PAM runs in the disposable privileged fork; this

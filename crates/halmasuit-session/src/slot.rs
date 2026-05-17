@@ -179,6 +179,20 @@ impl AuthSlot {
         Ok(evicted)
     }
 
+    /// Reap the in-flight worker and clear the slot.
+    ///
+    /// Called by the broker once it has read the worker's terminal
+    /// `WorkerOutcome` over [`InFlight::channel`] (the worker `_exit`s
+    /// after reporting). `None` if the slot is empty; otherwise the
+    /// `waitpid` result for the worker.
+    ///
+    /// # Errors
+    ///
+    /// (Inside the `Some`) any errno from `waitpid(2)`.
+    pub fn reap_current(&mut self) -> Option<io::Result<WaitStatus>> {
+        self.inflight.take().map(|i| i.handle.wait())
+    }
+
     #[cfg(test)]
     pub(crate) fn take_handle_for_test(&mut self) -> Option<WorkerHandle> {
         self.inflight.take().map(|i| i.handle)
@@ -315,5 +329,28 @@ mod tests {
                 .expect("within-bound create");
         }
         drain(&mut slot);
+    }
+
+    #[test]
+    fn reap_current_waits_and_clears_the_slot() {
+        let mut slot = AuthSlot::new(GREETER, 5, Duration::from_secs(10));
+        // A child that exits 0 promptly (the "worker finished and
+        // reported" shape the broker reaps after reading the outcome).
+        slot.create_at(Instant::now(), GREETER, || {
+            spawn_worker(|_chan| { /* return → _exit(0) */ })
+        })
+        .unwrap();
+        assert!(slot.current().is_some());
+        let status = slot
+            .reap_current()
+            .expect("a worker was in flight")
+            .expect("waitpid ok");
+        assert!(
+            matches!(status, WaitStatus::Exited(_, 0)),
+            "reap_current returns the worker's wait status: {status:?}"
+        );
+        assert!(slot.current().is_none(), "slot cleared after reap");
+        // Reaping an empty slot is None, not an error.
+        assert!(slot.reap_current().is_none());
     }
 }
