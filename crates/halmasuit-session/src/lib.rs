@@ -36,13 +36,13 @@ pub mod transport;
 pub mod worker;
 
 pub use auth::{AuthError, ResolvedIdentity, run_pam_auth};
-pub use broker::{BrokerError, Disposition, handle_connection};
+pub use broker::{BrokerError, Disposition, handle_connection, run_broker};
 pub use responder::ChannelResponder;
 pub use session::{SessionError, run_session};
 pub use session_leader::{SessionSpec, SpecError, merged_groups, sanitize_env, validate};
 pub use slot::{AuthSlot, SlotError};
 pub use transport::{SeqpacketChannel, TransportError, peer_uid};
 pub use worker::{
-    ParentMessage, WorkerHandle, WorkerOutcome, accept_seqpacket, spawn_auth_worker,
+    ParentMessage, WorkerHandle, WorkerOutcome, accept_seqpacket, own_raw_fd, spawn_auth_worker,
     spawn_session_leader, spawn_session_worker,
 };

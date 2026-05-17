@@ -28,7 +28,13 @@ halmasuit-session-ipc = { path = "../halmasuit-session-ipc", version = "0.1" }
 # ephemeral auth worker (Epic R4). signal: child signal-mask reset
 # (memory project-pre-exec-signal-mask) + SIGKILL-no-grace test.
 # resource: setrlimit bound on the disposable auth child (R4).
-nix                  = { workspace = true, features = ["socket", "user", "process", "signal", "resource"] }
+nix                  = { workspace = true, features = ["socket", "user", "process", "signal", "resource", "fs"] }
+# The Epic-R6 / Amendment-A2 broker event loop: ONE loop multiplexing
+# the systemd listener fd + the in-flight worker + the greeter + an
+# idle-exit timer (so evict-old is reachable and "no standing root when
+# idle" holds). Same workspace pin as smithay's calloop reexport; the
+# "signals" feature drives the SIGTERM/SIGINT clean-stop source.
+calloop              = { workspace = true }
 thiserror.workspace  = true
 # Trait bounds for the generic framed send/recv (same as the codec in
 # halmasuit-session-ipc). Pure data traits — no I/O.

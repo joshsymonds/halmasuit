@@ -19,12 +19,36 @@
 //! (process/relay testing is not a PAM mock).
 #![forbid(unsafe_code)]
 
+use std::io;
+use std::os::fd::{AsFd, RawFd};
+use std::time::{Duration, Instant};
+
+use calloop::generic::Generic;
+use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction, RegistrationToken};
 use halmasuit_session_ipc::{BrokerToCompositor, CompositorToBroker};
 use thiserror::Error;
 
 use crate::slot::{AuthSlot, SlotError};
 use crate::transport::{SeqpacketChannel, TransportError, peer_uid};
-use crate::worker::{ParentMessage, WorkerOutcome, spawn_session_worker};
+use crate::worker::{
+    ParentMessage, WorkerOutcome, accept_seqpacket, own_raw_fd, spawn_session_worker,
+};
+
+/// Idle window (Amendment A2.2): with no connection in flight and the
+/// slot empty for this long, the broker `exit(0)`s so the unit
+/// deactivates — systemd's PID1-retained socket re-activates it on the
+/// next connection. Interactive-scale; a real greeter reconnects in
+/// well under this.
+const IDLE_EXIT: Duration = Duration::from_secs(30);
+
+/// Whether the broker should idle-exit now (Amendment A2.2). Pure so
+/// the policy is unit-tested without the loop: exit ONLY when there is
+/// no in-flight connection AND the idle window has elapsed. An active
+/// connection never idle-exits regardless of elapsed time.
+#[must_use]
+pub(crate) const fn should_idle_exit(has_active_conn: bool, idle_window_elapsed: bool) -> bool {
+    !has_active_conn && idle_window_elapsed
+}
 
 /// How one accepted connection's lifecycle ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,6 +289,264 @@ pub fn handle_connection(
     slot.create(puid, || spawn_session_worker(&service, &username))
         .map_err(BrokerError::Slot)?;
     relay(slot, compositor)
+}
+
+/// The in-flight connection's per-conn state (Amendment A2): the
+/// broker OWNS the greeter channel (the relay's send/recv go through
+/// it); the two calloop sources are level-triggered readability
+/// wakeups over dup'd fds — the real I/O is on the owned channels.
+struct Active {
+    greeter: SeqpacketChannel,
+    relay: Relay,
+    greeter_token: RegistrationToken,
+    worker_token: RegistrationToken,
+}
+
+/// Broker event-loop state (Amendment A2.1): ONE loop multiplexing the
+/// systemd listener, the in-flight worker, the greeter, and an
+/// idle-exit timer. `slot` is the R5 global single slot; a new
+/// connection's `AuthSlot::create` evicts any in-flight worker
+/// (A2.3) — reachable ONLY because the listener stays armed while a
+/// connection is in flight (the serial loop could not do this).
+struct BrokerLoop {
+    slot: AuthSlot,
+    listener_fd: RawFd,
+    active: Option<Active>,
+    /// `Some(t)` since the slot went idle; `None` while a connection
+    /// is in flight. Drives the A2.2 idle-exit.
+    idle_since: Option<Instant>,
+    loop_handle: calloop::LoopHandle<'static, Self>,
+    loop_signal: LoopSignal,
+    running: bool,
+}
+
+impl BrokerLoop {
+    /// Tear down the in-flight connection's calloop sources and clear
+    /// `active` (the worker itself is SIGKILLed+reaped by the slot —
+    /// `cancel_current`/`reap_current` inside the relay step, or
+    /// `AuthSlot::create`'s evict). Arms the idle timer.
+    fn drop_active(&mut self) {
+        if let Some(a) = self.active.take() {
+            self.loop_handle.remove(a.greeter_token);
+            self.loop_handle.remove(a.worker_token);
+        }
+        self.idle_since = Some(Instant::now());
+    }
+
+    /// Drive one relay step for whichever side fired; on a terminal
+    /// step tear the connection down.
+    fn step(&mut self, worker_side: bool) {
+        let Self { slot, active, .. } = self;
+        let Some(a) = active.as_mut() else { return };
+        let res = if worker_side {
+            a.relay.on_worker_readable(slot, &a.greeter)
+        } else {
+            a.relay.on_greeter_readable(slot, &a.greeter)
+        };
+        match res {
+            Ok(RelayStep::Continue) => {}
+            Ok(RelayStep::Finished(disp)) => {
+                tracing_log(&format!("connection ended: {disp:?}"));
+                self.drop_active();
+            }
+            Err(e) => {
+                tracing_log(&format!("connection error: {e}"));
+                // The relay already cancel/reaped the worker on its
+                // error paths; just drop the loop sources.
+                self.drop_active();
+            }
+        }
+    }
+}
+
+// Stderr is the unit's journal (Type=notify service). No tracing dep
+// in this crate; a thin eprintln keeps the broker dependency-light.
+fn tracing_log(msg: &str) {
+    eprintln!("halmasuit-session: {msg}");
+}
+
+/// Accept and admit ONE pending connection on `listener_fd`.
+///
+/// `listener_fd` is already O_NONBLOCK. `Ok(true)` = a connection was
+/// admitted (or cleanly rejected); `Ok(false)` = nothing pending
+/// (`EWOULDBLOCK`).
+///
+/// Admitting calls [`AuthSlot::create`] which EVICTS any in-flight
+/// worker (Amendment A2.3); the prior connection's loop sources are
+/// torn down first so they cannot fire against the evicted worker.
+fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
+    let greeter = match accept_seqpacket(bl.listener_fd) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let puid = match peer_uid(&greeter) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing_log(&format!("peer_uid failed; dropping connection: {e}"));
+            return Ok(true);
+        }
+    };
+    let begin = match greeter.recv::<CompositorToBroker>() {
+        Ok(CompositorToBroker::BeginAuth { service, username }) => (service, username),
+        Ok(_) => {
+            tracing_log("first frame was not BeginAuth; dropping connection");
+            return Ok(true);
+        }
+        Err(e) => {
+            tracing_log(&format!("reading BeginAuth failed: {e}"));
+            return Ok(true);
+        }
+    };
+    // A new connection supersedes any in-flight one. Drop the old
+    // loop sources BEFORE create() so a stale readiness can't fire
+    // against the worker create() is about to SIGKILL.
+    bl.drop_active();
+    let (service, username) = begin;
+    if let Err(e) = bl
+        .slot
+        .create(puid, || spawn_session_worker(&service, &username))
+    {
+        tracing_log(&format!("auth slot refused: {e:?}"));
+        return Ok(true);
+    }
+    // dup the greeter + worker fds as level-triggered readability
+    // wakeups; the real recv/send is on the broker-owned channels.
+    let Some(worker_fd) = bl
+        .slot
+        .current()
+        .and_then(|i| i.channel().as_fd().try_clone_to_owned().ok())
+    else {
+        tracing_log("worker vanished immediately after create");
+        let _ = bl.slot.cancel_current();
+        return Ok(true);
+    };
+    let greeter_dup = greeter.as_fd().try_clone_to_owned()?;
+    let worker_token = bl
+        .loop_handle
+        .insert_source(
+            Generic::new(worker_fd, Interest::READ, Mode::Level),
+            |_, _, bl: &mut BrokerLoop| {
+                bl.step(true);
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| io::Error::other(format!("insert worker source: {e}")))?;
+    let greeter_token = bl
+        .loop_handle
+        .insert_source(
+            Generic::new(greeter_dup, Interest::READ, Mode::Level),
+            |_, _, bl: &mut BrokerLoop| {
+                bl.step(false);
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| {
+            bl.loop_handle.remove(worker_token);
+            io::Error::other(format!("insert greeter source: {e}"))
+        })?;
+    bl.idle_since = None;
+    bl.active = Some(Active {
+        greeter,
+        relay: Relay::new(),
+        greeter_token,
+        worker_token,
+    });
+    Ok(true)
+}
+
+/// Run the Epic-R6 / Amendment-A2 broker event loop.
+///
+/// `listener_fd` is the validated systemd activation socket;
+/// `greeter_uid` is the SO_PEERCRED-authorized peer. Returns when
+/// SIGTERM/SIGINT or the idle-exit fires — the process then exits 0
+/// and the unit deactivates (no standing root; PID1's retained socket
+/// re-activates on the next connection).
+///
+/// # Errors
+///
+/// [`io::Error`] on event-loop construction / source registration /
+/// a fatal `accept` errno.
+pub fn run_broker(listener_fd: RawFd, greeter_uid: u32) -> io::Result<()> {
+    let mut event_loop: EventLoop<'static, BrokerLoop> =
+        EventLoop::try_new().map_err(io::Error::other)?;
+    let loop_handle = event_loop.handle();
+    let loop_signal = event_loop.get_signal();
+
+    // Adopt the systemd listener fd (the only fd adoption — quarantined
+    // in `worker`), then make it non-blocking via its safe `AsFd` so
+    // the listener callback and the idle race-drain never block in
+    // accept(2). No unsafe here.
+    let listener_src = own_raw_fd(listener_fd);
+    nix::fcntl::fcntl(
+        listener_src.as_fd(),
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .map_err(io::Error::from)?;
+    loop_handle
+        .insert_source(
+            Generic::new(listener_src, Interest::READ, Mode::Level),
+            |_, _, bl: &mut BrokerLoop| {
+                // Drain all pending connections; each admit may evict
+                // the prior (Amendment A2.3).
+                loop {
+                    match admit_one(bl) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(e) => {
+                            tracing_log(&format!("accept failed: {e}"));
+                            break;
+                        }
+                    }
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| io::Error::other(format!("insert listener source: {e}")))?;
+
+    loop_handle
+        .insert_source(
+            calloop::signals::Signals::new(&[
+                calloop::signals::Signal::SIGTERM,
+                calloop::signals::Signal::SIGINT,
+            ])
+            .map_err(io::Error::other)?,
+            |_, &mut (), bl: &mut BrokerLoop| {
+                bl.running = false;
+                bl.loop_signal.stop();
+            },
+        )
+        .map_err(|e| io::Error::other(format!("insert signal source: {e}")))?;
+
+    let mut bl = BrokerLoop {
+        slot: AuthSlot::with_defaults(greeter_uid),
+        listener_fd,
+        active: None,
+        idle_since: Some(Instant::now()),
+        loop_handle,
+        loop_signal,
+        running: true,
+    };
+
+    while bl.running {
+        event_loop
+            .dispatch(Some(Duration::from_secs(1)), &mut bl)
+            .map_err(io::Error::other)?;
+        let elapsed = bl.idle_since.is_some_and(|t| t.elapsed() >= IDLE_EXIT);
+        if should_idle_exit(bl.active.is_some(), elapsed) {
+            // Race-drain (Amendment A2.2): one last non-blocking
+            // accept; if a connection slipped in, service it and stay.
+            match admit_one(&mut bl) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing_log("idle window elapsed; exiting (unit deactivates)");
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -553,6 +835,28 @@ mod tests {
             "greeter Cancel SIGKILLed + reaped the worker"
         );
         gt.join().unwrap();
+    }
+
+    #[test]
+    fn idle_exit_only_when_no_active_conn_and_window_elapsed() {
+        // Amendment A2.2: the broker exits (→ unit deactivates, no
+        // standing root) ONLY when there is no in-flight connection
+        // AND the idle window has elapsed. An active connection (auth
+        // or session in flight) NEVER triggers idle-exit regardless of
+        // elapsed time.
+        assert!(should_idle_exit(false, true), "idle + elapsed → exit");
+        assert!(
+            !should_idle_exit(true, true),
+            "active conn must never idle-exit"
+        );
+        assert!(
+            !should_idle_exit(false, false),
+            "idle but window not elapsed → stay"
+        );
+        assert!(
+            !should_idle_exit(true, false),
+            "active + not elapsed → stay"
+        );
     }
 
     #[test]

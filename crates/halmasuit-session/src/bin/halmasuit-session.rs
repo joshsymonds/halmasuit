@@ -18,7 +18,7 @@
 
 use std::os::fd::RawFd;
 
-use halmasuit_session::{AuthSlot, accept_seqpacket, handle_connection};
+use halmasuit_session::run_broker;
 
 /// `SD_LISTEN_FDS_START` — systemd passes the first activation fd here.
 const SD_LISTEN_FDS_START: RawFd = 3;
@@ -91,22 +91,16 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    // ONE slot for the whole process lifetime (Epic R5 global single
-    // slot). Serial accept: one connection's full lifecycle before the
-    // next is accepted.
-    let mut slot = AuthSlot::with_defaults(guid);
-    loop {
-        let chan = match accept_seqpacket(lfd) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("halmasuit-session: accept failed, exiting: {e}");
-                // Listener gone ⇒ unit deactivates; no standing root.
-                return std::process::ExitCode::SUCCESS;
-            }
-        };
-        match handle_connection(&mut slot, &chan) {
-            Ok(disp) => eprintln!("halmasuit-session: connection ended: {disp:?}"),
-            Err(e) => eprintln!("halmasuit-session: connection error: {e}"),
+    // Amendment A2: ONE calloop event loop multiplexing the listener,
+    // the in-flight worker, the greeter, and an idle-exit timer (so
+    // evict-old is reachable and "no standing root when idle" holds).
+    // NOT a serial accept loop (FORBIDDEN). Returns on SIGTERM/SIGINT
+    // or idle-exit; the process then exits 0 and the unit deactivates.
+    match run_broker(lfd, guid) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("halmasuit-session: event loop failed: {e}");
+            std::process::ExitCode::FAILURE
         }
     }
 }

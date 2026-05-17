@@ -1062,6 +1062,7 @@ version = "0.1.0"
 name = "halmasuit-session"
 version = "0.1.0"
 dependencies = [
+ "calloop",
  "halmasuit-session-ipc",
  "libc",
  "nix 0.30.1",

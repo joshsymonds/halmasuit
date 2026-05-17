@@ -218,6 +218,30 @@ pub fn accept_seqpacket(listener_fd: std::os::fd::RawFd) -> io::Result<Seqpacket
     Ok(SeqpacketChannel::new(owned))
 }
 
+/// Adopt a raw, already-open fd into an `OwnedFd` (Epic R6).
+///
+/// The fd is the systemd activation LISTEN_FDS socket, adopted so it
+/// can be a calloop `Generic` source. Dropping it at process exit
+/// closes only our copy (Amendment A2.2 — systemd keeps its own and
+/// re-activates). The only `unsafe` socket activation needs;
+/// quarantined here so the bin / `broker` event loop stay
+/// `#![forbid(unsafe_code)]`.
+pub fn own_raw_fd(fd: std::os::fd::RawFd) -> OwnedFd {
+    // SAFETY: `fd` is a valid open fd owned by this process (handed by
+    // systemd via LISTEN_FDS, validated by the caller's LISTEN_PID
+    // check). We take sole ownership for RAII close; systemd retains
+    // its independent copy. Same idiom as `accept_seqpacket`.
+    #[expect(
+        unsafe_code,
+        reason = "adopt the systemd activation listener fd into OwnedFd \
+                  (RAII); PID1 keeps its own copy. Quarantined so the \
+                  bin/broker stay #![forbid(unsafe_code)]."
+    )]
+    unsafe {
+        OwnedFd::from_raw_fd(fd)
+    }
+}
+
 /// Fork a disposable child running `child_main` on its SEQPACKET end;
 /// return the parent's handle + channel end. The generic seam lets the
 /// worker's own tests exercise fork/kill/reap with a non-PAM payload
