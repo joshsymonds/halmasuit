@@ -354,6 +354,80 @@ new inbound `BrokerToCompositor` variants; the two-key swap +
 SCM_RIGHTS pidfd land in the later R3 socket-wiring step. Recorded in
 epic Task #1 as **Amendment A5**.
 
+### 0.10 Broker-socket ownership across the auth→session boundary (2026-05-17, user-directed) — Amendment A6
+
+R3 step 3 surfaced a structural question the requirements did not pin:
+greetd's `Connection` is generic and, at `SessionState::Spawning`,
+DROPS the per-auth `PamSession` and yields `SpawnRequest{cmd,env}` —
+designed for the old model where in-process PAM auth is *finished* at
+that point. But the broker holds ONE PAM handle across auth AND
+session (R1) and, per A1, is BLOCKING to read the session spec on the
+same SEQPACKET socket *after* auth-success. So the broker socket must
+live the whole episode (BeginAuth → conv → Success → StartSession →
+SessionOpened → SessionEnded), past the point greetd tears its
+per-auth object down. Resolved like A1/A2/A5: three independent BLIND
+primary-source agents, different angles (privsep login daemons
+greetd/OpenSSH/GDM; the sans-IO doctrine + rustls/quinn/h2; kernel
+fd-ownership/close-EOF semantics + the OpenSSH-privsep CVE record).
+**Unanimous, strong convergence — and it overturned the initial
+dup-fd lean.**
+
+**Decision (Amendment A6):**
+
+A6.1 — **Single owner.** The one unprivileged↔broker SEQPACKET socket
+is owned by the compositor's per-greeter-connection EPISODE object
+(`ConnState`-scoped) for the ENTIRE episode (auth → `StartSession` →
+`SessionOpened`/`SessionEnded` → close). Exactly one owner; exactly
+one writer to the privilege-crossing channel at a time; one audit
+point.
+
+A6.2 — **Sans-IO auth driver; borrow, never own.** The greetd auth
+state machine is sans-IO and owns NOTHING transport. The per-auth
+driver is *fed* / *borrows* the broker channel; its drop at the
+auth→session boundary is inert because it holds no fd. "A per-auth
+object owns the privileged socket and is dropped at auth-success" is
+the canonical sans-IO anti-pattern (the literal httplib-baked-socket
+mistake) and is FORBIDDEN. Prior art is unanimous: greetd reuses ONE
+`Session` object `mem::swap`'d across the boundary (never
+dropped/recreated; auth state is a payload-only enum owning no fd);
+OpenSSH models auth→postauth as a dispatch-table swap on ONE
+persistent monitor channel; GDM's long-lived object is *named*
+"conversation" yet is session-scoped (the naming trap).
+
+A6.3 — **`dup`, `Rc<RefCell>`, `Arc<Mutex>` for this socket are
+REJECTED.** `dup` avoids the premature-EOF (last-close semantics) but
+adds a second writable fd to a privilege-crossing channel + a
+double-close obligation (least-authority violation). `Rc`/`Arc`
+reintroduce the premature-close hazard (last drop closes → broker
+gets EOF mid-PAM-handle → locked session, no diagnostic — the §0.2
+split-lifecycle failure). Single-owner-borrow makes that failure
+*structurally impossible*, not runtime-contingent. Backed by
+last-close EOF semantics (`close(2)`/`unix(7)`) and the OpenSSH PAM-
+monitor lifetime/authority CVE pair **CVE-2015-6563 / CVE-2015-6564**
+(unprivileged-side object lifetime must never implicitly control the
+privileged PAM handle's fate).
+
+A6.4 — **greetd seam consequence (in scope for R3).** Because
+greetd's `PamSessionFactory → 'static Box<dyn PamSession + Send>`
+cannot carry a borrow, the clean fix is a small greetd-seam change so
+the auth driver is *fed* the transport by `&mut` (the episode layer
+owns it) rather than owning a boxed session. This makes greetd MORE
+sans-IO — it strengthens R3/R12 (the generic/pure posture), it does
+not weaken them. The frozen `halmasuit-session-ipc` contract is
+unaffected (this is F-internal ownership only).
+
+A6.5 — Consequences: task #29's `BrokerSession` (which OWNS the
+`SeqpacketChannel`) is the identified smell; it is revised to a
+sans-IO auth driver the episode layer feeds (borrow, not own). R3
+step 3 (#30, the atomic make-live + R10/R14/R15 deletions) inherits
+the single-owner discipline. invariant: **transport lifetime ≥
+PAM-handle lifetime ≥ auth-state lifetime**; the shortest-lived
+(auth) owns the least (nothing transport).
+
+Recorded in epic Task #1 as **Amendment A6**. DO NOT reintroduce a
+per-auth/`PamSession`-object that owns the broker fd, nor
+dup/Rc/Arc multi-ownership of that socket.
+
 ---
 
 ---
