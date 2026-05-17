@@ -49,6 +49,9 @@ test-vm:
     echo "── session-r5r6 ──"
     nix build .#checks.x86_64-linux.session-r5r6 -L --print-build-logs --no-link
     echo
+    echo "── session-onehandle ──"
+    nix build .#checks.x86_64-linux.session-onehandle -L --print-build-logs --no-link
+    echo
     echo "── login-flash ──"
     nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link
     echo

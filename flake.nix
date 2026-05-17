@@ -644,6 +644,14 @@
           inherit nixpkgs;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
         };
+        # Epic #1 FLAGSHIP gate (headline): ONE pam_handle_t spans
+        # auth→session — real pam_unix, pam_mount-equivalent authtok
+        # witness, getgrouplist-MERGE, Amendment-A1.3 env survival.
+        session-onehandle = import ./tests/session-onehandle.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+        };
         drm-master-probe = import ./tests/drm-master-probe.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
