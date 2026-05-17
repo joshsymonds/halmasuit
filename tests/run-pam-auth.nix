@@ -1,16 +1,19 @@
-# Epic #1 R12 — the FIRST real-PAM gate.
+# Epic #1 R12 + R4 — the real-PAM gate.
 #
-# Proves `halmasuit_session::run_pam_auth` works against the REAL libpam
-# stack with the REAL test user, end-to-end over a real SOCK_SEQPACKET
-# socketpair. NO mock, NO PAM bypass (CLAUDE.md hard rule). The driver
-# binary calls the real run_pam_auth; the testScript only inspects its
-# parseable output.
+# Proves halmasuit-session authenticates against the REAL libpam stack
+# with the REAL test user, end-to-end over a real SOCK_SEQPACKET
+# socketpair, in BOTH paths: in-process `run_pam_auth` and through the
+# ephemeral SIGKILL-able privileged fork `spawn_auth_worker` (R4). NO
+# mock, NO PAM bypass (CLAUDE.md hard rule). The driver calls the real
+# code; the testScript only inspects its parseable output.
 #
 # Asserts:
-#   1. Correct password → Ok(ResolvedIdentity) whose username/uid/gid
-#      come from PAM's resolved name's pwent (Epic R8): test/1000/1000.
+#   1. Correct password → identity whose username/uid/gid come from
+#      PAM's resolved name's pwent (Epic R8): test/1000/1000 — both
+#      in-process and via the fork.
 #   2. Wrong password → fail closed (non-zero, bounded by the driver's
-#      watchdog, no hang, no panic).
+#      watchdog, no hang, no panic) — both paths.
+#   3. Via the fork: the worker child is reaped, no orphan survives.
 
 {
   system,
@@ -73,10 +76,35 @@ pkgs.testers.runNixOSTest {
         "halmasuit-session-pam-testdriver halmasuit-pam-test test /tmp/bad"
     )
 
+    # ── Epic R4: REAL PAM through the ephemeral privileged fork ──
+    # Same assertions, but PAM now runs in spawn_auth_worker's
+    # disposable child; this driver process is the broker parent
+    # relaying the conversation and reaping the child.
+    out = machine.succeed(
+        "halmasuit-session-pam-testdriver halmasuit-pam-test test /tmp/pw --via-fork"
+    )
+    assert "OK user=test uid=1000 gid=1000" in out, (
+        f"via-fork: expected test/1000/1000, got: {out!r}"
+    )
+    # (The driver reaps the worker via handle.wait() before exiting;
+    # the authoritative no-orphan proof is the pgrep check below.)
+
+    # Wrong password through the fork → fail closed.
+    machine.fail(
+        "halmasuit-session-pam-testdriver halmasuit-pam-test test /tmp/bad --via-fork"
+    )
+
+    # No orphaned worker process survives a via-fork run.
+    machine.succeed(
+        "halmasuit-session-pam-testdriver halmasuit-pam-test test /tmp/pw --via-fork"
+    )
+    machine.fail("pgrep -f halmasuit-session-pam-testdriver")
+
     print(
-        "run-pam-auth: REAL pam_unix auth succeeded for test "
-        "(uid=1000 gid=1000, identity from pam_get_user); "
-        "wrong password rejected fail-closed."
+        "run-pam-auth: REAL pam_unix succeeded for test (uid=1000 "
+        "gid=1000, identity from pam_get_user) BOTH in-process and "
+        "through the ephemeral privileged fork (R4); wrong password "
+        "rejected fail-closed; worker child reaped, no orphan."
     )
   '';
 }

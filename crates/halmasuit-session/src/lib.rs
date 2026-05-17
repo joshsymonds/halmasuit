@@ -34,4 +34,4 @@ pub mod worker;
 pub use auth::{AuthError, ResolvedIdentity, run_pam_auth};
 pub use responder::ChannelResponder;
 pub use transport::{SeqpacketChannel, TransportError, peer_uid};
-pub use worker::{WorkerHandle, WorkerOutcome, spawn_auth_worker};
+pub use worker::{ParentMessage, WorkerHandle, WorkerOutcome, spawn_auth_worker};

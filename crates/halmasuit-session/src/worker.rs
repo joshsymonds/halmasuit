@@ -31,16 +31,39 @@ use crate::transport::SeqpacketChannel;
 /// `{username,uid,gid}` stays ONE atomic unit (Epic R8) — PAM-resolved
 /// in the child; the parent never re-derives it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type")]
 pub enum WorkerOutcome {
+    /// Wire tag `worker_success` — DELIBERATELY disjoint from every
+    /// `BrokerToCompositor` tag (`conv_prompt`/`success`/`failure`) so
+    /// the parent demuxes the one channel (conv frames + this terminal
+    /// message) with no ambiguity. See [`ParentMessage`].
+    #[serde(rename = "worker_success")]
     Success {
         username: String,
         uid: u32,
         gid: u32,
     },
-    Failure {
-        reason: String,
-    },
+    /// Wire tag `worker_failure` — see [`WorkerOutcome::Success`].
+    #[serde(rename = "worker_failure")]
+    Failure { reason: String },
+}
+
+/// One datagram read by the broker parent from the worker channel.
+///
+/// The parent multiplexes the PAM conversation
+/// (`BrokerToCompositor::ConvPrompt`, wire tag `conv_prompt`) and the
+/// single terminal [`WorkerOutcome`] (`worker_success`/
+/// `worker_failure`) over ONE SEQPACKET. `#[serde(untagged)]` is sound
+/// here ONLY because those tag namespaces are disjoint (pinned by the
+/// `worker_outcome_wire_tags_are_disjoint_from_conv_frames` test): a
+/// `conv_prompt` datagram fails `WorkerOutcome` and decodes as `Conv`;
+/// a `worker_*` datagram fails `BrokerToCompositor` and decodes as
+/// `Outcome`. No datagram can decode as the wrong variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ParentMessage {
+    Conv(halmasuit_session_ipc::BrokerToCompositor),
+    Outcome(WorkerOutcome),
 }
 
 /// Handle to a live ephemeral auth child.
@@ -378,5 +401,72 @@ mod tests {
         // Failure outcome, or the channel closes — either way no hang.
         let _ = chan.recv::<WorkerOutcome>();
         let _ = handle.wait();
+    }
+
+    // ── parent-channel disambiguation (Epic R4 relay) ────────────────
+    //
+    // The parent channel multiplexes conv frames
+    // (`BrokerToCompositor::ConvPrompt`, wire tag "conv_prompt") and
+    // the terminal `WorkerOutcome`. Soundness of the single-stream
+    // decode rests on the tag namespaces being DISJOINT — these tests
+    // pin that invariant so a future rename can't silently reintroduce
+    // ambiguity.
+
+    #[test]
+    fn worker_outcome_wire_tags_are_disjoint_from_conv_frames() {
+        use halmasuit_session_ipc::{BrokerToCompositor, PromptStyle, encode};
+
+        // encode() = [len:4][json]; lossy-utf8 the body to inspect the
+        // serde tag (avoids a serde_json dev-dep).
+        let body = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+
+        let succ = body(
+            &encode(&WorkerOutcome::Success {
+                username: "u".into(),
+                uid: 1,
+                gid: 2,
+            })
+            .unwrap(),
+        );
+        let fail = body(&encode(&WorkerOutcome::Failure { reason: "x".into() }).unwrap());
+        assert!(succ.contains(r#""type":"worker_success""#), "got {succ}");
+        assert!(fail.contains(r#""type":"worker_failure""#), "got {fail}");
+
+        let prompt = body(
+            &encode(&BrokerToCompositor::ConvPrompt {
+                style: PromptStyle::Secret,
+                message: "p".into(),
+            })
+            .unwrap(),
+        );
+        // Disjoint: a conv frame's tag is never a WorkerOutcome tag.
+        assert!(prompt.contains(r#""type":"conv_prompt""#));
+        assert!(!prompt.contains("worker_success"));
+        assert!(!prompt.contains("worker_failure"));
+    }
+
+    #[test]
+    fn parent_message_decodes_each_stream_member_unambiguously() {
+        use halmasuit_session_ipc::{BrokerToCompositor, PromptStyle, encode, try_decode};
+
+        // A conv prompt on the wire → ParentMessage::Conv.
+        let prompt = BrokerToCompositor::ConvPrompt {
+            style: PromptStyle::Secret,
+            message: "Password: ".into(),
+        };
+        let bytes = encode(&prompt).unwrap();
+        let (pm, _): (ParentMessage, usize) = try_decode(&bytes).unwrap().unwrap();
+        assert_eq!(pm, ParentMessage::Conv(prompt));
+
+        // A terminal outcome on the wire → ParentMessage::Outcome,
+        // never decoded as a conv frame.
+        let outcome = WorkerOutcome::Success {
+            username: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+        };
+        let bytes = encode(&outcome).unwrap();
+        let (pm, _): (ParentMessage, usize) = try_decode(&bytes).unwrap().unwrap();
+        assert_eq!(pm, ParentMessage::Outcome(outcome));
     }
 }

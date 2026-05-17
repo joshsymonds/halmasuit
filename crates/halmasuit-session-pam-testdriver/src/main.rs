@@ -1,42 +1,121 @@
-//! Test-only driver for the `run-pam-auth` VM gate (Epic #1 R12).
+//! Test-only driver for the `run-pam-auth` VM gate (Epic #1 R12 / R4).
 //!
-//! Opens a real `SOCK_SEQPACKET` socketpair, plays the compositor /
-//! greeter side on a thread (answering every PAM prompt with the
-//! supplied password), and calls the REAL
-//! `halmasuit_session::run_pam_auth` against the REAL libpam stack —
-//! no mock, no PAM bypass (CLAUDE.md hard rule). Prints the resolved
-//! identity for the testScript to assert; exits non-zero on any auth
-//! failure; a watchdog guarantees it never hangs CI.
+//! Two modes, both exercising REAL libpam (no mock, no PAM bypass):
+//!
+//! - default `<service> <username> <password-file>` — calls the REAL
+//!   `run_pam_auth` IN-PROCESS, a sibling thread playing the greeter.
+//! - `… --via-fork` — calls `spawn_auth_worker` so PAM runs in the
+//!   ephemeral SIGKILL-able PRIVILEGED fork (Epic R4); this process is
+//!   the broker PARENT, relaying the conversation over the returned
+//!   channel and reading the terminal `WorkerOutcome`, then reaping
+//!   the child.
+//!
+//! Prints `OK user=… uid=… gid=…` (PAM-resolved identity, Epic R8) on
+//! success; non-zero on any failure; a 30s watchdog guarantees it
+//! never hangs CI.
 //!
 //! `#![forbid(unsafe_code)]`: the only unsafe in this dependency graph
-//! is quarantined in `halmasuit-session::pam_ffi`.
+//! is quarantined in `halmasuit-session::{pam_ffi,worker}`.
 #![forbid(unsafe_code)]
 
 use std::time::Duration;
 use std::{env, fs, process, thread};
 
-use halmasuit_session::{SeqpacketChannel, run_pam_auth};
+use halmasuit_session::{
+    ParentMessage, SeqpacketChannel, WorkerOutcome, run_pam_auth, spawn_auth_worker,
+};
 use halmasuit_session_ipc::{BrokerToCompositor, CompositorToBroker, Secret};
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 4 {
-        eprintln!("usage: {} <service> <username> <password-file>", args[0]);
-        process::exit(64);
-    }
-    let service = args[1].clone();
-    let username = args[2].clone();
-    let raw = fs::read_to_string(&args[3]).expect("read password file");
-    let password = raw.strip_suffix('\n').unwrap_or(&raw).to_owned();
-
-    // Watchdog: a wedged PAM module must never hang the gate. Bounded,
-    // distinct exit code so a timeout is unambiguous in the testScript.
+fn spawn_watchdog() {
     thread::spawn(|| {
         thread::sleep(Duration::from_secs(30));
-        eprintln!("ERR timeout: run_pam_auth did not complete in 30s");
+        eprintln!("ERR timeout: auth did not complete in 30s");
         process::exit(2);
     });
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let via_fork = args.iter().any(|a| a == "--via-fork");
+    let positional: Vec<&String> = args[1..].iter().filter(|a| !a.starts_with("--")).collect();
+    if positional.len() != 3 {
+        eprintln!(
+            "usage: {} <service> <username> <password-file> [--via-fork]",
+            args[0]
+        );
+        process::exit(64);
+    }
+    let service = positional[0].clone();
+    let username = positional[1].clone();
+    let raw = fs::read_to_string(positional[2]).expect("read password file");
+    let password = raw.strip_suffix('\n').unwrap_or(&raw).to_owned();
+
+    if via_fork {
+        run_via_fork(&service, &username, &password);
+    } else {
+        run_in_process(&service, &username, password);
+    }
+}
+
+/// Epic R4 path: PAM runs in the disposable privileged fork; this
+/// process is the broker parent relaying the conversation.
+fn run_via_fork(service: &str, username: &str, password: &str) {
+    // spawn_auth_worker forks. Do it BEFORE starting the watchdog
+    // thread so the fork happens single-threaded (a forked child that
+    // then runs libpam must not inherit a multithreaded address space
+    // mid-malloc — the OpenSSH privsep discipline).
+    let (handle, chan) = spawn_auth_worker(service, username).expect("spawn_auth_worker");
+    spawn_watchdog();
+
+    // Relay the one channel: conv prompts get the password; the
+    // terminal WorkerOutcome ends it. ParentMessage's disjoint tag
+    // namespaces make this decode unambiguous (see worker.rs).
+    let exit = loop {
+        match chan.recv::<ParentMessage>() {
+            Ok(ParentMessage::Conv(BrokerToCompositor::ConvPrompt { .. })) => {
+                if chan
+                    .send(&CompositorToBroker::ConvResponse {
+                        response: Secret::new(password.to_owned()),
+                    })
+                    .is_err()
+                {
+                    eprintln!("ERR channel closed while answering prompt");
+                    break 1;
+                }
+            }
+            Ok(ParentMessage::Conv(other)) => {
+                eprintln!("ERR unexpected conv frame from worker: {other:?}");
+                let _ = handle.kill();
+                break 1;
+            }
+            Ok(ParentMessage::Outcome(WorkerOutcome::Success { username, uid, gid })) => {
+                println!("OK user={username} uid={uid} gid={gid}");
+                break 0;
+            }
+            Ok(ParentMessage::Outcome(WorkerOutcome::Failure { reason })) => {
+                eprintln!("ERR {reason}");
+                break 1;
+            }
+            Err(_) => {
+                eprintln!("ERR worker channel closed before an outcome");
+                break 1;
+            }
+        }
+    };
+
+    // Reap the ephemeral child — the gate asserts no orphan remains.
+    match handle.wait() {
+        Ok(status) => eprintln!("worker reaped: {status:?}"),
+        Err(e) => eprintln!("ERR reaping worker: {e}"),
+    }
+    process::exit(exit);
+}
+
+/// In-process path (Epic R12 gate from task #8): real `run_pam_auth`
+/// here, a sibling thread playing the greeter. No fork.
+fn run_in_process(service: &str, username: &str, password: String) {
+    spawn_watchdog();
 
     let (broker_fd, peer_fd) = socketpair(
         AddressFamily::Unix,
@@ -48,10 +127,6 @@ fn main() {
     let broker = SeqpacketChannel::new(broker_fd);
     let peer = SeqpacketChannel::new(peer_fd);
 
-    // Greeter side: every prompt the broker relays is answered with the
-    // password. (ChannelResponder only forwards response-expecting
-    // styles; Info/Error never reach the channel.) Loop until the
-    // broker end is dropped, which ends the recv.
     let greeter = thread::spawn(move || {
         while let Ok(BrokerToCompositor::ConvPrompt { .. }) = peer.recv::<BrokerToCompositor>() {
             if peer
@@ -65,14 +140,12 @@ fn main() {
         }
     });
 
-    let result = run_pam_auth(&broker, &service, &username);
-    drop(broker); // unblock the greeter thread's pending recv
+    let result = run_pam_auth(&broker, service, username);
+    drop(broker);
     let _ = greeter.join();
 
     match result {
         Ok(id) => {
-            // Parseable line for the testScript. id.* is PAM-resolved
-            // (Epic R8): uid/gid come from the resolved name's pwent.
             println!("OK user={} uid={} gid={}", id.username, id.uid, id.gid);
             process::exit(0);
         }
