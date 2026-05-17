@@ -82,7 +82,9 @@ calloop.workspace            = true
 #   needs the default mask restored before execve)
 # - `process`: waitpid in the SIGCHLD reaper so dead greeter / session
 #   children don't accumulate as zombies
-nix = { workspace = true, features = ["user", "signal", "process"] }
+# `socket`: SOCK_SEQPACKET framed channel to the halmasuit-session
+# broker (the BrokerSession PamSession — Epic R3 / Amendment A4/A5).
+nix = { workspace = true, features = ["user", "signal", "process", "socket"] }
 # drm-rs types reach halmasuit via `smithay::reexports::drm` — same
 # version smithay itself uses (0.14 at the pinned rev), avoiding the
 # multi-version-of-drm problem (smithay's DrmDevice impls drm 0.14's
@@ -103,6 +105,6 @@ caps.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
-nix        = { workspace = true, features = ["signal", "user", "ioctl", "process"] }
+nix        = { workspace = true, features = ["signal", "user", "ioctl", "process", "socket"] }
 serde_json.workspace = true
 tempfile.workspace   = true

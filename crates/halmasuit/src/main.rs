@@ -15,6 +15,7 @@
 // land later. See ARCHITECTURE.md.
 
 mod broker_relay;
+mod broker_session;
 #[cfg(feature = "frame_audit")]
 mod dbus;
 mod drm;
