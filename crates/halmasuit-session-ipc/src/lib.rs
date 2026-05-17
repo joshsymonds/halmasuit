@@ -97,6 +97,30 @@ pub enum CompositorToBroker {
     BeginAuth { service: String, username: String },
     /// Answer the most recent [`BrokerToCompositor::ConvPrompt`].
     ConvResponse { response: Secret },
+    /// Launch the user session after a successful auth. Sent by the
+    /// compositor only after [`BrokerToCompositor::Success`]; the
+    /// broker runs it on the SAME `pam_handle_t` (Epic R1) as the
+    /// preceding auth. `cmd` is argv (`cmd[0]` is the program); `env`
+    /// is the explicit key/value set — the broker does NOT inherit its
+    /// own environment, and the session-leader env allowlist (Epic
+    /// R7/R11, enforced downstream in `halmasuit-session`) still
+    /// filters it. Identity is never carried here: it is always the
+    /// PAM-resolved one from `Success`, never re-asserted by the
+    /// compositor.
+    ///
+    /// Wire tag `start_session` is deliberately disjoint from every
+    /// other `CompositorToBroker`/`BrokerToCompositor` tag and the
+    /// `worker_*` `WorkerOutcome` tags, so the global tag namespace
+    /// stays unambiguous (the untagged `ParentMessage` demux and the
+    /// broker's frame routing both rely on this).
+    ///
+    /// A whole frame (cmd+env) is bounded by [`MAX_MESSAGE_SIZE`]
+    /// (1 MiB) like every other message; a realistic session
+    /// environment is a few KiB, well under the cap.
+    StartSession {
+        cmd: Vec<String>,
+        env: Vec<(String, String)>,
+    },
     /// Abort the in-flight auth. The broker SIGKILLs its auth fork and
     /// `pam_end`s the transaction (Epic R4/R5).
     Cancel,
@@ -303,6 +327,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wire_format_start_session() {
+        // The post-auth session-launch frame. cmd is argv (cmd[0] is
+        // the program); env is explicit key/value pairs serialized as
+        // JSON 2-arrays. This payload IS the contract.
+        let json = r#"{"type":"start_session","cmd":["bash","-l"],"env":[["PATH","/usr/bin"],["XDG_SESSION_TYPE","wayland"]]}"#;
+        let parsed: CompositorToBroker = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed,
+            CompositorToBroker::StartSession {
+                cmd: vec!["bash".into(), "-l".into()],
+                env: vec![
+                    ("PATH".into(), "/usr/bin".into()),
+                    ("XDG_SESSION_TYPE".into(), "wayland".into()),
+                ],
+            }
+        );
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn start_session_empty_cmd_and_env_roundtrip() {
+        // Degenerate but well-formed: the downstream session-leader
+        // validator (not this crate) rejects an empty argv; the wire
+        // codec must still round-trip it losslessly.
+        let msg = CompositorToBroker::StartSession {
+            cmd: vec![],
+            env: vec![],
+        };
+        let bytes = encode(&msg).unwrap();
+        let (decoded, consumed): (CompositorToBroker, usize) = try_decode(&bytes).unwrap().unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(
+            serde_json::to_string(&msg).unwrap(),
+            r#"{"type":"start_session","cmd":[],"env":[]}"#
+        );
+    }
+
+    #[test]
+    fn start_session_tag_is_globally_disjoint() {
+        // The untagged `ParentMessage` demux (worker.rs) and the
+        // broker's frame routing depend on every wire tag being unique
+        // across CompositorToBroker ∪ BrokerToCompositor ∪
+        // WorkerOutcome. `start_session` collides with none: a
+        // start_session datagram must NOT decode as any
+        // BrokerToCompositor variant, and no broker/worker tag may
+        // decode as a CompositorToBroker.
+        let ss = encode(&CompositorToBroker::StartSession {
+            cmd: vec!["x".into()],
+            env: vec![],
+        })
+        .unwrap();
+        let as_b2c: Result<Option<(BrokerToCompositor, usize)>, _> = try_decode(&ss);
+        assert!(
+            matches!(as_b2c, Err(CodecError::Json(_))),
+            "start_session must not decode as BrokerToCompositor, got {as_b2c:?}"
+        );
+
+        for tag in [
+            "conv_prompt",
+            "success",
+            "failure",
+            "worker_success",
+            "worker_failure",
+        ] {
+            let body = format!(r#"{{"type":"{tag}"}}"#);
+            let len = u32::try_from(body.len()).unwrap();
+            let mut buf = len.to_ne_bytes().to_vec();
+            buf.extend_from_slice(body.as_bytes());
+            let as_c2b: Result<Option<(CompositorToBroker, usize)>, _> = try_decode(&buf);
+            assert!(
+                matches!(as_c2b, Err(CodecError::Json(_))),
+                "tag {tag:?} must not decode as CompositorToBroker, got {as_c2b:?}"
+            );
+        }
+    }
+
     // ── codec roundtrips ─────────────────────────────────────────────
 
     #[test]
@@ -314,6 +416,10 @@ mod tests {
             },
             CompositorToBroker::ConvResponse {
                 response: Secret::new("hunter2".into()),
+            },
+            CompositorToBroker::StartSession {
+                cmd: vec!["bash".into(), "-l".into()],
+                env: vec![("HOME".into(), "/home/alice".into())],
             },
             CompositorToBroker::Cancel,
         ] {
