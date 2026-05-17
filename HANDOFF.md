@@ -205,72 +205,81 @@ OWASP MaxStartups/CWE-770/NIST-800-63B). Full detail in memory
    `halmasuit-spawn` stays microscopic + untouched unless deliberately
    scoped.
 
-### 0.8 Epic close-out scope decision (2026-05-17, user-directed) — R10/R14/R15 deferred to the G-layer epic
+### 0.8 Epic close-out scope (2026-05-17, user-directed) — R3 relay + R10/R14/R15 deletions are IN this epic (Amendment A4; A3 RESCINDED)
 
-The §0 epic was executed (Amendments A1 — greetd session-spec
+The §0 epic's broker is **built, deployed (socket-activated host-ns
+unit), and VM-proven end-to-end** (Amendments A1 — greetd session-spec
 sequencing + pam_putenv/getenvlist-merge; A2 — single calloop
-event-loop broker with idle-exit, evict-old reachable). The
-privilege-separated `halmasuit-session` broker is **built, deployed
-(socket-activated host-ns unit), and VM-proven end-to-end**, including
-the flagship gate: REAL `pam_mount` decrypts+mounts a LUKS `$HOME`
-at `pam_open_session` using the auth-phase password recovered from the
-SAME `pam_handle_t` — the §0.2 one-handle claim, empirically validated
-against the very module whose silent cross-handle failure motivated
-the epic. Gates: `run-pam-auth`, `session-r5r6`, `session-onehandle`
-(all real PAM, no mocks).
+event-loop broker, idle-exit, evict-old reachable). The flagship gate
+`session-onehandle` shows REAL `pam_mount` decrypting+mounting a LUKS
+`$HOME` at `pam_open_session` using the auth-phase password recovered
+from the SAME `pam_handle_t`. Gates: `run-pam-auth`, `session-r5r6`,
+`session-onehandle` (all real PAM, no mocks).
 
-**Decision (Option 1):** the R14/R15/R10 close-gate DELETIONS —
-delete `crates/halmasuit-pam`, delete the setuid
-`crates/halmasuit-spawn`, remove `halmasuit-greetd`'s
-`MAX_SESSION_BUILDS_PER_CONNECTION` — are **DEFERRED to the successor
-G-layer / compositor-integration epic**, NOT done in this epic.
+**Decision (Amendment A4, controlling):** the compositor→broker relay
+(R3) and the R14/R15/R10 close-gate DELETIONS — delete
+`crates/halmasuit-pam`, delete the setuid `crates/halmasuit-spawn` +
+its `security.wrappers` entry, remove `halmasuit-greetd`'s
+`MAX_SESSION_BUILDS_PER_CONNECTION` — are **IN this epic's scope and
+ARE preconditions for closing it.**
 
-Why: each close-gate is written "atomically with the broker becoming
-the **live** path." The broker becomes the live path only when the
-**compositor relays to it**, and that compositor→broker wiring is
-out of scope here (it belongs to §6 / the visual G-layer). Today
-`halmasuit-pam` + the setuid `halmasuit-spawn` are still the *only
-working* auth/session path for the compositor, `login-flash`, and the
-compositor VM tests. Deleting them now is NOT "atomic with the
-replacement landing" (no consumer of the broker exists yet) — it would
-simply break the compositor with nothing replacing it. The R10/R14/R15
-discipline ("correct + load-bearing until the replacement lands;
-deleted atomically, never before, never left behind after") therefore
-*requires* deferral until the consumer exists.
+An earlier same-day decision (A3, "Option 1") deferred these to a
+"successor G-layer / compositor-integration epic." **A3 is RESCINDED.**
+The deferral was a false division: it leaves `halmasuit-pam`
+(in-compositor PAM) and the broker's libpam FFI BOTH linked and live
+at once — the forbidden two-libpam-surface anti-pattern — and it makes
+the privilege boundary **unreviewable**, because the boundary's whole
+security claim (the unprivileged compositor cannot reach the
+credential; it only relays) cannot be evaluated when no relaying
+consumer exists. Deferring also ships C1 (the in-compositor PAM vuln)
+indefinitely under a "deferred" label. "Rip the old path out now
+without the relay" was rejected (breaks the compositor, nothing
+replacing it). "Harden the in-compositor path" was rejected (its
+insecurity is structural, not a bug — the only fix is replacement, =
+the broker). The R10/R14/R15 discipline ("deleted atomically WITH the
+replacement landing, never before, never left behind after") is
+satisfied by making the replacement land HERE.
 
-**Plan / expectation carried forward (the successor epic MUST honor):**
+**Remaining work in THIS epic (tasks created iteratively):**
 
-1. The successor (compositor→broker integration, the G-layer epic)
-   wires the unprivileged compositor to relay greeter conversation
-   frames to the `halmasuit-session` socket (the R3 relay; the broker
-   already speaks the frozen `halmasuit-session-ipc` contract). This
-   is the step that makes the broker the **live** path.
-2. ONLY THEN, atomically in that epic: delete `crates/halmasuit-pam`
-   (R14 close-gate — `cargo tree -p halmasuit` shows no `pam-sys`),
-   delete `crates/halmasuit-spawn` + its `security.wrappers` entry
-   (R15 close-gate — no world-exec setuid spawn helper anywhere),
-   and remove `halmasuit-greetd`'s `MAX_SESSION_BUILDS_PER_CONNECTION`
-   (R10 — its replacement, the `AuthSlot` churn throttle, already
-   shipped in this epic; the cap stays load-bearing for the still-live
-   in-compositor path until that path is deleted).
-3. The R14/R15/R10 close-gate ASSERTIONS (no two crates link libpam;
-   no setuid spawn inode; cap removed) move to the successor epic's
-   success criteria and are NOT preconditions for closing THIS epic.
-   This epic closes on: the broker built + the three real-PAM VM
-   gates green + `just check`/`just test-vm` green + R13 docs
-   describing the new privileged surface (broker + fork-then-drop
-   child; the setuid helper documented as *scheduled for deletion by
-   the successor epic*, not yet deleted) + `gambit:review`.
-4. R9's "extend the compositor's SIGCHLD reaper" clause is likewise
-   superseded by the broker (out-of-process, `AuthSlot`-owned
-   pidfd-kill+`waitpid` reap); R13 records this. The compositor-side
-   reaper goes away with `halmasuit-pam` in the successor epic.
+1. **R3 compositor→broker relay.** `halmasuit-greetd`'s greetd state
+   machine stops calling `halmasuit-pam` in-process and instead
+   connects to the `halmasuit-session` socket, sends `BeginAuth`, and
+   relays `ConvPrompt`/`ConvResponse`/`Success`/`StartSession`/
+   `Cancel` over the frozen `halmasuit-session-ipc` contract. This
+   makes the broker the LIVE auth/session path. No `_v2`/shim — the
+   in-process call site is replaced, not duplicated.
+2. **Atomic deletions, the moment #1 lands (R10/R14/R15):** delete
+   `crates/halmasuit-pam`; delete `crates/halmasuit-spawn` + its
+   `security.wrappers`/setuid install; remove `halmasuit-greetd`'s
+   `MAX_SESSION_BUILDS_PER_CONNECTION` +
+   `CodecError::SessionBuildLimitExceeded`. Then `cargo tree -p
+   halmasuit` shows no `pam-sys`; no world-exec setuid spawn inode
+   exists anywhere.
+3. **`login-flash` through the new path.** PID-continuity AND
+   `assert_frame_continuity` across greeter→session with the broker
+   launching the session; `login-flash` stays a HARD gate, unmodified.
+4. **R13 docs re-sweep.** The R13 pass done under A3 described the
+   helper as "interim / scheduled for deletion by a successor epic."
+   With A3 rescinded, re-sweep ARCHITECTURE.md/CLAUDE.md so the broker
+   is described as THE path and `halmasuit-pam` + setuid
+   `halmasuit-spawn` as DELETED — no interim/scheduled language.
+5. R9's compositor-SIGCHLD-reaper clause stays superseded by the
+   broker's `AuthSlot`-owned synchronous reaping (independently true);
+   it disappears with `halmasuit-pam`'s deletion in step 2.
 
-This is recorded in the epic Task as **Amendment A3** so the
-execution contract matches; epic #1's R14/R15 "CANNOT be marked
-complete while…" close-gates are amended to "deferred to the
-successor epic" by A3. Do NOT re-litigate Option 1 absent the
-compositor→broker integration being pulled into this epic's scope.
+**This epic closes on:** R3 relay landed (broker is the live path) +
+the R10/R14/R15 atomic deletions done + `cargo tree -p halmasuit`
+shows no `pam-sys` + no setuid spawn inode + `just check` green +
+`just test-vm` green INCLUDING `login-flash` through the
+broker-launched session + the three real-PAM broker gates green + R13
+docs re-swept + the two-tier `gambit:review` (Tier 1 whole-epic + Tier
+2 deep adversarial security) both pass. The review runs only AFTER R3
++ the deletions land — auditing the boundary before its consumer
+exists is the failure A4 corrects.
+
+Recorded in epic Task #1 as **Amendment A4** (controlling; A3 marked
+RESCINDED). Do NOT re-introduce the A3 deferral.
 
 ---
 
