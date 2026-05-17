@@ -46,6 +46,9 @@ test-vm:
     echo "── run-pam-auth ──"
     nix build .#checks.x86_64-linux.run-pam-auth -L --print-build-logs --no-link
     echo
+    echo "── session-r5r6 ──"
+    nix build .#checks.x86_64-linux.session-r5r6 -L --print-build-logs --no-link
+    echo
     echo "── login-flash ──"
     nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link
     echo

@@ -168,9 +168,37 @@ in
         future `halmasuit-greetd` path before that contract is in place.
       '';
     };
+
+    session = {
+      enable = lib.mkEnableOption ''
+        the socket-activated privileged `halmasuit-session` PAM-lifecycle
+        broker (Epic #1 R6 / Amendment A2). Independent of
+        `services.halmasuit.enable`: the broker is a self-contained
+        host-ns root unit that PID 1 activates on the first greeter
+        connection and which idle-exits when no auth/session is in
+        flight, so there is no standing root process at the login
+        screen. The compositor wiring that hands it connections lands
+        with the G-layer; this option exists so the broker can be
+        deployed and VM-gated on its own.
+      '';
+
+      package = lib.mkOption {
+        type        = lib.types.package;
+        default     = pkgs.halmasuit-session;
+        defaultText = lib.literalExpression "pkgs.halmasuit-session";
+        description = ''
+          The `halmasuit-session` broker package. Override with a
+          flake-built derivation when iterating without rebuilding
+          nixpkgs. Requires the halmasuit overlay (or a manual
+          `pkgs.halmasuit-session`) for the default to resolve.
+        '';
+      };
+    };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkMerge [
+
+   (lib.mkIf cfg.enable {
     assertions = [
       {
         assertion = cfg.greeterUid != null;
@@ -381,5 +409,107 @@ in
         HALMASUIT_SPLASH_IMAGE = toString cfg.splashImage;
       };
     };
-  };
+   })
+
+   # Epic #1 R6 / Amendment A2: the socket-activated privileged broker.
+   # A SEPARATE unit from the compositor (above) — it is the host-ns
+   # root PAM-lifecycle owner. PID 1 owns the listening socket and
+   # activates the service on the first greeter connection; the broker
+   # is a single calloop event loop that evicts an in-flight worker on
+   # a reconnect (R5) and `exit(0)`s when no auth/session has been in
+   # flight for its idle window, so the unit deactivates and there is
+   # NO standing root process at the idle login screen (R6). PID 1
+   # keeps the socket and re-activates losslessly on the next
+   # connection. There is no setuid helper anywhere in this path: the
+   # broker is already root and forks-then-drops the session leader in
+   # a non-setuid child (Epic R7/R15).
+   (lib.mkIf cfg.session.enable {
+     systemd.sockets."halmasuit-session" = {
+       description = "halmasuit-session privileged PAM-lifecycle broker socket";
+       wantedBy    = [ "sockets.target" ];
+       socketConfig = {
+         # SOCK_SEQPACKET: the broker's wire codec is one logical
+         # message per datagram (matches halmasuit-greetd's framing).
+         ListenSequentialPacket = "/run/halmasuit-session.sock";
+         # The binary owns the accept loop and the global single slot
+         # (Epic R5 / Amendment A2.1) — NOT one instance per
+         # connection.
+         Accept = false;
+         # SO_PEERCRED in the broker is the load-bearing authorization
+         # (only HALMASUIT_GREETER_UID may drive auth). The socket mode
+         # is defence-in-depth only; the compositor will broker greeter
+         # connections through a tighter SocketUser/SocketGroup once
+         # the G-layer lands. Until then a permissive mode lets the
+         # gated VM client connect; the SO_PEERCRED check still refuses
+         # any non-greeter peer.
+         SocketMode = "0666";
+       };
+     };
+
+     systemd.services."halmasuit-session" = {
+       description = "halmasuit-session privileged PAM-lifecycle broker";
+       # Socket-activated: deliberately NO wantedBy / install target.
+       # No standing root process when idle (Epic R6).
+       requires = [ "halmasuit-session.socket" ];
+       after    = [ "halmasuit-session.socket" ];
+
+       serviceConfig = {
+         Type      = "simple";
+         ExecStart = lib.getExe cfg.session.package;
+         # The broker idle-exits cleanly (exit 0) when no auth/session
+         # is in flight; that is the normal R6 deactivation path, not
+         # a failure. Socket activation restarts it on demand.
+         RemainAfterExit = false;
+         Restart         = "no";
+         StandardOutput  = "null";
+         StandardError   = "journal";
+         # Runs as root in the HOST mount namespace (User= unset on
+         # purpose): pam_systemd/logind + pam_mount need host-ns root.
+         # `shadow` group lets pam_unix's getspnam fast-path read
+         # /etc/shadow in-process rather than forking the setuid
+         # unix_chkpwd helper — the fork path is fragile under any
+         # sandboxed parent (memory project-pam-unix-shadow-group).
+         SupplementaryGroups = [ "shadow" ];
+         # Generous backstop ONLY (a wedged module is bounded by the
+         # broker's per-worker RLIMIT_CPU + SIGKILL-anytime + idle
+         # exit; this just caps a pathologically stuck instance).
+         RuntimeMaxSec = "12h";
+         # DELIBERATELY NO NoNewPrivileges-implying directives
+         # (MemoryDenyWriteExecute, RestrictNamespaces, RestrictRealtime,
+         # SystemCallFilter, LockPersonality, ProtectKernelTunables,
+         # ProtectKernelModules, RestrictSUIDSGID, ProtectClock,
+         # ProtectHostname, ProtectKernelLogs when unprivileged — see
+         # systemd.exec(5) context_has_no_new_privileges). The broker
+         # forks-then-drops the session leader in a NON-setuid child
+         # whose own setres*/getres*-verify privilege drop and the
+         # pam_unix unix_chkpwd fallback both break under NNP=yes
+         # (memory project-nnp-implying-directives). The privilege
+         # split itself (host-ns root broker, fuzzed in-child drop,
+         # UID floor, no setuid inode) is the defense — NOT seccomp on
+         # this unit.
+       };
+
+       environment = {
+         RUST_LOG = cfg.logLevel;
+         # SO_PEERCRED authorization: only this uid may drive auth
+         # (Epic R5/R8). Same env key the compositor module uses.
+         HALMASUIT_GREETER_UID = toString cfg.greeterUid;
+         # PAM service file lookup key — /etc/pam.d/<value>.
+         HALMASUIT_PAM_SERVICE = cfg.pamService;
+       };
+     };
+
+     assertions = [
+       {
+         assertion = cfg.greeterUid != null;
+         message   = ''
+           services.halmasuit.session.enable requires
+           services.halmasuit.greeterUid to be set: the broker's
+           SO_PEERCRED gate rejects every connection whose peer uid
+           does not match.
+         '';
+       }
+     ];
+   })
+  ];
 }

@@ -593,8 +593,9 @@
       # (`nixpkgs.overlays = [ halmasuit.overlays.default ];`) and then
       # `services.halmasuit.enable = true` works without further wiring.
       overlays.default = final: _prev: {
-        halmasuit       = self.packages.${final.stdenv.hostPlatform.system}.halmasuit;
-        halmasuit-spawn = self.packages.${final.stdenv.hostPlatform.system}.halmasuit-spawn;
+        halmasuit         = self.packages.${final.stdenv.hostPlatform.system}.halmasuit;
+        halmasuit-spawn   = self.packages.${final.stdenv.hostPlatform.system}.halmasuit-spawn;
+        halmasuit-session = self.packages.${final.stdenv.hostPlatform.system}.halmasuit-session;
       };
 
       # NixOS VM tests run on Linux only. Limited to x86_64-linux because
@@ -633,6 +634,15 @@
           inherit nixpkgs;
           halmasuit-session-pam-testdriver =
             self.packages.x86_64-linux.halmasuit-session-pam-testdriver;
+        };
+        # Epic #1 R5/R6 + Amendment A2: the socket-activated broker
+        # posture gate (no standing root when idle, on-demand
+        # activation, idle-exit + re-activation, evict-old reachable
+        # from the event loop) — real pam_unix, NO mock.
+        session-r5r6 = import ./tests/session-r5r6.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
         };
         drm-master-probe = import ./tests/drm-master-probe.nix {
           system = "x86_64-linux";
