@@ -683,4 +683,78 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn channel_responder_drives_trampoline_end_to_end() {
+        // ChannelResponder, behind ConvCtx, drives one synthetic prompt
+        // through the real conv_trampoline; the responder really talks
+        // over a socketpair to a peer thread (no libpam linked).
+        use crate::transport::SeqpacketChannel;
+        use halmasuit_session_ipc::{BrokerToCompositor, CompositorToBroker, PromptStyle, Secret};
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+        use std::thread;
+
+        let (sock_a, sock_b) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::empty(),
+        )
+        .expect("socketpair");
+        let broker = SeqpacketChannel::new(sock_a);
+        let peer = SeqpacketChannel::new(sock_b);
+
+        let peer_thread = thread::spawn(move || {
+            let got: BrokerToCompositor = peer.recv().expect("peer recv");
+            assert_eq!(
+                got,
+                BrokerToCompositor::ConvPrompt {
+                    style: PromptStyle::Secret,
+                    message: "PW: ".into(),
+                }
+            );
+            peer.send(&CompositorToBroker::ConvResponse {
+                response: Secret::new("s3cr3t".into()),
+            })
+            .expect("peer send");
+        });
+
+        let mut responder = crate::responder::ChannelResponder::new(&broker);
+        let mut ctx = ConvCtx {
+            responder: &mut responder,
+        };
+        let text = CString::new("PW: ").unwrap();
+        let message = pam_sys::pam_message {
+            msg_style: pam_sys::PAM_PROMPT_ECHO_OFF,
+            msg: text.as_ptr(),
+        };
+        let mut mptr: *const pam_sys::pam_message = std::ptr::from_ref(&message);
+        let mut resp: *mut pam_sys::pam_response = std::ptr::null_mut();
+        #[expect(
+            unsafe_code,
+            reason = "end-to-end: our own trampoline with one synthetic \
+                      prompt; the responder really talks over the \
+                      socketpair (no libpam linked into this test)."
+        )]
+        let rc = unsafe {
+            conv_trampoline(
+                1,
+                &raw mut mptr,
+                &raw mut resp,
+                (&raw mut ctx).cast::<c_void>(),
+            )
+        };
+        assert_eq!(rc, pam_sys::PAM_SUCCESS);
+        #[expect(
+            unsafe_code,
+            reason = "read back then free the trampoline's response array, as libpam would."
+        )]
+        unsafe {
+            let got = std::ffi::CStr::from_ptr((*resp).resp);
+            assert_eq!(got.to_str().unwrap(), "s3cr3t");
+            libc::free((*resp).resp.cast::<c_void>());
+            libc::free(resp.cast::<c_void>());
+        }
+        peer_thread.join().unwrap();
+    }
 }

@@ -18,6 +18,8 @@
 
 pub mod conv;
 pub mod pam_ffi;
+pub mod responder;
 pub mod transport;
 
+pub use responder::ChannelResponder;
 pub use transport::{SeqpacketChannel, TransportError, peer_uid};
