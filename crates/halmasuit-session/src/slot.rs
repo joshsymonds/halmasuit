@@ -193,6 +193,24 @@ impl AuthSlot {
         self.inflight.take().map(|i| i.handle.wait())
     }
 
+    /// Greeter-driven cancel of the in-flight worker (Epic R4/R5):
+    /// SIGKILL — never SIGTERM — then reap, clearing the slot. `None`
+    /// if the slot was empty; otherwise the worker's `waitpid` result.
+    /// Distinct from [`Self::reap_current`], which only waits (the
+    /// worker already `_exit`ed after reporting); this is for an abort
+    /// mid-conversation where the worker is still blocked in libpam.
+    ///
+    /// # Errors
+    ///
+    /// (Inside the `Some`) any errno from `waitpid(2)`. The SIGKILL
+    /// itself is best-effort (`ESRCH` ⇒ already gone ⇒ benign).
+    pub fn cancel_current(&mut self) -> Option<io::Result<WaitStatus>> {
+        self.inflight.take().map(|i| {
+            let _ = i.handle.kill();
+            i.handle.wait()
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn take_handle_for_test(&mut self) -> Option<WorkerHandle> {
         self.inflight.take().map(|i| i.handle)
@@ -329,6 +347,26 @@ mod tests {
                 .expect("within-bound create");
         }
         drain(&mut slot);
+    }
+
+    #[test]
+    fn cancel_current_sigkills_reaps_and_clears_the_slot() {
+        let mut slot = AuthSlot::new(GREETER, 5, Duration::from_secs(10));
+        slot.create_at(Instant::now(), GREETER, sleeper).unwrap();
+        assert!(slot.current().is_some());
+        // Greeter Cancel mid-flight (Epic R4/R5): SIGKILL — never
+        // SIGTERM — then reap; slot cleared.
+        let status = slot
+            .cancel_current()
+            .expect("a worker was in flight")
+            .expect("waitpid ok");
+        assert!(
+            matches!(status, WaitStatus::Signaled(_, Signal::SIGKILL, _)),
+            "cancel_current must SIGKILL the in-flight worker: {status:?}"
+        );
+        assert!(slot.current().is_none(), "slot cleared after cancel");
+        // Cancelling an empty slot is None, not an error.
+        assert!(slot.cancel_current().is_none());
     }
 
     #[test]

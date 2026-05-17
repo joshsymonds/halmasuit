@@ -25,6 +25,7 @@
 //! stays hard-`forbid`.
 
 pub mod auth;
+pub mod broker;
 pub mod conv;
 pub mod pam_ffi;
 pub mod responder;
@@ -35,6 +36,7 @@ pub mod transport;
 pub mod worker;
 
 pub use auth::{AuthError, ResolvedIdentity, run_pam_auth};
+pub use broker::{BrokerError, Disposition, handle_connection};
 pub use responder::ChannelResponder;
 pub use session::{SessionError, run_session};
 pub use session_leader::{SessionSpec, SpecError, merged_groups, sanitize_env, validate};
