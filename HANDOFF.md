@@ -281,6 +281,79 @@ exists is the failure A4 corrects.
 Recorded in epic Task #1 as **Amendment A4** (controlling; A3 marked
 RESCINDED). Do NOT re-introduce the A3 deferral.
 
+### 0.9 Broker→compositor session-lifecycle signalling (2026-05-17, user-directed) — Amendment A5
+
+R3 (the compositor→broker relay) raised one design point not pinned by
+the immutable requirements: under R7 the broker (not the compositor)
+owns and parents the session leader, so the unprivileged compositor
+must learn "session ready" / "session ended" to do the flash-free
+`wl_client` swap and revert — without being the leader's parent or the
+credential holder. Resolved like A1/A2: three independent BLIND
+primary-source agents, different angles (privsep-login lineage
+greetd/GDM/OpenSSH; system-compositor lineage Mir+USC/LightDM/
+gamescope; kernel + systemd-logind + pidfd threat model). Strong
+convergence + one load-bearing sharpening only the system-compositor
+agent surfaced.
+
+**Decision (Amendment A5):**
+
+1. **One-way trust, broker→compositor only.** Session-lifecycle
+   frames exist ONLY in `BrokerToCompositor`, NEVER in
+   `CompositorToBroker`. The compositor emits no lifecycle frame
+   ever; it is a pure sink. Structural (the type only deserializes
+   on the privileged-emit side — greetd `SessionChildToParent` /
+   GDM private worker→daemon bus), SO_PEERCRED-gated to the root
+   broker peer (authenticates, never authorizes). This structurally
+   kills (a) a compromised greeter/client forging a force-logout and
+   (b) forging "session ready" to phish the post-login surface.
+2. **Typed, outcome-bearing frame pair** added to
+   `halmasuit-session-ipc` `BrokerToCompositor`: `SessionOpened` and
+   `SessionEnded { Exited(code) | Signaled(signo) }`. Keep the
+   crash-vs-clean distinction (GDM `SESSION_EXITED`/`SESSION_DIED`;
+   do NOT collapse like greetd) — the compositor uses it for revert
+   UX/policy. The frame carries NO raw pid.
+3. **Two-key flash-free swap (load-bearing — the project's reason to
+   exist).** `SessionOpened` *authorizes/names* the session; the
+   actual VISIBLE greeter→session swap fires only on
+   AND(`SessionOpened` received, compositor's own in-process
+   observation of the session Wayland client's first committed
+   buffer of non-zero size). The greeter stays visible underneath
+   until that first real frame. Swapping on `SessionOpened` alone
+   reintroduces the exact flash halmasuit deletes (Mir/USC
+   `is_session_ready_for_display = session && ready`,
+   `WindowWlSurfaceRole` first-non-empty-buffer gate). The trust
+   model (who has authority) is unchanged by this; it governs only
+   WHEN the swap becomes visible.
+4. **Broker is the sole reaper.** It parents the leader, `waitpid`s
+   it, then `close_session`/`pam_end` (R7/R9/#16/#25). The
+   compositor is never the parent, holds no pid, never reaps
+   (`waitid` would `ECHILD`).
+5. **Revert** to greeter on (`SessionEnded` frame) OR (session
+   Wayland client disconnect). **Socket-close** = secondary
+   broker-crash backstop only, never the primary signal (loses the
+   outcome; conflates "broker died" with "session ended").
+6. **pidfd backstop (IN scope, user-directed).** The broker passes a
+   **poll-only** pidfd of the leader to the compositor via
+   SCM_RIGHTS; the compositor adds it to its calloop set and treats
+   `EPOLLIN` purely as a zero-latency, pid-reuse-immune,
+   broker-crash-resilient hint to start the revert. The compositor
+   MUST NOT `waitid`/reap it (not its child; `ECHILD`) and MUST NOT
+   `pidfd_send_signal` it. Authoritative signal is still the
+   `SessionEnded` frame; the pidfd is a latency/robustness
+   accelerator. Matches the existing `project-pidfd-over-raw-kill`
+   memory.
+7. **logind D-Bus `SessionRemoved` is NOT the compositor's cue** —
+   unspoofable but trailing-edge (emitted in `session_finalize`
+   after full scope teardown) and pulls in a zbus/D-Bus dep the
+   project constrains. Broker-internal corroboration at most.
+
+This is a minimal, primary-source-justified extension of the
+otherwise-frozen `halmasuit-session-ipc` contract, in-scope under A4.
+The R3 step-1 pure adapter (task #27) is built anticipating the two
+new inbound `BrokerToCompositor` variants; the two-key swap +
+SCM_RIGHTS pidfd land in the later R3 socket-wiring step. Recorded in
+epic Task #1 as **Amendment A5**.
+
 ---
 
 ---
