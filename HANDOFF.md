@@ -514,6 +514,81 @@ Recorded in epic Task #1 as **Amendment A7**. DO NOT put a blocking
 broker IPC, with or without a timeout; DO NOT re-introduce a
 synchronous blocking `PamSession::step` effect.
 
+### 0.12 Broker fd as a calloop source without dup/Rc/Arc — borrowed-fd source + episode-owned channel (2026-05-17, user-directed) — Amendment A8
+
+R3 #31/S1 bite 3 surfaced an unpinned integration fork A6/A7 did not
+resolve: calloop's `Generic<F: AsFd>` takes `F` BY VALUE and (only)
+the value's destructor closes the fd — so making the episode the sole
+owner of the broker socket (A6) while calloop watches it for readiness
+(A7) is not the default `Generic<OwnedFd>` shape. Resolved like
+A1/A2/A5/A6/A7: three independent BLIND primary-source agents
+(calloop API/source + `NoIoDrop`/`insert_source` bounds; production
+Smithay/anvil/niri per-connection-fd idiom; the cross-source +
+privilege-boundary close/dup discipline with sans-IO doctrine).
+**Strong convergence, and it surfaced an in-repo defect.**
+
+**Decision (Amendment A8):**
+
+A8.1 — **The episode (`ConnState`/`BrokerEpisode`) is the SOLE owner
+of the broker `SeqpacketChannel` (`OwnedFd`) for the whole episode
+(A6).** calloop watches it via a `Generic` over a NON-OWNING borrowing
+newtype: `struct …Fd(RawFd); impl AsFd { unsafe BorrowedFd::borrow_raw }`,
+**no `Drop`**. calloop verified to only ever call `as_fd()` for
+register/reregister/unregister and to NEVER `close(2)` (its `Drop`
+only `poller.delete`s). `insert_source`'s bound is `S: EventSource +
+'l` (NOT `'static`); a `RawFd`-holding newtype satisfies it trivially.
+This is permitted by calloop's contract but NOT in its cookbook → it
+is a code-review/test invariant, not a type guarantee.
+
+A8.2 — **Close-exactly-once discipline:** the borrowing source's
+`RegistrationToken` is `loop_handle.remove`d BEFORE the `ConnState`
+(hence the `OwnedFd`) is dropped. That ordering is what makes the
+`unsafe BorrowedFd::borrow_raw` sound (epoll never references a
+closed/stale fd) and guarantees the single `close(2)` is the episode's
+`OwnedFd::drop`. Asserted by test, not assumed.
+
+A8.3 — **NO `dup`/`try_clone_to_owned`/`Rc`/`Arc` of the
+privilege-crossing fd** (A6 restated, now with the calloop mechanism
+that obviates it). `dup` of a privsep socket = premature-/no-EOF +
+second writer + reused-fd double-close (close(2)/dup(2) semantics;
+OpenSSH privsep rationale; CVE-2015-6563/6564 class). The borrowing
+source needs no dup.
+
+A8.4 — **Cross-source coupling goes through the shared `&mut State`,
+never source-to-source.** Both calloop sources (greeter
+`Generic<UnixStream>`, broker borrowed-fd `Generic`) carry
+`&mut HalmasuitState` and reach `state.connections[id]`; the greeter
+callback's `Demand::Pam` does the one non-blocking `chan.send`
+directly on the episode-owned channel; the broker callback does the
+one non-blocking `chan.recv`. SEQPACKET = one datagram per logical
+message ⇒ NO outbox / `Ping` / `insert_idle` / combined-source
+machinery (those solve partial-write / cross-thread / non-fd problems
+this shape does not have). `MSG_DONTWAIT` both directions makes the
+no-block invariant (A7) structural even though the channel lives in
+the episode (the sans-IO "pure machine, reactor syscalls" ideal is
+not required here — calloop-reported readiness + SEQPACKET atomicity +
+`MSG_DONTWAIT` is the defensible, idiomatic shape; pattern (a)).
+
+A8.5 — **Consequence: #31/S1 bite 2's `BrokerEpisode` is CORRECT
+as-is** (owns the channel, `MSG_DONTWAIT` I/O in the drive methods);
+bite 3 must register the broker fd via the borrowing newtype (NOT move
+the channel into `Generic`, NOT dup).
+
+A8.6 — **In-repo defect found (broker side, separate task):** the
+already-landed `crates/halmasuit-session/src/broker.rs` (#22 calloop
+broker loop) registers the calloop readiness source over a
+`try_clone_to_owned()` **dup of the privilege-crossing worker fd**
+(and the greeter fd) — the exact A8.3/A6 anti-pattern, on the
+PRIVILEGED side. Fix tracked as a dedicated task (borrowed-fd source;
+single `InFlight`-owned close), in scope for this epic's two-tier
+review at minimum.
+
+Recorded in epic Task #1 as **Amendment A8**. DO NOT dup/Rc/Arc the
+broker fd for the calloop source; DO NOT move the episode's
+`SeqpacketChannel` into `Generic`; DO NOT add an outbox/Ping/idle for
+the SEQPACKET write path; DO remove the source token before the
+episode/`OwnedFd` drops (assert it).
+
 ---
 
 ---
