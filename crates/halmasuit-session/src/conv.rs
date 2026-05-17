@@ -6,6 +6,7 @@
 //! `#![forbid(unsafe_code)]` and links no PAM here. The (later) unsafe
 //! `extern "C"` conv callback is a thin shim over these functions —
 //! keeping the mapping logic testable in isolation, off the FFI path.
+#![forbid(unsafe_code)]
 
 use halmasuit_session_ipc::{BrokerToCompositor, PromptStyle};
 use thiserror::Error;

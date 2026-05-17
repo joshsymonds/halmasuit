@@ -22,3 +22,12 @@ thiserror.workspace  = true
 # Trait bounds for the generic framed send/recv (same as the codec in
 # halmasuit-session-ipc). Pure data traits — no I/O.
 serde.workspace      = true
+# libpam FFI (pam_ffi module only). This crate is the SOLE libpam-
+# linking surface in the workspace (Epic #1 R2/R14) and halmasuit-pam's
+# successor. Same pins/rationale as halmasuit-pam's FFI (see CLAUDE.md
+# "Ecosystem caveats": pam-sys is a de-facto-stable pre-release).
+pam-sys              = { workspace = true }
+libc.workspace       = true
+# Wipe credential buffers handed to libpam immediately after strdup
+# copies them into PAM-owned memory (Epic #1 R11).
+zeroize.workspace    = true
