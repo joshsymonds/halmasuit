@@ -642,6 +642,18 @@
           halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Amendment A5: two-key flash-free swap ORDERING + revert
+        # (headless event-stream proof; pixel proof is visual-foreground).
+        visual-revert = import ./tests/visual-revert.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-splash                  = self.packages.x86_64-linux.halmasuit-splash;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-toplevel-test-client    = self.packages.x86_64-linux.halmasuit-toplevel-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+        };
         # Epic layer E2: real keystroke → libinput → wl_seat →
         # focused client. Production halmasuit (input is core).
         halmasuit-input = import ./tests/halmasuit-input.nix {

@@ -175,6 +175,53 @@ pub enum Event {
         /// The new foreground.
         to: Foreground,
     },
+    /// Key 1 of the Amendment-A5 two-key flash-free swap: the
+    /// compositor received `BrokerToCompositor::SessionOpened` (the
+    /// broker forked+dropped the session leader and `pam_open_session`
+    /// succeeded). This *authorizes/names* the session; it does NOT by
+    /// itself make the session visible — swapping on this alone
+    /// reintroduces the flash this project deletes. Paired with
+    /// `SessionClientFirstFrame` (key 2) to gate `ForegroundChanged {
+    /// to: session }`.
+    SessionOpened,
+    /// Key 2 of the two-key swap: the session Wayland client committed
+    /// its first buffer of non-zero size that halmasuit will
+    /// composite. The greeter stays visible underneath until BOTH this
+    /// and `SessionOpened` are observed (Amendment A5; Mir/USC
+    /// `is_session_ready_for_display`).
+    SessionClientFirstFrame,
+    /// The session ended (Amendment A5.5 revert trigger): the broker
+    /// sent `BrokerToCompositor::SessionEnded`. Crash-vs-clean is
+    /// preserved (A5.2; GDM `SESSION_EXITED`/`SESSION_DIED` — NOT
+    /// collapsed like greetd). The compositor reverts the foreground
+    /// to the greeter/splash on this OR session-client disconnect.
+    SessionEnded {
+        /// How the session leader exited.
+        outcome: SessionExit,
+    },
+}
+
+/// How the session leader process terminated (Amendment A5.2).
+///
+/// The crash-vs-clean distinction is preserved end to end (mirrors
+/// `halmasuit_session_ipc::SessionOutcome`; duplicated here so the
+/// introspect schema crate stays dependency-light, like
+/// [`LayerRole`]/[`Foreground`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionExit {
+    /// The leader `_exit`ed with this status code (clean — GDM
+    /// `SESSION_EXITED`).
+    Exited {
+        /// Process exit status code.
+        code: i32,
+    },
+    /// The leader was killed by this signal (crash — GDM
+    /// `SESSION_DIED`).
+    Signaled {
+        /// Terminating signal number.
+        signal: i32,
+    },
 }
 
 /// Which client halmasuit treats as the foreground (composited above

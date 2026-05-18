@@ -21,6 +21,7 @@ mod dbus;
 mod drm;
 #[cfg(feature = "frame_audit")]
 mod frame_audit;
+mod swap_gate;
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -53,7 +54,7 @@ use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
+use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
 use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
@@ -173,13 +174,14 @@ struct HalmasuitState {
     /// Greeter we spawned at startup, held as a pid + pidfd pair.
     /// The pidfd is the kernel-anchored signal target (race-free
     /// across pid recycling — `pidfd_send_signal(2)`); the pid is
-    /// retained for the introspection event field. Killed in the
-    /// `SessionRequested` handler — per Epic #1, the greeter
-    /// wl_client must be killed before the user session takes
-    /// halmasuit's foreground slot. The SIGCHLD reaper picks up
-    /// the zombie. `None` when `HALMASUIT_GREETER_COMMAND` was
-    /// unset OR the greeter slot has already been consumed by
-    /// the kill-on-session-start path.
+    /// retained for the introspection event field. SIGKILLed by the
+    /// Amendment-A5 swap gate (`apply_swap_action`) when BOTH keys are
+    /// in (`SessionOpened` + the session client's first non-empty
+    /// frame) — the greeter stays visible underneath until then, then
+    /// releases halmasuit's foreground slot as the session takes it
+    /// (no flash). The SIGCHLD reaper picks up the zombie. `None` when
+    /// `HALMASUIT_GREETER_COMMAND` was unset OR the slot was already
+    /// consumed by the swap kill.
     greeter: Option<GreeterHandle>,
 
     /// uid of the authenticated user session, recorded by
@@ -190,6 +192,19 @@ struct HalmasuitState {
     /// (post-auth); the session connects under its own uid, distinct
     /// from the greeter's. `None` until a session spawn succeeds.
     session_uid: Option<u32>,
+
+    /// Amendment A5 two-key flash-free swap gate. The VISIBLE
+    /// greeter→session swap (SIGKILL greeter + `foreground = Session`)
+    /// fires only on AND(`SessionOpened`, the session client's first
+    /// non-empty frame). `session_uid` above is set EARLIER (on
+    /// `spawned`, so the session client can authorise+connect+paint);
+    /// this gate governs only WHEN that becomes visible, and the
+    /// revert (back to splash) on `SessionEnded`/disconnect.
+    swap: swap_gate::SwapGate,
+    /// Emit-once latch for `Event::SessionClientFirstFrame` (key 2):
+    /// the session client commits many frames; the introspect marker
+    /// and the gate input fire on the first non-empty one only.
+    session_first_frame_emitted: bool,
 }
 
 /// Greeter identity post-spawn. The pidfd is the load-bearing
@@ -206,6 +221,14 @@ struct GreeterHandle {
 /// `ClientData` impl so it's automatically cleaned up on disconnect.
 struct ClientState {
     compositor_state: CompositorClientState,
+    /// SO_PEERCRED uid of the connecting peer, captured at accept.
+    /// Lets the commit handler tell the session client (uid ==
+    /// `session_uid`) from the greeter (uid == `greeter_uid`) so the
+    /// Amendment-A5 key 2 (session client's first non-empty frame)
+    /// fires for the right client — connection identity is NOT
+    /// authority (R8), but it IS how the compositor knows whose pixels
+    /// just arrived.
+    uid: u32,
 }
 
 impl ClientData for ClientState {
@@ -248,6 +271,75 @@ impl HalmasuitState {
         }
         let serial = SERIAL_COUNTER.next_serial();
         keyboard.set_focus(self, surface, serial);
+    }
+
+    /// Apply the Amendment-A5 two-key swap-gate decision to the
+    /// visible scene. `Swap` (both keys in): SIGKILL the greeter (its
+    /// wl_client must release halmasuit's slot before the session
+    /// takes it — req 17), flip `foreground` to `Session`, focus the
+    /// session toplevel, re-composite. `Revert` (`SessionEnded` or
+    /// session-client disconnect, post-swap): foreground back to
+    /// `Greeter`, clear focus, re-composite — on logout the splash is
+    /// already running underneath and just becomes visible again
+    /// (ARCHITECTURE.md), so this is flash-free in the same way the
+    /// forward swap is. `None`: nothing changed on screen.
+    fn apply_swap_action(&mut self, action: swap_gate::SwapAction) {
+        match action {
+            swap_gate::SwapAction::None => return,
+            swap_gate::SwapAction::Swap => {
+                if let Some(g) = self.greeter.take() {
+                    let pid = g.pid;
+                    match pidfd_send_signal(&g.pidfd, libc::SIGKILL) {
+                        Ok(()) => emit(&Event::GreeterTerminated { pid }),
+                        Err(e) => {
+                            let error = format!("{e}");
+                            tracing::warn!(
+                                %error,
+                                greeter_pid = pid,
+                                "pidfd_send_signal greeter SIGKILL failed; session proceeds"
+                            );
+                            emit(&Event::GreeterKillFailed { pid, error });
+                        }
+                    }
+                }
+                self.foreground = halmasuit_introspect::Foreground::Session;
+                emit(&Event::ForegroundChanged {
+                    to: halmasuit_introspect::Foreground::Session,
+                });
+                if let Some(t) = self.foreground_toplevel.as_ref() {
+                    let s = t.wl_surface().clone();
+                    self.set_keyboard_focus(Some(s));
+                }
+            }
+            swap_gate::SwapAction::Revert => {
+                self.foreground = halmasuit_introspect::Foreground::Greeter;
+                emit(&Event::ForegroundChanged {
+                    to: halmasuit_introspect::Foreground::Greeter,
+                });
+                self.set_keyboard_focus(None);
+            }
+        }
+        // Re-composite now so the swap/revert is visible this frame and
+        // never via a stale/black intermediate (the no-flash invariant
+        // this project exists for). On revert we composite with no
+        // foreground toplevel — the persistent splash/backdrop layers
+        // are already running underneath.
+        let fg_surface = match action {
+            swap_gate::SwapAction::Swap => self
+                .foreground_toplevel
+                .as_ref()
+                .map(|t| t.wl_surface().clone()),
+            _ => None,
+        };
+        if let Some(backend) = self.drm_backend.as_mut()
+            && let Err(e) = backend.render_layer_elements(
+                &self.output,
+                fg_surface.as_ref(),
+                HALMASUIT_BRAND_CLEAR,
+            )
+        {
+            tracing::warn!(error = %e, "render_layer_elements on swap/revert failed");
+        }
     }
 }
 
@@ -338,11 +430,37 @@ impl CompositorHandler for HalmasuitState {
             }
         }
 
+        // Amendment A5 key 2: the session Wayland client's first
+        // committed buffer of non-zero size. The client is identified
+        // by its SO_PEERCRED uid == `session_uid` — connection
+        // identity is NOT authority (that is PAM-derived, R8), but it
+        // IS how the compositor knows WHOSE pixels just arrived.
+        // Emit-once; feeds the two-key `SwapGate` (key 1 is the
+        // broker's `SessionOpened`). Swapping before this point would
+        // show the session "window" before it has painted — the exact
+        // flash this project deletes.
+        if !self.session_first_frame_emitted
+            && let Some(suid) = self.session_uid
+            && surface_client_uid(surface) == Some(suid)
+        {
+            let non_empty =
+                smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
+                    s.buffer_size().is_some_and(|sz| sz.w > 0 && sz.h > 0)
+                })
+                .unwrap_or(false);
+            if non_empty {
+                self.session_first_frame_emitted = true;
+                emit(&Event::SessionClientFirstFrame);
+                let a = self.swap.session_first_frame();
+                self.apply_swap_action(a);
+            }
+        }
+
         // Focus-follows-foreground (req 17): the session's
         // xdg_toplevel gets keyboard focus on its first buffered
         // commit, but only once the greetd lifecycle has put the
-        // foreground in `Session` (set in the SpawnRequest handler) —
-        // never on connection identity alone.
+        // foreground in `Session` (set by the A5 swap gate) — never on
+        // connection identity alone.
         let fg_surface = self
             .foreground_toplevel
             .as_ref()
@@ -477,6 +595,14 @@ impl XdgShellHandler for HalmasuitState {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         if self.foreground_toplevel.as_ref() == Some(&surface) {
+            // Post-`spawned` the foreground toplevel IS the session
+            // client (its toplevel replaced the greeter's in
+            // `new_toplevel`); its destruction = the session Wayland
+            // client disconnected — Amendment A5.5 revert trigger (the
+            // authoritative signal is still the broker's `SessionEnded`
+            // frame; whichever arrives first reverts, the gate makes
+            // the other inert).
+            let was_session = self.session_uid.is_some();
             self.foreground_toplevel = None;
             // The foreground is gone — clear keyboard focus and
             // re-composite so the layers beneath (splash) reappear
@@ -487,6 +613,10 @@ impl XdgShellHandler for HalmasuitState {
                     backend.render_layer_elements(&self.output, None, HALMASUIT_BRAND_CLEAR)
             {
                 tracing::warn!(error = %e, "render on toplevel_destroyed failed");
+            }
+            if was_session {
+                let a = self.swap.session_client_gone();
+                self.apply_swap_action(a);
             }
         }
     }
@@ -809,18 +939,15 @@ fn handle_connection_ready(
                     if let Some(spawn) = out.spawned {
                         // The broker forked-then-dropped the leader
                         // (R7); the compositor never execs anything
-                        // (R3/R15). Record identity + tear the greeter
-                        // process down. The A5 two-key flash-free
-                        // VISIBLE swap is a later task — keep the
-                        // immediate Session foreground flip (PID
-                        // continuous; login-flash invariant intact).
+                        // (R3/R15). Amendment A5: identity bookkeeping
+                        // ONLY (authorises the session client to
+                        // connect+paint) — the greeter is NOT killed
+                        // and the foreground is NOT flipped here. The
+                        // VISIBLE swap is two-key-gated (SessionOpened
+                        // + the session client's first frame) and
+                        // happens on the broker/commit paths.
                         connstate.spawned = true;
-                        record_session_started(
-                            &spawn,
-                            &mut state.greeter,
-                            &mut state.session_uid,
-                            &mut state.foreground,
-                        );
+                        record_session_started(&spawn, &mut state.session_uid);
                     }
                     if out.terminate {
                         connstate.terminate = true;
@@ -925,26 +1052,43 @@ fn handle_broker_ready(
         return Ok(PostAction::Remove);
     };
 
-    if readiness.readable {
+    let (key1_session_opened, session_ended) = if readiness.readable {
         let out = connstate.episode.on_broker_readable();
         connstate.write_buf.extend(out.greeter_reply);
         if let Some(spawn) = out.spawned {
             connstate.spawned = true;
-            record_session_started(
-                &spawn,
-                &mut state.greeter,
-                &mut state.session_uid,
-                &mut state.foreground,
-            );
+            record_session_started(&spawn, &mut state.session_uid);
         }
         if out.terminate {
             connstate.terminate = true;
         }
-    }
+        (out.session_opened, out.session_ended)
+    } else {
+        (false, None)
+    };
 
     let terminate = connstate.terminate;
     let greeter_attached = connstate.greeter_token.is_some();
     // `connstate`'s borrow ends here.
+
+    // Amendment A5 two-key gate: key 1 (`SessionOpened`) and the
+    // revert trigger (`SessionEnded`) arrive on the broker channel.
+    // Apply BEFORE any teardown so a `SessionEnded` revert
+    // re-composites the splash before the `ConnState` drops (no
+    // black/stale intermediate — the no-flash invariant on the revert
+    // side too).
+    if key1_session_opened {
+        emit(&Event::SessionOpened);
+        let a = state.swap.session_opened();
+        state.apply_swap_action(a);
+    }
+    if let Some(outcome) = session_ended {
+        emit(&Event::SessionEnded {
+            outcome: session_exit_of(outcome),
+        });
+        let a = state.swap.session_ended();
+        state.apply_swap_action(a);
+    }
 
     if terminate {
         if greeter_attached {
@@ -969,16 +1113,43 @@ fn handle_broker_ready(
 
 /// Record that the broker has launched the session leader (it
 /// forked-then-dropped in a non-setuid child per R7 — the compositor
-/// never execs anything, R3/R15): set the session uid, SIGKILL the
-/// greeter process via its pidfd, flip the foreground to `Session`.
-/// Idempotent — a second `spawned` (e.g. seen from both the greeter
-/// and broker sources) is a no-op.
-fn record_session_started(
-    spawn: &SpawnRequest,
-    greeter: &mut Option<GreeterHandle>,
-    session_uid: &mut Option<u32>,
-    foreground: &mut halmasuit_introspect::Foreground,
-) {
+/// never execs anything, R3/R15): set the session uid and emit
+/// `SessionRequested`. Amendment A5: identity bookkeeping ONLY — this
+/// authorises the session client to connect to the Wayland socket
+/// (`wayland_peer_authorized`) and paint, but does NOT kill the
+/// greeter or flip the foreground. The VISIBLE swap is deferred to the
+/// two-key gate (AND of `SessionOpened` and the session client's first
+/// non-empty frame); swapping here would reintroduce the flash.
+/// Idempotent — a second `spawned` (seen from both the greeter and
+/// broker sources) is a no-op.
+/// Map the wire [`halmasuit_session_ipc::SessionOutcome`] to the
+/// introspect [`halmasuit_introspect::SessionExit`]. The crash-vs-clean
+/// distinction is preserved (Amendment A5.2; GDM
+/// `SESSION_EXITED`/`SESSION_DIED` — NOT collapsed like greetd).
+/// The SO_PEERCRED uid captured for `surface`'s wl_client at accept
+/// (`ClientState::uid`). `None` if the surface has no live client or
+/// no `ClientState` (every client halmasuit inserts has one — see the
+/// Wayland accept handler).
+fn surface_client_uid(surface: &WlSurface) -> Option<u32> {
+    surface
+        .client()
+        .and_then(|c| c.get_data::<ClientState>().map(|cs| cs.uid))
+}
+
+const fn session_exit_of(
+    outcome: halmasuit_session_ipc::SessionOutcome,
+) -> halmasuit_introspect::SessionExit {
+    match outcome {
+        halmasuit_session_ipc::SessionOutcome::Exited { code } => {
+            halmasuit_introspect::SessionExit::Exited { code }
+        }
+        halmasuit_session_ipc::SessionOutcome::Signaled { signal } => {
+            halmasuit_introspect::SessionExit::Signaled { signal }
+        }
+    }
+}
+
+fn record_session_started(spawn: &SpawnRequest, session_uid: &mut Option<u32>) {
     if session_uid.is_some() {
         return;
     }
@@ -987,25 +1158,6 @@ fn record_session_started(
         gid: spawn.gid,
     });
     *session_uid = Some(spawn.uid);
-    if let Some(g) = greeter.take() {
-        let pid = g.pid;
-        match pidfd_send_signal(&g.pidfd, libc::SIGKILL) {
-            Ok(()) => emit(&Event::GreeterTerminated { pid }),
-            Err(e) => {
-                let error = format!("{e}");
-                tracing::warn!(
-                    %error,
-                    greeter_pid = pid,
-                    "pidfd_send_signal greeter SIGKILL failed; session proceeds"
-                );
-                emit(&Event::GreeterKillFailed { pid, error });
-            }
-        }
-    }
-    *foreground = halmasuit_introspect::Foreground::Session;
-    emit(&Event::ForegroundChanged {
-        to: halmasuit_introspect::Foreground::Session,
-    });
 }
 
 /// Bind the greetd socket, register it as a calloop source, and emit
@@ -1332,9 +1484,11 @@ enum ReapOutcome {
     /// The greeter exited before authentication completed — the wedge
     /// condition (no greeter client, no session, nothing else notices).
     GreeterDiedPreAuth,
-    /// The greeter exited after a session start was confirmed —
-    /// `record_session_started` already SIGKILLed it and emitted
-    /// `GreeterTerminated`; the expected zombie.
+    /// The greeter exited after a session start was confirmed
+    /// (`session_uid` is set on `spawned`): either the A5 swap gate
+    /// SIGKILLed it (both keys in → `GreeterTerminated` emitted) or it
+    /// exited on its own in the post-`spawned` window; either way the
+    /// expected post-auth zombie, not the pre-auth wedge.
     GreeterDiedExpected,
     /// Not the tracked greeter pid (an already-cleared greeter slot).
     /// The compositor has no other children — the session leader is
@@ -1861,6 +2015,7 @@ fn main() -> io::Result<()> {
             }
             let client_data = Arc::new(ClientState {
                 compositor_state: CompositorClientState::default(),
+                uid: creds.uid,
             });
             match state.display_handle.insert_client(stream, client_data) {
                 Ok(_client) => tracing::debug!("new wl_client accepted"),
@@ -1973,6 +2128,8 @@ fn main() -> io::Result<()> {
         _drm_token: drm_token,
         greeter,
         session_uid: None,
+        swap: swap_gate::SwapGate::new(),
+        session_first_frame_emitted: false,
     };
 
     // Kick off the render loop with one initial frame. The page-flip

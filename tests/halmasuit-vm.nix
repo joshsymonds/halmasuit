@@ -11,8 +11,13 @@
 #      + wl_output + wl_shm) — verified by a real wayland-info client
 #   4. Full greetd auth round-trip via halmasuit-vm-client →
 #      compositor relays to the halmasuit-session broker (real
-#      pam_unix) → Event::SessionRequested → broker forks the
-#      session leader → Event::ForegroundChanged{to: session}
+#      pam_unix) → SessionRequested → broker forks the `true` session
+#      leader → SessionOpened → SessionEnded{exited:0}. The session
+#      never paints, so the Amendment-A5 two-key swap correctly does
+#      NOT fire (no greeter_terminated, no ForegroundChanged{session},
+#      greeter stays alive — a session that never shows must not blank
+#      the greeter). The two-key swap+revert WITH a painting session
+#      is proven by visual-revert.nix / visual-foreground.nix.
 #   5. Clean shutdown via systemctl stop
 #
 # The greeter peer in suite 4 runs as a real non-root system user
@@ -506,83 +511,82 @@ pkgs.testers.runNixOSTest {
             f"session_requested.gid must be alice's 1000, got: {session}"
         )
 
-        # Proof the broker spawn path actually fired, on the event
-        # surface (the old in-compositor `halmasuit-spawn launched`
-        # log is gone with the setuid helper — R15). The compositor
-        # emits ForegroundChanged{to: session} ONLY after it has
-        # successfully relayed StartSession to the broker; and the
-        # privileged halmasuit-session broker is socket-activated by
-        # that relay, so its unit must have run — real pam_unix, no
-        # mock (R12).
-        # There are TWO foreground_changed events: `to:greeter` at
-        # greeter spawn (startup), then `to:session` after the broker
-        # accepted StartSession. `find` returns the first match, so we
-        # scan for the session flip explicitly below.
+        # Proof the privileged broker lifecycle fired end to end, on
+        # the event surface (the old in-compositor `halmasuit-spawn
+        # launched` log is gone with the setuid helper — R15). The
+        # broker is socket-activated by the compositor's StartSession
+        # relay, so its unit must have run — real pam_unix, no mock
+        # (R12).
         #
-        # `record_session_started` emits, in order: SessionRequested →
-        # GreeterTerminated → ForegroundChanged{to:session} — all
-        # synchronously in one function before it returns. So once
-        # `greeter_terminated` is in the journal, the session flip is
-        # too. Wait on that robust unbroken substring rather than the
-        # structured event JSON (journald escapes the inner quotes, so
-        # a `"event":"…"` grep never matches — that was the round-4
-        # false timeout; the product had already flipped correctly).
+        # `/run/current-system/sw/bin/true` exits 0 IMMEDIATELY and
+        # NEVER connects a Wayland client / paints a frame. Under
+        # Amendment A5 (the project's reason to exist) the VISIBLE
+        # greeter→session swap is two-key-gated:
+        # AND(`session_opened`, the session client's first non-empty
+        # frame). A session that exits before painting satisfies key 1
+        # but never key 2 → the swap MUST NOT fire and the greeter MUST
+        # NOT be torn down. Tearing it down here (blanking the visible
+        # greeter for a session that never shows) is the precise flash
+        # this project deletes. So the A5-correct lifecycle for a
+        # `true` session is: session_requested → session_opened →
+        # session_ended{exited:0}, with NO greeter_terminated and NO
+        # foreground_changed{to:session}, and the greeter still alive.
+        #
+        # (The actual two-key swap + revert WITH a painting session is
+        # proven by tests/visual-revert.nix and visual-foreground.nix.)
+        #
+        # Bare-token grep: journald backslash-escapes the inner tracing
+        # JSON, so `"event":"…"` substrings never match.
         machine.wait_until_succeeds(
-            "journalctl -u halmasuit | grep -qF 'greeter_terminated'",
+            "journalctl -u halmasuit -o cat | grep -qF session_ended",
+            timeout=15,
+        )
+        machine.wait_until_succeeds(
+            "journalctl -u halmasuit-session.service | grep -q .",
             timeout=10,
         )
         events = captured_events()
+
+        opened = find(events, "session_opened")
+        assert opened is not None, (
+            f"broker pam_open_session must surface as session_opened "
+            f"(A5 key 1). Events tail: {[i for (_, i) in events[-10:]]}"
+        )
+        ended = find(events, "session_ended")
+        assert ended is not None, (
+            f"`true` session must end → session_ended. Events tail: "
+            f"{[i for (_, i) in events[-10:]]}"
+        )
+        assert ended.get("outcome") == {"exited": {"code": 0}}, (
+            f"`true` exits 0 cleanly; session_ended.outcome must be "
+            f"exited/0 (crash-vs-clean preserved, A5.2): {ended}"
+        )
+
+        # A5 invariant: a session that never painted must NOT have
+        # blanked/replaced the visible greeter. No swap, no kill.
+        assert find(events, "greeter_terminated") is None, (
+            "greeter_terminated emitted for a session that never "
+            "painted — that is the flash A5 forbids: "
+            f"{[i for (_, i) in events if i.get('event') == 'greeter_terminated']}"
+        )
         fg_session = [
             inner
             for (_, inner) in events
             if inner.get("event") == "foreground_changed"
             and inner.get("to") == "session"
         ]
-        assert fg_session, (
-            f"compositor must flip foreground to the broker-launched "
-            f"session; got foreground_changed events: "
-            f"{[i for (_, i) in events if i.get('event') == 'foreground_changed']}. "
-            f"Events tail: {[i for (_, i) in events[-10:]]}"
-        )
-        machine.wait_until_succeeds(
-            "journalctl -u halmasuit-session.service | grep -q .",
-            timeout=10,
+        assert not fg_session, (
+            "foreground flipped to session WITHOUT the session ever "
+            f"painting (A5 two-key violated — the flash): {fg_session}"
         )
 
-        # The greeter must be killed BEFORE the session takes the
-        # foreground slot — see Epic #1's immutable requirement.
-        # halmasuit emits `greeter_terminated` between
-        # `session_requested` and the ForegroundChanged{session} flip.
-        machine.wait_until_succeeds(
-            "journalctl -u halmasuit | grep -qF 'greeter_terminated'",
-            timeout=5,
-        )
-        events = captured_events()
-        terminated = find(events, "greeter_terminated")
-        assert terminated is not None, (
-            f"no greeter_terminated event captured. Events tail: {events[-10:]}"
-        )
-        greeter_pid_in_event = terminated.get("pid")
-        assert (
-            isinstance(greeter_pid_in_event, int) and greeter_pid_in_event > 0
-        ), (
-            f"greeter_terminated.pid must be positive int: {terminated}"
-        )
-        # PID must match the earlier greeter_spawned event.
+        # The greeter process must still be ALIVE (the no-flash
+        # guarantee for a never-shown session): its pid from the
+        # earlier greeter_spawned event is still in /proc.
         spawned = find(events, "greeter_spawned")
         assert spawned is not None, "greeter_spawned missing (caught in suite 1)"
-        assert greeter_pid_in_event == spawned["pid"], (
-            f"greeter_terminated.pid {greeter_pid_in_event!r} must match "
-            f"greeter_spawned.pid {spawned['pid']!r}"
-        )
-
-        # The greeter process should actually be gone from /proc.
-        # SIGKILL + the SIGCHLD reaper added in the earlier review
-        # pass should clear it; a stuck zombie would show up here.
-        machine.wait_until_succeeds(
-            f"! test -d /proc/{greeter_pid_in_event}",
-            timeout=5,
-        )
+        greeter_pid = spawned["pid"]
+        machine.succeed(f"test -d /proc/{greeter_pid}")
 
     # ──────────────────────────────────────────────────────────────────
     # Suite 5: Clean shutdown

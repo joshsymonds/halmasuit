@@ -39,7 +39,8 @@ use std::path::Path;
 
 use halmasuit_greetd::server::{Connection, Demand, SpawnRequest};
 use halmasuit_session_ipc::{
-    BrokerToCompositor, CodecError, CompositorToBroker, MAX_MESSAGE_SIZE, encode, try_decode,
+    BrokerToCompositor, CodecError, CompositorToBroker, MAX_MESSAGE_SIZE, SessionOutcome, encode,
+    try_decode,
 };
 use nix::sys::socket::{MsgFlags, recv, send};
 
@@ -191,6 +192,19 @@ pub struct EpisodeOutcome {
     /// session bookkeeping (`session_uid`, greeter teardown). The A5
     /// two-key flash-free VISIBLE swap is a later task.
     pub spawned: Option<SpawnRequest>,
+    /// Amendment A5 key 1: the broker sent `SessionOpened` (leader
+    /// forked+dropped, `pam_open_session` ok). Set once. The compositor
+    /// feeds this to its two-key [`crate::swap_gate::SwapGate`] — it
+    /// does NOT make the session visible by itself (that needs the
+    /// session client's first frame too; swapping on this alone is the
+    /// flash).
+    pub session_opened: bool,
+    /// Amendment A5.5 revert trigger: the broker sent `SessionEnded`,
+    /// carrying the leader's crash-vs-clean outcome (A5.2, NOT
+    /// collapsed). Accompanied by `terminate` (the broker channel is
+    /// done); the compositor reverts the foreground before tearing the
+    /// `ConnState` down.
+    pub session_ended: Option<SessionOutcome>,
     /// The whole episode is over (greetd auth-fail close, broker
     /// EOF/fail-closed, `SessionEnded`, or a fatal protocol error).
     /// The calloop layer drains `greeter_reply` then removes BOTH the
@@ -285,13 +299,18 @@ impl BrokerEpisode {
                 Err(_codec) => self.fail_closed(&mut out),
             },
             Ok(RelayEvent::SessionOpened) => {
-                // Minimal lifecycle consumption (Epic #31 scope): the
-                // A5 two-key flash-free VISIBLE swap + SCM_RIGHTS pidfd
-                // are later tasks. The episode stays alive for
-                // SessionEnded; nothing to relay to the greeter (its
-                // greetd connection ended at Spawning).
+                // A5 key 1. Surface it to the compositor's two-key
+                // SwapGate; the episode stays alive for SessionEnded.
+                // Nothing to relay to the greeter (its greetd
+                // connection ended at Spawning). NOT a visible swap by
+                // itself — that needs the session client's first frame.
+                out.session_opened = true;
             }
-            Ok(RelayEvent::SessionEnded(_outcome)) => {
+            Ok(RelayEvent::SessionEnded(outcome)) => {
+                // A5.5 revert trigger + episode end. The crash-vs-clean
+                // outcome (A5.2) drives the compositor's revert; the
+                // broker channel is done so the episode terminates.
+                out.session_ended = Some(outcome);
                 out.terminate = true;
             }
             Err(RelayError::OutOfPhase) => self.fail_closed(&mut out),
@@ -526,18 +545,27 @@ mod tests {
             other => panic!("expected StartSession, got {other:?}"),
         }
 
-        // Lifecycle: SessionOpened keeps the episode alive (no visible
-        // swap here — that's a later task); SessionEnded terminates it.
+        // Lifecycle (Amendment A5): SessionOpened is key 1 — surfaced
+        // to the compositor's two-key SwapGate, episode stays alive.
+        // SessionEnded carries the crash-vs-clean outcome (A5.2) and
+        // ends the episode.
         broker_send(&broker, &BrokerToCompositor::SessionOpened);
         let o = ep.on_broker_readable();
+        assert!(o.session_opened, "SessionOpened surfaces A5 key 1");
+        assert!(o.session_ended.is_none());
         assert!(!o.terminate, "SessionOpened must not end the episode");
         broker_send(
             &broker,
             &BrokerToCompositor::SessionEnded {
-                outcome: SessionOutcome::Exited { code: 0 },
+                outcome: SessionOutcome::Signaled { signal: 9 },
             },
         );
         let o = ep.on_broker_readable();
+        assert_eq!(
+            o.session_ended,
+            Some(SessionOutcome::Signaled { signal: 9 }),
+            "SessionEnded surfaces the crash-vs-clean outcome (A5.2)"
+        );
         assert!(o.terminate, "SessionEnded ends the episode");
     }
 
