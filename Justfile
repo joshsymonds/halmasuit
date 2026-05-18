@@ -8,7 +8,25 @@ default:
 # ── Top-level gates ─────────────────────────────────────────────────────────
 
 # Full local CI gate. Run before every push.
-check: lint test
+check: lint r14-gate test
+
+# R14 epic close-gate (Amendment A9 fold-in, review G3/F3): the
+# unprivileged compositor must never transitively link libpam. Exactly
+# ONE workspace crate (`halmasuit-session`) links `pam-sys`; `halmasuit`
+# with no features must show none. Structurally true today but
+# previously unenforced — a future dep edit could regress the
+# single-libpam-surface invariant silently. This makes it a hard gate.
+r14-gate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if cargo tree -p halmasuit --no-default-features -e normal 2>/dev/null | grep -qw pam-sys; then
+        echo "R14 VIOLATION (epic close-gate / Amendment A9 fold-in):"
+        echo "  halmasuit transitively links pam-sys. The compositor must"
+        echo "  hold NO libpam surface — only halmasuit-session may link it."
+        cargo tree -p halmasuit --no-default-features -e normal 2>/dev/null | grep -n pam-sys || true
+        exit 1
+    fi
+    echo "R14 close-gate OK: halmasuit (no features) links no pam-sys."
 
 # Lint everything (format + clippy + dep policy + spelling + dead deps).
 lint:

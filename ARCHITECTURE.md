@@ -476,10 +476,12 @@ Flow:
 6. Halmasuit terminates the greeter. The broker — already root,
    holding the *same* `pam_handle_t` through
    `pam_setcred`/`pam_open_session` — `fork`s once; the non-setuid
-   child drops privileges in-process (setresgid → `getgrouplist`-MERGE
-   of the PAM-established groups → setresuid → re-verify →
-   `PR_SET_NO_NEW_PRIVS` → `execve` with the `pam_getenvlist`-MERGED
-   environment) and execs niri as the authenticated user. The broker
+   child drops privileges in-process (setresgid →
+   `setgroups(getgrouplist(PAM-resolved user, primary gid))` — the
+   identity-derived set ONLY, never the broker's own `getgroups()`;
+   Amendment A9 → setresuid → re-verify → `PR_SET_NO_NEW_PRIVS` →
+   `execve` with the `pam_getenvlist`-MERGED environment) and execs
+   niri as the authenticated user. The broker
    parent keeps the handle open, `waitpid`s the leader, and runs
    `pam_close_session` → `pam_setcred(PAM_DELETE_CRED)` → `pam_end`
    at logout.
@@ -645,7 +647,7 @@ assert target_uid >= UID_MIN (typically 1000); reject (uid_t)-1 / overflow
 assert target_gid >= UID_MIN
 pwent (uid, gid, user) cross-check
 setresgid(target_gid, target_gid, target_gid)
-setgroups( getgrouplist-MERGE of the PAM-established supplementary set )
+setgroups( getgrouplist(PAM-resolved user, target_gid) — identity-derived ONLY, never the broker's getgroups() )
 setresuid(target_uid, target_uid, target_uid)
 re-verify getresuid/getresgid all equal the target
 prctl(PR_SET_NO_NEW_PRIVS)
@@ -654,12 +656,18 @@ execve(cmd, sanitized_argv, pam_getenvlist-MERGED env)   # absolute path, no PAT
 ```
 
 No intervening syscalls touch user-controlled state between the first
-`setres*` and `execve`. The supplementary groups are a `getgrouplist`
-**MERGE** with the PAM-established set, never a blind `initgroups`
-(which would clobber groups added by `pam_group`/`pam_systemd`/
-`pam_mount`); the environment is `pam_getenvlist()` **MERGED** with a
-fixed allowlist, never the raw greeter-supplied env (the same clobber
-hazard for `pam_env`-class modules).
+`setres*` and `execve`. The supplementary groups are
+`getgrouplist(PAM-resolved user, primary gid)` **ONLY** — the
+OpenSSH/login/GDM identity-derived shape (Amendment A9, HANDOFF
+§0.13) — **never** the privileged broker's own `getgroups()`. Under R1
+`pam_setcred` runs in the broker, which carries its own groups (e.g.
+`shadow` for pam_unix's in-process getspnam); sourcing the leader's
+set from that process is the CVE-2021-41617 / sddm#1159
+privilege-escalation class. `pam_group`/`group.conf` conditional
+grants are out of scope under the one-handle-in-parent model. The
+environment is `pam_getenvlist()` **MERGED** with a fixed allowlist,
+never the raw greeter-supplied env (a clobber hazard for
+`pam_env`-class modules).
 
 The UID-floor refusal is what makes the privilege split *not* security
 theater. A compromised compositor can ask the broker to start a
@@ -726,8 +734,9 @@ the `start_session` spec (`cmd` + `env`), `pam_putenv`s that env into
 the handle, *then* opens the session — so `pam_systemd`/logind and
 `pam_mount` register the session against the correct environment. The
 leader's `execve` environment is `pam_getenvlist()` MERGED with the
-fixed allowlist (the env analogue of the mandatory
-`getgrouplist`-MERGE). This intervening non-PAM I/O between `setcred`
+fixed allowlist (its supplementary groups, by contrast, are
+`getgrouplist(PAM-resolved user)`-only — Amendment A9). This
+intervening non-PAM I/O between `setcred`
 and `open_session` is PAM-legal and is greetd's exact ordering.
 
 State machine (the wire/relay layer, in `halmasuit-greetd`):
@@ -1343,11 +1352,17 @@ Things we will not do regardless of pressure:
   CVE-2023-22809 attack class. The setuid `halmasuit-spawn` helper is
   **deleted** — there is no setuid inode in the closure at all
   (Epic R15); no setuid spawn path may be re-introduced.
-- **NO inheriting environment / blind `initgroups` in the
-  session-leader child.** Env is `pam_getenvlist()` MERGED with a
-  fixed allowlist; supplementary groups are a `getgrouplist` MERGE
-  with the PAM-established set — never a blind replace (it clobbers
-  `pam_env`/`pam_group`/`pam_mount`/`pam_systemd` state).
+- **NO sourcing the session-leader child's supplementary groups from
+  the privileged broker's own `getgroups()`** (Amendment A9, HANDOFF
+  §0.13). They are `getgrouplist(PAM-resolved user, primary gid)`
+  ONLY — the OpenSSH/login/GDM identity-derived shape. The broker
+  carries its own privileged groups (e.g. `shadow`); grafting them
+  onto the dropped session is the CVE-2021-41617 / sddm#1159
+  escalation class. `pam_group`/`group.conf` conditional grants are
+  out of scope under the one-handle-in-parent model. **NO inheriting
+  environment in the child** either: env is `pam_getenvlist()` MERGED
+  with a fixed allowlist, never a blind replace (it clobbers
+  `pam_env`/`pam_systemd`/`pam_mount` state).
 - **NO splitting `pam_handle_t` across processes / two-handle
   design.** `pam_set_data`/`PAM_AUTHTOK` are process-local heap;
   pam_mount/gnome-keyring/krb5 silently break across a split (locked

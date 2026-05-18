@@ -39,7 +39,7 @@ pub use auth::{AuthError, ResolvedIdentity, run_pam_auth};
 pub use broker::{BrokerError, Disposition, run_broker};
 pub use responder::ChannelResponder;
 pub use session::{SessionError, run_session};
-pub use session_leader::{SessionSpec, SpecError, merged_groups, sanitize_env, validate};
+pub use session_leader::{SessionSpec, SpecError, sanitize_env, user_groups, validate};
 pub use slot::{AuthSlot, SlotError};
 pub use transport::{SeqpacketChannel, TransportError, peer_uid};
 pub use worker::{

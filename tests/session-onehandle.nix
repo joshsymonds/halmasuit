@@ -26,13 +26,16 @@
 #  - Amendment A1.3: a session-phase `pam_env` sets the allowlisted
 #    `LANG` to a sentinel; it reaches the leader's env ONLY via
 #    `pam_getenvlist`-merge (a blind env replace would drop it).
-#  - R7/R11 getgrouplist-MERGE: the broker process carries the
-#    supplementary group `shadow` (the unit's `SupplementaryGroups=`),
-#    which is NOT a /etc/group membership of `test`. It reaches the
-#    privilege-dropped leader ONLY if `merged_groups` took the UNION
-#    of the broker's established supplementary set; a blind `initgroups(test)`
-#    would yield only test's static groups and DROP `shadow` — the
-#    exact anti-pattern R7/R11 forbids.
+#  - Amendment A9 (HANDOFF §0.13) leak regression: the broker process
+#    carries the supplementary group `shadow` (the unit's
+#    `SupplementaryGroups=`, for pam_unix's in-process getspnam). The
+#    privilege-dropped leader's supplementary set is
+#    `getgrouplist(test, 1000)` ONLY — derived from the PAM-resolved
+#    identity, NEVER the broker's own `getgroups()`. So `shadow` MUST
+#    be ABSENT from the leader and `test`'s static NSS groups (wheel)
+#    MUST be present. `shadow` reaching the leader would be the
+#    CVE-2021-41617 / sddm#1159 privilege-escalation the broker exists
+#    to prevent — a RED gate.
 #  - R8 (identity is PAM-resolved test/1000/1000) and R6 (clean
 #    teardown → idle-exit, no standing root).
 #
@@ -257,13 +260,16 @@ pkgs.testers.runNixOSTest {
     #    leader env via pam_getenvlist-merge (greeter sent env=[]).
     machine.succeed("grep -q '^LANG=oh_ONEHANDLE.UTF-8$' /tmp/oh/leader-env")
 
-    # ── R7/R11 getgrouplist-MERGE: `shadow` (the broker unit's
-    #    SupplementaryGroups=, NOT a /etc/group membership of `test`)
-    #    reached the privilege-dropped leader → merged_groups took the
-    #    UNION of the broker's established supplementary set. A blind
-    #    initgroups(test) would yield only test/wheel/video/input and
-    #    DROP `shadow` — the exact anti-pattern R7/R11 forbids.
-    machine.succeed("grep -qw shadow /tmp/oh/leader-id")
+    # ── Amendment A9 (HANDOFF §0.13) leak regression: the leader's
+    #    supplementary groups are `getgrouplist(test,1000)` ONLY,
+    #    derived from the PAM-resolved identity — NEVER the broker's
+    #    own `getgroups()`. The broker carries `shadow` (its unit
+    #    SupplementaryGroups=, for pam_unix); it MUST NOT reach the
+    #    dropped session (CVE-2021-41617 / sddm#1159). `test`'s static
+    #    NSS group `wheel` MUST be present (proves user-derived groups
+    #    flow through).
+    machine.fail("grep -qw shadow /tmp/oh/leader-id")
+    machine.succeed("grep -qw wheel /tmp/oh/leader-id")
 
     # R6: leader exited → close_session/teardown → broker idle-exits,
     # unit deactivates, no standing root.
@@ -278,9 +284,11 @@ pkgs.testers.runNixOSTest {
         "the privileged broker — REAL pam_mount decrypted+mounted a "
         "LUKS volume at session using the auth-phase password from the "
         "SAME handle (the §0.2 channel; a split handle would silently "
-        "fail), the broker's established `shadow` group MERGED into "
-        "the privilege-dropped leader (blind initgroups would drop "
-        "it), the session-phase pam_env var survived into the "
+        "fail), the leader's supplementary groups were "
+        "getgrouplist(test,1000) ONLY — the broker's own `shadow` did "
+        "NOT leak into the dropped session (Amendment A9 / "
+        "CVE-2021-41617 regression), the session-phase pam_env var "
+        "survived into the "
         "leader's environment (Amendment A1.3); identity was "
         "PAM-resolved test/1000/1000 (R8); clean teardown → no "
         "standing root (R6)."

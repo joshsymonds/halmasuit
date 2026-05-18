@@ -54,8 +54,6 @@ pub enum SessionError {
     Transport(#[from] TransportError),
     #[error("session leader: {0}")]
     Io(#[from] std::io::Error),
-    #[error("group capture failed: {0}")]
-    Groups(String),
     /// The greeter cancelled after auth, before sending a session spec
     /// (`CompositorToBroker::Cancel`). Clean abort — the handle drops
     /// (`pam_end`); no session was opened.
@@ -129,16 +127,6 @@ pub fn run_session(
 
     pam.open_session()?;
 
-    // Supplementary groups pam_group/pam_systemd established on THIS
-    // process during setcred/open_session. merged_groups unions them
-    // with getgrouplist so the leader child keeps them — a blind
-    // initgroups would clobber them (R7/R11).
-    let established: Vec<u32> = nix::unistd::getgroups()
-        .map_err(|e| SessionError::Groups(e.to_string()))?
-        .iter()
-        .map(|g| g.as_raw())
-        .collect();
-
     // Amendment A1.3: the leader's env is `pam_getenvlist` — the
     // StartSession env this process putenv'd UNION whatever
     // pam_env/pam_systemd/pam_mount added during setcred/open_session
@@ -148,7 +136,13 @@ pub fn run_session(
     // initgroups.
     let pam_env = pam.getenvlist()?;
     let spec = session_leader::validate(&id.username, id.uid, id.gid, cmd, pam_env)?;
-    let groups = session_leader::merged_groups(&id.username, id.gid, &established)?;
+    // Amendment A9 (HANDOFF §0.13): the leader's supplementary groups
+    // are `getgrouplist(PAM-resolved user, primary gid)` ONLY — derived
+    // from the R8 identity, NEVER from this (broker) process's own
+    // `getgroups()`. The broker carries privileged groups (e.g.
+    // `shadow`); sourcing the leader's set from them is the
+    // CVE-2021-41617 / sddm#1159 escalation class.
+    let groups = session_leader::user_groups(&id.username, id.gid)?;
 
     // Fork-not-exec the privilege-dropped session leader (R7). The
     // handle owner (this process) does NOT exec — it waits. Forked

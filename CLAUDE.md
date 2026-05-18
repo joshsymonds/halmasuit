@@ -92,9 +92,13 @@ Do not relax them without explicit user direction:
 - **One `pam_handle_t`, never split, owner never `execve`s between
   auth and session.** No two-handle / cross-process-handle design
   (pam_mount/keyring/krb5 silently break — locked `$HOME`, no error).
-  No blind `initgroups`/env-replace in the session leader (clobbers
-  pam_group/pam_systemd/pam_mount/pam_env — must `getgrouplist`- and
-  `pam_getenvlist`-MERGE).
+  The session leader's supplementary groups are
+  `getgrouplist(PAM-resolved user, primary gid)` ONLY (Amendment A9),
+  derived from the R8 identity — NEVER the privileged broker's own
+  `getgroups()` (sourcing the handle-owner's set leaks `shadow` into
+  every session: CVE-2021-41617 / sddm#1159). Its `execve` env is
+  `pam_getenvlist()` MERGED with the fixed allowlist, never a blind
+  env-replace (clobbers pam_env/pam_systemd/pam_mount).
 - **No `start_session` path that bypasses PAM success.** The greetd
   state machine in `halmasuit-greetd` enforces this; never add a code
   path that side-steps it.

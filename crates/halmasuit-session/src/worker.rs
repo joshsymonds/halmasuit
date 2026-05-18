@@ -128,9 +128,11 @@ impl WorkerHandle {
 
     /// Block until the child terminates; reap it.
     ///
-    /// The compositor-side single-SIGCHLD-reaper integration (Epic R9)
-    /// lands later in `halmasuit/src/main.rs`; this is the
-    /// broker-local reap used by the worker's own tests and teardown.
+    /// The broker is the SOLE reaper of the session leader (Epic
+    /// R9 / Amendments A4, A5): the compositor is never the leader's
+    /// parent and never `waitid`/reaps/signals it (its SCM_RIGHTS pidfd
+    /// is poll-only). This is that broker-local reap, driven by the
+    /// session lifecycle (and the worker's own tests/teardown).
     ///
     /// # Errors
     ///
@@ -602,9 +604,11 @@ fn prefork_gates(spec: &crate::session_leader::SessionSpec) -> io::Result<()> {
 /// [`WorkerHandle`] (it waits, then runs `pam_close_session` on the
 /// still-held handle). EUID==0 gate FIRST — refuses a non-root caller
 /// before any fork. Discipline relocated from `halmasuit-spawn`
-/// (deleted at epic close, R15); supplementary groups are MERGED by
-/// the caller via [`crate::session_leader::merged_groups`] (R7/R11) —
-/// NEVER a blind `initgroups`.
+/// (deleted at epic close, R15); supplementary groups are
+/// `getgrouplist(PAM-resolved user, primary gid)` ONLY, passed by the
+/// caller via [`crate::session_leader::user_groups`] (Amendment A9,
+/// HANDOFF §0.13) — derived from the R8 identity, never the
+/// handle-owner's own `getgroups()` (CVE-2021-41617 / sddm#1159 class).
 ///
 /// # Errors
 ///
@@ -692,8 +696,9 @@ pub fn spawn_session_leader(
             if nix::unistd::setresgid(gid, gid, gid).is_err() {
                 die(82);
             }
-            // MERGED groups (R7/R11) — caller passed
-            // session_leader::merged_groups; never blind initgroups.
+            // Supplementary groups = getgrouplist(resolved user) only
+            // (Amendment A9) — caller passed session_leader::user_groups;
+            // never the handle-owner's ambient getgroups().
             if nix::unistd::setgroups(&gids).is_err() {
                 die(83);
             }

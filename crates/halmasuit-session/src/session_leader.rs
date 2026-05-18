@@ -13,13 +13,24 @@
 //! fuzzable successor function. NOT a dependency/wrapper of
 //! halmasuit-spawn (it encodes the deleted setuid model).
 //!
-//! NEW vs halmasuit-spawn (the R7/R11 finding): groups are
-//! `getgrouplist`-MERGED with the pam_setcred/pam_open_session-
-//! established set — a blind `initgroups` REPLACES the list and would
-//! silently clobber groups added by pam_group/pam_systemd/pam_mount.
+//! Supplementary groups are `getgrouplist(PAM-resolved username,
+//! PAM-resolved primary gid)` ONLY (Amendment A9, HANDOFF §0.13),
+//! derived in the fork-drop child from the R8 identity — the
+//! OpenSSH/login/GDM `initgroups` shape. The handle-owner's own
+//! `getgroups()` is NEVER a source: under R1 `pam_setcred` runs in the
+//! privileged broker (which carries its own groups, e.g. `shadow`), so
+//! merging that process's set into the dropped session is the
+//! CVE-2021-41617 / sddm#1159 privilege-escalation class. `pam_group`/
+//! `group.conf` conditional grants are out of scope under the
+//! one-handle-in-parent model. (A9 RESCINDS the earlier
+//! "getgrouplist-MERGE the established set / blind initgroups is
+//! forbidden" R7/R11 sub-clause — it was written on a wrong model of
+//! the PAM group contract; `pam_setcred(3)` assigns the group base to
+//! the application via `initgroups`/`getgrouplist`, and no
+//! `pam_getgrouplist` exists.)
 //!
 //! `#![forbid(unsafe_code)]` — this module is the pure
-//! validation/group-merge core; the unsafe `fork`/`setres*`/`execve`
+//! validation/group core; the unsafe `fork`/`setres*`/`execve`
 //! privilege-drop sequence that consumes its [`SessionSpec`] lives in
 //! [`crate::worker::spawn_session_leader`] (the unsafe-quarantine
 //! module), which re-checks the UID/GID floor + sentinel before the
@@ -144,8 +155,8 @@ pub fn validate(
         return Err(SpecError::RelativeCommand);
     }
     // pwent (uid,gid,user) cross-check — the load-bearing defense
-    // against supplementary-group escalation (a `1000 1000 root`
-    // triple would otherwise graft root's groups via the merge).
+    // against identity substitution (a `1000 1000 root` triple would
+    // otherwise resolve root's `getgrouplist`, A9 group source).
     let user = lookup_user(username)?;
     if user.uid.as_raw() != uid {
         return Err(SpecError::PwentMismatch(format!(
@@ -174,26 +185,29 @@ fn dedup_push(out: &mut Vec<u32>, g: u32) {
     }
 }
 
-/// The MERGED supplementary-group set for the session leader (R7/R11).
+/// The supplementary-group set for the session leader (Amendment A9,
+/// HANDOFF §0.13).
 ///
-/// `getgrouplist(user, primary_gid)` UNION the pam_setcred/
-/// pam_open_session-established gids, with `primary_gid` included,
-/// deduped (insertion order stable, deterministic).
+/// `getgrouplist(username, primary_gid)` from the PAM-resolved identity
+/// ONLY, with `primary_gid` included, deduped (insertion order stable,
+/// deterministic). This is the OpenSSH/login/GDM `initgroups` shape.
 ///
-/// NEVER a blind `initgroups` — that REPLACES the list and would
-/// silently clobber groups added by pam_group/pam_systemd/pam_mount
-/// during `setcred`/`open_session` (the R7/R11 finding). Fail-closed
-/// on an unknown user (getgrouplist alone does NOT error for an
-/// unknown name — it returns just the primary gid).
+/// The handle-owner's own `getgroups()` is NEVER a source: under R1
+/// `pam_setcred` runs in the privileged broker, which carries its own
+/// groups (e.g. `shadow` for pam_unix's in-process getspnam); grafting
+/// that process's set onto the dropped session is the CVE-2021-41617 /
+/// sddm#1159 privilege-escalation class. `pam_group`/`group.conf`
+/// conditional grants are out of scope under the one-handle-in-parent
+/// model (A9 RESCINDS the prior getgrouplist-MERGE sub-clause).
+///
+/// Fail-closed on an unknown user — `getgrouplist` alone does NOT error
+/// for an unknown name (it returns just the primary gid), so existence
+/// is verified first.
 ///
 /// # Errors
-/// [`SpecError::Groups`] on unknown user / NSS failure / interior NUL;
-/// [`SpecError::PwentMismatch`] is reused for the unknown-user case.
-pub fn merged_groups(
-    username: &str,
-    primary_gid: u32,
-    pam_established: &[u32],
-) -> Result<Vec<u32>, SpecError> {
+/// [`SpecError::Groups`] on NSS failure / interior NUL;
+/// [`SpecError::PwentMismatch`] for the unknown-user case.
+pub fn user_groups(username: &str, primary_gid: u32) -> Result<Vec<u32>, SpecError> {
     // Fail-closed: getgrouplist returns Ok([primary]) for an unknown
     // user, so verify existence first.
     lookup_user(username)?;
@@ -205,9 +219,6 @@ pub fn merged_groups(
     dedup_push(&mut out, primary_gid);
     for g in base {
         dedup_push(&mut out, g.as_raw());
-    }
-    for &g in pam_established {
-        dedup_push(&mut out, g);
     }
     Ok(out)
 }
@@ -254,7 +265,8 @@ mod tests {
     #[test]
     fn pwent_mismatch_rejected() {
         // "root" with a ≥1000 uid/gid that is NOT root's real pwent →
-        // the supplementary-group-escalation vector, refused.
+        // the identity-substitution vector (would resolve root's
+        // getgrouplist under A9), refused.
         let r = validate("root", 4000, 4000, ok_cmd(), vec![]);
         assert!(matches!(r, Err(SpecError::PwentMismatch(_))), "got {r:?}");
         // An unknown account also fails closed.
@@ -324,29 +336,49 @@ mod tests {
     }
 
     #[test]
-    fn merged_groups_unions_pam_established_not_blind_replace() {
-        // getgrouplist("root", 0) is well-defined on every Linux box.
-        // A pam-established gid NOT in root's /etc/group set must
-        // still appear (proves MERGE, not the blind-initgroups
-        // REPLACE that R7/R11 forbids), and the primary gid is present.
-        let pam_established = [4242u32, 4243u32];
-        let merged = merged_groups("root", 0, &pam_established).expect("getgrouplist");
-        assert!(merged.contains(&0), "primary gid present: {merged:?}");
-        for g in pam_established {
-            assert!(
-                merged.contains(&g),
-                "pam-established gid {g} must survive the merge: {merged:?}"
-            );
+    fn user_groups_is_exactly_getgrouplist_no_ambient_source() {
+        // Amendment A9: the leader's supplementary set is
+        // `getgrouplist(user, primary)` ONLY — never the handle-owner's
+        // ambient `getgroups()`. Pin it against an independent
+        // getgrouplist computation, and assert a sentinel gid that the
+        // test process may carry ambiently but that is NOT in root's
+        // grouplist is ABSENT (the CVE-2021-41617 / sddm#1159 leak
+        // regression — a `shadow`-style broker group must never reach
+        // the session via this path).
+        let got = user_groups("root", 0).expect("getgrouplist");
+        assert!(got.contains(&0), "primary gid present: {got:?}");
+
+        let cname = CString::new("root").unwrap();
+        let expected_base = getgrouplist(&cname, Gid::from_raw(0)).expect("getgrouplist");
+        let mut expected: Vec<u32> = Vec::new();
+        dedup_push(&mut expected, 0);
+        for g in expected_base {
+            dedup_push(&mut expected, g.as_raw());
         }
+        assert_eq!(
+            got, expected,
+            "A9: result must be exactly getgrouplist(root,0), no ambient gids: {got:?}"
+        );
+
+        // A gid that is NOT part of root's grouplist must not appear —
+        // there is no `pam_established`/ambient parameter that could
+        // inject it (proven structurally: `user_groups` takes only
+        // (username, primary_gid)).
+        let ambient_sentinel = 0xDEAD_u32;
+        assert!(
+            !got.contains(&ambient_sentinel),
+            "no ambient/broker gid leaks into the leader set: {got:?}"
+        );
+
         // Deduped.
-        let mut sorted = merged.clone();
+        let mut sorted = got.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), merged.len(), "no duplicate gids: {merged:?}");
+        assert_eq!(sorted.len(), got.len(), "no duplicate gids: {got:?}");
     }
 
     #[test]
-    fn merged_groups_unknown_user_fails_closed() {
-        assert!(merged_groups("halmasuit_no_such_user_zz", 1000, &[]).is_err());
+    fn user_groups_unknown_user_fails_closed() {
+        assert!(user_groups("halmasuit_no_such_user_zz", 1000).is_err());
     }
 }

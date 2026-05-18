@@ -589,6 +589,126 @@ broker fd for the calloop source; DO NOT move the episode's
 the SEQPACKET write path; DO remove the source token before the
 episode/`OwnedFd` drops (assert it).
 
+### 0.13 Session-leader supplementary groups derive from the PAM-resolved user, never the handle-owner's `getgroups()` (2026-05-17, user-directed) — Amendment A9 (CONTROLLING; SUPERSEDES the R7/R11 "getgrouplist-MERGE the established supplementary set / blind initgroups is forbidden" clause)
+
+**Surfaced by:** the epic close-gate two-tier `gambit:review` (round 3),
+Security reviewer + verifier (high confidence), then resolved with two
+independent blind primary-source research agents that converged with
+zero divergence.
+
+**The defect.** The handle-owning broker process runs with its own
+supplementary group `shadow` (deliberate and load-bearing — lets
+pam_unix's `getspnam` fast-path read `/etc/shadow` in-process, avoiding
+the fragile `unix_chkpwd` helper fork under the sandboxed unit; see the
+standing `project-pam-unix-shadow-group` rationale). The shipped code
+(`session.rs` `nix::unistd::getgroups()` → `merged_groups` →
+`worker.rs` `setgroups`) derived the fork-drop child's supplementary
+set from the **broker's own post-`setcred` `getgroups()`** and unioned
+it, unfiltered, onto the session leader. Net: **every authenticated
+user session received the `shadow` group → world-readable `/etc/shadow`
+→ offline crack of all password hashes incl. root.** This negates the
+epic's core threat-model promise ("a compromised/abused halmasuit is
+not a root compromise"). The flagship gate #24
+(`tests/session-onehandle.nix`) did not catch it — it *asserted it as
+correct* (`grep -qw shadow /tmp/oh/leader-id`), having been written on
+the same wrong model.
+
+**Why R7/R11's group clause was wrong (primary sources).** R7/R11 said
+the leader's groups must be the "getgrouplist-MERGE of the
+PAM-established supplementary set" and that "blind `initgroups`" is the
+forbidden anti-pattern. The PAM group contract is the inverse:
+
+- `pam_setcred(3)` (man7.org, verbatim): *"these properties (along
+  with the default supplementary groups of which the user is a member)
+  are credentials that should be set directly by the application and
+  not by PAM. Such credentials should be established, by the
+  application, prior to a call to this function. For example,
+  `initgroups(2)` (or equivalent) should have been performed."* PAM
+  assigns the supplementary-group base to the **application, via
+  `initgroups`/`getgrouplist`, from the user's identity** — and there
+  is **no `pam_getgrouplist`** (no group analogue of
+  `pam_getenvlist`); module-added groups are only a side effect on the
+  calling process's credential set.
+- OpenSSH `do_setusercontext()`: `initgroups(pw->pw_name, pw->pw_gid)`
+  — user identity only, never the daemon's `getgroups()`.
+- util-linux `login(1)` `init_groups()`:
+  `initgroups(cxt.username, pwd->pw_gid)`, with the in-source comment
+  *"This should be done before pam_setcred, because PAM modules might
+  add groups during that call."* Root → `setgroups(0, NULL)`, never
+  inherits login's own set.
+- GDM `gdm-session-worker.c`: `initgroups(worker->username, gid)`
+  before `pam_setcred`. Same pattern.
+- **CVE-2021-41617 (OpenSSH ≤8.7)** and **sddm #1159** are this exact
+  bug — a privileged daemon's supplementary groups leaking into a
+  process running as another user, classified as privilege escalation.
+  sddm maintainers, verbatim: *"`getgroups` simply retrieves the
+  groups of the current user, which is `root` for `sddm-helper`."*
+  The sanctioned fix in both: derive from the **target user's
+  identity** via `initgroups`/`getgrouplist`.
+
+"Capture the handle-owner's `getgroups()` post-`setcred` and graft it
+onto the user" is not a pattern with tradeoffs — it is a named CVE
+class. `pam_group`-via-`setcred` conditional grants land in whichever
+process runs `pam_setcred`; under R1 that is the privileged broker
+parent (which carries `shadow`), so those grants are *inseparable* from
+the broker's own groups and cannot be preserved without leaking. They
+are therefore out of scope (no test or stated requirement needs them;
+the only thing that ever rode that path was the leak). The base-layer
+principle is the same one R8 already enforces for uid/gid/username: **a
+privileged launcher derives a principal's credentials from that
+principal's identity, never from its own process state.** A9 brings
+group derivation back into line with that invariant; it is the
+canonical prior-art shape, not a patch.
+
+**Decision (Amendment A9, controlling — SUPERSEDES R7/R11 group
+clause):**
+
+A9.1 — The session leader's supplementary groups are
+`getgrouplist(PAM-resolved username, PAM-resolved primary gid)` ONLY,
+computed in the fork-drop child from the R8 PAM-derived identity. The
+handle-owner's own `getgroups()` is NEVER a source. `setgroups` of that
+user-derived list happens in the child while still privileged, before
+`setresuid` (the existing R7 ordering slot that previously applied the
+merged list).
+
+A9.2 — R7/R11's "getgrouplist-MERGE the PAM-established supplementary
+set" requirement and the "blind `initgroups` is the forbidden
+anti-pattern" framing are RESCINDED. `initgroups`-equivalent
+(`getgrouplist(user)` + `setgroups`) from the resolved identity is the
+*correct, mandated* behavior. `pam_group`/`group.conf` conditional
+grants are explicitly OUT OF SCOPE under the one-handle-in-parent
+architecture (R1).
+
+A9.3 — The broker continuing to carry `shadow` is, with A9.1 in place,
+structurally irrelevant to the session (the child never reads the
+parent's group set). Eliminating `shadow` from the broker (e.g.
+reverting to the `unix_chkpwd` helper) is a SEPARATE, OPTIONAL
+defense-in-depth question with its own cost (helper-fork fragility
+under the sandboxed unit — the original reason `shadow` was added) and
+is explicitly NOT part of this fix and NOT a blocker.
+
+A9.4 — Gate #24 (`tests/session-onehandle.nix`): the
+`grep -qw shadow /tmp/oh/leader-id` assertion and its rationale block
+are DELETED and replaced with the regression invariant — `shadow` is
+**absent** from the leader, the user's static NSS groups are
+**present**. The flagship purpose of #24 (the real pam_mount LUKS
+one-handle proof + the A1.3 `LANG` env survival) is UNCHANGED; only the
+wrong secondary group assertion flips.
+
+A9.5 — R1 (one handle, one process, owner never execs), R7's
+fork-then-drop child syscall sequence, R8 (PAM-resolved + re-verified
+identity), A1's env-merge, and the §0.2 one-handle pam_mount proof are
+ALL unchanged. A9 is surgical: it corrects one requirement clause that
+was written on a wrong model of the PAM group contract.
+
+Recorded in epic Task #1 as **Amendment A9**. DO NOT derive the session
+leader's supplementary groups from the handle-owner's `getgroups()`;
+DO NOT reintroduce a "merge the broker's established set" path; DO NOT
+treat `initgroups`/`getgrouplist(user)` as a forbidden anti-pattern
+(A9 makes it mandatory). DO NOT REVISIT unless the architecture stops
+running `pam_setcred` in a process distinct from the session leader
+(i.e. only if R1's one-handle-in-parent model is itself rescinded).
+
 ---
 
 ---
