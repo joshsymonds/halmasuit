@@ -1,4 +1,5 @@
-//! Session-leader validation + supplementary-group merge (Epic R7/R11).
+//! Session-leader validation + supplementary-group derivation
+//! (Epic R7/R11; group source per Amendment A9, HANDOFF §0.13).
 //!
 //! The PURE, privilege-free, PAM-free security core of the Design-A
 //! session leader: validate the PAM-resolved identity + session
@@ -360,15 +361,29 @@ mod tests {
             "A9: result must be exactly getgrouplist(root,0), no ambient gids: {got:?}"
         );
 
-        // A gid that is NOT part of root's grouplist must not appear —
-        // there is no `pam_established`/ambient parameter that could
-        // inject it (proven structurally: `user_groups` takes only
-        // (username, primary_gid)).
-        let ambient_sentinel = 0xDEAD_u32;
-        assert!(
-            !got.contains(&ambient_sentinel),
-            "no ambient/broker gid leaks into the leader set: {got:?}"
-        );
+        // The real A9 leak vector: this test process carries its own
+        // ambient supplementary groups (analogue of the broker's
+        // `shadow`). Any of them NOT in root's grouplist must NOT
+        // appear in `user_groups("root",0)` — proving the result is
+        // derived from the resolved identity, never the caller's
+        // ambient `getgroups()`. (Skips only in the degenerate case
+        // where the runner shares all of root's groups and nothing
+        // else — then the exact-equality assertion above already
+        // fully pins it.)
+        let ambient: Vec<u32> = nix::unistd::getgroups()
+            .expect("getgroups")
+            .iter()
+            .map(|g| g.as_raw())
+            .filter(|g| !expected.contains(g))
+            .collect();
+        for g in &ambient {
+            assert!(
+                !got.contains(g),
+                "ambient caller gid {g} leaked into the leader set \
+                 (A9 regression — must derive from getgrouplist(user), \
+                 never the caller's getgroups()): {got:?}"
+            );
+        }
 
         // Deduped.
         let mut sorted = got.clone();
