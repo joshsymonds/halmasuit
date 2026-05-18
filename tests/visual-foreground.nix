@@ -11,11 +11,20 @@
 #
 # Asserts: ForegroundChanged ordering (greeter→session), halmasuit
 # PID continuous across the swap (login-flash invariant on the real
-# path), and — the point — exact-image continuity across the WHOLE
-# transition: the greeter scene and the post-swap session scene are
-# each compared pixel-for-pixel against their checked-in goldens, so a
-# flash (black/uncovered frame) at the swap could not pass. The pixel
-# gate IS the no-flash proof; there is no aggregate-statistic proxy.
+# path), and — the point — no-flash continuity across the WHOLE
+# transition, via TWO orthogonal live gates:
+#
+#   * Per-scene sampled exact-IMAGE goldens (ssimulacra2) — the
+#     greeter scene and the post-swap session scene each compared
+#     pixel-for-pixel against their checked-in goldens (content
+#     correctness at the settled phases).
+#
+#   * The 100%-of-`frame_rendered`-stream no-flash gate
+#     (`visual.assert_no_flash_stream`) — EVERY composited frame
+#     across the real greeter→session swap checked as EXACT facts,
+#     zero tolerance. A sampled settled-scene golden cannot see a
+#     transient one-frame flash at the swap instant; the stream gate
+#     can. Both are live; neither replaces the other.
 #
 # NOTE: the session user reaching halmasuit's wayland socket is
 # arranged test-locally (group membership). The production
@@ -237,13 +246,16 @@ pkgs.testers.runNixOSTest {
     print(f"PASS: halmasuit pid {halmasuit_pid} continuous across greeter→session")
 
     time.sleep(1)
-    # The point: no black/uncovered frame across the REAL transition.
-    # The deleted mean_luminance/backdrop_coverage continuity proxy is
-    # replaced by the per-scene exact-image gate — the greeter and the
-    # post-transition session frame are each compared pixel-for-pixel
-    # against their checked-in goldens, which a flash (black/uncovered
-    # frame) at the swap could not pass.
     visual.assert_matches_golden(machine, "foreground-session")
+
+    # The point: no black/uncovered/degenerate frame ANYWHERE across
+    # the REAL greeter→session swap. Asserted over 100% of the
+    # frame_rendered stream as exact facts (clear_pixel_count==0 once
+    # the background mapped, never degenerate, backdrop mapped once and
+    # never resized), zero tolerance — catches a transient one-frame
+    # flash at the swap instant that the two sampled settled-scene
+    # goldens above cannot observe.
+    visual.assert_no_flash_stream(machine)
 
     print("visual-foreground: ALL ASSERTIONS PASSED")
   '';

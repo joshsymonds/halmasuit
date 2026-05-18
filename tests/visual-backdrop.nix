@@ -12,13 +12,20 @@
 #   session-fullscreen   — + a fullscreen opaque OVERLAY client
 #   post-session-splash  — session client stopped; splash visible again
 #
-# Each scene is gated by a Snapshot() exact-image golden compared via
-# ssimulacra2. The no-flash proof (Epic #1 req 11) is the exact-image
-# chain itself: splash-only → greeter-over-splash → session-fullscreen
-# → splash-only again, each frame compared pixel-for-pixel against its
-# checked-in golden. A flash (a black or uncovered frame) at any layer
-# transition could not match these goldens, so the pixel gate IS the
-# continuity proof — there is no separate aggregate-statistic proxy.
+# Two orthogonal gates run together:
+#
+#   * Per-scene sampled exact-IMAGE goldens (ssimulacra2) — content
+#     correctness at each SETTLED scene: splash-only →
+#     greeter-over-splash → session-fullscreen → splash-only again.
+#
+#   * The 100%-of-`frame_rendered`-stream no-flash gate
+#     (`visual.assert_no_flash_stream`, Epic #1 req 11 / R3) — asserted
+#     over EVERY composited frame as EXACT facts (clear_pixel_count==0
+#     post-background, never degenerate, backdrop mapped once and never
+#     resized). A sampled settled-scene golden cannot observe a
+#     transient one-frame flash mid-transition; the stream gate can,
+#     with zero tolerance. Both gates are live — neither replaces the
+#     other.
 
 {
   system,
@@ -208,13 +215,16 @@ pkgs.testers.runNixOSTest {
     machine.succeed("systemctl stop test-greeter.service")
     machine.wait_until_fails("systemctl is-active --quiet test-greeter.service", timeout=30)
     time.sleep(2)
-    # The actual no-flash proof: the four scenes above are each
-    # compared pixel-for-pixel against their checked-in goldens. The
-    # deleted mean_luminance/backdrop_coverage continuity proxy is
-    # superseded by this exact-image chain — splash-only → greeter →
-    # session → splash-only again — a flash (black/uncovered frame) at
-    # any layer transition could not match these goldens.
     visual.assert_matches_golden(machine, "backdrop-post-session-splash")
+
+    # The 100%-stream no-flash proof: EVERY frame_rendered halmasuit
+    # emitted across all four scenes and the three transitions between
+    # them is checked as exact facts (clear_pixel_count==0 once the
+    # background mapped, never degenerate, backdrop mapped once and
+    # never resized), zero tolerance. This catches a transient
+    # one-frame flash at a layer transition that the sampled
+    # settled-scene goldens above cannot observe.
+    visual.assert_no_flash_stream(machine)
 
     print("visual-backdrop: ALL ASSERTIONS PASSED")
   '';

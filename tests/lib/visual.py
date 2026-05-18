@@ -28,15 +28,24 @@ The module wraps three concerns:
     so the helper doesn't have to guess.
 
   * `assert_matches_witness(machine, name, threshold=95.0)` — the
-    exact-image gate. Same capture + ssimulacra2 path as
+    sampled exact-IMAGE gate. Same capture + ssimulacra2 path as
     `assert_matches_golden`, but the default threshold is the tighter
     95.0 (deterministic offscreen llvmpipe readback of a known scene
     must match its checked-in witness near-exactly; only sub-JND
-    swrast rounding is tolerated). This is the model that REPLACES the
-    deleted `mean_luminance`/`backdrop_coverage` proxy heuristics: a
-    pixel-exact comparison against a reference image, never a "is it
-    dark enough / mostly covered" guess. Never bit-exact (epic anti-
-    pattern); never below the repo-wide 90.0 floor.
+    swrast rounding is tolerated). A pixel-exact comparison against a
+    reference image at a SETTLED scene — never a "is it dark enough /
+    mostly covered" guess. Never bit-exact (epic anti-pattern); never
+    below the repo-wide 90.0 floor. This is content correctness; it is
+    NOT the no-flash proof (a sampled settled-scene image cannot see a
+    transient one-frame flash mid-transition).
+
+  * `assert_no_flash_stream(machine)` — the 100%-of-`frame_rendered`-
+    stream no-flash gate, asserted as EXACT integer/boolean facts
+    (`clear_pixel_count == 0` post-background; never `degenerate`;
+    backdrop mapped once and never resized). This is the no-flash
+    proof; it runs over EVERY composited frame, not a sample, with
+    zero tolerance. Orthogonal to and live ALONGSIDE the sampled
+    witness/golden image gates, never instead of them.
 
 Two environment variables tune behavior:
 
@@ -255,11 +264,12 @@ def assert_matches_witness(
     witness `${GOLDENS_DIR}/{name}.png` with ssimulacra2 ≥ `threshold`
     (default 95.0).
 
-    This REPLACES the deleted `assert_frame_continuity` proxy: instead
-    of inferring "no flash" from `mean_luminance`/`backdrop_coverage`
-    aggregates, it compares the exact pixels of halmasuit's own
-    composited frame against a known reference image. Deterministic
-    (llvmpipe + a fixed scene), so the tolerance is tight.
+    This is the sampled CONTENT-correctness gate: it compares the
+    exact pixels of halmasuit's own composited frame against a known
+    reference image at a settled scene. Deterministic (llvmpipe + a
+    fixed scene), so the tolerance is tight. The no-flash proof is a
+    separate, always-live gate (`assert_no_flash_stream`), asserted
+    over 100% of the frame stream, not a sample.
 
     Capture / regen / missing-golden semantics are identical to
     `assert_matches_golden`; only the default threshold differs and the
@@ -298,3 +308,112 @@ def introspect_events(machine) -> list:
         if isinstance(ev, dict) and "event" in ev:
             events.append(ev)
     return events
+
+
+def assert_no_flash_stream(machine, events=None) -> None:
+    """The no-flash invariant (Epic #1 req 11 / R3), asserted over
+    100% of the `frame_rendered` stream as EXACT integer/boolean facts
+    — NOT sampled screenshots, NOT fuzzy aggregate float thresholds.
+
+    A sampled `Snapshot()` golden is taken at a SETTLED scene and
+    cannot observe a transient one-frame flash mid-transition; this
+    parses every `frame_rendered` halmasuit emitted and checks, with
+    zero tolerance:
+
+    - From the first `client_first_frame{role:background}` onward,
+      every `frame_rendered` must have ``clear_pixel_count == 0`` — the
+      backdrop fully covers; even a single sentinel-clear pixel
+      showing through is a flash (exact integer count, zero tolerance).
+    - From the first `client_first_frame` of ANY role onward, no
+      `frame_rendered` may be ``degenerate`` (all-clear, all-black, or
+      empty/dropped) — the exact boolean flash predicate, with no
+      luminance/coverage threshold.
+    - The backdrop surface is mapped exactly once and never
+      resized/recreated mid-stream: exactly one
+      `client_first_frame{role:background}` event, and `pixel_count`
+      is constant across every post-background `frame_rendered`.
+
+    Requires at least one post-background `frame_rendered` so an empty
+    or audit-less stream cannot vacuously pass. Fails loudly, naming
+    the offending event(s) and their index.
+
+    `events` may be passed pre-parsed (used by the synthetic-stream
+    negative proof); otherwise it is read from the machine journal.
+    """
+    if events is None:
+        events = introspect_events(machine)
+
+    bg_cff = [
+        i
+        for i, ev in enumerate(events)
+        if ev["event"] == "client_first_frame" and ev.get("role") == "background"
+    ]
+    first_any = next(
+        (i for i, ev in enumerate(events) if ev["event"] == "client_first_frame"),
+        None,
+    )
+    if not bg_cff:
+        raise AssertionError(
+            "no client_first_frame{role:background} in the halmasuit "
+            "event stream — splash never composited a background frame.\n"
+            f"events seen: {[e['event'] for e in events]}"
+        )
+    if len(bg_cff) != 1:
+        raise AssertionError(
+            "background surface was mapped/recreated more than once: "
+            f"{len(bg_cff)} client_first_frame{{role:background}} events "
+            f"at indices {bg_cff} (expected exactly 1 — the backdrop "
+            "must be mapped once and never recreated)."
+        )
+    first_bg = bg_cff[0]
+    # A background cff is itself an "any" cff, so first_any is set and
+    # first_any <= first_bg.
+    assert first_any is not None and first_any <= first_bg
+
+    post_bg = [
+        (i, ev)
+        for i, ev in enumerate(events)
+        if i >= first_bg and ev["event"] == "frame_rendered"
+    ]
+    if not post_bg:
+        raise AssertionError(
+            "no frame_rendered events after the background's first "
+            f"frame (@#{first_bg}); the exact no-flash stream gate "
+            "cannot vacuously pass — frame_audit must be live and the "
+            "backdrop must have composited at least one frame.\n"
+            f"events seen: {[e['event'] for e in events]}"
+        )
+
+    clear_viol = [
+        (i, ev) for i, ev in post_bg if ev["clear_pixel_count"] != 0
+    ]
+    degen_viol = [
+        (i, ev)
+        for i, ev in enumerate(events)
+        if i >= first_any
+        and ev["event"] == "frame_rendered"
+        and ev["degenerate"]
+    ]
+    # Backdrop never resized/recreated: pixel_count constant post-bg.
+    sizes = sorted({ev["pixel_count"] for _, ev in post_bg})
+    size_viol = sizes if len(sizes) != 1 else []
+
+    if clear_viol or degen_viol or size_viol:
+        raise AssertionError(
+            "frame_rendered no-flash invariant VIOLATED "
+            f"({len(post_bg)} post-bg frames; first bg cff @#{first_bg}, "
+            f"first any cff @#{first_any}):\n"
+            f"  clear_pixel_count != 0 after bg: {clear_viol[:5]}\n"
+            f"  degenerate frame after first commit: {degen_viol[:5]}\n"
+            f"  pixel_count not constant post-bg: {size_viol}"
+        )
+    print(
+        json.dumps(
+            {
+                "no_flash_stream": "OK",
+                "post_bg_frames": len(post_bg),
+                "first_background_cff_index": first_bg,
+                "pixel_count": sizes[0],
+            }
+        )
+    )

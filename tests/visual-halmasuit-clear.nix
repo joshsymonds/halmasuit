@@ -10,8 +10,7 @@
 # `GlesTexture`, so it is pixel-correct and deterministic run-to-run
 # even fully headless (virtio-gpu-pci). This is why the gate is
 # exact-image: `assert_matches_witness` compares the PNG to the
-# checked-in witness with ssimulacra2 ≥ 95.0 — replacing the deleted
-# mean_luminance/backdrop_coverage proxy heuristics.
+# checked-in witness with ssimulacra2 ≥ 95.0.
 #
 # Greeter is `sleep infinity` — we never drive auth here; the test
 # waits for halmasuit's `scanout_active` event and for the D-Bus name
