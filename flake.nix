@@ -642,6 +642,18 @@
           halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Amendment A5.6: poll-only leader pidfd backstop — SCM_RIGHTS
+        # worker→broker→compositor armed + fires on leader exit.
+        visual-pidfd-revert = import ./tests/visual-pidfd-revert.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-splash                  = self.packages.x86_64-linux.halmasuit-splash;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-toplevel-test-client    = self.packages.x86_64-linux.halmasuit-toplevel-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+        };
         # Amendment A5: two-key flash-free swap ORDERING + revert
         # (headless event-stream proof; pixel proof is visual-foreground).
         visual-revert = import ./tests/visual-revert.nix {

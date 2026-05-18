@@ -34,7 +34,7 @@
 #![allow(dead_code)]
 
 use std::fmt;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use halmasuit_greetd::server::{Connection, Demand, SpawnRequest};
@@ -42,7 +42,7 @@ use halmasuit_session_ipc::{
     BrokerToCompositor, CodecError, CompositorToBroker, MAX_MESSAGE_SIZE, SessionOutcome, encode,
     try_decode,
 };
-use nix::sys::socket::{MsgFlags, recv, send};
+use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg, send};
 
 use crate::broker_relay::{BrokerRelay, RelayError, RelayEvent};
 
@@ -133,17 +133,78 @@ impl SeqpacketChannel {
     /// not exactly one complete message; [`WireError::Io`] on a `recv`
     /// error other than would-block.
     pub fn recv(&self) -> Result<Option<BrokerToCompositor>, WireError> {
+        // Always recvmsg-with-cmsg-space (never bare recv): the broker
+        // attaches an SCM_RIGHTS leader pidfd to `SessionOpened`
+        // (Amendment A5.6). A bare recv would truncate that ancillary
+        // data (`MSG_CTRUNC`) and the kernel would leak the dup'd fd.
+        // This wrapper drops any fd; `recv_with_fd` keeps it.
+        Ok(self.recv_with_fd()?.map(|(msg, fd)| {
+            drop(fd);
+            msg
+        }))
+    }
+
+    /// Amendment A5.6 receive: like [`Self::recv`] but also returns any
+    /// ONE `SCM_RIGHTS` fd the broker attached (the poll-only leader
+    /// pidfd, sent with `SessionOpened`). Non-blocking; `Ok(None)` on
+    /// `EAGAIN`. The fd is a fresh [`OwnedFd`] kernel-dup'd into this
+    /// process; the compositor treats it STRICTLY poll-only (never
+    /// waitid/reap/pidfd_send_signal — the broker is the sole reaper,
+    /// R9/A5).
+    ///
+    /// Fail-closed: received fds are adopted into `OwnedFd` BEFORE the
+    /// fallible decode so no error path leaks a privilege-crossing
+    /// kernel fd; >1 fd (a protocol the broker never speaks) closes
+    /// them all and errors.
+    ///
+    /// # Errors
+    /// As [`Self::recv`], plus [`WireError::Malformed`] on >1 attached
+    /// fd.
+    pub fn recv_with_fd(&self) -> Result<Option<(BrokerToCompositor, Option<OwnedFd>)>, WireError> {
         let mut buf = vec![0u8; std::mem::size_of::<u32>() + MAX_MESSAGE_SIZE as usize];
-        let n = match recv(self.fd.as_raw_fd(), &mut buf, MsgFlags::MSG_DONTWAIT) {
-            Ok(n) => n,
+        let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+        let mut cmsg = nix::cmsg_space!(RawFd);
+        let r = match recvmsg::<()>(
+            self.fd.as_raw_fd(),
+            &mut iov,
+            Some(&mut cmsg),
+            MsgFlags::MSG_DONTWAIT,
+        ) {
+            Ok(r) => r,
             Err(nix::errno::Errno::EAGAIN) => return Ok(None),
             Err(e) => return Err(WireError::Io(e)),
         };
+        // Adopt every received fd into an OwnedFd IMMEDIATELY (before
+        // the fallible decode) so no error path leaks a kernel fd.
+        let mut fds: Vec<OwnedFd> = Vec::new();
+        for c in r.cmsgs().map_err(WireError::Io)? {
+            if let ControlMessageOwned::ScmRights(raws) = c {
+                for raw in raws {
+                    // SAFETY: `raw` was just produced by
+                    // recvmsg(SCM_RIGHTS) in THIS process; nothing else
+                    // owns it. Sole ownership → closed on drop on every
+                    // path (no privilege-crossing-fd leak).
+                    #[expect(
+                        unsafe_code,
+                        reason = "adopt a kernel-fresh SCM_RIGHTS fd \
+                                  into OwnedFd so it is closed on every \
+                                  error path (A5.6 leader pidfd)"
+                    )]
+                    fds.push(unsafe { OwnedFd::from_raw_fd(raw) });
+                }
+            }
+        }
+        let n = r.bytes;
         if n == 0 {
             return Err(WireError::Closed);
         }
+        if fds.len() > 1 {
+            return Err(WireError::Malformed); // extra fds drop/close here
+        }
+        let fd = fds.into_iter().next();
         match try_decode::<BrokerToCompositor>(&buf[..n])? {
-            Some((msg, consumed)) if consumed == n => Ok(Some(msg)),
+            Some((msg, consumed)) if consumed == n => Ok(Some((msg, fd))),
+            // `fd` drops (closes) here — no leak on the malformed path.
             _ => Err(WireError::Malformed),
         }
     }
@@ -233,6 +294,14 @@ pub struct BrokerEpisode {
     service: String,
     relay: Option<BrokerRelay>,
     conn: Connection,
+    /// Amendment A5.6: the poll-only leader pidfd the broker attached
+    /// to `SessionOpened` via SCM_RIGHTS, stashed here (not in
+    /// `EpisodeOutcome`, which is `PartialEq`) until the calloop layer
+    /// `take_leader_pidfd()`s it to arm a poll-only liveness backstop.
+    /// The episode is the sole owner until taken (A6); the compositor
+    /// NEVER waitid/reap/signals it (the broker is the sole reaper —
+    /// R9/A5).
+    leader_pidfd: Option<OwnedFd>,
 }
 
 impl BrokerEpisode {
@@ -246,7 +315,18 @@ impl BrokerEpisode {
             service,
             relay: None,
             conn: Connection::new(),
+            leader_pidfd: None,
         }
+    }
+
+    /// Take the Amendment-A5.6 leader pidfd received with
+    /// `SessionOpened` (poll-only liveness backstop). `Some` exactly
+    /// once, on the call after the `EpisodeOutcome` whose
+    /// `session_opened` was set; `None` otherwise (incl. the
+    /// fd-less / older path — the backstop is an accelerator, not the
+    /// authoritative `SessionEnded` signal).
+    pub const fn take_leader_pidfd(&mut self) -> Option<OwnedFd> {
+        self.leader_pidfd.take()
     }
 
     /// The broker fd, for registering it as a calloop source.
@@ -277,8 +357,8 @@ impl BrokerEpisode {
     /// relay, resume the suspended greetd machine. NO blocking I/O.
     pub fn on_broker_readable(&mut self) -> EpisodeOutcome {
         let mut out = EpisodeOutcome::default();
-        let frame = match self.chan.recv() {
-            Ok(Some(f)) => f,
+        let (frame, leader_pidfd) = match self.chan.recv_with_fd() {
+            Ok(Some(pair)) => pair,
             // Spurious calloop wakeup (no datagram): do nothing.
             Ok(None) => return out,
             // Peer hangup or any transport error → fail closed (A7.4).
@@ -305,6 +385,10 @@ impl BrokerEpisode {
                 // connection ended at Spawning). NOT a visible swap by
                 // itself — that needs the session client's first frame.
                 out.session_opened = true;
+                // A5.6: stash the SCM_RIGHTS leader pidfd (if any) for
+                // the calloop layer to take and arm a poll-only
+                // liveness backstop. Only SessionOpened carries one.
+                self.leader_pidfd = leader_pidfd;
             }
             Ok(RelayEvent::SessionEnded(outcome)) => {
                 // A5.5 revert trigger + episode end. The crash-vs-clean
@@ -396,7 +480,7 @@ mod tests {
         try_decode as greetd_try_decode,
     };
     use halmasuit_session_ipc::{PromptStyle, SessionOutcome};
-    use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, recv, socketpair};
 
     /// (compositor channel, broker end) connected SEQPACKET pair. The
     /// tests act as the broker SYNCHRONOUSLY on the broker end —

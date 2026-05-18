@@ -199,6 +199,23 @@ pub enum Event {
         /// How the session leader exited.
         outcome: SessionExit,
     },
+    /// Amendment A5.6: the compositor received the leader pidfd the
+    /// broker passed via `SCM_RIGHTS` on `SessionOpened` and armed it
+    /// as a POLL-ONLY calloop liveness source. Proves the
+    /// privilege-crossing fd transfer (worker→broker→compositor)
+    /// succeeded end to end. The compositor never
+    /// waitid/reap/`pidfd_send_signal`s it (the broker is the sole
+    /// reaper, R9/A5); `EPOLLIN` (leader exited) is a
+    /// latency/broker-crash-resilient accelerator for the revert, not
+    /// the authoritative signal (that is `SessionEnded`).
+    SessionLeaderPidfdArmed,
+    /// Amendment A5.6: the poll-only leader pidfd became readable — the
+    /// session leader EXITED. The compositor drives the revert from
+    /// this WITHOUT the `SessionEnded` frame (broker-crash resilience);
+    /// it does NOT reap/signal (poll-only). The [`SessionEnded`] frame
+    /// remains the authoritative signal when the broker is alive; the
+    /// swap gate makes whichever trigger arrives later inert.
+    SessionLeaderExitedViaPidfd,
 }
 
 /// How the session leader process terminated (Amendment A5.2).

@@ -35,7 +35,7 @@
 #![forbid(unsafe_code)]
 
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 use calloop::generic::Generic;
@@ -47,7 +47,7 @@ use crate::slot::{AuthSlot, SlotError};
 use crate::transport::{SeqpacketChannel, TransportError, peer_uid};
 use crate::worker::{
     BorrowedSourceFd, ParentMessage, WorkerOutcome, accept_seqpacket, own_raw_fd,
-    spawn_session_worker,
+    recv_frame_with_fd, send_frame_with_fd, spawn_session_worker,
 };
 
 /// Idle window (Amendment A2.2): with no connection in flight and the
@@ -166,11 +166,14 @@ impl Relay {
             // down the calloop sources (A8.2) — the relay never reaps.
             return Err(BrokerError::UnexpectedFrame);
         }
-        let pm: ParentMessage = slot
-            .current()
-            .ok_or(BrokerError::WorkerGone)?
-            .channel()
-            .recv()?;
+        // recv-with-fd (never bare recv) so the Amendment-A5.6 leader
+        // pidfd the worker attaches to `SessionOpened` survives the
+        // worker→broker hop. For every other frame `leader_pidfd` is
+        // `None`; if it is `Some` it is closed at end of scope unless
+        // the SessionOpened arm forwards it (the broker keeps no copy —
+        // the WORKER owns the reaping pidfd; R9).
+        let (pm, leader_pidfd): (ParentMessage, Option<OwnedFd>) =
+            recv_frame_with_fd(slot.current().ok_or(BrokerError::WorkerGone)?.channel())?;
         match pm {
             ParentMessage::Conv(prompt @ BrokerToCompositor::ConvPrompt { .. }) => {
                 compositor.send(&prompt)?;
@@ -188,9 +191,23 @@ impl Relay {
             // compositor never emits these). SessionOpened is the
             // authorization key of the two-key flash-free swap; the
             // visible swap is gated compositor-side on the first
-            // session-client frame (a later R3 step), not here.
+            // session-client frame (#34), not here.
+            //
+            // Amendment A5.6: relay the worker-attached leader pidfd to
+            // the compositor by SCM_RIGHTS on the SAME frame. The
+            // broker forwards a kernel-dup and keeps NO copy (its
+            // `leader_pidfd` drops/closes after this); the worker
+            // remains the sole reaper/signaller (R9). The compositor's
+            // copy is strictly poll-only. If the worker attached no fd
+            // (older path / error) SessionOpened still goes — the
+            // backstop is an accelerator, not the authoritative
+            // signal (that is `SessionEnded`).
             ParentMessage::Outcome(WorkerOutcome::SessionOpened { .. }) => {
-                compositor.send(&BrokerToCompositor::SessionOpened)?;
+                send_frame_with_fd(
+                    compositor,
+                    &BrokerToCompositor::SessionOpened,
+                    leader_pidfd.as_ref().map(AsFd::as_fd),
+                )?;
                 self.phase = RelayPhase::SessionRunning;
                 Ok(RelayStep::Continue)
             }

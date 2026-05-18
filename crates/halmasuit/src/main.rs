@@ -38,7 +38,7 @@ use calloop::signals::{Signal, Signals};
 use calloop::{
     EventLoop, Interest, LoopHandle, Mode as CalloopMode, PostAction, RegistrationToken,
 };
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 
 use halmasuit_greetd::server::{SpawnRequest, bind_socket, peer_credentials};
 
@@ -723,6 +723,22 @@ struct ConnState {
     /// the greeter source only detaches itself; the episode lives on
     /// the broker channel until `SessionEnded`.
     spawned: bool,
+    /// Amendment A5.6: the SOLE owner of the poll-only leader pidfd the
+    /// broker passed via SCM_RIGHTS on `SessionOpened`. Its `close(2)`
+    /// is this `OwnedFd`'s drop (at `ConnState` teardown); a SECOND
+    /// `Generic` over a non-owning [`BorrowedLeaderPidfd`] watches it
+    /// readable (= leader exited). NEVER waitid/reap/`pidfd_send_signal`
+    /// — the broker is the sole reaper (R9/A5); this is a latency /
+    /// broker-crash-resilience accelerator, not the authoritative
+    /// signal (that is `SessionEnded`).
+    leader_pidfd: Option<OwnedFd>,
+    /// calloop token of the leader-pidfd backstop source. Removed
+    /// before this `ConnState`'s `leader_pidfd` `OwnedFd` drops (A8.2):
+    /// the one-shot callback `PostAction::Remove`s it (deregister at
+    /// end-of-dispatch) while the `OwnedFd` lives on in `ConnState`,
+    /// and every full-teardown site removes it (if still armed) before
+    /// dropping the `ConnState`.
+    leader_pidfd_token: Option<RegistrationToken>,
 }
 
 /// Non-owning calloop fd wrapper for the broker `SeqpacketChannel`
@@ -747,6 +763,33 @@ impl std::os::fd::AsFd for BorrowedBrokerFd {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         // SAFETY: see the #[expect] reason — the fd is live for as long
         // as this source is registered (A8.2 teardown ordering).
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0) }
+    }
+}
+
+/// Non-owning calloop fd wrapper for the Amendment-A5.6 poll-only
+/// leader pidfd backstop. Same A8.1 discipline as [`BorrowedBrokerFd`]:
+/// calloop only `as_fd()`s (epoll arm/disarm), never `close(2)`s; the
+/// sole `OwnedFd` is `ConnState::leader_pidfd`, dropped only AFTER this
+/// source is deregistered (A8.2 — the one-shot callback
+/// `PostAction::Remove`s it; full teardown removes the token first).
+/// The compositor only ever WATCHES this fd (`EPOLLIN` = leader gone);
+/// it never `waitid`/`pidfd_send_signal`s it (R9/A5 — broker is the
+/// sole reaper).
+struct BorrowedLeaderPidfd(std::os::fd::RawFd);
+
+impl std::os::fd::AsFd for BorrowedLeaderPidfd {
+    #[expect(
+        unsafe_code,
+        reason = "A8.1/A5.6: calloop needs an AsFd to arm epoll on the \
+                  leader pidfd; it must NOT own/close it (no dup/Rc/Arc). \
+                  The RawFd outlives this source — ConnState::leader_pidfd \
+                  (the sole OwnedFd) drops only AFTER the token is removed \
+                  (A8.2)."
+    )]
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        // SAFETY: see the #[expect] reason — the fd is live as long as
+        // this source is registered (A8.2 teardown ordering).
         unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0) }
     }
 }
@@ -870,6 +913,8 @@ fn handle_listener_ready(
                         greeter_token: Some(greeter_tok),
                         terminate: false,
                         spawned: false,
+                        leader_pidfd: None,
+                        leader_pidfd_token: None,
                     },
                 );
                 tracing::debug!(id, peer_uid = creds.uid, "accepted greeter connection");
@@ -1003,12 +1048,17 @@ fn handle_connection_ready(
         && connstate.greeter_token.is_some()
         && connstate.write_buf.is_empty();
     let broker_tok = connstate.broker_token;
+    let leader_pidfd_tok = connstate.leader_pidfd_token;
     // `connstate`'s borrow of `state.connections` ends here.
 
     if episode_over {
-        // Full teardown. A8.2: deregister the broker source BEFORE the
-        // `ConnState` (its sole `OwnedFd`) drops.
+        // Full teardown. A8.2: deregister BOTH borrowed-fd sources
+        // (broker channel + the A5.6 leader-pidfd backstop) BEFORE the
+        // `ConnState` (the sole `OwnedFd` of each) drops.
         if let Some(t) = broker_tok {
+            state.loop_handle.remove(t);
+        }
+        if let Some(t) = leader_pidfd_tok {
             state.loop_handle.remove(t);
         }
         state.connections.remove(&id);
@@ -1081,6 +1131,9 @@ fn handle_broker_ready(
         emit(&Event::SessionOpened);
         let a = state.swap.session_opened();
         state.apply_swap_action(a);
+        // A5.6: arm the poll-only leader-pidfd liveness backstop the
+        // broker passed via SCM_RIGHTS on this same frame.
+        arm_leader_pidfd_backstop(id, state);
     }
     if let Some(outcome) = session_ended {
         emit(&Event::SessionEnded {
@@ -1102,13 +1155,107 @@ fn handle_broker_ready(
         // `PostAction::Remove` defers deregistration to end-of-dispatch
         // — so DEFER the `ConnState` drop to an idle callback that runs
         // AFTER this source is deregistered, keeping the A8.2 ordering
-        // (epoll-deregister before the one `close(2)`).
+        // (epoll-deregister before the one `close(2)`). The idle also
+        // removes the A5.6 leader-pidfd backstop source (if still
+        // armed) BEFORE dropping the `ConnState` — same A8.2 ordering
+        // for that second borrowed fd.
         state.loop_handle.insert_idle(move |st| {
+            if let Some(t) = st.connections.get(&id).and_then(|cs| cs.leader_pidfd_token) {
+                st.loop_handle.remove(t);
+            }
             st.connections.remove(&id);
         });
         return Ok(PostAction::Remove);
     }
     Ok(PostAction::Continue)
+}
+
+/// Amendment A5.6 — arm the poll-only leader-pidfd liveness backstop.
+///
+/// Takes the SCM_RIGHTS leader pidfd the broker attached to
+/// `SessionOpened` (absent on the fd-less/older path — the backstop is
+/// an accelerator, NOT the authoritative signal, which is
+/// `SessionEnded`) and registers a SECOND borrowed-fd `Generic` source
+/// over it. The sole `OwnedFd` is stored in `ConnState::leader_pidfd`
+/// BEFORE the non-owning source is registered (A8.1/A8.2). The
+/// compositor only ever WATCHES this fd; it never
+/// `waitid`/`pidfd_send_signal`s it (R9/A5 — the broker is the sole
+/// reaper).
+fn arm_leader_pidfd_backstop(id: usize, state: &mut HalmasuitState) {
+    let Some(fd) = state
+        .connections
+        .get_mut(&id)
+        .and_then(|cs| cs.episode.take_leader_pidfd())
+    else {
+        return;
+    };
+    let raw = fd.as_raw_fd();
+    // Store the SOLE OwnedFd in ConnState BEFORE registering the
+    // non-owning source — the borrow is valid only while it lives.
+    if let Some(cs) = state.connections.get_mut(&id) {
+        cs.leader_pidfd = Some(fd);
+    } else {
+        return; // ConnState vanished; `fd` drops (closes) here.
+    }
+    match state.loop_handle.insert_source(
+        Generic::new(BorrowedLeaderPidfd(raw), Interest::READ, CalloopMode::Level),
+        move |_readiness, _fd, st| handle_leader_pidfd_ready(id, st),
+    ) {
+        Ok(tok) => {
+            if let Some(cs) = state.connections.get_mut(&id) {
+                cs.leader_pidfd_token = Some(tok);
+                // The privilege-crossing fd made it worker→broker→
+                // compositor and is armed poll-only (A5.6).
+                emit(&Event::SessionLeaderPidfdArmed);
+            } else {
+                // ConnState vanished between the two borrows: the just-
+                // registered source would fire against a dropped fd —
+                // deregister it now (A8.2).
+                state.loop_handle.remove(tok);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "leader-pidfd backstop registration failed; \
+                 SessionEnded / client-disconnect still drive the revert"
+            );
+            // No source watches it — drop the OwnedFd we stored.
+            if let Some(cs) = state.connections.get_mut(&id) {
+                cs.leader_pidfd = None;
+            }
+        }
+    }
+}
+
+/// calloop callback for the A5.6 leader-pidfd backstop. `EPOLLIN` on a
+/// pidfd means the target task has EXITED. Poll-only (A5.6): we MUST
+/// NOT `waitid`/reap/`pidfd_send_signal` it (not our child — `ECHILD`;
+/// the broker is the sole reaper, R9/A5). It is one-shot — the leader
+/// exits exactly once — and a latency/robustness ACCELERATOR for the
+/// revert, not the authoritative signal. The [`swap_gate::SwapGate`]
+/// makes whichever of {this, `SessionEnded`, session-client
+/// disconnect} arrives later inert ⇒ exactly one revert.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "calloop callback signature requires Result<PostAction, io::Error>"
+)]
+fn handle_leader_pidfd_ready(
+    id: usize,
+    state: &mut HalmasuitState,
+) -> Result<PostAction, io::Error> {
+    if let Some(cs) = state.connections.get_mut(&id) {
+        // The source is being removed (PostAction::Remove below); clear
+        // the token so the full-teardown sites don't double-remove an
+        // already-removed registration.
+        cs.leader_pidfd_token = None;
+    }
+    emit(&Event::SessionLeaderExitedViaPidfd);
+    let a = state.swap.session_client_gone();
+    state.apply_swap_action(a);
+    // Deregister at end-of-dispatch; `ConnState` keeps the `OwnedFd`
+    // (closed at its own teardown, AFTER this deregister — A8.2).
+    Ok(PostAction::Remove)
 }
 
 /// Record that the broker has launched the session leader (it

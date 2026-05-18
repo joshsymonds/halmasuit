@@ -81,7 +81,9 @@ calloop.workspace            = true
 #   children don't accumulate as zombies
 # `socket`: SOCK_SEQPACKET framed channel to the halmasuit-session
 # broker (the BrokerSession PamSession — Epic R3 / Amendment A4/A5).
-nix = { workspace = true, features = ["user", "signal", "process", "socket"] }
+# `uio`: recvmsg/SCM_RIGHTS to receive the poll-only leader pidfd
+# backstop the broker passes on `SessionOpened` (Amendment A5.6).
+nix = { workspace = true, features = ["user", "signal", "process", "socket", "uio"] }
 # drm-rs types reach halmasuit via `smithay::reexports::drm` — same
 # version smithay itself uses (0.14 at the pinned rev), avoiding the
 # multi-version-of-drm problem (smithay's DrmDevice impls drm 0.14's

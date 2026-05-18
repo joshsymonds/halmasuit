@@ -39,7 +39,7 @@ use crate::pam_ffi::{self, PamError};
 use crate::responder::ChannelResponder;
 use crate::session_leader::{self, SpecError};
 use crate::transport::{SeqpacketChannel, TransportError};
-use crate::worker::{WorkerOutcome, spawn_session_leader};
+use crate::worker::{WorkerOutcome, send_frame_with_fd, spawn_session_leader};
 
 /// Failure of the full session lifecycle.
 #[derive(Debug, Error)]
@@ -150,15 +150,30 @@ pub fn run_session(
     let spec = session_leader::validate(&id.username, id.uid, id.gid, cmd, pam_env)?;
     let groups = session_leader::merged_groups(&id.username, id.gid, &established)?;
 
-    ch.send(&WorkerOutcome::SessionOpened {
-        username: id.username.clone(),
-        uid: id.uid,
-        gid: id.gid,
-    })?;
-
     // Fork-not-exec the privilege-dropped session leader (R7). The
-    // handle owner (this process) does NOT exec — it waits.
+    // handle owner (this process) does NOT exec — it waits. Forked
+    // BEFORE SessionOpened so the leader pidfd exists and rides with
+    // that frame (Amendment A5.6): SessionOpened semantically means
+    // "leader running", and the compositor needs the pidfd to arm its
+    // poll-only liveness backstop at the same moment it learns key 1.
     let handle = spawn_session_leader(&spec, &groups)?;
+
+    // Amendment A5.6: hand the compositor a DUP of the leader pidfd via
+    // SCM_RIGHTS alongside SessionOpened. The broker keeps the owning
+    // fd and remains the SOLE reaper/signaller (R9); the compositor
+    // treats its copy strictly poll-only (never waitid/reap/signal).
+    // No raw leader pid is ever serialized into any frame (A5) — only
+    // the fd crosses, kernel-dup'd.
+    send_frame_with_fd(
+        ch,
+        &WorkerOutcome::SessionOpened {
+            username: id.username.clone(),
+            uid: id.uid,
+            gid: id.gid,
+        },
+        Some(handle.pidfd()),
+    )?;
+
     let status = handle.wait()?;
 
     // Teardown on the SAME handle, in order (R7): close_session →

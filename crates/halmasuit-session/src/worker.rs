@@ -18,13 +18,14 @@
 //! `kill(pid)` (pid-reuse race); `ESRCH` ⇒ already-exited ⇒ benign.
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
-use halmasuit_session_ipc::SessionOutcome;
+use halmasuit_session_ipc::{MAX_MESSAGE_SIZE, SessionOutcome, encode, try_decode};
+use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::run_pam_auth;
-use crate::transport::SeqpacketChannel;
+use crate::transport::{SeqpacketChannel, TransportError};
 
 /// What the disposable auth child reports to the broker parent, sent
 /// over the SEQPACKET channel after `run_pam_auth` returns.
@@ -140,6 +141,16 @@ impl WorkerHandle {
         );
         nix::sys::wait::waitpid(pid, None).map_err(io::Error::from)
     }
+
+    /// Borrow the child's pidfd for Amendment-A5.6 SCM_RIGHTS transfer
+    /// to the compositor (poll-only leader-liveness backstop). Borrowed,
+    /// not consumed: the broker keeps the owning fd (it remains the
+    /// sole reaper/signaller — R9; the kernel DUPs an independent copy
+    /// into the peer, which treats it poll-only).
+    #[must_use]
+    pub fn pidfd(&self) -> BorrowedFd<'_> {
+        self.pidfd.as_fd()
+    }
 }
 
 // pidfd helpers — the project's raw-syscall idiom (mirrors
@@ -244,6 +255,111 @@ pub fn own_raw_fd(fd: std::os::fd::RawFd) -> OwnedFd {
     )]
     unsafe {
         OwnedFd::from_raw_fd(fd)
+    }
+}
+
+/// Amendment A5.6 — send one framed message with an OPTIONAL single
+/// `SCM_RIGHTS` fd attached (the leader pidfd). The kernel DUPs the fd
+/// into the peer; `fd` is borrowed, the caller keeps its own copy.
+///
+/// Lives here (not `transport.rs`) so `transport.rs` stays
+/// `#![forbid(unsafe_code)]` — the matching receive needs an
+/// `OwnedFd::from_raw_fd` adoption that only the quarantine modules may
+/// carry. `sendmsg` itself is `nix`-safe; co-located with `recv` for
+/// cohesion.
+///
+/// # Errors
+/// [`TransportError::Codec`] on encode overflow; [`TransportError::Io`]
+/// on `sendmsg`; [`TransportError::Malformed`] on a short write.
+pub fn send_frame_with_fd<M: Serialize>(
+    chan: &SeqpacketChannel,
+    msg: &M,
+    fd: Option<BorrowedFd<'_>>,
+) -> Result<(), TransportError> {
+    let bytes = encode(msg)?;
+    let iov = [io::IoSlice::new(&bytes)];
+    let raw = [fd.map_or(-1, |f| f.as_raw_fd())];
+    let cmsgs: &[ControlMessage] = if fd.is_some() {
+        &[ControlMessage::ScmRights(&raw)]
+    } else {
+        &[]
+    };
+    let n = sendmsg::<()>(
+        chan.as_fd().as_raw_fd(),
+        &iov,
+        cmsgs,
+        MsgFlags::empty(),
+        None,
+    )
+    .map_err(TransportError::Io)?;
+    if n == bytes.len() {
+        Ok(())
+    } else {
+        Err(TransportError::Malformed)
+    }
+}
+
+/// Amendment A5.6 — receive one framed message plus any ONE
+/// `SCM_RIGHTS` fd the peer attached. The fd is a fresh [`OwnedFd`]
+/// (kernel-dup'd into this process); `None` if none was attached.
+///
+/// Fail-closed: received fds are adopted into `OwnedFd` BEFORE any
+/// fallible decode so no error path leaks a privilege-crossing kernel
+/// fd; >1 attached fd (a protocol the broker never speaks) closes them
+/// all and errors. Quarantined here for the one `from_raw_fd`.
+///
+/// # Errors
+/// [`TransportError::Closed`] on peer hangup; [`TransportError::Codec`]
+/// on a bad/oversized body; [`TransportError::Malformed`] if the
+/// datagram is not exactly one message or carried >1 fd;
+/// [`TransportError::Io`] on `recvmsg`.
+pub fn recv_frame_with_fd<T: serde::de::DeserializeOwned>(
+    chan: &SeqpacketChannel,
+) -> Result<(T, Option<OwnedFd>), TransportError> {
+    let mut buf = vec![0u8; std::mem::size_of::<u32>() + MAX_MESSAGE_SIZE as usize];
+    let mut iov = [io::IoSliceMut::new(&mut buf)];
+    let mut cmsg = nix::cmsg_space!(RawFd);
+    let r = recvmsg::<()>(
+        chan.as_fd().as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg),
+        MsgFlags::empty(),
+    )
+    .map_err(TransportError::Io)?;
+    // Adopt every received fd into an OwnedFd IMMEDIATELY (before the
+    // fallible decode below) so no error path can leak a kernel fd.
+    let mut fds: Vec<OwnedFd> = Vec::new();
+    for c in r.cmsgs().map_err(TransportError::Io)? {
+        if let ControlMessageOwned::ScmRights(raws) = c {
+            for raw in raws {
+                // SAFETY: `raw` was just produced by recvmsg(SCM_RIGHTS)
+                // in THIS process; nothing else owns it. Sole ownership
+                // → closed on drop on every path (no leak).
+                #[expect(
+                    unsafe_code,
+                    reason = "adopt a kernel-fresh SCM_RIGHTS fd into \
+                              OwnedFd so it is closed on every error \
+                              path (no privilege-crossing-fd leak); \
+                              quarantined so transport.rs stays \
+                              #![forbid(unsafe_code)]"
+                )]
+                fds.push(unsafe { OwnedFd::from_raw_fd(raw) });
+            }
+        }
+    }
+    let n = r.bytes;
+    if n == 0 {
+        return Err(TransportError::Closed);
+    }
+    if fds.len() > 1 {
+        // Extra fds drop (close) here. Fail closed.
+        return Err(TransportError::Malformed);
+    }
+    let fd = fds.into_iter().next();
+    match try_decode::<T>(&buf[..n])? {
+        Some((msg, consumed)) if consumed == n => Ok((msg, fd)),
+        // `fd` drops (closes) here — no leak on the malformed path.
+        _ => Err(TransportError::Malformed),
     }
 }
 
@@ -576,6 +692,63 @@ mod tests {
     use super::*;
     use nix::sys::signal::Signal;
     use nix::sys::wait::WaitStatus;
+
+    fn seqpacket_pair() -> (SeqpacketChannel, SeqpacketChannel) {
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+        let (a, b) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::empty(),
+        )
+        .expect("socketpair");
+        (SeqpacketChannel::new(a), SeqpacketChannel::new(b))
+    }
+
+    #[test]
+    fn scm_rights_round_trips_frame_plus_one_fd_and_no_fd_is_none() {
+        let (tx, rx) = seqpacket_pair();
+        // A pipe whose READ end we hand across as the "leader pidfd"
+        // stand-in; writing the original write end then reading the
+        // RECEIVED fd proves it is the same kernel object (a real dup,
+        // not the same number in a different table).
+        let (pipe_r, pipe_w) = nix::unistd::pipe().expect("pipe");
+
+        let opened = WorkerOutcome::SessionOpened {
+            username: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+        };
+        send_frame_with_fd(&tx, &opened, Some(pipe_r.as_fd())).expect("send with fd");
+        let (got, fd): (WorkerOutcome, Option<OwnedFd>) =
+            recv_frame_with_fd(&rx).expect("recv with fd");
+        assert_eq!(got, opened);
+        let received = fd.expect("an fd must come through SCM_RIGHTS");
+
+        nix::unistd::write(&pipe_w, b"Z").expect("write original");
+        let mut byte = [0u8; 1];
+        nix::unistd::read(&received, &mut byte).expect("read received fd");
+        assert_eq!(&byte, b"Z", "received fd is the same kernel object");
+
+        // The no-fd path: a frame sent without ancillary data decodes
+        // with `None` (the common case — only SessionOpened carries one).
+        send_frame_with_fd(
+            &tx,
+            &WorkerOutcome::AuthOk {
+                username: "alice".into(),
+                uid: 1000,
+                gid: 1000,
+            },
+            None,
+        )
+        .expect("send no fd");
+        let (got2, fd2): (WorkerOutcome, Option<OwnedFd>) =
+            recv_frame_with_fd(&rx).expect("recv no fd");
+        assert!(
+            matches!(got2, WorkerOutcome::AuthOk { .. }) && fd2.is_none(),
+            "no ancillary fd ⇒ None"
+        );
+    }
 
     #[test]
     fn child_outcome_round_trips_and_child_exits_zero() {
