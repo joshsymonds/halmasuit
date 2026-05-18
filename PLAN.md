@@ -4,25 +4,38 @@ How halmasuit v2 gets built. Companion to [`ARCHITECTURE.md`](ARCHITECTURE.md)
 (what we're building) and [`RESEARCH.md`](RESEARCH.md) (what's been
 empirically validated).
 
-## Where we are (2026-05-14)
+## Where we are
 
-**Phase A's in-repo contract is complete.** `tests/login-flash.nix` is
-GREEN (the v1 baseline assertion of greeter→session PID continuity
-holds, measured against halmasuit's PID as the long-lived compositor).
-132/132 unit tests pass; the consolidated `halmasuit-vm` integration
-test passes in ~15s end-to-end with the full lifecycle exercised. The
-`gambit:review` panel returned 15 findings against the integration
-milestone; all are implemented or fixed inline. The privilege split
-is real: halmasuit drops to a configured compositor system user, retains
-exactly `CAP_KILL` over the drop, kills the greeter on session start.
+**Phase A's in-repo contract is complete, and the privilege model has
+been rebuilt.** The original Phase A shipped in-compositor PAM
+(`halmasuit-pam`) plus a setuid `halmasuit-spawn` helper. The **unified
+session/pamd privilege-separation epic** then replaced that model
+wholesale with the OpenSSH/GDM shape: a single privileged
+`halmasuit-session` broker that owns one `pam_handle_t` for the entire
+auth→session lifecycle, runs `pam_authenticate` in an ephemeral
+SIGKILL-able fork, and launches the session by forking once and dropping
+privileges in a non-setuid child. `halmasuit-pam` and the setuid
+`halmasuit-spawn` are **deleted** — one libpam surface, no setuid inode.
+The compositor is now an unprivileged sans-IO relay to the broker. See
+[`HANDOFF.md`](HANDOFF.md) §0 (the decision record + Amendments A1–A9)
+and [`ARCHITECTURE.md`](ARCHITECTURE.md) "Authentication and session
+lifecycle".
+
+`tests/login-flash.nix` is GREEN **through the broker-launched session**
+(PID + frame continuity across the real greeter→session transition).
+`just check` is 244/244 + `r14-gate`; `just test-vm` is the 14-gate
+sweep incl. the three real-PAM broker gates (`run-pam-auth`,
+`session-r5r6`, `session-onehandle`).
 
 **What's left to put halmasuit on real hardware is cross-repo work in
 nix-config / DMS / gnomon:** the DankGreeter launcher patch, the
-dms-niri integration switchover, and a real-hardware shakedown.
+dms-niri integration switchover, and a real-hardware shakedown. The
+in-repo next milestone is the **visual G-layer** (real DankGreeter +
+real niri on the broker-launched path — HANDOFF §6).
 
 **Phase B (initramfs survival) hasn't started.** drm-master-probe
 Phases 0–3 already validated the empirical mechanics; the production
-wiring is the next major milestone.
+wiring is a later major milestone.
 
 ## Goal
 
@@ -90,23 +103,23 @@ adapter crates).
 | Component | Status | Current state |
 |---|---|---|
 | `halmasuit` binary — smithay scaffolding | Done | smithay 0.7 (pinned to niri's rev); `wl_compositor`, `xdg_wm_base`, `wl_seat`, `wl_output`, `wl_shm` advertised. |
-| `halmasuit` binary — greetd I/O integration | Done | calloop-wired `Listener` (SO_PEERCRED authz) + per-fd `Connection` + `PamThread` factory; `MAX_GREETD_CONNECTIONS=4` runaway cap; `SpawnRequest` handoff to `halmasuit-spawn`. |
+| `halmasuit` binary — greetd I/O integration | Done | calloop-wired `Listener` (SO_PEERCRED authz) + per-fd `Connection`; the greetd state machine is sans-IO and relays to the `halmasuit-session` broker (per-greeter `BrokerEpisode`, non-blocking broker calloop source — A6/A7/A8). No in-process PAM; no `SpawnRequest` (the broker fork-then-drops the session leader). |
 | `halmasuit` binary — DRM master | Done | `DRM_IOCTL_SET_MASTER` on `/dev/dri/card0` (or `HALMASUIT_DRM_DEVICE`) at startup while still root; FD held for process lifetime. Fail-closed if `HALMASUIT_SKIP_DRM_MASTER` set under euid 0. |
-| `halmasuit` binary — privilege drop | Done | In-process `setresgid` + `setresuid` to configured compositor uid. Final capability posture: `CapPrm=CapEff={CAP_KILL}` (signal authority over the greeter for the session-start kill); `CapBnd={CAP_SETUID, CAP_SETGID}` (what halmasuit-spawn inherits via its setuid-root execve to operate as root); `CapInh=CapAmb=∅`. Fail-closed if compositor uid unset and euid is root. |
+| `halmasuit` binary — privilege drop | Done | In-process `setresgid` + `setresuid` to configured compositor uid. Final capability posture: `CapPrm=CapEff={CAP_KILL}` (signal authority over the greeter for the session-start kill); **bounding set empty** (`CapBnd=0` — the compositor execs no setuid helper, so any retained cap would be a least-authority regression, R15); `CapInh=CapAmb=∅`. Fail-closed if compositor uid unset and euid is root. |
 | `halmasuit` binary — greeter spawning | Done | Fork+exec the configured greeter via `Command::pre_exec`: sigprocmask reset + setresgid + setresuid into greeter system user, minimal env passthrough (XDG_RUNTIME_DIR, WAYLAND_DISPLAY, GREETD_SOCK, PATH). SIGCHLD reaper claims the zombie when the greeter exits. |
-| `halmasuit` binary — greeter kill on `SessionRequested` | Done | `Child::kill()` immediately after the `SessionRequested` event emit, before invoking halmasuit-spawn. CAP_KILL retention crosses the uid boundary (compositor uid 998 → greeter uid 999). `Event::GreeterTerminated { pid }` records the action. |
-| `halmasuit-spawn` | Done | Audit-grade ~140 lines, `#![forbid(unsafe_code)]`, UID floor (load-bearing per ARCHITECTURE.md row 11), pwent validation, env allowlist, fuzz harness. `gambit:review` complete (task #9 security fix). |
-| `halmasuit-greetd` | Done | Clean-room wire types from the [protocol spec](https://man.sr.ht/~kennylevinsen/greetd/protocol.md), state machine, length-prefixed JSON codec, `Listener` (SO_PEERCRED, world-mode rejection, `accept_authorized` w/ both positive- and rejection-path tests), `Connection` (per-fd driver with `Zeroizing` read buffer, explicit size cap, propagated codec errors). `gambit:review` complete (18 improvements implemented). |
-| `halmasuit-pam` | Done | Real libpam FFI quarantined to this crate (`#![deny(unsafe_code)]` + per-block `#[expect]`). `Pam` RAII handle, `bridge_conv` extern "C" callback (catch_unwind, zeroized response buffers, NUL-rejection), `PAM_FAIL_DELAY` no-op, `PamThread` worker with bounded `recv_timeout`. `gambit:review` complete (3 gaps + 14 improvements addressed). |
+| `halmasuit` binary — greeter kill on session start | Done | `pidfd_send_signal(greeter, SIGKILL)` on the A5 two-key swap. `CAP_KILL` retention crosses the uid boundary (compositor uid → greeter uid). `Event::GreeterTerminated { pid }` records the action. |
+| `halmasuit-session` (privileged broker) | Done | One `pam_handle_t` whole lifecycle; `pam_authenticate` in an ephemeral SIGKILL-able `setrlimit`-bounded fork; fork-then-drop **non-setuid** session leader; identity independently PAM-re-derived (`pam_get_user`→pwent); UID floor in the leader child; `getgrouplist(resolved user)`-only supplementary groups (A9); `pam_getenvlist()`-merged env (A1); single calloop broker, socket-activated, idle-exit, evict-old slot (A2); relay-peer `SO_PEERCRED` gate (R8). `unsafe` confined to `pam_ffi`/`worker`. Two-tier `gambit:review` APPROVED (A9 escalation found + closed). |
+| `halmasuit-session-ipc` (pure wire contract) | Done | Types + codec for the compositor↔broker relay; A5 one-way `BrokerToCompositor` lifecycle frames (`SessionOpened`/`SessionEnded`); `#![forbid(unsafe_code)]`. |
+| `halmasuit-greetd` | Done | Clean-room wire types from the [protocol spec](https://man.sr.ht/~kennylevinsen/greetd/protocol.md), **fully sans-IO** state machine (emit/suspend/resume, A7), length-prefixed JSON codec, `Listener` (SO_PEERCRED, world-mode rejection). No libpam; relays to the broker. `MAX_SESSION_BUILDS_PER_CONNECTION` removed (R14). |
 | `halmasuit-splash` | Deferred to Phase B | Static logo painted via dumb buffer. Phase B (initramfs survival) is where the splash becomes visible; before that there's nothing to paint over. |
 | `halmasuit-luks` / `-fsck` / `-emergency` | Deferred to Phase B | Adapter crates that depend on initramfs context. |
 | `halmasuit-kms` / `-protocols` / `-ipc` / `-cli` | Stub | Workspace crates exist as placeholders. Concrete code lands as the consuming task arrives — `halmasuit-kms` likely populates during the Phase B DRM-backend work. |
 | Introspection surface — NDJSON to journald | Done | `halmasuit-introspect` emits `Event` variants through `tracing` + `tracing-subscriber`'s JSON formatter to stderr; systemd captures into journald. Variants in stable use: `Started`, `PhaseEntered` (Init/DrmMasterAcquired/WaylandReady/GreetdReady/Deprivileged), `GreeterSpawned`, `GreeterTerminated`, `SessionRequested`, `Shutdown`, `Fatal`. |
 | Introspection surface — live snapshot socket | Queued | `/run/halmasuit/introspect.sock` + `org.halmasuit.Debug.Introspect.Snapshot()` over D-Bus. Schema details deferred to the implementing task. |
 | `sd_notify` / SIGTERM handling | Phase A done | Graceful SIGTERM emits `Shutdown { reason: signal_term }`; SIGCHLD reaper handles zombie children. Phase B adds `SurviveFinalKillSignal=yes` + `execve` re-pivot to rootfs (drm-master-probe Phases 2+3 validated this works). |
-| NixOS module | Done | `services.halmasuit.enable = true` with full option surface: `compositorUid`, `greeterUid`, `greeterGroup`, `greeterCommand`, `pamService`, `spawnPackage`, `installPamConfig`. Hardening directives kept that don't imply NoNewPrivileges; security.wrappers for `halmasuit-spawn` (setuid root) unconditional. PAM service auto-installed; `SupplementaryGroups = [ "shadow" ]` so pam_unix's `getspnam` fast-path avoids the `unix_chkpwd` fork. |
-| `tests/login-flash.nix` | Done — GREEN | Measures halmasuit's PID continuity across greeter→session (the v1 baseline measured niri's PID, which was greetd-architecture-specific). CI's `continue-on-error` + the Justfile inversion are removed; it's a hard gate. |
-| `tests/halmasuit-vm.nix` | Done | Consolidated VM gate: lifecycle events, socket permissions, post-drop process identity, greeter child identity, Wayland globals, full PAM auth + halmasuit-spawn invocation + greeter termination, clean shutdown. ~15s end-to-end. |
+| NixOS module | Done | `services.halmasuit.enable = true`; socket-activated host-ns `halmasuit-session` broker unit (no standing root when idle) + the hardened deprivileged `halmasuit.service`. **No `security.wrappers` setuid entry** (the setuid `halmasuit-spawn` is deleted — R15); no setuid inode in the closure. PAM service auto-installed; the broker carries `SupplementaryGroups = [ "shadow" ]` so pam_unix's `getspnam` fast-path avoids the `unix_chkpwd` fork (irrelevant to the session — A9 derives leader groups from the resolved user only). `HALMASUIT_BROKER_PEER_UID`/`relay_peer_uid` set to the compositor uid when the compositor is enabled, else the greeter uid. |
+| `tests/login-flash.nix` | Done — GREEN | Measures halmasuit's PID + frame continuity across the real greeter→session transition **through the broker-launched session**. Normal pass/fail hard gate — the old CI `continue-on-error` + Justfile exit-code inversion are deleted and must not return. |
+| `tests/halmasuit-vm.nix` | Done | Consolidated VM gate: lifecycle events, socket permissions, post-drop process identity, greeter child identity, Wayland globals, full real-PAM auth through the broker + greeter termination, clean shutdown. |
 | `tests/full-boot-flash.nix` | Deferred to Phase B | Frame-capture continuity from kernel handoff through `SESSION`; depends on initramfs survival being in place. |
 | DankGreeter launcher patch | **Cross-repo** | ~20 lines in DMS (nix-config) to skip its nested-niri spawn when `WAYLAND_DISPLAY` is set by halmasuit. |
 | dms-niri integration on gnomon | **Cross-repo** | Replace `services.greetd.enable` with `services.halmasuit.enable` in gnomon's host config; declare halmasuit-greeter / halmasuit-compositor users. |
@@ -184,10 +197,10 @@ consuming code lands.
 
 ### Resolved during Phase A
 
-- ~~**PAM bindings strategy.**~~ **RESOLVED:** `pam-sys` 1.0.0-alpha5 directly, no wrapper crate. Implemented in `halmasuit-pam`; review-approved.
+- ~~**PAM bindings strategy.**~~ **RESOLVED:** `pam-sys` directly, no wrapper crate. Originally in `halmasuit-pam`; **superseded by the privilege-separation epic** — `pam-sys` now links in exactly one crate, the privileged `halmasuit-session` broker (`halmasuit-pam` deleted; `r14-gate` enforces the single libpam surface).
 - ~~**smithay revision pin.**~~ **RESOLVED:** pinned to niri's current git revision (`ff5fa7df...`) in workspace `Cargo.toml`.
-- ~~**Build order within "broadly working."**~~ **RESOLVED:** introspection sink first, then `halmasuit-spawn` audit-grade, then the smithay spine, then `halmasuit-greetd` + `halmasuit-pam`, then calloop wiring + DRM master + privilege drop + greeter spawn + login-flash flip.
-- ~~**Privilege-drop mechanism + setuid wrapper for `halmasuit-spawn`.**~~ **RESOLVED:** halmasuit drops in-process via `setresgid` + `setresuid` after binding sockets and acquiring DRM master. Post-drop capability posture: `CapPrm=CapEff={CAP_KILL}` for the greeter-kill on session start; `CapBnd={CAP_SETUID, CAP_SETGID}` which is what halmasuit-spawn inherits via the setuid-root execve formula `P'(permitted) = P(inheritable) | P(bounding)`. `halmasuit-spawn` wrapped setuid root via `security.wrappers`. NoNewPrivileges-implying hardening directives are unconditionally off (incompatible with the setuid handoff); `SupplementaryGroups = [ "shadow" ]` so pam_unix avoids the fragile `unix_chkpwd` fork.
+- ~~**Build order within "broadly working."**~~ **RESOLVED** (Phase A): introspection sink first, then the smithay spine, then `halmasuit-greetd`, then calloop wiring + DRM master + privilege drop + greeter spawn + login-flash flip.
+- ~~**Privilege-drop mechanism + setuid wrapper.**~~ **SUPERSEDED by the privilege-separation epic.** Phase A's setuid-`halmasuit-spawn` model is **deleted**. The compositor drops in-process via `setresgid`/`setresuid` after binding sockets and acquiring DRM master to a post-drop posture of `CapPrm=CapEff={CAP_KILL}` with an **empty bounding set** (it execs no setuid helper — R15). Privilege-drop+exec exists only in the `halmasuit-session` broker's **non-setuid** fork-then-drop session-leader child (already root — R7/R11). No `security.wrappers` setuid entry; no `NoNewPrivileges` constraint from a setuid handoff (there is none). See HANDOFF §0 / ARCHITECTURE.md "Authentication and session lifecycle".
 - ~~**login-flash measurement target.**~~ **RESOLVED:** measures halmasuit's `MainPID` (the long-lived compositor) across greeter→session, replacing the v1 baseline's niri-PID assertion (greetd-architecture-specific). Same assertion intent — no compositor restart — different process under measurement.
 
 ### Open

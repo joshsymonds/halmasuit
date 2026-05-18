@@ -134,9 +134,10 @@ mostly language-secondary:
 - **License** (GPL-3+) and **NixOS packaging burden** (Mir's transitive
   dependency graph isn't packaged for NixOS) are real but secondary.
 - **Language posture.** halmasuit leans hard on Rust's memory-safety
-  guarantees — `#![forbid(unsafe_code)]` on production crates, a
-  ≤80-line audit-grade setuid helper. C++ in skilled hands is fine,
-  but the project's broader posture is consistently Rust-first.
+  guarantees — `#![forbid(unsafe_code)]` on every crate except the one
+  privileged broker, where `unsafe` is confined to its auditable
+  `pam_ffi`/`worker` modules. C++ in skilled hands is fine, but the
+  project's broader posture is consistently Rust-first.
 
 Forking USC would mean tearing out everything in that bullet list —
 leaving an architectural skeleton of a few hundred lines. The
@@ -1189,8 +1190,11 @@ solve nothing of the project's stated mission.
 
 Implementation is staged into **Phase A** (rootfs spine) and **Phase
 B** (initramfs survival). The split is execution sequencing only;
-the architectural commitment is unchanged. Phase A is complete as of
-2026-05-14 — see [`PLAN.md`](PLAN.md) for the in-scope status table.
+the architectural commitment is unchanged. Phase A is complete and its
+auth/session model has since been rebuilt by the privilege-separation
+epic (the `halmasuit-session` broker; see "Authentication and session
+lifecycle" above and [`HANDOFF.md`](HANDOFF.md) §0). See
+[`PLAN.md`](PLAN.md) for the in-scope status table.
 
 Scope:
 

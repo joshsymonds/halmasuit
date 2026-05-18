@@ -1,52 +1,54 @@
 # halmasuit epic — HANDOFF
 
-Status as of **2026-05-16**, canonical branch **`main`** @ `677d0ac` (the
-live line converged here — see "Branch topology" below). This document is
-the cold-start brief for whoever (or whichever session/context — work is
-moving to **vermissian**) resumes halmasuit. It is self-contained.
+Canonical branch **`main`** @ `17ae692`, pushed to `origin/main`. This
+document is the self-contained cold-start brief for resuming halmasuit.
 
-**Read order: §0 first.** The original epic was the "renderer → real
-session, no-flash visual proof" work (§§1–7 below). That work is **paused
-behind one prerequisite**: the unified **session/pamd epic** in §0. Do §0
-first; then resume the visual G-layer work (§6).
+**State.** The unified **session/pamd privilege-separation epic** (§0) is
+**SHIPPED** — 45 commits, fast-forward-merged to `main`, two-tier
+`gambit:review` APPROVED (round 4, zero gaps; it caught and closed a real
+privilege escalation, Amendment A9 / §0.13). The privileged
+`halmasuit-session` broker is the **live** auth/session path; the
+in-compositor `halmasuit-pam` and the setuid `halmasuit-spawn` are
+**deleted**. Gates green: `just check` 244/244 + `r14-gate`;
+`just test-vm` 14/14 incl. `login-flash` through the broker-launched
+session and the three real-PAM broker gates (`run-pam-auth`,
+`session-r5r6`, `session-onehandle`).
 
-**Branch topology (resolved 2026-05-16).** The earlier two-branch split
-(`feature/visual-compositor` for visual; `fold/visual-compositor-hardening`
-for hardening) was a coordination mistake and is collapsed. `main` @
-`677d0ac` now carries everything, gate-verified (`just check` 171/171,
-`just test-vm` 11/11):
-- v2 visual compositor layers A–F2 (was on `feature/visual-compositor`),
-- the hardening fold R1–R6 + C3 (reviewed clean via `gambit:review`
-  epic #19 — 4 fresh reviewers, zero findings),
-- the two security fixes the live line was missing, ported forward:
-  `dfae047` (PAM-resolved-username provenance into AuthSuccess, F1/MEDIUM,
-  orig `ab1eb13`) and `6f0e744` (halmasuit-spawn static-musl +
-  no-PT_INTERP, F3, orig `f8e1321`).
-`feature/visual-compositor`'s role is done; `fold/...` superseded.
-**`harden/phase-a-review` is retained (NOT deleted)** — 9/10 of its
-commits are superseded re-ports, but `aa93f4f` (a login-flash
-DRM-master-continuity assertion) is unique. It was attempted as a port
-and **reverted**: as written it greps debugfs for the compositor PID as
-DRM master, which is false-by-construction under v2's libseat/seatd model
+**Read order.** §0 is now the **decision record** for the shipped
+privilege-separation work — the rationale and the DO-NOT-REVISIT
+conditions (CLAUDE.md cites §0.7–§0.13 as canonical). §§1–4 describe what
+halmasuit is and the visual-compositor layers already landed (A–F2, G0).
+§5 records that the namespace-handoff blocker is **resolved** (Mechanism
+D shipped *as* the broker). **§6 is the live work queue: the visual
+G-layer (G1–G4) is what remains** — it was the thing §0 unblocked.
+
+**Branch topology.** Collapsed and resolved. `main` carries everything;
+`feature/session-pamd` was merged and deleted, `feature/visual-compositor`
+/ `fold/...` superseded. **`harden/phase-a-review` is retained** for one
+unique commit, `aa93f4f` (a login-flash DRM-master-continuity assertion).
+That implementation is wrong for v2 — it greps debugfs for the compositor
+PID as DRM master, false-by-construction under the libseat/seatd model
 (seatd is the registered master; halmasuit holds the DRM fd *via*
-libseat — there is no flash). The concept is valuable; the rewrite is a
-scoped item (§6) and the branch is the reference impl until it lands.
+libseat). The concept is valuable; the rewrite is the §6 sidecar and the
+branch stays the reference impl until it lands.
 
 ---
 
-## 0. START HERE — Unified session/pamd epic (PARKED, do this FIRST)
+## 0. Decision record — Unified session/pamd epic (SHIPPED)
 
-**Status: PARKED.** Fully brainstormed (decisions locked below); NOT
-implemented. It is the prerequisite for the visual G-layer (§6) — G1+
-need a real session with a real `$HOME`/`$XDG_RUNTIME_DIR`, which is
-exactly what this epic delivers. Work parked because the user is
-context-switching to **vermissian**; resume here.
+**Status: SHIPPED** and merged to `main` @ `17ae692`. This section is the
+canonical record of *why* the privileged broker is shaped the way it is
+and *what must not be revisited*. The locked decisions (§0.3) and
+Amendments A1–A9 (§0.8–§0.13) are immutable unless their stated
+DO-NOT-REVISIT condition changes; CLAUDE.md's hard rules are the
+enforced subset. The narrative below is preserved as the derivation — do
+not re-derive it.
 
 ### 0.1 The core realization (the expensive insight — do not re-derive)
 
 C1 ("PAM must be a killable subprocess") and Mechanism D ("session-spawn
-namespace handoff", §5) are **not two problems — they are two ends of one
-`pam_handle_t` lifecycle**:
+namespace handoff", §5) were **not two problems — they are two ends of
+one `pam_handle_t` lifecycle**:
 
 - **Auth phase** — `pam_start`/`pam_authenticate`/`pam_acct_mgmt`. "Is
   this person who they claim to be." This is what C1 moves into a
@@ -61,28 +63,27 @@ namespace handoff", §5) are **not two problems — they are two ends of one
 
 Designing C1 and D independently produces two incompatible models of who
 holds `pam_handle_t`, discovered at integration, at the worst place.
-**They must be co-designed as one epic.**
+They were co-designed as one epic.
 
-### 0.2 THE unresolved crux (headline open decision for the epic)
+### 0.2 The crux — RESOLVED: one shared handle, owned by the broker (R1)
 
 Credential-passing PAM modules (pam_mount unlocking an encrypted `$HOME`,
 pam_gnome_keyring, pam_krb5) require **the same `pam_handle_t` to span
 `authenticate` → `open_session`** (greetd's `worker.rs` comment is the
-canonical statement; cited by the research). So:
+canonical statement; confirmed by the research).
 
-> **One shared handle** (greetd-style): the killable auth subprocess must
-> itself *be / become* the privileged host-ns session owner — which
-> contradicts "unprivileged, auth-only, SIGKILL-anytime worker."
-> **vs. Two handles**: a separate unprivileged killable auth worker + a
-> separate privileged host-ns session unit (Mechanism D), accepting that
-> credential-passing modules break **unless** halmasuit constrains its
-> supported PAM stack, or re-runs a constrained auth in the session unit.
-
-This is **the** decision the epic must make first; everything else below
-is settled scaffolding around it. Do NOT just pick one — it is a
-threat-model + architecture decision (the user's standing rule: "when
-uncertain about architecture, stop and ask"; "I don't want to just vibes
-it").
+**Resolved: one shared handle.** The privileged `halmasuit-session`
+broker owns ONE `pam_handle_t` for the whole lifecycle (auth → setcred →
+open_session → … → close_session → pam_end) and never `execve`s between
+auth and session. The "killable, SIGKILL-anytime" property of C1 is
+satisfied **not** by making the handle-owner killable but by running
+`pam_authenticate` in an **ephemeral SIGKILL-able `setrlimit`-bounded
+privileged fork** that reports the result back to the handle-owning
+parent (R5/R7). The two-handle option was rejected: it silently breaks
+credential-passing modules (locked `$HOME`, no error). This is the
+greetd/OpenSSH/GDM/su shape. Codified as **R1** in CLAUDE.md's hard
+rules; DO NOT REVISIT unless R1's one-handle-in-parent model is itself
+rescinded (see §0.13/A9.5).
 
 ### 0.3 Locked design decisions (brainstormed + research-backed; immutable unless 0.2 forces otherwise)
 
@@ -187,23 +188,36 @@ OWASP MaxStartups/CWE-770/NIST-800-63B). Full detail in memory
   research showed process-isolation + single-slot eliminates the class;
   a limiter only paces it.
 
-### 0.7 First moves when resuming
+### 0.7 What shipped (the realized crate layout)
 
-1. Resolve §0.2 (one-handle vs two) — this likely needs another short
-   `gambit:brainstorming` round with the user (it's the threat-model
-   decision deliberately not vibed). Mechanism D (§5) is the same
-   decision wearing the session-phase hat — decide them together.
-2. Then run `gambit:brainstorming` → epic Task with §0.3 as immutable
-   requirements + §0.6 as anti-patterns → `gambit:executing-plans`, TDD,
-   real-PAM VM tests only (no mocks — CLAUDE.md hard rule), per-task
-   checkpoints. Worktree off `main`.
-3. Crates in play: `halmasuit-pam` (becomes the parent-side lib + new
-   `halmasuit-pam-worker` binary), `halmasuit-greetd` (`server.rs`
-   Connection state machine; remove the R6 cap here), `halmasuit`
-   (`main.rs`: supervisor `WorkerHandle`, reaper integration, factory),
-   plus the Mechanism-D privileged session unit (§5) + `nix/module.nix`.
-   `halmasuit-spawn` stays microscopic + untouched unless deliberately
-   scoped.
+The epic landed exactly the locked decisions of §0.3 with Amendments
+A1–A9. As built:
+
+- **`halmasuit-session`** (NEW, privileged) — the host-ns broker. Owns
+  the one `pam_handle_t` (R1); runs `pam_authenticate` in an ephemeral
+  SIGKILL-able `setrlimit`-bounded privileged fork (R5); forks once and
+  drops privileges in a **non-setuid** session-leader child (R7/R11,
+  already root — no setuid binary); single calloop event-loop broker,
+  socket-activated, idle-exits, evict-old slot (A2); relay-peer
+  `SO_PEERCRED` gate (R8). `unsafe` confined to its `pam_ffi`/`worker`
+  modules. Module doc in `src/broker.rs` is the authoritative spec.
+- **`halmasuit-session-ipc`** (NEW, pure) — the frozen wire contract
+  (types + codec only) for the compositor↔broker relay, incl. the A5
+  one-way `BrokerToCompositor` lifecycle frames.
+- **`halmasuit-greetd`** — its greetd state machine is now fully sans-IO
+  (emit/suspend/resume, A7); no in-process PAM; `MAX_SESSION_BUILDS_PER_
+  CONNECTION` + `CodecError::SessionBuildLimitExceeded` removed (R6/R14).
+- **`halmasuit`** — `broker_session.rs` (the per-greeter `BrokerEpisode`,
+  sole `OwnedFd` owner of the broker socket, A6/A8), `broker_relay.rs`
+  (pure relay phase machine), `swap_gate.rs` (the A5 two-key flash-free
+  greeter→session swap). Post-drop bounding set empty; keeps only
+  `CAP_KILL` (R15).
+- **DELETED:** `crates/halmasuit-pam`, the setuid `crates/halmasuit-spawn`
+  + its `security.wrappers` entry, `tests/halmasuit-spawn.nix` (R10/R14/
+  R15, atomic with the broker going live).
+- **`nix/module.nix`** — the socket-activated `halmasuit-session` unit;
+  no setuid inode in the closure; `r14-gate` in `just check` fails the
+  build if the compositor ever transitively links `pam-sys`.
 
 ### 0.8 Epic close-out scope (2026-05-17, user-directed) — R3 relay + R10/R14/R15 deletions are IN this epic (Amendment A4; A3 RESCINDED)
 
@@ -735,14 +749,20 @@ Design constraints that matter for everything below (full text in
 - halmasuit composites; it never paints its own UI. The background is a
   separate client (`halmasuit-splash`); the greeter and niri are unmodified
   upstream clients.
-- Only `halmasuit-spawn` (a microscopic setuid helper) is privileged.
-  `#![forbid(unsafe_code)]`, ~80 lines, capability bounding set locked to
-  `{CAP_SETUID, CAP_SETGID}`, load-bearing UID floor (refuses uid OR gid
-  < 1000). Every change to it is a security-review event.
+- The single privileged surface is the `halmasuit-session` broker (§0):
+  it owns one `pam_handle_t` for the whole lifecycle, runs
+  `pam_authenticate` in an ephemeral SIGKILL-able fork, and launches the
+  session by forking once and dropping privileges in a **non-setuid**
+  child (already root — no setuid binary anywhere). `unsafe` is confined
+  to its `pam_ffi`/`worker` modules; the load-bearing UID floor (refuses
+  uid OR gid < ~1000) lives in its session-leader child. Every change to
+  its privileged boundary is a security-review event.
 - halmasuit itself runs as a hardened, deprivileged systemd service
   (`ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true` — i.e. a
-  private mount namespace). This hardening is deliberate and is the crux of
-  the current blocker (§5).
+  private mount namespace) holding no credentials and no escalation
+  capability (post-drop bounding set empty; keeps only `CAP_KILL`). This
+  hardening is what made the namespace handoff a problem; §0's broker
+  (host-ns, separate unit) resolved it (§5).
 - No PAM bypass; no mocking PAM/renderer/DRM/input/clients in VM tests; goldens
   are human-eyeball-inspected, never CI-regenerated; the no-flash invariant is
   asserted over 100% of the `FrameRendered` stream, not sampled screenshots.
@@ -802,12 +822,10 @@ nix-config's own inputs (not a nix-config branch).
 
 ## 3. How far we got — layer by layer
 
-`just check` = **171/171** green (was 150/150 before the hardening fold +
-security ports). **11 VM gates** green via `just test-vm` (plus the
-`drm-master-probe` phase probes). Every layer below, the R1–R6+C3
-hardening fold (reviewed clean — `gambit:review` epic #19), and the
-`ab1eb13`/`f8e1321` security ports are committed on **`main`** @
-`677d0ac` (see "Branch topology" in the header) and gate-verified.
+`just check` = **244/244** green incl. `r14-gate`. **14 VM gates** green
+via `just test-vm` (plus the `drm-master-probe` phase probes). Every
+layer below, plus the shipped §0 privilege-separation epic, is committed
+on **`main`** @ `17ae692` and gate-verified.
 
 | Layer | What | Gate(s) | Commit | Task |
 |---|---|---|---|---|
@@ -820,24 +838,27 @@ hardening fold (reviewed clean — `gambit:review` epic #19), and the
 | F1 | Real `xdg_toplevel` fullscreen compositing over splash | `visual-halmasuit-toplevel` | `64a18e0` | #12 ✓ |
 | F2 | greeter→session foreground state machine; no-flash across the **real greetd** transition | `visual-foreground` | `a7078c2` | #16 ✓ |
 | G0 | Pin nix-config→main (user's forks); real DMS stack boots | `smoke-boot` (real greetd+DankGreeter+niri+quickshell) | `1586aaa` | #17 ✓ |
-| **G1** | Real niri nested as the session | — | **popped (see §5)** | #18 pending |
-| G2–G4 | Real DankGreeter; full real-auth arc; interactive proof | — | not started | #13 (+ to-create) |
+| §0 | Privilege-separation epic: `halmasuit-session` broker is the live auth/session path; `halmasuit-pam` + setuid `halmasuit-spawn` deleted | `run-pam-auth`, `session-r5r6`, `session-onehandle`, `login-flash` | `17ae692` | SHIPPED ✓ |
+| **G1** | Real niri nested as the broker-launched session | — | **next (§6); unblocked by §0** | pending |
+| G2–G4 | Real DankGreeter; full real-auth arc; interactive proof | — | not started | to-create |
 
-What F2 already proved (the no-flash thesis, on the real mechanism): real
-greetd full-auth → `ForegroundChanged{session}` → halmasuit-spawn execs the
-session → **halmasuit PID continuous across the real greeter→session swap**,
+What F2 proved (the no-flash thesis, on the real mechanism): real greetd
+full-auth → `ForegroundChanged{session}` → the session is launched →
+**halmasuit PID continuous across the real greeter→session swap**,
 `FrameRendered` continuity OK across the whole transition, both scene goldens
-matched. The only thing F2 used a stand-in for is the *content* of the two
-endpoints (solid-color clients); the entire mechanism is real.
+matched. F2 used a stand-in only for the *content* of the two endpoints
+(solid-color clients); the mechanism is real. Post-§0, `login-flash`
+proves the same continuity **through the broker-launched session** (the
+session leader is the broker's fork-then-drop child, not a setuid exec).
 
 ---
 
 ## 4. G1 attempt — what we learned (knowledge preserved, code discarded)
 
-G1 (real niri as the session) was attempted and the WIP **deliberately
-discarded** (`git restore`/clean — the test file is cheap to recreate and its
-session-environment section will be rewritten by the §5 decision anyway). The
-*findings* are the value and are durable in memory
+An early G1 (real niri as the session) attempt was **deliberately
+discarded** (`git restore`/clean — the test file is cheap to recreate and
+its session-environment section is rewritten for the broker-launched
+session anyway). The *findings* are the value and are durable in memory
 (`session-spawn-namespace-handoff`, `g-layer-pins`) and here:
 
 - **Real niri works nested under halmasuit.** niri's winit/GL backend
@@ -846,31 +867,38 @@ session-environment section will be rewritten by the §5 decision anyway). The
   E/F protocol surface is sufficient for real niri's render path. **No
   halmasuit protocol gap** — the biggest rendering unknown of layer G is
   retired.
-- niri runs correctly as the authenticated user (uid/euid/gid 1001) via
-  halmasuit-spawn. The privilege drop is fine.
-- Incidental, already understood: the session wrapper runs with **no PATH**
-  (halmasuit-spawn's minimal env — by design); pass niri its config via
-  `--config`, not via shell `mkdir`/`cp`. niri (a compositor even when nested)
-  binds its **own** client socket in `XDG_RUNTIME_DIR` and needs a writable
-  `$HOME`.
+- niri runs correctly as the authenticated user. The privilege drop is
+  fine (now the broker's non-setuid fork-then-drop session-leader child).
+- Incidental, still relevant for G1: the session env is minimal —
+  `pam_getenvlist()` merged with a fixed allowlist (A1), not the caller's
+  environment. Pass niri its config via `--config`, not via shell
+  `mkdir`/`cp`. niri (a compositor even when nested) binds its **own**
+  client socket in `XDG_RUNTIME_DIR` and needs a writable `$HOME` — which
+  the broker now provides via `pam_open_session` (pam_systemd +
+  pam_mount) in the host mount namespace.
 
-Then the blocker (§5) stopped it.
+Then the namespace blocker (§5) stopped that attempt; §0 has since
+resolved it.
 
 ---
 
-## 5. THE BLOCKER — session↔compositor namespace handoff
+## 5. The namespace-handoff blocker — RESOLVED (Mechanism D shipped as the broker)
 
-niri, as a child of the hardened `halmasuit.service`, inherits its
-`ProtectHome=true` / `ProtectSystem=strict` / `PrivateTmp=true` **mount
-namespace**. So `/home/alice` and `/run/user/1001` — created correctly on the
-host — are invisible to the session. `setresuid` does not change the mount
-namespace; fork/exec does not escape it. This is kernel-enforced, not a test
-artifact. F2 never hit it because a solid-color stand-in needs neither a HOME
-nor a runtime dir; the *real* session does.
+**This was the layer-G blocker; §0 resolved it.** Recorded here as the
+problem statement and the research that picked Mechanism D.
 
-This is exactly the **"production session→compositor handover" that
-ARCHITECTURE/PLAN explicitly parked as a layer-G open decision.** Four research
-agents (sshd, systemd-logind/pam_systemd, greetd/GDM/SDDM, namespace mechanics)
+The problem: niri, as a child of the hardened `halmasuit.service`,
+inherited its `ProtectHome=true` / `ProtectSystem=strict` /
+`PrivateTmp=true` **mount namespace**. So `/home/alice` and
+`/run/user/1001` — created correctly on the host — were invisible to the
+session. `setresuid` does not change the mount namespace; fork/exec does
+not escape it. Kernel-enforced, not a test artifact. F2 never hit it
+because a solid-color stand-in needs neither a HOME nor a runtime dir;
+the *real* session does.
+
+This was the **"production session→compositor handover"** the design
+explicitly parked as a layer-G open decision. Four research agents (sshd,
+systemd-logind/pam_systemd, greetd/GDM/SDDM, namespace mechanics)
 converged with source-level citations (full detail in memory
 `session-spawn-namespace-handoff`):
 
@@ -902,88 +930,84 @@ converged with source-level citations (full detail in memory
      `CAP_SYS_ADMIN`+`CAP_SYS_CHROOT` in the helper, breaks forbid-unsafe,
      inverts the UID-floor threat model. Do not revisit.
 
-**This is no longer a separate thread — it has been folded into §0.** The
-realization (see §0.1) is that Mechanism D *is* the session-phase half of
-the same `pam_handle_t` lifecycle as C1's auth-phase killable subprocess;
-the §0.2 crux (one shared handle vs two) is the decision that resolves
-*both*. Mechanism D's options C/D and the rejected-A `setns` ranking above
-remain valid input to §0; **do not design Mechanism D in isolation — it is
-§0.7 step 1, co-decided with the one-handle-vs-two crux.** Memory:
-[[pam-killable-subprocess-direction]], `session-spawn-namespace-handoff`,
-[[fvc-port-reconciliation]] (branch topology, now resolved).
+**Resolved as Mechanism D, shipped as `halmasuit-session`.** Mechanism D
+*is* the session-phase half of the same `pam_handle_t` lifecycle as C1's
+auth-phase killable subprocess (§0.1); the §0.2 crux (one shared handle)
+resolved both. The shipped broker is the deliberately-unsandboxed
+host-ns privileged unit Mechanism D describes: PID 1 socket-activates it,
+it runs the `pam_open_session` tail (pam_systemd + pam_mount) and
+fork-then-drops the session leader in the host mount namespace; the
+hardened compositor relays to it over `SO_PEERCRED`-authenticated IPC
+only after PAM-verified `start_session`. No `CAP_SYS_ADMIN`; no setuid;
+the rejected-A `setns` path was never taken (DO NOT REVISIT — §0.6).
+Memory: [[pam-killable-subprocess-direction]],
+`session-spawn-namespace-handoff`, [[fvc-port-reconciliation]].
 
 ---
 
-## 6. Remaining work to land the epic
+## 6. Remaining work — the visual G-layer (live queue)
 
-Strict order; each blocked by the previous:
+§0 is shipped; the namespace blocker is gone. The visual G-layer is what
+remains: prove the no-flash compositor on the *real* greeter→session path
+with the *real* software, now running through the broker-launched
+session. Strict order, each blocked by the previous, **except the
+sidecar** (independent — do it anytime):
 
-1. **[BLOCKER] The entire §0 unified session/pamd epic.** Mechanism D
-   (session-spawn namespace handoff) is its session-phase half; C1
-   (killable PAM subprocess) its auth-phase half; the §0.2 crux resolves
-   both. This subsumes what was previously listed here as a standalone
-   handoff task. Until §0 lands, G1–G4 cannot run on the real path
-   (the real session needs a real `$HOME`/`$XDG_RUNTIME_DIR`, which only
-   the §0 handoff provides). *Do §0 before any G1 carve-out, so the
-   flagship proof runs on the true production path with no synthetic
-   `ProtectHome=false` to later unwind.*
+1. **G1 — real niri nested as the broker-launched session.** Build
+   `tests/visual-niri-session.nix` from `tests/visual-foreground.nix`
+   (swap `sessionCmd` → real niri `--config <minimal kdl>`; niri pkg =
+   `nix-config.inputs.niri-flake.packages.x86_64-linux.niri-unstable`;
+   wire flake.nix check + Justfile). Session env + `$HOME`/
+   `$XDG_RUNTIME_DIR` now flow through the broker's `pam_open_session`
+   (no `ProtectHome=false` carve-out — that is the whole point of §0).
+   Assert: real greetd auth (through the broker) → niri `xdg_toplevel`
+   fullscreen foreground; niri marker (`pgrep -x niri`); PID-continuity
+   across greeter→niri; `assert_frame_continuity`; Snapshot
+   `niri-session` golden, Read-inspected before commit. Greeter stays
+   the layer-shell stand-in.
+2. **G2 — real DankGreeter as `greeterCommand`** (replaces the stand-in
+   layer client). Talks greetd to halmasuit's socket; enumerate the
+   Wayland protocols it binds and add any halmasuit lacks (never patch
+   DankGreeter). Golden inspected; real keyboard input → DankGreeter.
+3. **G3 — full real-auth arc gate**: boot → splash(user image) → real
+   DankGreeter over splash → emulated keystrokes type the test-user
+   password → PAM success **through the broker** → broker fork-then-drops
+   real niri → niri foreground. Continuity invariant + PID-continuity
+   across the **real** DankGreeter→niri transition; niri marker; goldens
+   (splash → DankGreeter → niri) inspected.
+4. **G4 — interactive bootable proof + docs**: `just` recipe, QEMU GTK
+   window, user's image, the full arc by hand; documented (how to pass
+   the image, what you should see). Plus re-verify `cargo tree -p
+   halmasuit` (no features) clean / production halmasuit zero
+   `frame_audit`.
+5. **Epic close**: layer-G acceptance gate. When all G subtasks are green
+   → `gambit:review` → `finishing-branch`. `login-flash` stays a GREEN
+   hard gate (it already passes through the broker-launched session); the
+   CI inversion is gone — keep it a normal pass/fail check.
 
-   **Sidecar (independent of §0; can be done anytime):
-   libseat-aware DRM-master-continuity assertion on `login-flash`.** The
-   current `login-flash` proves *PID* continuity across greeter→session;
-   it does NOT prove the compositor never internally drops/re-acquires
-   DRM master (a real flash vector PID-continuity cannot see). The
-   concept + a reference implementation live in commit `aa93f4f` on the
-   retained `harden/phase-a-review` branch, BUT that implementation is
-   wrong for v2: it greps debugfs for the *compositor PID* as DRM master,
-   which never holds under libseat/seatd — **seatd** is the registered
-   master and halmasuit holds the DRM fd *via* libseat. The rewrite must
-   instead assert, across the transition: (a) `seatd` continuously holds
-   DRM master, and (b) halmasuit's libseat session is never closed/
-   reopened (no `CloseSession`/`OpenSession` churn in the seatd log, and
-   halmasuit's seatd client id is stable). It modifies the canonical
-   `login-flash` (CLAUDE.md hard-rule territory) — additive only, never
-   weaken the existing PID assertion; re-gate full `just test-vm`. Delete
-   `harden/phase-a-review` once this lands.
-2. **G1 — real niri nested as the session** (task **#18**, reset to pending,
-   redo from scratch). Rebuild `tests/visual-niri-session.nix` from
-   `tests/visual-foreground.nix` (swap `sessionCmd` → real niri `--config
-   <minimal kdl>`; niri pkg =
-   `nix-config.inputs.niri-flake.packages.x86_64-linux.niri-unstable`; wire
-   flake.nix check + Justfile). Session env flows through the decided handoff
-   (no carve-out if D landed). Assert: real greetd auth → niri xdg_toplevel
-   fullscreen foreground; niri marker (`pgrep -x niri`); PID-continuity across
-   greeter→niri; `assert_frame_continuity`; Snapshot `niri-session` golden,
-   Read-inspected before commit. Greeter stays the layer-shell stand-in.
-3. **G2 — real DankGreeter as `greeterCommand`** (replaces the stand-in layer
-   client). Talks greetd to halmasuit's socket; enumerate the wayland
-   protocols it binds and add any halmasuit lacks (never patch DankGreeter).
-   Golden inspected; real keyboard input → DankGreeter.
-4. **G3 — full real-auth arc gate**: boot → splash(user image) → real
-   DankGreeter over splash → emulated keystrokes type the test-user password →
-   PAM success → halmasuit-spawn execs real niri → niri foreground.
-   Continuity invariant + PID-continuity across the **real** DankGreeter→niri
-   transition; niri marker; goldens (splash → DankGreeter → niri) inspected.
-5. **G4 — interactive bootable proof + docs**: `just` recipe, QEMU GTK window,
-   user's image, the full arc by hand; documented (how to pass the image, what
-   you should see). Plus re-verify `cargo tree -p halmasuit` (no features)
-   clean / production halmasuit zero `frame_audit`.
-6. **Epic close**: task #13 is the layer-G acceptance gate (currently blocked
-   by #18; will gain #-G2/G3/G4 blockers as those are created). When all G
-   subtasks are green → `gambit:review` → `finishing-branch`. Do **not** flip
-   any `login-flash` CI inversion sloppily — it is already green-by-design
-   under v2; keep it a hard gate.
+**Sidecar (independent — anytime): libseat-aware DRM-master-continuity
+assertion on `login-flash`.** Today `login-flash` proves *PID* continuity
+across greeter→session; it does NOT prove the compositor never internally
+drops/re-acquires DRM master (a real flash vector PID-continuity cannot
+see). A reference impl lives in commit `aa93f4f` on the retained
+`harden/phase-a-review` branch, BUT it is wrong for v2: it greps debugfs
+for the *compositor PID* as DRM master, which never holds under
+libseat/seatd — **seatd** is the registered master and halmasuit holds
+the DRM fd *via* libseat. The rewrite must instead assert, across the
+transition: (a) `seatd` continuously holds DRM master, and (b)
+halmasuit's libseat session is never closed/reopened (no `CloseSession`/
+`OpenSession` churn in the seatd log, and halmasuit's seatd client id is
+stable). It modifies the canonical `login-flash` (CLAUDE.md hard-rule
+territory) — additive only, never weaken the existing PID assertion;
+re-gate full `just test-vm`. Delete `harden/phase-a-review` once it
+lands.
 
-Task-tool state: those `#1/#13/#18` IDs belong to the *visual epic's*
-task universe from the originating session — task IDs do NOT carry across
-sessions, so a fresh context will not resolve them; treat the §3 table +
-§6 list as the authoritative state, not the IDs. Conceptually: visual
-epic open; layers A–F2 done; G1 (real niri) pending, redo from scratch,
-blocked on §0; G2/G3/G4 not yet created (create iteratively as G1 lands).
-**§0 (unified session/pamd epic) has no tasks yet — it is parked;
-create its epic + first task via `gambit:brainstorming` on resume per
-§0.7.** The integration that converged everything onto `main` was
-tracked as epic #19 (this session) — reviewed clean and closed.
+Task-tool state: task IDs do NOT carry across sessions — treat the §3
+table + this list as the authoritative state. The visual G-layer has no
+gambit tasks yet; create its epic + first task (G1) via
+`gambit:brainstorming`. Conceptually: layers A–F2 + G0 done; §0
+privilege-separation epic SHIPPED; G1 next (unblocked); G2/G3/G4 created
+iteratively as G1 lands.
 
 ---
 
@@ -998,16 +1022,26 @@ tracked as epic #19 (this session) — reviewed clean and closed.
   is the template for G1–G3 (real greetd full-auth + Snapshot + continuity).
   `tests/smoke-boot.nix` shows how the real DMS stack is brought up via
   `${nix-config}/modules/desktop/dms-niri.nix` + `node.specialArgs.inputs`.
-- **Commands**: `just check` (rustfmt+clippy+deny+machete+typos+nextest);
-  `just test-vm` (the 11-gate sweep); `just test-vm-drive <name>` (interactive
-  QEMU for debugging); `just update-goldens <name>` (human-in-the-loop golden
-  regen — inspect every PNG before commit).
-- **Spawn/PAM boundary** (the code the handoff reshapes):
-  `crates/halmasuit-spawn/src/main.rs` (the comment block is its spec),
-  `crates/halmasuit-greetd/` (the greetd state machine — the PAM-success
-  gate), `nix/module.nix` (the hardened `halmasuit.service` —
-  `ProtectHome`/`ProtectSystem`/`PrivateTmp` at ~324).
+  Broker gates: `tests/{run-pam-auth,session-r5r6,session-onehandle}.nix`
+  (all real PAM, no mocks); `tests/login-flash.nix` is the canonical
+  no-flash gate (through the broker-launched session).
+- **Commands**: `just check` (rustfmt+clippy+deny+machete+typos+nextest
+  + `r14-gate`); `just test-vm` (the 14-gate sweep); `just test-vm-drive
+  <name>` (interactive QEMU for debugging); `just update-goldens <name>`
+  (human-in-the-loop golden regen — inspect every PNG before commit).
+- **Privileged PAM/session boundary** (the shipped code):
+  `crates/halmasuit-session/src/broker.rs` (module doc = authoritative
+  spec: one handle, killable auth fork, fork-then-drop leader, slot-owned
+  reaping, relay-peer `SO_PEERCRED` gate); `session_leader.rs`/`worker.rs`
+  (the fork-then-drop syscall sequence, A9 group derivation);
+  `crates/halmasuit/src/broker_session.rs` (the compositor's per-greeter
+  `BrokerEpisode`, A6/A7/A8); `crates/halmasuit-greetd/src/server.rs`
+  (sans-IO greetd state machine — the PAM-success gate); `nix/module.nix`
+  (the socket-activated `halmasuit-session` unit + the hardened
+  `halmasuit.service`).
 - **Hard rules** (`CLAUDE.md`): no PAM bypass; no client patching (fix
-  halmasuit); halmasuit-spawn stays microscopic + forbid-unsafe + minimal
-  caps + UID floor; no running halmasuit as root; goldens human-inspected; no
+  halmasuit); one `pam_handle_t` in the broker, never split/`execve`'d;
+  no setuid inode / no second libpam surface; UID floor in the broker's
+  session-leader child; compositor never blocks the render loop on broker
+  IPC; no running the compositor as root; goldens human-inspected; no
   weakening/skipping structural tests; no `--no-verify`/`--no-gpg-sign`.
