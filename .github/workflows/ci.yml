@@ -56,14 +56,20 @@ jobs:
       - name: Lint + unit gate
         run: nix develop --command just check
 
-      - name: Smoke test
-        run: nix build .#checks.x86_64-linux.smoke-boot -L --print-build-logs --no-link
-
-      - name: halmasuit VM gate
-        run: nix build .#checks.x86_64-linux.halmasuit-vm -L --print-build-logs --no-link
-
-      - name: halmasuit-spawn VM gate
-        run: nix build .#checks.x86_64-linux.halmasuit-spawn -L --print-build-logs --no-link
-
-      - name: login-flash (hard gate)
-        run: nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link
+      # Full VM gate — the SAME `just test-vm` the local gate runs, so
+      # CI and local never drift. It builds every check sequentially
+      # (set -euo pipefail; aborts on the first failure):
+      # smoke-boot, halmasuit-vm, run-pam-auth, session-r5r6,
+      # session-onehandle (the epic flagship), login-flash (the GREEN
+      # hard gate — proves PID + frame continuity across the real
+      # broker-launched greeter→session transition; a FAIL means the
+      # flash regressed, the thing this project exists to prevent),
+      # halmasuit-input, and the visual-* gates incl. visual-revert /
+      # visual-pidfd-revert. login-flash runs as an ordinary
+      # pass/fail check here — the old `continue-on-error` /
+      # `expected-fail`-as-success inversion is GONE and must NOT
+      # return. The deleted `halmasuit-spawn` check (R10/R14/R15 — no
+      # setuid inode in the closure) is correctly absent: it is not in
+      # `just test-vm`.
+      - name: Full VM gate (just test-vm)
+        run: nix develop --command just test-vm
