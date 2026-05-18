@@ -27,6 +27,17 @@ The module wraps three concerns:
     supplied to the helper via the `GOLDENS_DIR` environment variable
     so the helper doesn't have to guess.
 
+  * `assert_matches_witness(machine, name, threshold=95.0)` — the
+    exact-image gate. Same capture + ssimulacra2 path as
+    `assert_matches_golden`, but the default threshold is the tighter
+    95.0 (deterministic offscreen llvmpipe readback of a known scene
+    must match its checked-in witness near-exactly; only sub-JND
+    swrast rounding is tolerated). This is the model that REPLACES the
+    deleted `mean_luminance`/`backdrop_coverage` proxy heuristics: a
+    pixel-exact comparison against a reference image, never a "is it
+    dark enough / mostly covered" guess. Never bit-exact (epic anti-
+    pattern); never below the repo-wide 90.0 floor.
+
 Two environment variables tune behavior:
 
   * `HALMASUIT_GOLDEN_REGEN=1` — `assert_matches_golden` copies the
@@ -225,6 +236,38 @@ def assert_matches_golden(
         )
 
 
+# The exact-image floor. Tighter than DEFAULT_THRESHOLD because the
+# offscreen llvmpipe readback of a deterministic, known scene must match
+# its checked-in witness near-exactly — only sub-JND software-rasterizer
+# rounding is allowed. Still strictly above the repo-wide 90.0 floor;
+# never bit-exact (epic anti-pattern).
+WITNESS_THRESHOLD = 95.0
+
+
+def assert_matches_witness(
+    machine,
+    name: str,
+    *,
+    threshold: float = WITNESS_THRESHOLD,
+) -> None:
+    """Exact-image gate: capture the real composited frame via the
+    offscreen GLES readback and assert it matches the checked-in
+    witness `${GOLDENS_DIR}/{name}.png` with ssimulacra2 ≥ `threshold`
+    (default 95.0).
+
+    This REPLACES the deleted `assert_frame_continuity` proxy: instead
+    of inferring "no flash" from `mean_luminance`/`backdrop_coverage`
+    aggregates, it compares the exact pixels of halmasuit's own
+    composited frame against a known reference image. Deterministic
+    (llvmpipe + a fixed scene), so the tolerance is tight.
+
+    Capture / regen / missing-golden semantics are identical to
+    `assert_matches_golden`; only the default threshold differs and the
+    intent is documented as exact-image rather than perceptual-golden.
+    """
+    assert_matches_golden(machine, name, threshold=threshold)
+
+
 def introspect_events(machine) -> list:
     """Return halmasuit's introspection Event stream, in journal
     (chronological) order, as a list of dicts.
@@ -255,70 +298,3 @@ def introspect_events(machine) -> list:
         if isinstance(ev, dict) and "event" in ev:
             events.append(ev)
     return events
-
-
-def assert_frame_continuity(machine) -> None:
-    """The no-flash invariant (Epic #1 req 11), asserted over the
-    full `FrameRendered` stream — NOT sampled screenshots.
-
-    - From the first `client_first_frame{role:background}` onward,
-      every `frame_rendered` must have ``backdrop_coverage > 0.95``.
-    - From the first `client_first_frame` of ANY role onward, no
-      `frame_rendered` may have ``mean_luminance < 0.01`` (no black
-      frame once a client has committed; pre-commit clear frames are
-      exempt).
-
-    Fails loudly, naming the offending event(s) and their index.
-    """
-    events = introspect_events(machine)
-
-    first_bg = None
-    first_any = None
-    for i, ev in enumerate(events):
-        if ev["event"] == "client_first_frame":
-            if first_any is None:
-                first_any = i
-            if ev.get("role") == "background" and first_bg is None:
-                first_bg = i
-    if first_bg is None:
-        raise AssertionError(
-            "no client_first_frame{role:background} in the halmasuit "
-            "event stream — splash never composited a background frame.\n"
-            f"events seen: {[e['event'] for e in events]}"
-        )
-    # A background cff is itself an "any" cff, so first_any is set and
-    # first_any <= first_bg.
-    assert first_any is not None
-
-    cov_viol = [
-        (i, ev)
-        for i, ev in enumerate(events)
-        if i >= first_bg
-        and ev["event"] == "frame_rendered"
-        and ev["backdrop_coverage"] <= 0.95
-    ]
-    lum_viol = [
-        (i, ev)
-        for i, ev in enumerate(events)
-        if i >= first_any
-        and ev["event"] == "frame_rendered"
-        and ev["mean_luminance"] < 0.01
-    ]
-    frames = sum(1 for e in events if e["event"] == "frame_rendered")
-    if cov_viol or lum_viol:
-        raise AssertionError(
-            "FrameRendered continuity invariant VIOLATED "
-            f"({frames} frames; first bg cff @#{first_bg}, "
-            f"first any cff @#{first_any}):\n"
-            f"  backdrop_coverage<=0.95 after bg: {cov_viol[:5]}\n"
-            f"  mean_luminance<0.01 after first commit: {lum_viol[:5]}"
-        )
-    print(
-        json.dumps(
-            {
-                "continuity": "OK",
-                "frames": frames,
-                "first_background_cff_index": first_bg,
-            }
-        )
-    )

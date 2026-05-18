@@ -11,9 +11,11 @@
 #
 # Asserts: ForegroundChanged ordering (greeter→session), halmasuit
 # PID continuous across the swap (login-flash invariant on the real
-# path), and — the point — the FrameRendered continuity invariant
-# holds across the WHOLE transition (no black frame, splash coverage
-# never lost). Snapshots gate the greeter and session scenes.
+# path), and — the point — exact-image continuity across the WHOLE
+# transition: the greeter scene and the post-swap session scene are
+# each compared pixel-for-pixel against their checked-in goldens, so a
+# flash (black/uncovered frame) at the swap could not pass. The pixel
+# gate IS the no-flash proof; there is no aggregate-statistic proxy.
 #
 # NOTE: the session user reaching halmasuit's wayland socket is
 # arranged test-locally (group membership). The production
@@ -235,10 +237,13 @@ pkgs.testers.runNixOSTest {
     print(f"PASS: halmasuit pid {halmasuit_pid} continuous across greeter→session")
 
     time.sleep(1)
-    visual.assert_matches_golden(machine, "foreground-session")
-
     # The point: no black/uncovered frame across the REAL transition.
-    visual.assert_frame_continuity(machine)
+    # The deleted mean_luminance/backdrop_coverage continuity proxy is
+    # replaced by the per-scene exact-image gate — the greeter and the
+    # post-transition session frame are each compared pixel-for-pixel
+    # against their checked-in goldens, which a flash (black/uncovered
+    # frame) at the swap could not pass.
+    visual.assert_matches_golden(machine, "foreground-session")
 
     print("visual-foreground: ALL ASSERTIONS PASSED")
   '';

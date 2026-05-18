@@ -2,12 +2,16 @@
 # halmasuit binary (halmasuit-debug, frame_audit on).
 #
 # Pins the precondition that halmasuit alone — no wl_client connected —
-# scans out the brand color #0a0014. Capture is the in-process
-# `Snapshot()` D-Bus method (a CPU readback of the exact composited
-# frame), NOT a QMP screendump of QEMU's display: Snapshot reads
-# halmasuit's own framebuffer, so the QEMU display substrate is
-# irrelevant and transient/pre-flip sampling cannot occur. ssimulacra2
-# compares the PNG to the checked-in golden.
+# composites the brand color #0a0014. Capture is the in-process
+# `Snapshot()` D-Bus method: a CPU readback of the OFFSCREEN GLES
+# render target (Mesa llvmpipe, no GPU, no GBM scanout), NOT a QMP
+# screendump of QEMU's display. The offscreen path renders the exact
+# same scene the production pipeline composites into a CPU-mappable
+# `GlesTexture`, so it is pixel-correct and deterministic run-to-run
+# even fully headless (virtio-gpu-pci). This is why the gate is
+# exact-image: `assert_matches_witness` compares the PNG to the
+# checked-in witness with ssimulacra2 ≥ 95.0 — replacing the deleted
+# mean_luminance/backdrop_coverage proxy heuristics.
 #
 # Greeter is `sleep infinity` — we never drive auth here; the test
 # waits for halmasuit's `scanout_active` event and for the D-Bus name
@@ -130,7 +134,11 @@ pkgs.testers.runNixOSTest {
         f"Snapshot method missing from Introspect interface:\n{introspect}"
     )
 
-    visual.assert_matches_golden(machine, "halmasuit-clear-color")
+    # Exact-image gate (ssimulacra2 >= 95.0) against the offscreen
+    # readback of the deterministic clear scene. Headless llvmpipe;
+    # no GPU, no GBM scanout — the offscreen GLES target is what makes
+    # this pixel-correct and reproducible.
+    visual.assert_matches_witness(machine, "halmasuit-clear-color")
 
     print("visual-halmasuit-clear: ALL ASSERTIONS PASSED")
   '';

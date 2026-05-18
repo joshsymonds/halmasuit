@@ -70,10 +70,8 @@ where
         .current_mode()
         .ok_or_else(|| io::Error::other("offscreen: output has no current mode"))?;
     let (w, h) = (mode.size.w, mode.size.h);
-    let wu =
-        usize::try_from(w).map_err(|_| io::Error::other("offscreen: negative mode width"))?;
-    let hu =
-        usize::try_from(h).map_err(|_| io::Error::other("offscreen: negative mode height"))?;
+    let wu = usize::try_from(w).map_err(|_| io::Error::other("offscreen: negative mode width"))?;
+    let hu = usize::try_from(h).map_err(|_| io::Error::other("offscreen: negative mode height"))?;
     if wu == 0 || hu == 0 {
         return Err(io::Error::other("offscreen: zero mode size"));
     }
@@ -104,12 +102,15 @@ where
 /// `clear_rgb` (no client content) must produce: every pixel is
 /// `[r, g, b, 0xFF]`, tightly packed, row-major.
 ///
-/// This is the deterministic exact-image reference for the clear scene.
-/// The visual gate compares the live offscreen readback against the
-/// PNG of this buffer via ssimulacra2 (≥ 95.0); the `frame_audit` unit
-/// tests compare [`read_frame_rgba`]'s analyzed output against bytes
-/// built here. It replaces the old `mean_luminance < 0.02` /
-/// `backdrop_coverage` proxy heuristics with an exact-image model.
+/// This is the deterministic exact-image reference for the clear
+/// scene, used by the in-crate exact-image unit tests (`frame_audit`
+/// and this module). The VM gate's exact-image comparison is the
+/// Python ssimulacra2 path (≥ 95.0) against the checked-in PNG
+/// witness; this Rust helper is the unit-test embodiment of the same
+/// model that replaces the old `mean_luminance < 0.02` /
+/// `backdrop_coverage` proxy heuristics. `#[cfg(test)]`: it has no
+/// non-test consumer, so it never bloats `halmasuit-debug` either.
+#[cfg(test)]
 #[must_use]
 pub fn expected_solid_frame(width: usize, height: usize, clear_rgb: [u8; 3]) -> Vec<u8> {
     let [r, g, b] = clear_rgb;
@@ -127,6 +128,8 @@ pub fn expected_solid_frame(width: usize, height: usize, clear_rgb: [u8; 3]) -> 
 /// exact-image equality used by the `frame_audit` unit tests; the VM
 /// gate uses ssimulacra2 (≥ 95.0) instead so minor llvmpipe rounding
 /// is tolerated, never bit-exact equality (epic anti-pattern).
+/// `#[cfg(test)]`: in-crate unit-test helper only.
+#[cfg(test)]
 #[must_use]
 pub fn frames_exactly_equal(a: &[u8], b: &[u8], width: usize, height: usize) -> bool {
     let n = width * height * 4;

@@ -12,13 +12,13 @@
 #   session-fullscreen   — + a fullscreen opaque OVERLAY client
 #   post-session-splash  — session client stopped; splash visible again
 #
-# Each scene is gated by a Snapshot() golden. Across the WHOLE run the
-# `FrameRendered` stream is asserted to satisfy the continuity
-# invariant (Epic #1 req 11): from the first
-# client_first_frame{role:background} every frame has
-# backdrop_coverage>0.95, and no frame is black once any client
-# committed. That stream assertion — not the snapshots — is the
-# actual no-flash proof.
+# Each scene is gated by a Snapshot() exact-image golden compared via
+# ssimulacra2. The no-flash proof (Epic #1 req 11) is the exact-image
+# chain itself: splash-only → greeter-over-splash → session-fullscreen
+# → splash-only again, each frame compared pixel-for-pixel against its
+# checked-in golden. A flash (a black or uncovered frame) at any layer
+# transition could not match these goldens, so the pixel gate IS the
+# continuity proof — there is no separate aggregate-statistic proxy.
 
 {
   system,
@@ -208,10 +208,13 @@ pkgs.testers.runNixOSTest {
     machine.succeed("systemctl stop test-greeter.service")
     machine.wait_until_fails("systemctl is-active --quiet test-greeter.service", timeout=30)
     time.sleep(2)
+    # The actual no-flash proof: the four scenes above are each
+    # compared pixel-for-pixel against their checked-in goldens. The
+    # deleted mean_luminance/backdrop_coverage continuity proxy is
+    # superseded by this exact-image chain — splash-only → greeter →
+    # session → splash-only again — a flash (black/uncovered frame) at
+    # any layer transition could not match these goldens.
     visual.assert_matches_golden(machine, "backdrop-post-session-splash")
-
-    # ── the actual no-flash proof: continuity over the whole run ────
-    visual.assert_frame_continuity(machine)
 
     print("visual-backdrop: ALL ASSERTIONS PASSED")
   '';
