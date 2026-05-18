@@ -36,6 +36,19 @@ use smithay::reexports::drm::control::connector;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::DeviceFd;
 
+/// Brand clear color halmasuit paints before any wl_client commits, as
+/// the RGB bytes of an `#0a0014` pixel: `red=0x0A, green=0x00,
+/// blue=0x14`. THE single source of truth for the clear color —
+/// `main.rs`'s scanout clear (`HALMASUIT_BRAND_CLEAR`) is
+/// `xrgb_le(CLEAR_RGB[0], CLEAR_RGB[1], CLEAR_RGB[2])` and
+/// `frame_audit`/`offscreen` reference this exact const, so the
+/// renderer and the audit can never silently disagree. This module is
+/// compiled into BOTH the production `halmasuit` and `halmasuit-debug`
+/// (it is not `frame_audit`-gated), so it is the only place all
+/// consumers can share. Value is IMMUTABLE per the visual-compositor
+/// epic's Requirement #5; do not change it.
+pub const CLEAR_RGB: [u8; 3] = [0x0A, 0x00, 0x14];
+
 /// Color formats we'll accept for scanout. ARGB2101010 first (preferred
 /// 10-bit), then 8-bit ARGB8888 / ABGR8888 as fallbacks. Matches anvil's
 /// list and is widely supported across virtio-gpu and real GPUs.
@@ -514,6 +527,10 @@ impl DrmBackend {
     /// pixel). Shared by `audit_frame` (analysis + `FrameRendered`)
     /// and the D-Bus `Snapshot()` publisher so the GL plumbing exists
     /// once. Returns `(rgba, width_px, height_px)`.
+    ///
+    /// Thin delegate to [`crate::offscreen::read_frame_rgba`] — the
+    /// offscreen GLES render-target mechanism lives in its own cohesive
+    /// `frame_audit`-gated module so production never compiles it.
     #[cfg(feature = "frame_audit")]
     fn read_frame_rgba<E>(
         &mut self,
@@ -524,50 +541,8 @@ impl DrmBackend {
     where
         E: smithay::backend::renderer::element::RenderElement<GlesRenderer>,
     {
-        use smithay::backend::allocator::Fourcc;
-        use smithay::backend::renderer::damage::OutputDamageTracker;
-        use smithay::backend::renderer::gles::GlesTexture;
-        use smithay::backend::renderer::{Bind, ExportMem, Offscreen};
-        use smithay::utils::{Point, Rectangle, Size};
-
-        let mode = output
-            .current_mode()
-            .ok_or_else(|| io::Error::other("frame_audit: output has no current mode"))?;
-        let (w, h) = (mode.size.w, mode.size.h);
-        let (wu, hu) = (
-            usize::try_from(w).map_err(|_| io::Error::other("frame_audit: negative mode width"))?,
-            usize::try_from(h)
-                .map_err(|_| io::Error::other("frame_audit: negative mode height"))?,
-        );
-        if wu == 0 || hu == 0 {
-            return Err(io::Error::other("frame_audit: zero mode size"));
-        }
         let color = xrgb_le_to_color32f(clear_color);
-
-        let mut tex: GlesTexture = Offscreen::<GlesTexture>::create_buffer(
-            &mut self.renderer,
-            Fourcc::Abgr8888,
-            (w, h).into(),
-        )
-        .map_err(|e| io::Error::other(format!("frame_audit create_buffer: {e}")))?;
-        let rgba = {
-            let mut fb = Bind::bind(&mut self.renderer, &mut tex)
-                .map_err(|e| io::Error::other(format!("frame_audit bind: {e}")))?;
-            let mut dt = OutputDamageTracker::from_output(output);
-            dt.render_output(&mut self.renderer, &mut fb, 0, elements, color)
-                .map_err(|e| io::Error::other(format!("frame_audit render_output: {e:?}")))?;
-            let region = Rectangle::new(Point::from((0, 0)), Size::from((w, h)));
-            let mapping =
-                ExportMem::copy_framebuffer(&mut self.renderer, &fb, region, Fourcc::Abgr8888)
-                    .map_err(|e| io::Error::other(format!("frame_audit copy_framebuffer: {e}")))?;
-            // `fb` (and its tex binding) is unused past the readback;
-            // drop it before `map_texture` per significant_drop_tightening.
-            drop(fb);
-            let bytes = ExportMem::map_texture(&mut self.renderer, &mapping)
-                .map_err(|e| io::Error::other(format!("frame_audit map_texture: {e}")))?;
-            bytes.to_vec()
-        };
-        Ok((rgba, wu, hu))
+        crate::offscreen::read_frame_rgba(&mut self.renderer, output, elements, color)
     }
 
     /// Acknowledge a page-flip completion. Called from the

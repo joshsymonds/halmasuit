@@ -11,11 +11,14 @@
 // crate, no img_hash: the perceptual hash is an in-house 8x8
 // average-hash so production `cargo tree` stays clean.
 
-/// Brand clear color halmasuit paints before any client commits,
-/// as the RGB bytes of an `#0a0014` pixel. A pixel exactly equal to
-/// this is "halmasuit's clear", not client content; `backdrop_coverage`
-/// is the fraction of pixels that differ from it.
-const CLEAR_RGB: [u8; 3] = [0x0a, 0x00, 0x14];
+/// Brand clear color halmasuit paints before any client commits, as
+/// the RGB bytes of an `#0a0014` pixel. A pixel exactly equal to this
+/// is "halmasuit's clear", not client content; `backdrop_coverage` is
+/// the fraction of pixels that differ from it. Re-exported from
+/// [`crate::drm::CLEAR_RGB`] — the single source of truth shared with
+/// the renderer clear and the `offscreen` exact-image model — so the
+/// audit can never disagree with what was actually painted.
+use crate::drm::CLEAR_RGB;
 
 /// Rec.709 perceptual luma of one RGB pixel, normalized `0.0..=1.0`.
 fn luma(r: u8, g: u8, b: u8) -> f64 {
@@ -119,25 +122,47 @@ pub fn analyze(bytes: &[u8], width: usize, height: usize) -> FrameStats {
 #[cfg(test)]
 mod tests {
     use super::{CLEAR_RGB, analyze, luma};
+    use crate::offscreen::{expected_solid_frame, frames_exactly_equal};
 
     const EPS: f64 = 1e-12;
 
     fn fill(w: usize, h: usize, rgb: [u8; 3]) -> Vec<u8> {
-        let mut v = Vec::with_capacity(w * h * 4);
-        for _ in 0..w * h {
-            v.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 0xFF]);
-        }
-        v
+        expected_solid_frame(w, h, rgb)
     }
 
     #[test]
-    fn all_clear_color_is_zero_coverage_and_dim() {
-        let s = analyze(&fill(16, 16, CLEAR_RGB), 16, 16);
+    fn all_clear_color_matches_expected_clear_frame_exactly() {
+        // Exact-image model (replaces the old `mean_luminance < 0.02`
+        // "dim" proxy): a frame of pure clear color must be byte-for-
+        // byte the canonical clear readback, and `analyze` must report
+        // ZERO non-clear coverage. No luminance threshold — the gate is
+        // exact-image equality (ssimulacra2 ≥ 95.0 in the VM), not "is
+        // it dark enough".
+        let frame = fill(16, 16, CLEAR_RGB);
+        assert!(frames_exactly_equal(
+            &frame,
+            &expected_solid_frame(16, 16, CLEAR_RGB),
+            16,
+            16
+        ));
+        let s = analyze(&frame, 16, 16);
         assert!(s.backdrop_coverage.abs() < EPS);
-        // luma(#0a0014) is tiny but nonzero.
-        let expected = luma(0x0a, 0x00, 0x14);
-        assert!((s.mean_luminance - expected).abs() < 1e-9);
-        assert!(s.mean_luminance < 0.02);
+        // Cross-check the perceptual luma is exactly luma(#0a0014) —
+        // pins the channel order, not a "dim enough" heuristic.
+        assert!((s.mean_luminance - luma(CLEAR_RGB[0], CLEAR_RGB[1], CLEAR_RGB[2])).abs() < 1e-9);
+    }
+
+    #[test]
+    fn black_frame_does_not_match_clear_frame() {
+        // The bug this project exists to catch: halmasuit painting
+        // black instead of #0a0014. Exact-image inequality fires.
+        let black = fill(16, 16, [0, 0, 0]);
+        assert!(!frames_exactly_equal(
+            &black,
+            &expected_solid_frame(16, 16, CLEAR_RGB),
+            16,
+            16
+        ));
     }
 
     #[test]

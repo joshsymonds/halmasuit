@@ -21,6 +21,8 @@ mod dbus;
 mod drm;
 #[cfg(feature = "frame_audit")]
 mod frame_audit;
+#[cfg(feature = "frame_audit")]
+mod offscreen;
 mod swap_gate;
 
 use std::collections::HashMap;
@@ -1389,11 +1391,15 @@ fn broker_socket_path_from_env() -> PathBuf {
 /// client yet" from "halmasuit broken / producing black" — every
 /// frame painted before halmasuit-splash connects is this exact color.
 ///
-/// Built via [`drm::xrgb_le`] so the byte ordering is unit-tested at
-/// build (see `drm::tests::xrgb_le_pins_byte_order`) — silent reverts
-/// to the wrong byte order, channel transpose, or `#000000` trip a
-/// fast unit test before the visual VM gate.
-const HALMASUIT_BRAND_CLEAR: [u8; 4] = drm::xrgb_le(0x0A, 0x00, 0x14);
+/// Built via [`drm::xrgb_le`] from [`drm::CLEAR_RGB`] — the single
+/// source of truth for the clear color — so the byte ordering is
+/// unit-tested at build (see `drm::tests::xrgb_le_pins_byte_order`)
+/// and the renderer clear can never drift from what `frame_audit` /
+/// `offscreen` expect. Silent reverts to the wrong byte order, a
+/// channel transpose, or `#000000` trip a fast unit test before the
+/// visual VM gate.
+const HALMASUIT_BRAND_CLEAR: [u8; 4] =
+    drm::xrgb_le(drm::CLEAR_RGB[0], drm::CLEAR_RGB[1], drm::CLEAR_RGB[2]);
 
 /// Resolve the DRM device path to use, honoring overrides and the
 /// `HALMASUIT_SKIP_DRM_MASTER` dev/test bypass. Returns `Ok(None)` only
