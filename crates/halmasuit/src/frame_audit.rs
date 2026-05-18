@@ -31,12 +31,23 @@ fn luma(r: u8, g: u8, b: u8) -> f64 {
     acc / 255.0
 }
 
-/// Result of analyzing one composited frame. Field semantics match
-/// the like-named `Event::FrameRendered` fields.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Result of analyzing one composited frame. EXACT integer/boolean
+/// facts (no fuzzy aggregate floats); field semantics match the
+/// like-named `Event::FrameRendered` fields. The no-flash stream gate
+/// is asserted over these exact values with zero tolerance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameStats {
-    pub mean_luminance: f64,
-    pub backdrop_coverage: f64,
+    /// Total pixels (`width * height`).
+    pub pixel_count: u64,
+    /// EXACT count of pixels byte-equal to [`CLEAR_RGB`] (the
+    /// uncovered-clear sentinel).
+    pub clear_pixel_count: u64,
+    /// EXACT count of pixels byte-equal to pure black `#000000`.
+    pub black_pixel_count: u64,
+    /// The frame is all-clear, all-black, or empty — the zero-tolerance
+    /// flash predicate.
+    pub degenerate: bool,
+    /// 64-bit average-hash perceptual fingerprint (exact integer).
     pub phash: u64,
 }
 
@@ -52,12 +63,12 @@ pub struct FrameStats {
 /// zero — both are caller bugs (the readback size is derived from the
 /// output mode), not runtime conditions.
 // reason: r,g,b,x,y are the conventional pixel-channel / coordinate
-// names; pixel and area counts are bounded far below 2^52 so the
-// usize->f64 casts are exact, not lossy.
+// names; the phash block-luma means stay f64 but pixel/area counts are
+// bounded far below 2^52 so the usize->f64 casts there are exact.
 #[allow(
     clippy::many_single_char_names,
     clippy::cast_precision_loss,
-    reason = "conventional channel/coord names; counts << 2^52 so f64 is exact"
+    reason = "conventional channel/coord names; phash block counts << 2^52 so f64 is exact"
 )]
 #[must_use]
 pub fn analyze(bytes: &[u8], width: usize, height: usize) -> FrameStats {
@@ -70,9 +81,16 @@ pub fn analyze(bytes: &[u8], width: usize, height: usize) -> FrameStats {
         px
     );
 
-    let mut luma_sum = 0.0_f64;
-    let mut non_clear = 0_usize;
-    // 8x8 block luma accumulators for the average-hash.
+    // EXACT integer pixel classification — no luminance/coverage
+    // float aggregates. `clear`/`black` are byte-equality counts; a
+    // flash is "the clear sentinel showed through" (clear > 0 after
+    // the backdrop maps) or "all clear / all black" (degenerate),
+    // both decidable with zero tolerance.
+    let mut clear = 0_u64;
+    let mut black = 0_u64;
+    // 8x8 block luma accumulators for the average-hash. The phash is
+    // itself an exact integer fingerprint; only its internal block
+    // means are floats (content-shift detection, not a flash gate).
     let mut block_sum = [0.0_f64; 64];
     let mut block_cnt = [0_u32; 64];
 
@@ -81,13 +99,14 @@ pub fn analyze(bytes: &[u8], width: usize, height: usize) -> FrameStats {
         for x in 0..width {
             let i = (y * width + x) * 4;
             let (r, g, b) = (bytes[i], bytes[i + 1], bytes[i + 2]);
-            let lum = luma(r, g, b);
-            luma_sum += lum;
-            if [r, g, b] != CLEAR_RGB {
-                non_clear += 1;
+            if [r, g, b] == CLEAR_RGB {
+                clear += 1;
+            }
+            if [r, g, b] == [0, 0, 0] {
+                black += 1;
             }
             let bx = (x * 8 / width).min(7);
-            block_sum[by * 8 + bx] += lum;
+            block_sum[by * 8 + bx] += luma(r, g, b);
             block_cnt[by * 8 + bx] += 1;
         }
     }
@@ -112,32 +131,40 @@ pub fn analyze(bytes: &[u8], width: usize, height: usize) -> FrameStats {
         }
     }
 
+    let pixel_count = px as u64;
+    // Degenerate iff every pixel is the clear sentinel, or every pixel
+    // is pure black, or there are no pixels. `analyze` asserts px > 0
+    // above, so the empty case is structurally handled by the caller;
+    // it is folded in here so the predicate is total over the schema.
+    let degenerate = pixel_count == 0 || clear == pixel_count || black == pixel_count;
+
     FrameStats {
-        mean_luminance: luma_sum / px as f64,
-        backdrop_coverage: non_clear as f64 / px as f64,
+        pixel_count,
+        clear_pixel_count: clear,
+        black_pixel_count: black,
+        degenerate,
         phash,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CLEAR_RGB, analyze, luma};
+    use super::{CLEAR_RGB, analyze};
     use crate::offscreen::{expected_solid_frame, frames_exactly_equal};
-
-    const EPS: f64 = 1e-12;
 
     fn fill(w: usize, h: usize, rgb: [u8; 3]) -> Vec<u8> {
         expected_solid_frame(w, h, rgb)
     }
 
     #[test]
-    fn all_clear_color_matches_expected_clear_frame_exactly() {
-        // Exact-image model (replaces the old `mean_luminance < 0.02`
-        // "dim" proxy): a frame of pure clear color must be byte-for-
-        // byte the canonical clear readback, and `analyze` must report
-        // ZERO non-clear coverage. No luminance threshold — the gate is
-        // exact-image equality (ssimulacra2 ≥ 95.0 in the VM), not "is
-        // it dark enough".
+    fn all_clear_color_is_exact_clear_and_degenerate() {
+        // Exact-integer model (replaces the old `mean_luminance` /
+        // `backdrop_coverage` float proxy): a frame of pure clear
+        // color is byte-for-byte the canonical clear readback, EVERY
+        // pixel counts as clear, and the frame is `degenerate` (the
+        // zero-tolerance flash predicate fires — a fully-clear frame
+        // after the backdrop maps is exactly the flash). No luminance
+        // threshold anywhere.
         let frame = fill(16, 16, CLEAR_RGB);
         assert!(frames_exactly_equal(
             &frame,
@@ -146,16 +173,18 @@ mod tests {
             16
         ));
         let s = analyze(&frame, 16, 16);
-        assert!(s.backdrop_coverage.abs() < EPS);
-        // Cross-check the perceptual luma is exactly luma(#0a0014) —
-        // pins the channel order, not a "dim enough" heuristic.
-        assert!((s.mean_luminance - luma(CLEAR_RGB[0], CLEAR_RGB[1], CLEAR_RGB[2])).abs() < 1e-9);
+        assert_eq!(s.pixel_count, 256);
+        assert_eq!(s.clear_pixel_count, 256);
+        assert_eq!(s.black_pixel_count, 0);
+        assert!(s.degenerate);
     }
 
     #[test]
-    fn black_frame_does_not_match_clear_frame() {
+    fn black_frame_is_exact_black_and_degenerate() {
         // The bug this project exists to catch: halmasuit painting
-        // black instead of #0a0014. Exact-image inequality fires.
+        // black instead of #0a0014. Exact-image inequality fires AND
+        // the all-black frame reads as degenerate with an exact black
+        // pixel count == pixel_count and zero clear pixels.
         let black = fill(16, 16, [0, 0, 0]);
         assert!(!frames_exactly_equal(
             &black,
@@ -163,29 +192,29 @@ mod tests {
             16,
             16
         ));
+        let s = analyze(&black, 16, 16);
+        assert_eq!(s.black_pixel_count, 256);
+        assert_eq!(s.clear_pixel_count, 0);
+        assert!(s.degenerate);
     }
 
     #[test]
-    fn all_white_is_full_coverage_and_bright() {
+    fn all_white_is_fully_painted_not_degenerate() {
+        // Solid client content (not clear, not black): zero clear
+        // pixels, zero black pixels, NOT degenerate — a healthy
+        // fully-covered frame.
         let s = analyze(&fill(16, 16, [255, 255, 255]), 16, 16);
-        assert!((s.backdrop_coverage - 1.0).abs() < EPS);
-        assert!((s.mean_luminance - 1.0).abs() < 1e-9);
+        assert_eq!(s.clear_pixel_count, 0);
+        assert_eq!(s.black_pixel_count, 0);
+        assert!(!s.degenerate);
     }
 
     #[test]
-    fn all_black_is_full_coverage_and_dark() {
-        // Black (0,0,0) is NOT the clear color, so a client painting
-        // black still counts as covered — and it must read as a black
-        // frame (mean_luminance ~0) so the no-black-frame invariant
-        // can fire.
-        let s = analyze(&fill(16, 16, [0, 0, 0]), 16, 16);
-        assert!((s.backdrop_coverage - 1.0).abs() < EPS);
-        assert!(s.mean_luminance.abs() < EPS);
-    }
-
-    #[test]
-    fn half_covered_is_half_coverage() {
-        // Left half clear, right half green.
+    fn half_clear_half_content_is_exact_clear_count_not_degenerate() {
+        // Left half clear sentinel, right half green. The exact clear
+        // count is half the pixels — a partial flash the stream gate
+        // catches via `clear_pixel_count != 0` (NOT a >0.95 coverage
+        // float). Not degenerate (neither all-clear nor all-black).
         let (w, h) = (16, 16);
         let mut v = Vec::new();
         for _y in 0..h {
@@ -199,7 +228,25 @@ mod tests {
             }
         }
         let s = analyze(&v, w, h);
-        assert!((s.backdrop_coverage - 0.5).abs() < 1e-9);
+        assert_eq!(s.clear_pixel_count, 128);
+        assert_eq!(s.pixel_count, 256);
+        assert!(!s.degenerate);
+    }
+
+    #[test]
+    fn single_clear_pixel_is_caught_exactly() {
+        // Zero-tolerance: ONE sentinel-clear pixel in an otherwise
+        // fully-painted frame is a nonzero exact count. The stream
+        // gate asserts == 0, so this single pixel is a detected flash
+        // (a fuzzy >0.95-coverage proxy would have rounded it away).
+        let (w, h) = (32, 32);
+        let mut v = expected_solid_frame(w, h, [0x16, 0xC4, 0x4E]);
+        v[0] = CLEAR_RGB[0];
+        v[1] = CLEAR_RGB[1];
+        v[2] = CLEAR_RGB[2];
+        let s = analyze(&v, w, h);
+        assert_eq!(s.clear_pixel_count, 1);
+        assert!(!s.degenerate);
     }
 
     #[test]

@@ -514,8 +514,10 @@ impl DrmBackend {
         }
         halmasuit_introspect::emit(&halmasuit_introspect::Event::FrameRendered {
             frame_id: self.frame_counter,
-            mean_luminance: stats.mean_luminance,
-            backdrop_coverage: stats.backdrop_coverage,
+            pixel_count: stats.pixel_count,
+            clear_pixel_count: stats.clear_pixel_count,
+            black_pixel_count: stats.black_pixel_count,
+            degenerate: stats.degenerate,
             phash: stats.phash,
         });
         self.frame_counter += 1;
