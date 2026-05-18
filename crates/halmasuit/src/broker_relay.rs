@@ -9,10 +9,10 @@
 //! (Epic R1/R2/R3).
 //!
 //! **Pure**: no socket, no libpam, no process control, no `unsafe`,
-//! no pidfd. The later R3 socket-wiring step wraps this brain with the
-//! actual `SOCK_SEQPACKET` I/O to become the live `PamSession` and
-//! implements the Amendment-A5 two-key flash-free swap + the
-//! SCM_RIGHTS pidfd backstop — none of that lives here.
+//! no pidfd. [`crate::broker_session::BrokerEpisode`] wraps this brain
+//! with the actual `SOCK_SEQPACKET` I/O — it is the live `PamSession`
+//! and implements the Amendment-A5 two-key flash-free swap + the
+//! SCM_RIGHTS pidfd backstop; none of that lives here.
 //!
 //! Amendment A5: session-lifecycle is one-way broker→compositor. This
 //! adapter only ever *consumes* [`BrokerToCompositor::SessionOpened`]/
@@ -21,14 +21,6 @@
 //! `CompositorToBroker` variant). Frame ordering is enforced by an
 //! explicit phase machine that fails closed on anything out of
 //! sequence.
-
-// reason: this pure adapter is the brain; the live `PamSessionFactory`
-// swap + SEQPACKET I/O wrapper that constructs and drives it is R3
-// step 2 (the next task). Until that lands the type is exercised only
-// by this module's tests, so the non-test build sees it as unused.
-// The allowance is removed when step 2 wires it into the connection
-// loop (Amendment A4 — atomic with deleting halmasuit-pam).
-#![allow(dead_code)]
 
 use std::fmt;
 
@@ -219,13 +211,6 @@ impl BrokerRelay {
             cmd,
             env: env.iter().map(|e| split_env_pair(e)).collect(),
         })
-    }
-
-    /// Abort: emit `Cancel` and become terminal. Valid in any
-    /// non-terminal phase (a greeter `CancelSession` / disconnect).
-    pub const fn cancel(&mut self) -> CompositorToBroker {
-        self.phase = Phase::Done;
-        CompositorToBroker::Cancel
     }
 
     /// Force the terminal phase WITHOUT emitting a frame.
@@ -592,23 +577,5 @@ mod tests {
     fn step_after_success_is_out_of_phase() {
         let mut r = authed();
         assert_eq!(r.on_pam_step(None), Err(RelayError::OutOfPhase));
-    }
-
-    // ── cancel ───────────────────────────────────────────────────────
-
-    #[test]
-    fn cancel_emits_cancel_and_is_terminal() {
-        let mut r = begun();
-        assert_eq!(r.cancel(), CompositorToBroker::Cancel);
-        // Terminal afterwards.
-        assert_eq!(r.on_pam_step(None), Err(RelayError::OutOfPhase));
-        assert_eq!(
-            r.on_broker_frame(BrokerToCompositor::Success {
-                username: "x".into(),
-                uid: 1,
-                gid: 1,
-            }),
-            Err(RelayError::OutOfPhase)
-        );
     }
 }

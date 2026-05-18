@@ -27,12 +27,6 @@
 //! `halmasuit-session-ipc` codec is shared (the SEQPACKET syscall
 //! wrapper is reimplemented locally).
 
-// reason: `BrokerEpisode` is constructed + driven by the calloop
-// rewire (the next S1 bite, #31); until that lands it is exercised
-// only by this module's tests, so the non-test build sees it as
-// unused. The allowance is removed when the calloop wiring lands.
-#![allow(dead_code)]
-
 use std::fmt;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
@@ -122,33 +116,17 @@ impl SeqpacketChannel {
         }
     }
 
-    /// Read at most one datagram and decode it, non-blocking.
+    /// Read at most one datagram, decode it, and return any ONE
+    /// `SCM_RIGHTS` fd the broker attached (the Amendment-A5.6
+    /// poll-only leader pidfd, sent with `SessionOpened`).
+    /// Non-blocking — always `recvmsg`-with-cmsg-space (never a bare
+    /// `recv`, which would truncate the ancillary data, set
+    /// `MSG_CTRUNC`, and leak the kernel-dup'd fd).
     ///
     /// `Ok(None)` means "no datagram ready" (`EAGAIN`/`EWOULDBLOCK`) —
-    /// a spurious calloop wakeup; the caller does nothing.
-    ///
-    /// # Errors
-    /// [`WireError::Closed`] on peer hangup; [`WireError::Codec`] on a
-    /// bad/oversized body; [`WireError::Malformed`] if the datagram is
-    /// not exactly one complete message; [`WireError::Io`] on a `recv`
-    /// error other than would-block.
-    pub fn recv(&self) -> Result<Option<BrokerToCompositor>, WireError> {
-        // Always recvmsg-with-cmsg-space (never bare recv): the broker
-        // attaches an SCM_RIGHTS leader pidfd to `SessionOpened`
-        // (Amendment A5.6). A bare recv would truncate that ancillary
-        // data (`MSG_CTRUNC`) and the kernel would leak the dup'd fd.
-        // This wrapper drops any fd; `recv_with_fd` keeps it.
-        Ok(self.recv_with_fd()?.map(|(msg, fd)| {
-            drop(fd);
-            msg
-        }))
-    }
-
-    /// Amendment A5.6 receive: like [`Self::recv`] but also returns any
-    /// ONE `SCM_RIGHTS` fd the broker attached (the poll-only leader
-    /// pidfd, sent with `SessionOpened`). Non-blocking; `Ok(None)` on
-    /// `EAGAIN`. The fd is a fresh [`OwnedFd`] kernel-dup'd into this
-    /// process; the compositor treats it STRICTLY poll-only (never
+    /// a spurious calloop wakeup; the caller does nothing. The fd is a
+    /// fresh [`OwnedFd`] kernel-dup'd into this process; the compositor
+    /// treats it STRICTLY poll-only (never
     /// waitid/reap/pidfd_send_signal — the broker is the sole reaper,
     /// R9/A5).
     ///
@@ -158,8 +136,10 @@ impl SeqpacketChannel {
     /// them all and errors.
     ///
     /// # Errors
-    /// As [`Self::recv`], plus [`WireError::Malformed`] on >1 attached
-    /// fd.
+    /// [`WireError::Closed`] on peer hangup; [`WireError::Codec`] on a
+    /// bad/oversized body; [`WireError::Malformed`] if the datagram is
+    /// not exactly one complete message or carried >1 fd;
+    /// [`WireError::Io`] on a `recvmsg` error other than would-block.
     pub fn recv_with_fd(&self) -> Result<Option<(BrokerToCompositor, Option<OwnedFd>)>, WireError> {
         let mut buf = vec![0u8; std::mem::size_of::<u32>() + MAX_MESSAGE_SIZE as usize];
         let mut iov = [std::io::IoSliceMut::new(&mut buf)];
@@ -250,8 +230,10 @@ pub struct EpisodeOutcome {
     /// Set once, when greetd reached `Spawning` and `StartSession` was
     /// forwarded to the broker. Carries the broker's PAM-resolved
     /// identity (R8 — never the client hint) for the compositor's
-    /// session bookkeeping (`session_uid`, greeter teardown). The A5
-    /// two-key flash-free VISIBLE swap is a later task.
+    /// session bookkeeping (`session_uid`); identity bookkeeping ONLY —
+    /// the greeter teardown + foreground flip are gated by the A5
+    /// two-key `SwapGate` (`session_opened` + the session client's
+    /// first non-empty frame), never on `spawned` alone.
     pub spawned: Option<SpawnRequest>,
     /// Amendment A5 key 1: the broker sent `SessionOpened` (leader
     /// forked+dropped, `pam_open_session` ok). Set once. The compositor

@@ -2,12 +2,14 @@
 //!
 //! PID 1 (systemd) creates+binds+listens the `SOCK_SEQPACKET` socket
 //! and passes it as `LISTEN_FDS` fd 3; this process never binds
-//! anything itself. It then serially accepts ONE connection at a time
-//! (Epic R5 global single slot) and runs the full one-handle lifecycle
-//! per connection via `halmasuit_session::handle_connection`, with a
-//! single long-lived `AuthSlot`. When the listening socket goes away
-//! the process exits and the unit deactivates — there is NO standing
-//! root process when idle (Epic R6).
+//! anything itself. It runs `halmasuit_session::run_broker` — the
+//! Amendment-A2 single calloop event loop multiplexing the listener,
+//! the in-flight worker, the greeter channel and signals over one
+//! global `AuthSlot` (Epic R5 single slot; a new `CreateSession`
+//! evicts the in-flight one). An idle-exit timer ends the process
+//! when nothing is in flight; the unit deactivates and PID 1's
+//! retained socket re-activates it on the next connection — there is
+//! NO standing root process when idle (Epic R6).
 //!
 //! `#![forbid(unsafe_code)]`: pure composition. The inherited-fd
 //! adoption (the only `unsafe` socket activation needs) is quarantined

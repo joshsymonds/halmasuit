@@ -9,29 +9,27 @@
 //! `#![forbid(unsafe_code)]`; the only unsafe in the crate stays in
 //! `pam_ffi`/`worker`.
 //!
-//! R9 teardown note (for R13's ARCHITECTURE.md/CLAUDE.md rewrite):
-//! the Epic-R9 clause "extend the COMPOSITOR's existing single
-//! SIGCHLD `waitpid(WNOHANG)` reaper with a `PamWorker` `ReapOutcome`
-//! variant" is SUPERSEDED by this out-of-process broker and is N/A
-//! here. The compositor neither spawns nor reaps the PAM worker; the
-//! broker's `AuthSlot` owns `WorkerHandle{pid,pidfd}` and reaps it
-//! synchronously (pidfd-kill + `waitpid`) at every connection-terminal
-//! point — success/auth-fail (`reap_current`), greeter-cancel /
-//! out-of-phase (`cancel_current`), and transport-error (the R9
-//! invariant added below in `relay`/`BrokerLoop::step`). No second
+//! R9 reaping: the broker's `AuthSlot` owns `WorkerHandle{pid,pidfd}`
+//! and is the SOLE reaper — it reaps synchronously (pidfd-kill +
+//! `waitpid`) at every connection-terminal point: success/auth-fail
+//! (`reap_current`), greeter-cancel / out-of-phase (`cancel_current`),
+//! and transport-error (the R9 invariant in `BrokerLoop::step`). The
+//! compositor neither spawns nor reaps the worker (Epic-R9's
+//! superseded "extend the compositor SIGCHLD reaper" clause is N/A —
+//! `halmasuit-pam` is deleted; Amendments A4/A5). No second
 //! SIGCHLD/`waitid(P_PIDFD)` reaper exists (R9 anti-pattern); reaping
-//! stays slot-owned and synchronous. The superseded compositor-reaper
-//! extension goes away with `halmasuit-pam` in the successor
-//! (compositor→broker) epic (Amendment A3).
+//! stays slot-owned and synchronous.
 //!
-//! The relay is strictly turn-based, mirroring the PAM conversation:
-//! the worker prompts and the broker pumps the answer back, then the
-//! worker reports `AuthOk` and BLOCKS for the greeter's
-//! `StartSession` (Amendment A1.1 — the spec is read post-auth), then
-//! `SessionOpened`/`SessionEnded`. The real libpam path is proven by
-//! the flagship VM gate (Epic R12 forbids PAM mocks); the relay state
-//! machine here is exercised PAM-free with a scripted worker child
-//! (process/relay testing is not a PAM mock).
+//! The relay is the step-driven `Relay` state machine (Amendment A2):
+//! the calloop loop in `run_broker` pumps `on_worker_readable`/
+//! `on_greeter_readable` on FD readiness, never blocking the thread.
+//! It mirrors the PAM conversation — the worker prompts and the broker
+//! pumps the answer back, then the worker reports `AuthOk` and BLOCKS
+//! for the greeter's `StartSession` (Amendment A1.1 — the spec is read
+//! post-auth), then `SessionOpened`/`SessionEnded`. The real libpam
+//! path is proven by the flagship VM gate (Epic R12 forbids PAM
+//! mocks); the state machine here is exercised PAM-free with a
+//! scripted worker child (process/relay testing is not a PAM mock).
 #![forbid(unsafe_code)]
 
 use std::io;
@@ -141,6 +139,12 @@ impl Relay {
         }
     }
 
+    /// Test-only phase accessor. The production driver is the calloop
+    /// loop's `BrokerLoop::step`, which dispatches by WHICH fd became
+    /// readable (calloop tells it), never by querying the phase; only
+    /// the turn-based test harness (`drive`) and the `step_machine_*`
+    /// phase-transition assertions need this getter.
+    #[cfg(test)]
     pub(crate) const fn phase(&self) -> RelayPhase {
         self.phase
     }
@@ -286,81 +290,6 @@ fn reap_for_disposition(slot: &mut AuthSlot, disp: &Disposition) {
             let _ = slot.cancel_current();
         }
     }
-}
-
-/// Blocking driver over [`Relay`] — turn-based, used by
-/// [`handle_connection`] and the relay tests. The Amendment-A2 calloop
-/// loop (next task) calls the step methods directly from FD callbacks
-/// and DELETES this driver + the serial binary loop (no shim then).
-///
-/// # Errors
-///
-/// [`BrokerError`] on transport failure, an out-of-phase frame, or a
-/// vanished worker.
-pub(crate) fn relay(
-    slot: &mut AuthSlot,
-    compositor: &SeqpacketChannel,
-) -> Result<Disposition, BrokerError> {
-    let mut r = Relay::new();
-    loop {
-        let step = match r.phase() {
-            RelayPhase::AwaitWorker | RelayPhase::SessionRunning => {
-                r.on_worker_readable(slot, compositor)
-            }
-            RelayPhase::AwaitGreeterConvResponse | RelayPhase::AwaitGreeterStartSession => {
-                r.on_greeter_readable(slot, compositor)
-            }
-        };
-        match step {
-            Ok(RelayStep::Continue) => {}
-            Ok(RelayStep::Finished(d)) => {
-                // R9: reap exactly once at the terminal point. (No
-                // calloop sources here — this blocking driver is used
-                // by handle_connection + the relay tests, not the loop;
-                // A8.2 ordering is the loop's concern, in `step`.)
-                reap_for_disposition(slot, &d);
-                return Ok(d);
-            }
-            Err(e) => {
-                // R9: the connection ended for ANY reason (transport
-                // failure / out-of-phase / vanished worker) ⇒ SIGKILL +
-                // reap exactly once before returning — no transient
-                // zombie. The relay no longer reaps in-step, so this is
-                // the sole reaper for every error path; idempotent if
-                // the worker is already gone.
-                let _ = slot.cancel_current();
-                return Err(e);
-            }
-        }
-    }
-}
-
-/// Handle ONE accepted compositor↔broker connection end to end.
-///
-/// SO_PEERCRED-gated (via [`AuthSlot::create`]'s relay-peer gate),
-/// reads [`CompositorToBroker::BeginAuth`], spawns the
-/// Amendment-A1 full-lifecycle worker into the global single slot,
-/// then [`relay`]s. The `service`/`username` from `BeginAuth` are
-/// only the `pam_start` hint; the authoritative identity is the
-/// worker's PAM-resolved one (Epic R8).
-///
-/// # Errors
-///
-/// [`BrokerError`] — peer/slot refusal, an out-of-phase frame, or
-/// transport failure.
-pub fn handle_connection(
-    slot: &mut AuthSlot,
-    compositor: &SeqpacketChannel,
-) -> Result<Disposition, BrokerError> {
-    let puid = peer_uid(compositor)?;
-    let CompositorToBroker::BeginAuth { service, username } =
-        compositor.recv::<CompositorToBroker>()?
-    else {
-        return Err(BrokerError::UnexpectedFrame);
-    };
-    slot.create(puid, || spawn_session_worker(&service, &username))
-        .map_err(BrokerError::Slot)?;
-    relay(slot, compositor)
 }
 
 /// The in-flight connection's per-conn state (Amendment A2): the
@@ -665,10 +594,56 @@ mod tests {
         (SeqpacketChannel::new(a), SeqpacketChannel::new(b))
     }
 
-    /// Drive the relay with a scripted worker child (real fork, NO
-    /// libpam — process/relay testing, Epic R12 intact) that walks the
-    /// full Amendment-A1 sequence, and a greeter thread on the
-    /// compositor end.
+    /// Test harness: drive a fresh [`Relay`] to a terminal
+    /// [`Disposition`] turn-by-turn, EXACTLY as the production calloop
+    /// loop's [`BrokerLoop::step`] does (phase-dispatch the step
+    /// methods; on a terminal step reap via the same
+    /// `reap_for_disposition`/`cancel_current` the loop uses). This is
+    /// the test-only end-to-end orchestration of the SAME step methods
+    /// `run_broker` calls — there is NO production turn-based driver
+    /// (the old `relay`/`handle_connection` are deleted; the loop is
+    /// the sole production driver).
+    fn drive(
+        slot: &mut AuthSlot,
+        compositor: &SeqpacketChannel,
+    ) -> Result<Disposition, BrokerError> {
+        let mut r = Relay::new();
+        loop {
+            let step = match r.phase() {
+                RelayPhase::AwaitWorker | RelayPhase::SessionRunning => {
+                    r.on_worker_readable(slot, compositor)
+                }
+                RelayPhase::AwaitGreeterConvResponse | RelayPhase::AwaitGreeterStartSession => {
+                    r.on_greeter_readable(slot, compositor)
+                }
+            };
+            match step {
+                Ok(RelayStep::Continue) => {}
+                Ok(RelayStep::Finished(d)) => {
+                    // Same as the loop's `step()`: caller reaps once at
+                    // the terminal point (A8.6 — the relay step never
+                    // reaps in-step).
+                    reap_for_disposition(slot, &d);
+                    return Ok(d);
+                }
+                Err(e) => {
+                    // R9: connection ended for ANY reason ⇒ SIGKILL +
+                    // reap exactly once (no transient zombie). Same
+                    // sole-error-reaper contract as the loop's `step()`.
+                    let _ = slot.cancel_current();
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// End-to-end relay walk of the full Amendment-A1 sequence via the
+    /// production step methods (driven by the `drive` harness, the
+    /// shape `run_broker` calls them in). Scripted worker child (real
+    /// fork, NO libpam — process/relay testing, Epic R12 intact) + a
+    /// greeter thread on the compositor end. Asserts R8 `Success`
+    /// identity passthrough and A5 one-way `SessionOpened`/
+    /// `SessionEnded` forwarding.
     #[test]
     fn relay_full_lifecycle_auth_then_session() {
         let mut slot = AuthSlot::new(GREETER, 5, Duration::from_secs(10));
@@ -751,7 +726,7 @@ mod tests {
             );
         });
 
-        let disp = relay(&mut slot, &broker_end).expect("relay ok");
+        let disp = drive(&mut slot, &broker_end).expect("relay ok");
         assert_eq!(
             disp,
             Disposition::Completed {
@@ -825,7 +800,7 @@ mod tests {
             );
         });
 
-        let disp = relay(&mut slot, &broker_end).expect("relay ok");
+        let disp = drive(&mut slot, &broker_end).expect("relay ok");
         assert_eq!(
             disp,
             Disposition::Completed {
@@ -860,46 +835,15 @@ mod tests {
             );
         });
 
-        let disp = relay(&mut slot, &broker_end).expect("relay ok");
+        let disp = drive(&mut slot, &broker_end).expect("relay ok");
         assert!(matches!(disp, Disposition::AuthFailed { .. }));
         assert!(slot.current().is_none());
         gt.join().unwrap();
     }
 
-    #[test]
-    fn relay_greeter_cancel_sigkills_the_worker() {
-        let mut slot = AuthSlot::new(GREETER, 5, Duration::from_secs(10));
-        slot.create(GREETER, || {
-            spawn_worker(|w| {
-                w.send(&BrokerToCompositor::ConvPrompt {
-                    style: PromptStyle::Secret,
-                    message: "PW: ".into(),
-                })
-                .unwrap();
-                // Greeter cancels instead of answering; the worker is
-                // SIGKILLed, so this recv never returns — block.
-                let _: Result<CompositorToBroker, _> = w.recv();
-                loop {
-                    std::thread::park();
-                }
-            })
-        })
-        .unwrap();
-
-        let (greeter, broker_end) = pair();
-        let gt = thread::spawn(move || {
-            let _p: BrokerToCompositor = greeter.recv().unwrap();
-            greeter.send(&CompositorToBroker::Cancel).unwrap();
-        });
-
-        let disp = relay(&mut slot, &broker_end).expect("relay ok");
-        assert_eq!(disp, Disposition::Cancelled);
-        assert!(
-            slot.current().is_none(),
-            "cancelled worker SIGKILLed + reaped, slot cleared"
-        );
-        gt.join().unwrap();
-    }
+    // (greeter-cancel-SIGKILLs-the-worker is covered by
+    // `step_machine_greeter_cancel_at_conv_finishes_cancelled`, which
+    // drives the SAME live step methods — no separate driver test.)
 
     #[test]
     fn relay_worker_dies_mid_relay_is_reaped_no_zombie() {
@@ -923,7 +867,7 @@ mod tests {
         assert!(slot.current().is_some());
 
         let (_greeter, broker_end) = pair();
-        let r = relay(&mut slot, &broker_end);
+        let r = drive(&mut slot, &broker_end);
         assert!(
             matches!(r, Err(BrokerError::Transport(_))),
             "worker death mid-relay surfaces as a transport error: {r:?}"
@@ -935,30 +879,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_connection_rejects_non_authorized_peer() {
-        // socketpair peers are the test process's own uid; configure a
-        // DIFFERENT relay-peer uid so the SO_PEERCRED gate (in
-        // AuthSlot::create) refuses without spawning anything.
-        let my_uid = nix::unistd::getuid().as_raw();
-        let mut slot = AuthSlot::new(my_uid.wrapping_add(1), 5, Duration::from_secs(10));
-        let (greeter, broker_end) = pair();
-        let gt = thread::spawn(move || {
-            greeter
-                .send(&CompositorToBroker::BeginAuth {
-                    service: "halmasuit".into(),
-                    username: "alice".into(),
-                })
-                .unwrap();
-        });
-        let r = handle_connection(&mut slot, &broker_end);
-        assert!(
-            matches!(r, Err(BrokerError::Slot(_))),
-            "non-authorized peer refused: {r:?}"
-        );
-        assert!(slot.current().is_none(), "no worker spawned");
-        gt.join().unwrap();
-    }
+    // (SO_PEERCRED relay-peer-gate refusal is owned and directly
+    // tested by `AuthSlot::create` — see slot.rs
+    // `non_authorized_peer_cannot_create_on_empty_slot` /
+    // `non_authorized_peer_cannot_evict_inflight_untouched`. The
+    // deleted `handle_connection` only re-mapped that `SlotError`; the
+    // gate itself loses no coverage.)
 
     // ── Amendment A2: the step-driven state machine ──────────────────
     // Same scripted-worker socketpair harness (NOT a PAM mock — R12);
