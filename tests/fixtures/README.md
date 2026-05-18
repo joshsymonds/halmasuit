@@ -32,3 +32,36 @@ magick \( /tmp/q_tl.png /tmp/q_tr.png +append \) \
 halmasuit-splash stretches it to fill the output (v1 = no aspect
 preservation), so at 1280×800 it still reads as four equal colour
 quadrants — a stable, recognisable golden.
+
+## `witness.png`
+
+The locked **witness** image — the Ḫalmašuit (deified throne)
+enthroned in the Hittite winged sun-disc: cobalt ground, gold/oxblood
+constructivist screenprint. This is the *instrument* of the no-flash
+continuity proof, not branding: it is the one image that must remain
+on screen — never black, never moved, never resized, never replaced —
+across every handover from frame 0 through the real DankGreeter, the
+broker privilege drop, and into real niri. If at any captured phase
+the pixels are not this image, the no-flash invariant has regressed.
+
+- **2560×1600, 8-bit RGB, sRGB, no alpha.** 16:10; the render path
+  stretches non-aspect-preserving, so it identity-stretches at 16:10
+  outputs (e.g. 1280×800) with no distortion.
+- It is **both** the ssimulacra2 reference the visual gates compare
+  against **and** the source halmasuit composites as its internal
+  witness plane (epic G-layer R3/R7).
+
+Provenance: a generative composition, locked and human-approved
+2026-05-18 (epic amendment G1). The generation master is kept **out
+of the repo** — scratch/rejected/source generation images are never
+committed (epic anti-pattern; repo permanence). If the master is
+re-supplied, finalize it identically (ImageMagick 7):
+
+```sh
+magick <master>.png -resize '2560x1600!' -colorspace sRGB \
+       -alpha off -strip tests/fixtures/witness.png
+```
+
+Regenerating this fixture changes every visual golden that references
+it; it is therefore human-inspected before commit, never
+CI-regenerated.
