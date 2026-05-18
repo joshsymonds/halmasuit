@@ -1,21 +1,23 @@
-// halmasuit/src/drm.rs — DRM backend (B.2 slice: GLES + GBM + DrmCompositor).
+// halmasuit/src/drm.rs — DRM backend: GLES + GBM + DrmCompositor.
 //
-// Production renderer wiring. Halmasuit owns the DRM device, runs a GLES
-// renderer through smithay's `DrmCompositor`, and scans out a brand-clear
-// `#0a0014` first frame (the same color the B.1 dumb-buffer path painted)
-// before any wl_client has connected. Subsequent subtasks layer
-// wlr-layer-shell + buffer import + frame_audit on top of this same
-// pipeline.
+// Production renderer wiring. halmasuit owns the DRM device, runs a
+// GLES renderer through smithay's `DrmCompositor`, and composites the
+// internal witness plane as the bottom-most element on every frame —
+// including frame 0, before any wl_client connects. There is no
+// pre-client solid phase (epic amendment G1/R3/R6): the GL clear
+// color is a transient fully covered by the witness on every frame.
+// wlr-layer-shell surfaces, the foreground toplevel, and (in
+// halmasuit-debug) frame_audit layer on top of this same pipeline.
 //
 // Pattern lifted from niri's `src/backend/tty.rs` + smithay's anvil
 // example at the pinned `ff5fa7df` rev, simplified to:
 //
-//   * Single GPU, single output, single CRTC (no MultiRenderer, no udev
-//     hot-plug, no multi-monitor)
+//   * Single GPU, single output, single CRTC (no MultiRenderer, no
+//     udev hot-plug, no multi-monitor)
 //   * Render loop driven by `DrmEvent::VBlank` from the
 //     `DrmDeviceNotifier` calloop source
-//   * Empty element set — the entire scene is the clear color until B.3
-//     adds wlr-layer-shell
+//   * The witness plane is the bottom-most render element; the
+//     front-to-back element list composites every surface over it
 
 use std::io;
 use std::path::Path;
@@ -27,7 +29,10 @@ use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmSurface};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::Color32F;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::element::render_elements;
+use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::texture::{TextureBuffer, TextureRenderElement};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::session::Session;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::output::{Mode as OutputMode, Output, OutputModeSource, PhysicalProperties, Subpixel};
@@ -36,17 +41,20 @@ use smithay::reexports::drm::control::connector;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::DeviceFd;
 
-/// Brand clear color halmasuit paints before any wl_client commits, as
-/// the RGB bytes of an `#0a0014` pixel: `red=0x0A, green=0x00,
-/// blue=0x14`. THE single source of truth for the clear color —
-/// `main.rs`'s scanout clear (`HALMASUIT_BRAND_CLEAR`) is
-/// `xrgb_le(CLEAR_RGB[0], CLEAR_RGB[1], CLEAR_RGB[2])` and
-/// `frame_audit`/`offscreen` reference this exact const, so the
-/// renderer and the audit can never silently disagree. This module is
-/// compiled into BOTH the production `halmasuit` and `halmasuit-debug`
-/// (it is not `frame_audit`-gated), so it is the only place all
-/// consumers can share. Value is IMMUTABLE per the visual-compositor
-/// epic's Requirement #5; do not change it.
+/// The transient GL clear color, as the RGB bytes of an `#0a0014`
+/// pixel: `red=0x0A, green=0x00, blue=0x14`. Under epic amendment
+/// G1/R6 there is no observable pre-client solid phase — the witness
+/// plane covers the entire output on every frame including frame 0,
+/// so this clear is never scanned out. It is retained as THE single
+/// source of truth shared by the renderer clear
+/// (`HALMASUIT_BRAND_CLEAR` = `xrgb_le(CLEAR_RGB[0..3])`) and
+/// `frame_audit`/`offscreen`: the no-flash audit treats a pixel
+/// byte-equal to this as the uncovered sentinel ("witness not
+/// covering"), so renderer and audit must never disagree about its
+/// value. This module is compiled into BOTH `halmasuit` and
+/// `halmasuit-debug` (not `frame_audit`-gated), the only place all
+/// consumers can share it. Keep the value stable: the audit math
+/// keys on it as the sentinel even though it is never visible.
 pub const CLEAR_RGB: [u8; 3] = [0x0A, 0x00, 0x14];
 
 /// Color formats we'll accept for scanout. ARGB2101010 first (preferred
@@ -86,6 +94,55 @@ pub fn xrgb_le_to_color32f(bytes: [u8; 4]) -> Color32F {
     )
 }
 
+render_elements! {
+    /// One frame's render elements. smithay element lists are
+    /// front-to-back (index 0 = topmost, drawn last). `Surface` wraps
+    /// a committed wl_client subtree; `Witness` is halmasuit's
+    /// internal full-output background plane, always the LAST element
+    /// so every surface composites over it (epic G1/R3/R6).
+    pub SceneElement<=GlesRenderer>;
+    Surface = WaylandSurfaceRenderElement<GlesRenderer>,
+    Witness = TextureRenderElement<GlesTexture>,
+}
+
+/// The index the internal witness plane occupies in the front-to-back
+/// element list, or `None` when no witness is configured.
+///
+/// With `n_surfaces` surface elements already pushed, the witness goes
+/// at index `n_surfaces` — i.e. it is appended LAST, making it the
+/// bottom-most element of the `n_surfaces + 1`-element scene (frame 0,
+/// with no surfaces, is therefore exactly the witness, never a solid
+/// clear). With no witness configured the scene is just the surfaces
+/// (the legacy clear-only path used by non-visual integration tests).
+/// `scene_elements` branches on this; the contract is unit-pinned by
+/// `tests::witness_is_the_bottom_most_element` (no GPU needed).
+#[must_use]
+fn witness_slot(n_surfaces: usize, has_witness: bool) -> Option<usize> {
+    has_witness.then_some(n_surfaces)
+}
+
+/// Decode the witness PNG at `path` into tightly-packed RGBA8 bytes
+/// (`[R, G, B, A]`, the layout `Fourcc::Abgr8888` expects) plus its
+/// pixel dimensions.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or is not a decodable
+/// image.
+fn decode_witness(path: &Path) -> io::Result<(Vec<u8>, i32, i32)> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| io::Error::other(format!("read witness {}: {e}", path.display())))?;
+    let img = image::load_from_memory(&bytes)
+        .map_err(|e| io::Error::other(format!("decode witness {}: {e}", path.display())))?
+        .to_rgba8();
+    let (w, h) = img.dimensions();
+    Ok((
+        img.into_raw(),
+        i32::try_from(w).unwrap_or(i32::MAX),
+        i32::try_from(h).unwrap_or(i32::MAX),
+    ))
+}
+
 /// The full GLES + GBM + DrmCompositor stack wrapped around a single
 /// DRM device + connector + CRTC. Pinned for the process lifetime in
 /// `HalmasuitState`. Dropping this value releases the master, tears
@@ -105,6 +162,12 @@ pub struct DrmBackend {
     /// GLES renderer bound to the GBM device's EGL display. Used by
     /// `render_frame` every vblank to clear + composite.
     pub renderer: GlesRenderer,
+    /// The internal witness plane, imported once at startup from
+    /// `HALMASUIT_WITNESS_IMAGE` and reused as the bottom-most element
+    /// every frame (epic G1/R3/R6). `None` when no witness is
+    /// configured — the legacy clear-only path for non-visual
+    /// integration tests; production/visual deployments always set it.
+    witness: Option<TextureBuffer<GlesTexture>>,
     /// Monotonic frame counter for the `frame_audit` `FrameRendered`
     /// stream. Only exists in `halmasuit-debug`.
     #[cfg(feature = "frame_audit")]
@@ -163,6 +226,7 @@ pub fn setup_drm_backend<S, F>(
     path: &Path,
     loop_handle: &smithay::reexports::calloop::LoopHandle<'static, S>,
     drm_event_handler: F,
+    witness_path: Option<&Path>,
 ) -> io::Result<(
     DrmBackend,
     smithay::reexports::calloop::RegistrationToken,
@@ -238,7 +302,7 @@ where
         unsafe_code,
         reason = "GlesRenderer::new is unsafe by smithay API contract; the EGLContext is owned and not made current on another thread"
     )]
-    let renderer = unsafe { GlesRenderer::new(egl_context) }
+    let mut renderer = unsafe { GlesRenderer::new(egl_context) }
         .map_err(|e| io::Error::other(format!("GlesRenderer::new: {e}")))?;
 
     // Allocator + framebuffer exporter, both wrapping the same GBM
@@ -312,6 +376,31 @@ where
     )
     .map_err(|e| io::Error::other(format!("DrmCompositor::new: {e}")))?;
 
+    // Import the witness PNG once into a GPU texture (reused every
+    // frame as the bottom-most element). `to_rgba8()` yields
+    // `[R,G,B,A]` bytes, which `Fourcc::Abgr8888` reads in that
+    // little-endian order. `renderer` is no longer borrowed (the
+    // immutable `render_formats` borrow above has ended) and is moved
+    // into `DrmBackend` just below.
+    let witness = match witness_path {
+        Some(p) => {
+            let (rgba, iw, ih) = decode_witness(p)?;
+            let buffer = TextureBuffer::from_memory(
+                &mut renderer,
+                &rgba,
+                Fourcc::Abgr8888,
+                (iw, ih),
+                false,
+                1,
+                smithay::utils::Transform::Normal,
+                None,
+            )
+            .map_err(|e| io::Error::other(format!("witness texture import: {e}")))?;
+            Some(buffer)
+        }
+        None => None,
+    };
+
     // Register the DRM event notifier with calloop. The notifier
     // emits `DrmEvent::VBlank(crtc)` on every page-flip ack and
     // `DrmEvent::Error(e)` on async DRM errors. The caller-provided
@@ -324,6 +413,7 @@ where
         DrmBackend {
             compositor,
             renderer,
+            witness,
             #[cfg(feature = "frame_audit")]
             frame_counter: 0,
             #[cfg(feature = "frame_audit")]
@@ -335,62 +425,38 @@ where
 }
 
 impl DrmBackend {
-    /// Render one frame and queue it on the surface. Returns `Ok(true)`
-    /// if a frame was actually queued (non-empty damage), `Ok(false)`
-    /// if no damage and no flip was queued. The clear color is always
-    /// the halmasuit brand `#0a0014` — by B.2 there are still no
-    /// wl_clients to composite, so the clear IS the entire scene.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `render_frame` or `queue_frame` fail.
-    pub fn render_one_frame(
-        &mut self,
-        output: &smithay::output::Output,
-        clear_color: [u8; 4],
-    ) -> io::Result<bool> {
-        // Equivalent to calling `render_layer_elements` with no layer
-        // surfaces mapped — empty element list, just the clear color.
-        // Kept as a thin alias so the B.2 initial-render call site in
-        // main()'s startup still reads naturally.
-        use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-        let elements: &[WaylandSurfaceRenderElement<GlesRenderer>] = &[];
-        self.render_with_elements_inner(output, elements, clear_color)
-    }
-
-    /// Render a frame composed of layer-shell surfaces mapped onto
-    /// `output`'s LayerMap, on top of the brand clear color. Walks
-    /// the map in z-order (BACKGROUND, BOTTOM, TOP, OVERLAY) and
-    /// builds a `WaylandSurfaceRenderElement<GlesRenderer>` per
-    /// surface via `render_elements_from_surface_tree` — the renderer
-    /// lazily imports committed `wl_shm` buffers as `GlesTexture`s
-    /// during the draw.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `render_frame` or `queue_frame` fail.
-    pub fn render_layer_elements(
+    /// Build one frame's front-to-back render-element list (index 0 =
+    /// topmost). Walks the output's LayerMap in scene z-order — top →
+    /// bottom: Overlay, Top, the foreground xdg toplevel
+    /// (greeter/session), Bottom, Background — wrapping each committed
+    /// surface subtree as a `SceneElement::Surface`
+    /// (`render_elements_from_surface_tree`; the renderer lazily
+    /// imports committed `wl_shm` buffers as `GlesTexture`s during the
+    /// draw). The internal witness plane, when configured, is appended
+    /// LAST as `SceneElement::Witness` — the bottom-most element, so
+    /// every surface composites over it and frame 0 (no surfaces) is
+    /// already the witness, never a solid clear (epic G1/R3/R6). The
+    /// foreground toplevel sits above the wallpaper layers and below
+    /// OSK/lock/notification overlays.
+    fn scene_elements(
         &mut self,
         output: &smithay::output::Output,
         foreground: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
-        clear_color: [u8; 4],
-    ) -> io::Result<bool> {
+    ) -> Vec<SceneElement> {
         use smithay::backend::renderer::element::Kind;
-        use smithay::backend::renderer::element::surface::{
-            WaylandSurfaceRenderElement, render_elements_from_surface_tree,
-        };
+        use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
         use smithay::desktop::layer_map_for_output;
         use smithay::utils::Scale;
         use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
         let scale = Scale::from(1.0);
         let map = layer_map_for_output(output);
-        let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+        let mut elements: Vec<SceneElement> = Vec::new();
         let mut push_surface_at =
             |renderer: &mut GlesRenderer,
              surface: &_,
              loc: smithay::utils::Point<i32, smithay::utils::Physical>| {
-                let mut es: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                let es: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                     render_elements_from_surface_tree(
                         renderer,
                         surface,
@@ -399,15 +465,9 @@ impl DrmBackend {
                         1.0,
                         Kind::Unspecified,
                     );
-                elements.append(&mut es);
+                elements.extend(es.into_iter().map(SceneElement::Surface));
             };
 
-        // smithay render-element lists are FRONT-TO-BACK: the first
-        // element is topmost (drawn last, over the rest). Scene
-        // z-order, top → bottom: Overlay, Top, the foreground xdg
-        // toplevel (greeter/session), Bottom, Background (splash).
-        // The toplevel sits above the wallpaper/normal layers and
-        // below OSK/lock/notification overlays.
         for which in [WlrLayer::Overlay, WlrLayer::Top] {
             for layer in map.layers_on(which) {
                 let loc = map.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
@@ -435,6 +495,63 @@ impl DrmBackend {
         }
         drop(map);
 
+        if let Some(slot) = witness_slot(elements.len(), self.witness.is_some()) {
+            debug_assert_eq!(slot, elements.len(), "witness is the bottom-most element");
+            let witness = self
+                .witness
+                .as_ref()
+                .expect("witness_slot returns Some only when witness is_some");
+            let osize = output.current_mode().map(|m| m.size).unwrap_or_default();
+            let dst =
+                smithay::utils::Size::<i32, smithay::utils::Logical>::from((osize.w, osize.h));
+            elements.push(SceneElement::Witness(
+                TextureRenderElement::from_texture_buffer(
+                    smithay::utils::Point::<f64, smithay::utils::Physical>::from((0.0, 0.0)),
+                    witness,
+                    None,
+                    None,
+                    Some(dst),
+                    Kind::Unspecified,
+                ),
+            ));
+        }
+        elements
+    }
+
+    /// Render one frame with no foreground toplevel — the frame-0 /
+    /// no-layers shape. The scene is the internal witness plane (when
+    /// configured); `clear_color` is the transient GL clear the
+    /// witness fully covers (epic G1/R6). With no witness configured
+    /// it is the legacy clear-only path used by non-visual
+    /// integration tests. Returns `Ok(true)` if a frame was queued
+    /// (non-empty damage), `Ok(false)` if nothing changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `render_frame` or `queue_frame` fail.
+    pub fn render_one_frame(
+        &mut self,
+        output: &smithay::output::Output,
+        clear_color: [u8; 4],
+    ) -> io::Result<bool> {
+        let elements = self.scene_elements(output, None);
+        self.render_with_elements_inner(output, &elements, clear_color)
+    }
+
+    /// Render a frame composed of the mapped layer-shell surfaces and
+    /// the optional foreground toplevel over the internal witness
+    /// plane. See [`scene_elements`](Self::scene_elements) for z-order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `render_frame` or `queue_frame` fail.
+    pub fn render_layer_elements(
+        &mut self,
+        output: &smithay::output::Output,
+        foreground: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+        clear_color: [u8; 4],
+    ) -> io::Result<bool> {
+        let elements = self.scene_elements(output, foreground);
         self.render_with_elements_inner(output, &elements, clear_color)
     }
 
@@ -595,5 +712,33 @@ mod tests {
         assert!(color.g().abs() < eps);
         assert!((color.b() - f32::from(0x14_u8) / 255.0).abs() < eps);
         assert!((color.a() - 1.0).abs() < eps);
+    }
+
+    /// The witness plane is the bottom-most render element: it is
+    /// appended LAST to the front-to-back element list (index 0 =
+    /// topmost), so every wl_client composites over it and frame 0 is
+    /// already the witness — there is no pre-client solid phase (epic
+    /// G1/R3/R6). `scene_elements` branches on `witness_slot`; this
+    /// pins that contract without a GPU.
+    #[test]
+    fn witness_is_the_bottom_most_element() {
+        // Frame 0 / no surfaces, witness configured: the scene is
+        // exactly one element — the witness — at index 0 (== last).
+        assert_eq!(witness_slot(0, true), Some(0));
+
+        // With N surfaces the witness slot is N: the last index of an
+        // (N+1)-element list, i.e. bottom-most.
+        for n in [1, 3, 7] {
+            let slot = witness_slot(n, true).expect("witness configured");
+            assert_eq!(slot, n, "witness must be appended after every surface");
+            let total_len = n + 1;
+            assert_eq!(slot, total_len - 1, "witness must be the LAST element");
+        }
+
+        // No witness configured (non-visual integration paths): no
+        // witness slot — the legacy clear-only scene is unchanged.
+        for n in [0, 1, 5] {
+            assert_eq!(witness_slot(n, false), None);
+        }
     }
 }

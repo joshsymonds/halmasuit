@@ -1385,19 +1385,20 @@ fn broker_socket_path_from_env() -> PathBuf {
     )
 }
 
-/// Brand clear color rendered before any wl_client connects: `#0a0014`
-/// in XRGB8888 little-endian. Per the visual-compositor epic's
-/// IMMUTABLE Requirement #5, this distinguishes "halmasuit alive, no
-/// client yet" from "halmasuit broken / producing black" — every
-/// frame painted before halmasuit-splash connects is this exact color.
+/// The transient GL clear color in XRGB8888 little-endian, derived
+/// from [`drm::CLEAR_RGB`]. Under epic amendment G1/R6 it is never
+/// visible: the witness plane covers the entire output on every frame
+/// including frame 0, so there is no observable pre-client solid
+/// phase. It remains the uncovered sentinel the no-flash audit keys
+/// on — a pixel byte-equal to it means the witness is NOT covering
+/// (a flash / broken renderer).
 ///
 /// Built via [`drm::xrgb_le`] from [`drm::CLEAR_RGB`] — the single
-/// source of truth for the clear color — so the byte ordering is
-/// unit-tested at build (see `drm::tests::xrgb_le_pins_byte_order`)
-/// and the renderer clear can never drift from what `frame_audit` /
-/// `offscreen` expect. Silent reverts to the wrong byte order, a
-/// channel transpose, or `#000000` trip a fast unit test before the
-/// visual VM gate.
+/// source of truth — so the byte ordering is unit-tested at build
+/// (see `drm::tests::xrgb_le_pins_byte_order`) and the renderer clear
+/// can never drift from what `frame_audit` / `offscreen` expect. A
+/// wrong byte order, a channel transpose, or `#000000` trips a fast
+/// unit test before the visual VM gate.
 const HALMASUIT_BRAND_CLEAR: [u8; 4] =
     drm::xrgb_le(drm::CLEAR_RGB[0], drm::CLEAR_RGB[1], drm::CLEAR_RGB[2]);
 
@@ -1459,6 +1460,16 @@ fn compositor_uid_from_env() -> io::Result<Option<u32>> {
 /// `services.halmasuit.greeterCommand`.
 fn greeter_command_from_env() -> Option<PathBuf> {
     std::env::var_os("HALMASUIT_GREETER_COMMAND").map(PathBuf::from)
+}
+
+/// Path of the witness PNG halmasuit composites as its internal
+/// bottom-most background plane from frame 0 (epic G1/R3/R6). Returns
+/// `None` when `HALMASUIT_WITNESS_IMAGE` is unset — non-visual
+/// integration tests run without one (the legacy clear-only scene);
+/// production and visual deployments always set it via
+/// `services.halmasuit.witnessImage`.
+fn witness_image_from_env() -> Option<PathBuf> {
+    std::env::var_os("HALMASUIT_WITNESS_IMAGE").map(PathBuf::from)
 }
 
 /// Spawn the greeter binary as a child process running under the
@@ -1991,6 +2002,10 @@ fn main() -> io::Result<()> {
     // built — `setup_drm_backend` needs `loop_handle` to wire the
     // page-flip event source.
     let drm_device_path = drm_device_path_from_env()?;
+    // The internal witness plane (epic G1/R3/R6). Decoded once inside
+    // `setup_drm_backend`; `is_some()` here also gates the frame-0
+    // background anchor emitted below.
+    let witness_path = witness_image_from_env();
 
     // Initialize the Wayland display + protocol state.
     let display: Display<HalmasuitState> = Display::new().map_err(io::Error::other)?;
@@ -2063,6 +2078,7 @@ fn main() -> io::Result<()> {
                     tracing::warn!(error = %e, "DRM device error");
                 }
             },
+            witness_path.as_deref(),
         )?;
 
         // libinput, fed device fds through the SAME seatd session
@@ -2285,18 +2301,35 @@ fn main() -> io::Result<()> {
         session_first_frame_emitted: false,
     };
 
+    // The witness plane is composited from frame 0 (epic G1/R3/R6):
+    // emit the `Background` first-frame anchor BEFORE the initial
+    // render so `assert_no_flash_stream` counts frame 0's audit as
+    // post-background (it must already be witness-covered — there is
+    // no pre-client solid phase). The `seen_layer_roles` guard makes
+    // this the single `ClientFirstFrame{Background}` for the episode;
+    // a later real Background layer client cannot emit a second one
+    // (the no-flash invariant requires exactly one). Skipped when no
+    // witness is configured (non-visual integration tests).
+    if witness_path.is_some()
+        && state
+            .seen_layer_roles
+            .insert(halmasuit_introspect::LayerRole::Background)
+    {
+        emit(&Event::ClientFirstFrame {
+            role: halmasuit_introspect::LayerRole::Background,
+        });
+    }
+
     // Kick off the render loop with one initial frame. The page-flip
     // for this frame triggers the next vblank, which our DRM event
     // handler observes (`frame_submitted`) — that's the keepalive for
-    // the render loop. Future damage events (B.3+ wl_client commits)
-    // will queue additional frames. For now the scene is just the
-    // brand clear color.
+    // the render loop. Subsequent damage events (wl_client commits)
+    // queue additional frames over the witness plane.
     //
     // `Phase::ScanoutActive` fires here, on the first successful
-    // `queue_frame` — moved from B.1's "post-SETCRTC" timing to
-    // "first pixel via GLES" per the epic's IMMUTABLE Requirement #5
-    // semantics. The SKIP-path state (no `drm_backend`) emits neither
-    // event.
+    // `queue_frame` — "first pixel via GLES" per the epic's IMMUTABLE
+    // Requirement #5 semantics. The SKIP-path state (no `drm_backend`)
+    // emits neither event.
     if let Some(backend) = state.drm_backend.as_mut() {
         let queued = backend.render_one_frame(&state.output, HALMASUIT_BRAND_CLEAR)?;
         if queued {

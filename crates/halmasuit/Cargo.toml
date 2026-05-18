@@ -22,9 +22,11 @@ workspace = true
 # `dep:zbus`/`dep:png` are the ONLY feature deps: zbus serves the
 # `org.halmasuit.Debug.Introspect.Snapshot` method, png encodes the
 # captured frame. Both optional, so production `cargo tree` lists
-# neither (Epic #1 req 7). Still no `img_hash`/`image`: luminance/
-# coverage are arithmetic and the perceptual hash is an in-house 8x8
-# average-hash.
+# neither (Epic #1 req 7). `image` is a NON-feature production dep
+# (below): halmasuit decodes the witness PNG at startup to composite
+# it as the internal background plane (epic G1/R3/R6) — that is
+# production behavior, not frame_audit. The exact-image audit math
+# (`frame_audit`) is arithmetic over the readback bytes; no `img_hash`.
 frame_audit = ["dep:zbus", "dep:png"]
 
 [dependencies]
@@ -92,6 +94,12 @@ nix = { workspace = true, features = ["user", "signal", "process", "socket", "ui
 # Linux capabilities for drop_privileges' CAP_KILL preservation —
 # halmasuit must retain signal authority over its greeter child
 # (uid 999) post-deprivilege to uid 998. Pure-Rust over libc.
+# Decode the witness PNG at startup into RGBA8 for the internal
+# background plane (epic G1/R3/R6). NON-optional production dep:
+# halmasuit always composites the witness — there is no pre-client
+# solid phase. `default-features = false, features = ["png"]` at the
+# workspace level (no JPEG/GIF/… codecs pulled in).
+image = { workspace = true }
 # frame_audit-only. `optional = true` keeps them out of the default
 # (production) dependency graph entirely; `frame_audit` turns them on.
 zbus = { workspace = true, optional = true }
