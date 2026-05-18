@@ -12,12 +12,12 @@
 // average-hash so production `cargo tree` stays clean.
 
 /// Brand clear color halmasuit paints before any client commits, as
-/// the RGB bytes of an `#0a0014` pixel. A pixel exactly equal to this
-/// is "halmasuit's clear", not client content; `backdrop_coverage` is
-/// the fraction of pixels that differ from it. Re-exported from
-/// [`crate::drm::CLEAR_RGB`] — the single source of truth shared with
-/// the renderer clear and the `offscreen` exact-image model — so the
-/// audit can never disagree with what was actually painted.
+/// the RGB bytes of an `#0a0014` pixel. A pixel byte-equal to this is
+/// "halmasuit's clear" (the uncovered sentinel), not client content;
+/// `clear_pixel_count` is the EXACT number of such pixels. Re-exported
+/// from [`crate::drm::CLEAR_RGB`] — the single source of truth shared
+/// with the renderer clear and the `offscreen` exact-image model — so
+/// the audit can never disagree with what was actually painted.
 use crate::drm::CLEAR_RGB;
 
 /// Rec.709 perceptual luma of one RGB pixel, normalized `0.0..=1.0`.
