@@ -247,6 +247,49 @@ pub fn own_raw_fd(fd: std::os::fd::RawFd) -> OwnedFd {
     }
 }
 
+/// A NON-owning `AsFd` over a raw fd.
+///
+/// Registers an fd the caller still owns as a calloop readiness source
+/// WITHOUT a `dup` (Amendment A8.3: no `dup`/`Rc`/`Arc` of the
+/// privilege-crossing worker fd — the sole `OwnedFd` stays in the slot
+/// / the greeter channel in `Active`). Has NO `Drop`: it closes
+/// nothing; calloop only ever calls `as_fd()`
+/// (register/reregister/unregister).
+///
+/// SOUNDNESS (Amendment A8.2): the calloop source built over this MUST
+/// be removed before the owning `OwnedFd` is dropped. `broker.rs`
+/// guarantees that — `BrokerLoop::drop_active` removes both source
+/// tokens *before* the slot reap/cancel (or `AuthSlot::create`'s
+/// evict) closes the worker fd, and before `Active` drops the greeter
+/// channel. Quarantined here so `broker.rs`/the bin stay
+/// `#![forbid(unsafe_code)]`.
+pub struct BorrowedSourceFd(std::os::fd::RawFd);
+
+impl BorrowedSourceFd {
+    #[must_use]
+    pub const fn new(fd: std::os::fd::RawFd) -> Self {
+        Self(fd)
+    }
+}
+
+impl std::os::fd::AsFd for BorrowedSourceFd {
+    #[expect(
+        unsafe_code,
+        reason = "A8.3: hand calloop a NON-owning AsFd so the Generic \
+                  source neither owns nor closes the privilege-crossing \
+                  worker fd (no dup). A8.2 keeps the borrow live: the \
+                  source token is removed before the owning OwnedFd is \
+                  closed (broker.rs drop_active). Quarantined so \
+                  broker.rs/bin stay #![forbid(unsafe_code)]."
+    )]
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        // SAFETY: see the #[expect] reason — the fd outlives this
+        // borrow because the calloop source is removed before the
+        // owning OwnedFd is dropped (A8.2 teardown ordering).
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0) }
+    }
+}
+
 /// Fork a disposable child running `child_main` on its SEQPACKET end;
 /// return the parent's handle + channel end. The generic seam lets the
 /// worker's own tests exercise fork/kill/reap with a non-PAM payload

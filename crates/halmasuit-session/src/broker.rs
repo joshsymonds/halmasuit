@@ -35,7 +35,7 @@
 #![forbid(unsafe_code)]
 
 use std::io;
-use std::os::fd::{AsFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use calloop::generic::Generic;
@@ -46,7 +46,8 @@ use thiserror::Error;
 use crate::slot::{AuthSlot, SlotError};
 use crate::transport::{SeqpacketChannel, TransportError, peer_uid};
 use crate::worker::{
-    ParentMessage, WorkerOutcome, accept_seqpacket, own_raw_fd, spawn_session_worker,
+    BorrowedSourceFd, ParentMessage, WorkerOutcome, accept_seqpacket, own_raw_fd,
+    spawn_session_worker,
 };
 
 /// Idle window (Amendment A2.2): with no connection in flight and the
@@ -154,14 +155,15 @@ impl Relay {
     /// vanished worker.
     pub(crate) fn on_worker_readable(
         &mut self,
-        slot: &mut AuthSlot,
+        slot: &AuthSlot,
         compositor: &SeqpacketChannel,
     ) -> Result<RelayStep, BrokerError> {
         if !matches!(
             self.phase,
             RelayPhase::AwaitWorker | RelayPhase::SessionRunning
         ) {
-            let _ = slot.cancel_current();
+            // R9: the caller reaps on this terminal error AFTER tearing
+            // down the calloop sources (A8.2) — the relay never reaps.
             return Err(BrokerError::UnexpectedFrame);
         }
         let pm: ParentMessage = slot
@@ -194,14 +196,12 @@ impl Relay {
             }
             ParentMessage::Outcome(WorkerOutcome::SessionEnded { outcome }) => {
                 compositor.send(&BrokerToCompositor::SessionEnded { outcome })?;
-                let _ = slot.reap_current();
                 Ok(RelayStep::Finished(Disposition::Completed { outcome }))
             }
             ParentMessage::Outcome(WorkerOutcome::Failure { reason }) => {
                 compositor.send(&BrokerToCompositor::Failure {
                     reason: reason.clone(),
                 })?;
-                let _ = slot.reap_current();
                 Ok(RelayStep::Finished(Disposition::AuthFailed { reason }))
             }
             // Out of phase: the worker only ever relays a ConvPrompt
@@ -209,7 +209,6 @@ impl Relay {
             // broker→greeter only); and `Success` is the auth-only
             // worker variant `spawn_session_worker` never emits.
             ParentMessage::Conv(_) | ParentMessage::Outcome(WorkerOutcome::Success { .. }) => {
-                let _ = slot.cancel_current();
                 Err(BrokerError::UnexpectedFrame)
             }
         }
@@ -224,14 +223,13 @@ impl Relay {
     /// vanished worker.
     pub(crate) fn on_greeter_readable(
         &mut self,
-        slot: &mut AuthSlot,
+        slot: &AuthSlot,
         compositor: &SeqpacketChannel,
     ) -> Result<RelayStep, BrokerError> {
         let expect_start = match self.phase {
             RelayPhase::AwaitGreeterConvResponse => false,
             RelayPhase::AwaitGreeterStartSession => true,
             RelayPhase::AwaitWorker | RelayPhase::SessionRunning => {
-                let _ = slot.cancel_current();
                 return Err(BrokerError::UnexpectedFrame);
             }
         };
@@ -246,14 +244,29 @@ impl Relay {
                 self.phase = RelayPhase::AwaitWorker;
                 Ok(RelayStep::Continue)
             }
-            (CompositorToBroker::Cancel, _) => {
-                let _ = slot.cancel_current();
-                Ok(RelayStep::Finished(Disposition::Cancelled))
-            }
-            _ => {
-                let _ = slot.cancel_current();
-                Err(BrokerError::UnexpectedFrame)
-            }
+            (CompositorToBroker::Cancel, _) => Ok(RelayStep::Finished(Disposition::Cancelled)),
+            _ => Err(BrokerError::UnexpectedFrame),
+        }
+    }
+}
+
+/// Reap the in-flight worker for a terminal disposition (R9: reaped
+/// exactly once at every connection-terminal point, no transient
+/// zombie). The relay no longer reaps in-step — the caller reaps here,
+/// AFTER tearing down the calloop sources, so the source token is gone
+/// before the worker fd closes (Amendment A8.2; this is what lets the
+/// loop watch the worker fd via a NON-owning borrowed-fd source with
+/// no `dup`). `Completed`/`AuthFailed`: the worker `_exit`s after
+/// reporting → `reap_current` (waitpid). `Cancelled`: the worker is
+/// still blocked (greeter cancelled mid-conversation) → `cancel_current`
+/// (SIGKILL + reap). Both idempotent (a no-op if the slot is empty).
+fn reap_for_disposition(slot: &mut AuthSlot, disp: &Disposition) {
+    match disp {
+        Disposition::Completed { .. } | Disposition::AuthFailed { .. } => {
+            let _ = slot.reap_current();
+        }
+        Disposition::Cancelled => {
+            let _ = slot.cancel_current();
         }
     }
 }
@@ -283,17 +296,21 @@ pub(crate) fn relay(
         };
         match step {
             Ok(RelayStep::Continue) => {}
-            Ok(RelayStep::Finished(d)) => return Ok(d),
+            Ok(RelayStep::Finished(d)) => {
+                // R9: reap exactly once at the terminal point. (No
+                // calloop sources here — this blocking driver is used
+                // by handle_connection + the relay tests, not the loop;
+                // A8.2 ordering is the loop's concern, in `step`.)
+                reap_for_disposition(slot, &d);
+                return Ok(d);
+            }
             Err(e) => {
-                // R9 invariant: the connection ended for ANY reason ⇒
-                // the slot worker is reaped exactly once before we
-                // return (no transient zombie lingering to the next
-                // create-evict or the ≤30s idle-exit). Idempotent: the
-                // out-of-phase/unexpected-frame paths already
-                // `cancel_current()` (so `take()` is `None` here — no
-                // second wait); the transport-error `?` paths
-                // (worker/greeter `recv`/`send` failed mid-relay) did
-                // NOT — this reaps those.
+                // R9: the connection ended for ANY reason (transport
+                // failure / out-of-phase / vanished worker) ⇒ SIGKILL +
+                // reap exactly once before returning — no transient
+                // zombie. The relay no longer reaps in-step, so this is
+                // the sole reaper for every error path; idempotent if
+                // the worker is already gone.
                 let _ = slot.cancel_current();
                 return Err(e);
             }
@@ -332,7 +349,10 @@ pub fn handle_connection(
 /// The in-flight connection's per-conn state (Amendment A2): the
 /// broker OWNS the greeter channel (the relay's send/recv go through
 /// it); the two calloop sources are level-triggered readability
-/// wakeups over dup'd fds — the real I/O is on the owned channels.
+/// wakeups over NON-owning [`BorrowedSourceFd`]s (A8.3 — no dup of a
+/// privilege-crossing fd) — the real I/O is on the owned channels.
+/// A8.2: `drop_active` removes both source tokens (epoll del) BEFORE
+/// the slot reap closes the owning fd, so the borrow never dangles.
 struct Active {
     greeter: SeqpacketChannel,
     relay: Relay,
@@ -359,10 +379,13 @@ struct BrokerLoop {
 }
 
 impl BrokerLoop {
-    /// Tear down the in-flight connection's calloop sources and clear
-    /// `active` (the worker itself is SIGKILLed+reaped by the slot —
-    /// `cancel_current`/`reap_current` inside the relay step, or
-    /// `AuthSlot::create`'s evict). Arms the idle timer.
+    /// Tear down the in-flight connection's calloop sources (epoll
+    /// del) and clear `active`. A8.2: the source tokens are removed
+    /// HERE, strictly before the worker fd is closed — `step()` calls
+    /// this immediately before the slot reap (`reap_for_disposition`/
+    /// `cancel_current`), and `admit_one` calls it before the
+    /// `AuthSlot::create` evict. The worker itself is SIGKILLed+reaped
+    /// by the slot, never here. Arms the idle timer.
     fn drop_active(&mut self) {
         if let Some(a) = self.active.take() {
             self.loop_handle.remove(a.greeter_token);
@@ -374,31 +397,36 @@ impl BrokerLoop {
     /// Drive one relay step for whichever side fired; on a terminal
     /// step tear the connection down.
     fn step(&mut self, worker_side: bool) {
-        let Self { slot, active, .. } = self;
-        let Some(a) = active.as_mut() else { return };
-        let res = if worker_side {
-            a.relay.on_worker_readable(slot, &a.greeter)
-        } else {
-            a.relay.on_greeter_readable(slot, &a.greeter)
+        let res = {
+            let Self { slot, active, .. } = self;
+            let Some(a) = active.as_mut() else { return };
+            if worker_side {
+                a.relay.on_worker_readable(slot, &a.greeter)
+            } else {
+                a.relay.on_greeter_readable(slot, &a.greeter)
+            }
         };
         match res {
             Ok(RelayStep::Continue) => {}
             Ok(RelayStep::Finished(disp)) => {
                 tracing_log(&format!("connection ended: {disp:?}"));
+                // A8.2 ORDER: deregister the calloop sources (epoll
+                // del) BEFORE the slot reap closes the worker fd the
+                // `BorrowedSourceFd` aliases — token gone before the
+                // owning fd drops, so the borrow never dangles.
                 self.drop_active();
+                reap_for_disposition(&mut self.slot, &disp);
             }
             Err(e) => {
                 tracing_log(&format!("connection error: {e}"));
                 // R9 invariant: connection ended for ANY reason ⇒ slot
-                // worker reaped exactly once, here, before the sources
-                // are dropped — no transient zombie until the next
-                // create-evict or the idle-exit. Idempotent: the
-                // out-of-phase/unexpected-frame relay paths already
-                // `cancel_current()` (`take()` → `None`, no second
-                // wait); the transport-error `recv`/`send` paths did
-                // NOT — this reaps those. Then drop the loop sources.
-                let _ = slot.cancel_current();
+                // worker reaped exactly once. The relay no longer reaps
+                // in-step (A8.6); this is the SOLE reaper for every
+                // transport-error path. A8.2 order: sources gone
+                // (epoll del) before the worker fd close.
+                // `cancel_current` is idempotent (`take()` → `None`).
                 self.drop_active();
+                let _ = self.slot.cancel_current();
             }
         }
     }
@@ -455,22 +483,22 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
         tracing_log(&format!("auth slot refused: {e:?}"));
         return Ok(true);
     }
-    // dup the greeter + worker fds as level-triggered readability
-    // wakeups; the real recv/send is on the broker-owned channels.
-    let Some(worker_fd) = bl
-        .slot
-        .current()
-        .and_then(|i| i.channel().as_fd().try_clone_to_owned().ok())
-    else {
+    // A8.3: hand calloop NON-owning borrowed-fd sources — the broker
+    // never dups a privilege-crossing fd. The slot's worker channel
+    // and the broker-owned greeter channel remain the sole owners;
+    // `drop_active` removes these source tokens before either fd is
+    // closed (A8.2), so the raw fds the sources alias never dangle.
+    let Some(worker_raw) = bl.slot.current().map(|i| i.channel().as_fd().as_raw_fd()) else {
         tracing_log("worker vanished immediately after create");
         let _ = bl.slot.cancel_current();
         return Ok(true);
     };
-    let greeter_dup = greeter.as_fd().try_clone_to_owned()?;
+    let worker_src = BorrowedSourceFd::new(worker_raw);
+    let greeter_src = BorrowedSourceFd::new(greeter.as_fd().as_raw_fd());
     let worker_token = bl
         .loop_handle
         .insert_source(
-            Generic::new(worker_fd, Interest::READ, Mode::Level),
+            Generic::new(worker_src, Interest::READ, Mode::Level),
             |_, _, bl: &mut BrokerLoop| {
                 bl.step(true);
                 Ok(PostAction::Continue)
@@ -480,7 +508,7 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
     let greeter_token = bl
         .loop_handle
         .insert_source(
-            Generic::new(greeter_dup, Interest::READ, Mode::Level),
+            Generic::new(greeter_src, Interest::READ, Mode::Level),
             |_, _, bl: &mut BrokerLoop| {
                 bl.step(false);
                 Ok(PostAction::Continue)
@@ -963,23 +991,34 @@ mod tests {
         assert_eq!(r.phase(), RelayPhase::AwaitWorker);
         // worker prompt → forwarded to greeter; await its response.
         assert_eq!(
-            r.on_worker_readable(&mut slot, &broker_end).unwrap(),
+            r.on_worker_readable(&slot, &broker_end).unwrap(),
             RelayStep::Continue
         );
         assert_eq!(r.phase(), RelayPhase::AwaitGreeterConvResponse);
         // greeter response → forwarded to worker; back to await worker.
         assert_eq!(
-            r.on_greeter_readable(&mut slot, &broker_end).unwrap(),
+            r.on_greeter_readable(&slot, &broker_end).unwrap(),
             RelayStep::Continue
         );
         assert_eq!(r.phase(), RelayPhase::AwaitWorker);
-        // worker SessionEnded → terminal, reaped.
+        // worker SessionEnded → terminal. A8.6 caller-reaps contract:
+        // the relay step does NOT reap; the loop's `step()` reaps via
+        // `reap_for_disposition` AFTER tearing the sources down (A8.2).
+        let fin = r.on_worker_readable(&slot, &broker_end).unwrap();
         assert_eq!(
-            r.on_worker_readable(&mut slot, &broker_end).unwrap(),
+            fin,
             RelayStep::Finished(Disposition::Completed {
                 outcome: SessionOutcome::Exited { code: 0 }
             })
         );
+        assert!(
+            slot.current().is_some(),
+            "relay step must NOT reap in-step (A8.6)"
+        );
+        let RelayStep::Finished(disp) = fin else {
+            unreachable!()
+        };
+        reap_for_disposition(&mut slot, &disp);
         assert!(slot.current().is_none(), "reaped after SessionEnded");
         gt.join().unwrap();
     }
@@ -1010,14 +1049,17 @@ mod tests {
 
         let mut r = Relay::new();
         assert_eq!(
-            r.on_worker_readable(&mut slot, &broker_end).unwrap(),
+            r.on_worker_readable(&slot, &broker_end).unwrap(),
             RelayStep::Continue
         );
         assert_eq!(r.phase(), RelayPhase::AwaitGreeterConvResponse);
-        assert_eq!(
-            r.on_greeter_readable(&mut slot, &broker_end).unwrap(),
-            RelayStep::Finished(Disposition::Cancelled)
-        );
+        let fin = r.on_greeter_readable(&slot, &broker_end).unwrap();
+        assert_eq!(fin, RelayStep::Finished(Disposition::Cancelled));
+        // A8.6: relay step does not reap; caller reaps post-teardown.
+        let RelayStep::Finished(disp) = fin else {
+            unreachable!()
+        };
+        reap_for_disposition(&mut slot, &disp);
         assert!(
             slot.current().is_none(),
             "greeter Cancel SIGKILLed + reaped the worker"
@@ -1066,9 +1108,12 @@ mod tests {
         let (_greeter, broker_end) = pair();
         let mut r = Relay::new();
         assert!(matches!(
-            r.on_worker_readable(&mut slot, &broker_end),
+            r.on_worker_readable(&slot, &broker_end),
             Err(BrokerError::UnexpectedFrame)
         ));
+        // A8.6: relay step no longer reaps on error; the caller
+        // (`relay()`/loop `step()`) is the sole error-path reaper.
+        let _ = slot.cancel_current();
         assert!(
             slot.current().is_none(),
             "out-of-phase frame fails closed: worker cancelled + reaped"
