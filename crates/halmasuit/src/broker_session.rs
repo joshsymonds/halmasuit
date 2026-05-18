@@ -91,12 +91,28 @@ impl From<CodecError> for WireError {
 /// `MSG_DONTWAIT` (A7: the compositor never blocks on broker IPC).
 pub struct SeqpacketChannel {
     fd: OwnedFd,
+    /// Reusable receive scratch, allocated ONCE at the max framed size
+    /// and reused across every `recv_with_fd` — which runs on the
+    /// compositor render/calloop thread on EVERY broker-source
+    /// readiness. Avoids a ~1 MiB `vec![0u8; …]` alloc+memset per
+    /// datagram on the load-bearing no-flash thread. The episode owns
+    /// exactly one channel for its whole lifetime (A6/A8 single owner)
+    /// ⇒ never aliased; `RefCell` keeps `recv_with_fd`'s `&self`
+    /// signature so the calloop borrow shape is unchanged.
+    recv_buf: std::cell::RefCell<Vec<u8>>,
 }
 
 impl SeqpacketChannel {
     #[must_use]
-    pub const fn new(fd: OwnedFd) -> Self {
-        Self { fd }
+    pub fn new(fd: OwnedFd) -> Self {
+        Self {
+            fd,
+            recv_buf: std::cell::RefCell::new(vec![
+                0u8;
+                std::mem::size_of::<u32>()
+                    + MAX_MESSAGE_SIZE as usize
+            ]),
+        }
     }
 
     /// Encode `msg` and write it as exactly one datagram, non-blocking.
@@ -141,7 +157,10 @@ impl SeqpacketChannel {
     /// not exactly one complete message or carried >1 fd;
     /// [`WireError::Io`] on a `recvmsg` error other than would-block.
     pub fn recv_with_fd(&self) -> Result<Option<(BrokerToCompositor, Option<OwnedFd>)>, WireError> {
-        let mut buf = vec![0u8; std::mem::size_of::<u32>() + MAX_MESSAGE_SIZE as usize];
+        // Reuse the per-channel scratch (episode owns one channel for
+        // its lifetime, A6/A8 ⇒ never aliased) — no ~1 MiB alloc+memset
+        // per datagram on the compositor render/calloop thread.
+        let mut buf = self.recv_buf.borrow_mut();
         let mut iov = [std::io::IoSliceMut::new(&mut buf)];
         let mut cmsg = nix::cmsg_space!(RawFd);
         let r = match recvmsg::<()>(

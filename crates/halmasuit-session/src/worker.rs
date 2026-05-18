@@ -20,7 +20,7 @@
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
-use halmasuit_session_ipc::{MAX_MESSAGE_SIZE, SessionOutcome, encode, try_decode};
+use halmasuit_session_ipc::{SessionOutcome, encode, try_decode};
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 use serde::{Deserialize, Serialize};
 
@@ -316,7 +316,9 @@ pub fn send_frame_with_fd<M: Serialize>(
 pub fn recv_frame_with_fd<T: serde::de::DeserializeOwned>(
     chan: &SeqpacketChannel,
 ) -> Result<(T, Option<OwnedFd>), TransportError> {
-    let mut buf = vec![0u8; std::mem::size_of::<u32>() + MAX_MESSAGE_SIZE as usize];
+    // Reuse the channel's one-time scratch (single-owner per A6/A8) —
+    // no ~1 MiB alloc+memset per SCM_RIGHTS datagram on the relay loop.
+    let mut buf = chan.recv_scratch();
     let mut iov = [io::IoSliceMut::new(&mut buf)];
     let mut cmsg = nix::cmsg_space!(RawFd);
     let r = recvmsg::<()>(
@@ -549,6 +551,50 @@ pub fn spawn_session_worker(
     })
 }
 
+/// Pre-fork fail-closed gates for [`spawn_session_leader`], extracted
+/// so the privileged drop+exec function stays small and these gates
+/// are independently unit-testable.
+///
+/// 1. UID/GID floor + `(uid_t)-1`/`u32::MAX` sentinel re-check — pure
+///    input validation (CLAUDE.md: "UID floor is load-bearing —
+///    enforced by the broker's session-leader child"; CVE-2019-14287
+///    class). The sole production caller passes a `validate()`-checked
+///    spec, so this is defence-in-depth — but it makes the documented
+///    child-enforced floor REAL: any future caller that builds a
+///    `SessionSpec` without `validate` still cannot drive a
+///    sub-`UID_MIN`/sentinel privilege drop. Checked FIRST so it is
+///    unit-testable without root (order is security-neutral — both
+///    gates must pass).
+/// 2. EUID==0 — the broker is root in the host ns; nothing else may
+///    drive a session launch (Epic R7/R11).
+///
+/// Runs PARENT-side before any fork, so a normal `Err` is correct
+/// (NOT `_exit`).
+///
+/// # Errors
+/// [`io::ErrorKind::PermissionDenied`] on a sub-floor/sentinel uid|gid
+/// or non-root EUID.
+fn prefork_gates(spec: &crate::session_leader::SessionSpec) -> io::Result<()> {
+    use crate::session_leader::UID_MIN;
+    if spec.uid == u32::MAX || spec.gid == u32::MAX || spec.uid < UID_MIN || spec.gid < UID_MIN {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "spawn_session_leader: uid/gid ({}/{}) below UID_MIN ({UID_MIN}) \
+                 or the (uid_t)-1 sentinel — refused before fork",
+                spec.uid, spec.gid
+            ),
+        ));
+    }
+    if !nix::unistd::geteuid().is_root() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "spawn_session_leader requires EUID==0 (the broker is root in the host ns)",
+        ));
+    }
+    Ok(())
+}
+
 /// The Design-A session leader (Epic R7).
 ///
 /// The already-root broker `fork()`s; the NON-setuid child does the
@@ -562,12 +608,19 @@ pub fn spawn_session_worker(
 ///
 /// # Errors
 ///
-/// [`io::ErrorKind::PermissionDenied`] if EUID != 0 (NO fork performed);
-/// [`io::ErrorKind::InvalidInput`] on an empty command / interior NUL
-/// in an arg or env entry; any errno from `fork`/`pidfd_open`. The
-/// CHILD never returns through this `Result` — on ANY drop/exec
-/// failure it `libc::_exit`s (never `?`/return — that would re-enter
-/// the root parent with duplicated state; Epic R7 anti-pattern).
+/// [`io::ErrorKind::PermissionDenied`] if EUID != 0 OR the spec's
+/// uid/gid is below [`crate::session_leader::UID_MIN`] or the
+/// `(uid_t)-1`/`u32::MAX` sentinel (NO fork performed — the UID floor
+/// is re-checked HERE in the privilege-dropping function as
+/// defence-in-depth, making CLAUDE.md's "enforced by the broker's
+/// session-leader child" invariant true even if a future caller
+/// bypasses [`crate::session_leader::validate`]; CVE-2019-14287
+/// class); [`io::ErrorKind::InvalidInput`] on an empty command /
+/// interior NUL in an arg or env entry; any errno from
+/// `fork`/`pidfd_open`. The CHILD never returns through this `Result`
+/// — on ANY drop/exec failure it `libc::_exit`s (never `?`/return —
+/// that would re-enter the root parent with duplicated state; Epic R7
+/// anti-pattern).
 pub fn spawn_session_leader(
     spec: &crate::session_leader::SessionSpec,
     groups: &[u32],
@@ -576,14 +629,8 @@ pub fn spawn_session_leader(
 
     use nix::unistd::{Gid, Uid};
 
-    // EUID==0 gate FIRST — before any fork (Epic R7/R11). The broker
-    // is root in the host ns; nothing else may drive a session launch.
-    if !nix::unistd::geteuid().is_root() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "spawn_session_leader requires EUID==0 (the broker is root in the host ns)",
-        ));
-    }
+    // Pre-fork fail-closed gates (floor/sentinel re-check + EUID==0).
+    prefork_gates(spec)?;
 
     // Build everything BEFORE the fork so the privileged window
     // between the first setres* and execve has ZERO allocations (Epic
@@ -1021,5 +1068,47 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
             "EUID==0 gate must reject non-root before any fork: {e:?}"
         );
+    }
+
+    #[test]
+    fn spawn_session_leader_re_checks_uid_floor_before_fork() {
+        use crate::session_leader::{SessionSpec, UID_MIN};
+
+        // Amendment-A5.6-adjacent defence-in-depth (review G2 / C2):
+        // the UID/GID floor + `(uid_t)-1`/`u32::MAX` sentinel is
+        // re-checked INSIDE `spawn_session_leader` itself, ordered
+        // BEFORE the EUID gate, so it fails closed regardless of root
+        // and is unit-testable without root (CLAUDE.md: "UID floor is
+        // load-bearing — enforced by the broker's session-leader
+        // child"; CVE-2019-14287 class). Every case must reject with
+        // PermissionDenied and a message naming UID_MIN — proving the
+        // FLOOR check fired, not the EUID gate.
+        for (uid, gid) in [
+            (0_u32, 0_u32),         // root
+            (UID_MIN - 1, UID_MIN), // uid below floor
+            (UID_MIN, UID_MIN - 1), // gid below floor
+            (u32::MAX, UID_MIN),    // (uid_t)-1 sentinel
+            (UID_MIN, u32::MAX),    // gid sentinel
+        ] {
+            let spec = SessionSpec {
+                username: "x".into(),
+                uid,
+                gid,
+                cmd: vec!["/bin/true".into()],
+                env: vec![],
+            };
+            let e = spawn_session_leader(&spec, &[gid])
+                .expect_err("sub-floor / sentinel uid/gid must be refused before fork");
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "({uid}/{gid}) must be PermissionDenied: {e:?}"
+            );
+            assert!(
+                e.to_string().contains("UID_MIN"),
+                "({uid}/{gid}) must be refused by the FLOOR re-check (message names UID_MIN), \
+                 not the EUID gate: {e}"
+            );
+        }
     }
 }

@@ -18,8 +18,12 @@
 //! established set — a blind `initgroups` REPLACES the list and would
 //! silently clobber groups added by pam_group/pam_systemd/pam_mount.
 //!
-//! `#![forbid(unsafe_code)]` — pure validation/computation; the unsafe
-//! `fork`/`setres*`/`execve` syscall sequence lands in the NEXT task.
+//! `#![forbid(unsafe_code)]` — this module is the pure
+//! validation/group-merge core; the unsafe `fork`/`setres*`/`execve`
+//! privilege-drop sequence that consumes its [`SessionSpec`] lives in
+//! [`crate::worker::spawn_session_leader`] (the unsafe-quarantine
+//! module), which re-checks the UID/GID floor + sentinel before the
+//! fork as defence-in-depth.
 
 #![forbid(unsafe_code)]
 
@@ -317,24 +321,6 @@ mod tests {
         for good in ["PATH", "HOME", "XDG_RUNTIME_DIR", "LC_ALL"] {
             assert!(keys.contains(&good), "must keep {good}: {keys:?}");
         }
-    }
-
-    #[test]
-    fn validate_stores_sanitized_env_in_spec() {
-        let spec = validate(
-            "root",
-            1000,
-            1000,
-            ok_cmd(),
-            vec![
-                ("LD_PRELOAD".into(), "/evil.so".into()),
-                ("PATH".into(), "/bin".into()),
-            ],
-        );
-        // root@1000 fails pwent, so use a name we can't guarantee;
-        // instead assert the env-sanitization independently above and
-        // here only that an invalid identity never yields a spec.
-        assert!(spec.is_err());
     }
 
     #[test]

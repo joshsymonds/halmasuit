@@ -46,11 +46,36 @@ pub enum TransportError {
 #[derive(Debug)]
 pub struct SeqpacketChannel {
     fd: OwnedFd,
+    /// Reusable receive scratch, allocated ONCE at the max framed size
+    /// and reused across every `recv` (the channel has exactly one
+    /// owner per Amendment A6/A8, so no concurrent access — a single
+    /// non-aliasing borrow per call). Avoids a ~1 MiB `vec![0u8; …]`
+    /// alloc+memset on every datagram, incl. on the broker relay loop.
+    /// `RefCell` (not `&mut self`) keeps `recv`'s `&self` signature so
+    /// the calloop borrow shapes are unchanged; no `unsafe` (this
+    /// module stays `#![forbid(unsafe_code)]`).
+    recv_buf: std::cell::RefCell<Vec<u8>>,
 }
 
 impl SeqpacketChannel {
-    pub const fn new(fd: OwnedFd) -> Self {
-        Self { fd }
+    #[must_use]
+    pub fn new(fd: OwnedFd) -> Self {
+        Self {
+            fd,
+            recv_buf: std::cell::RefCell::new(vec![
+                0u8;
+                std::mem::size_of::<u32>()
+                    + MAX_MESSAGE_SIZE as usize
+            ]),
+        }
+    }
+
+    /// Borrow the reusable receive scratch (Amendment-A6 single-owner
+    /// channel ⇒ never aliased). Used by [`crate::worker`]'s
+    /// SCM_RIGHTS `recv_frame_with_fd` so it shares this channel's
+    /// one-time buffer instead of allocating per datagram.
+    pub(crate) fn recv_scratch(&self) -> std::cell::RefMut<'_, Vec<u8>> {
+        self.recv_buf.borrow_mut()
     }
 
     /// Encode `msg` and write it as exactly one datagram.
@@ -80,10 +105,11 @@ impl SeqpacketChannel {
     /// [`TransportError::Malformed`] if the datagram is not exactly one
     /// complete message; [`TransportError::Io`] on `recv`.
     pub fn recv<T: serde::de::DeserializeOwned>(&self) -> Result<T, TransportError> {
-        // SEQPACKET delivers one datagram per recv; size the buffer to
-        // the largest framed message the codec will ever accept so a
-        // valid message is never truncated.
-        let mut buf = vec![0u8; std::mem::size_of::<u32>() + MAX_MESSAGE_SIZE as usize];
+        // SEQPACKET delivers one datagram per recv; the scratch is
+        // already sized to the largest framed message the codec will
+        // ever accept so a valid message is never truncated. Reused
+        // across calls (single-owner channel) — no per-datagram alloc.
+        let mut buf = self.recv_scratch();
         let n = recv(self.fd.as_raw_fd(), &mut buf, MsgFlags::empty())?;
         if n == 0 {
             return Err(TransportError::Closed);
