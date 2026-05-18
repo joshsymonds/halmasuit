@@ -38,7 +38,7 @@ These are anti-patterns from `ARCHITECTURE.md` codified as Claude rules.
 Do not relax them without explicit user direction:
 
 - **`login-flash` is a GREEN hard gate.** It proves halmasuit's PID
-  and `assert_frame_continuity` hold across the real greeter→session
+  and `assert_no_flash_stream` hold across the real greeter→session
   transition *through the broker-launched session* — no compositor
   restart, no flash. Never weaken, skip, invert, or conditionalize the
   assertion to keep it green; an unexpected FAIL means the flash

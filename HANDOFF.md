@@ -271,7 +271,7 @@ satisfied by making the replacement land HERE.
    halmasuit` shows no `pam-sys`; no world-exec setuid spawn inode
    exists anywhere.
 3. **`login-flash` through the new path.** PID-continuity AND
-   `assert_frame_continuity` across greeter→session with the broker
+   `assert_no_flash_stream` across greeter→session with the broker
    launching the session; `login-flash` stays a HARD gate, unmodified.
 4. **R13 docs re-sweep.** The R13 pass done under A3 described the
    helper as "interim / scheduled for deletion by a successor epic."
@@ -962,7 +962,7 @@ sidecar** (independent — do it anytime):
    (no `ProtectHome=false` carve-out — that is the whole point of §0).
    Assert: real greetd auth (through the broker) → niri `xdg_toplevel`
    fullscreen foreground; niri marker (`pgrep -x niri`); PID-continuity
-   across greeter→niri; `assert_frame_continuity`; Snapshot
+   across greeter→niri; `assert_no_flash_stream`; Snapshot
    `niri-session` golden, Read-inspected before commit. Greeter stays
    the layer-shell stand-in.
 2. **G2 — real DankGreeter as `greeterCommand`** (replaces the stand-in
