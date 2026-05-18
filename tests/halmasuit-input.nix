@@ -13,7 +13,7 @@
   system,
   nixpkgs,
   halmasuit,
-  halmasuit-spawn,
+  halmasuit-session,
   halmasuit-layer-shell-test-client,
 }:
 
@@ -43,7 +43,7 @@ pkgs.testers.runNixOSTest {
       services.halmasuit = {
         enable         = true;
         package        = halmasuit;
-        spawnPackage   = halmasuit-spawn;
+        session.package   = halmasuit-session;
         greeterUid     = 999;
         greeterGroup   = "halmasuit-greeter";
         compositorUid  = 998;

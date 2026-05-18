@@ -8,13 +8,26 @@
 # The unit starts as root (User= unset on purpose). halmasuit binds
 # its sockets while still privileged, then in-process `setresuid`s to
 # the configured `compositorUid`. From that point on every halmasuit
-# code path runs unprivileged; the only setuid binary on the closure
-# is halmasuit-spawn, wrapped via `security.wrappers` below.
+# code path runs unprivileged. The compositor holds NO PAM handle and
+# execs NO setuid helper: it relays the greetd auth conversation over
+# a SOCK_SEQPACKET channel to the privileged, host-ns,
+# socket-activated `halmasuit-session` broker (Epic #1 R2/R3), which
+# owns the one pam_handle_t and forks-then-drops the session leader in
+# a non-setuid child. There is no setuid binary on the closure.
 
 { config, lib, pkgs, ... }:
 
 let
   cfg = config.services.halmasuit;
+
+  # The uid the broker's SO_PEERCRED gate authorizes as its trusted
+  # relay peer (Epic R5/R8 — authenticates the peer; identity is still
+  # independently PAM-derived). In the live topology the compositor is
+  # that peer: greeter →[compositor's greetd greeter-gate]→ compositor
+  # →[broker's relay-peer gate]→ broker. When the broker is deployed
+  # standalone (no compositor), whatever drives it directly (the
+  # greeter uid, as the direct-broker VM gates do) is the peer.
+  brokerPeerUid = if cfg.enable then cfg.compositorUid else cfg.greeterUid;
 in
 {
   options.services.halmasuit = {
@@ -27,19 +40,6 @@ in
       description = ''
         halmasuit package to use. Override with a flake-built derivation
         when iterating on the compositor without rebuilding nixpkgs.
-      '';
-    };
-
-    spawnPackage = lib.mkOption {
-      type        = lib.types.package;
-      default     = pkgs.halmasuit-spawn;
-      defaultText = lib.literalExpression "pkgs.halmasuit-spawn";
-      description = ''
-        Package providing the halmasuit-spawn privilege-drop helper. The
-        unit invokes `''${spawnPackage}/bin/halmasuit-spawn` on session
-        start to fork + setresuid into the authenticated user. Requires
-        the halmasuit overlay (or a manual `pkgs.halmasuit-spawn`
-        definition) for the default to resolve.
       '';
     };
 
@@ -172,14 +172,18 @@ in
     session = {
       enable = lib.mkEnableOption ''
         the socket-activated privileged `halmasuit-session` PAM-lifecycle
-        broker (Epic #1 R6 / Amendment A2). Independent of
-        `services.halmasuit.enable`: the broker is a self-contained
+        broker (Epic #1 R6 / Amendment A2) explicitly, on its own (for
+        deploying / VM-gating the broker without the compositor).
+
+        You normally do NOT set this: enabling
+        `services.halmasuit.enable` implies it, because the compositor's
+        only auth path is relaying the greetd conversation to this
+        broker (Epic #1 R3 / Amendment A4 — there is no in-compositor
+        PAM and no setuid spawn helper). The broker is a self-contained
         host-ns root unit that PID 1 activates on the first greeter
         connection and which idle-exits when no auth/session is in
         flight, so there is no standing root process at the login
-        screen. The compositor wiring that hands it connections lands
-        with the G-layer; this option exists so the broker can be
-        deployed and VM-gated on its own.
+        screen
       '';
 
       package = lib.mkOption {
@@ -273,36 +277,34 @@ in
     ];
 
     # Default PAM service file — gives us unixAuth-backed pam_unix +
-    # pam_env + pam_limits, which is what halmasuit-pam exercises in
-    # the VM test and is the conventional starting stack for greeters.
-    # Operators wanting custom modules disable installPamConfig and
-    # declare security.pam.services.<name> themselves.
+    # pam_env + pam_limits, the stack the privileged halmasuit-session
+    # broker authenticates against and the conventional starting stack
+    # for greeters. Operators wanting custom modules disable
+    # installPamConfig and declare security.pam.services.<name>
+    # themselves.
     security.pam.services = lib.mkIf cfg.installPamConfig {
       ${cfg.pamService} = {};
     };
 
-    # Setuid wrapper for halmasuit-spawn. After halmasuit deprivileges
-    # itself, it still needs to fork+exec halmasuit-spawn to bring up
-    # the authenticated user's session — halmasuit-spawn's own
-    # `setresuid` requires euid==0, which the kernel grants at exec
-    # time via the setuid bit on this wrapper. The real binary lives
-    # in the nix store; security.wrappers writes a tiny setuid shim
-    # at /run/wrappers/bin/halmasuit-spawn that re-execs it.
-    security.wrappers.halmasuit-spawn = {
-      owner  = "root";
-      group  = "root";
-      setuid = true;
-      source = "${cfg.spawnPackage}/bin/halmasuit-spawn";
-    };
+    # No setuid wrapper: the compositor execs no privilege-drop helper.
+    # Session launch is the privileged halmasuit-session broker
+    # forking-then-dropping a non-setuid child (Epic #1 R7/R15) — see
+    # the broker unit below. There is no setuid inode in the closure.
 
     systemd.services.halmasuit = {
       description = "halmasuit — Linux system compositor";
       wantedBy    = [ "multi-user.target" ];
       # seatd must be up before halmasuit so `LibSeatSession::new()`
-      # can reach the broker socket while halmasuit is still root
+      # can reach the seatd socket while halmasuit is still root
       # (pre-privilege-drop). `requires` so a seatd failure fails
       # halmasuit loudly rather than silently losing the GPU.
-      after       = [ "local-fs.target" "seatd.service" ];
+      #
+      # `halmasuit-session.socket` ordered before us so the broker's
+      # SOCK_SEQPACKET listening socket is bound (PID 1 owns it) by the
+      # time the compositor relays its first greeter auth to it (Epic
+      # #1 R3). NOT `requires`: the broker is socket-activated and
+      # idle-exits — only the socket need exist, not a running service.
+      after       = [ "local-fs.target" "seatd.service" "halmasuit-session.socket" ];
       requires    = [ "seatd.service" ];
 
       serviceConfig = {
@@ -325,30 +327,23 @@ in
         # files under this dir.
         RuntimeDirectory     = "halmasuit";
         RuntimeDirectoryMode = "0755";
-        # `shadow` group access lets halmasuit-pam (running as the
-        # compositor uid) call `getspnam` directly on /etc/shadow
-        # rather than forking the setuid `unix_chkpwd` helper.
-        # The fork path is fragile: any inherited seccomp filter or
-        # NNP bit on halmasuit silently disables the setuid bit on
-        # the helper, leaving auth wedged with a confusing
-        # "user unknown" log line. Direct shadow access is the
-        # documented escape: pam_unix tries `getspnam` first and
-        # only falls back to the helper on EPERM.
-        SupplementaryGroups    = [ "shadow" ];
-        # Hardening posture. The privilege split (halmasuit deprivileges
-        # to compositorUid; halmasuit-spawn is the only setuid binary)
-        # is the primary defense. The directives below are
-        # defense-in-depth. We deliberately do NOT enable the systemd
-        # directives that implicitly set `NoNewPrivileges=yes`
-        # (MemoryDenyWriteExecute, RestrictNamespaces, RestrictRealtime,
-        # SystemCallFilter, LockPersonality, ProtectKernelTunables,
-        # ProtectKernelModules, RestrictSUIDSGID — see
-        # systemd.exec(5)'s context_has_seccomp/no_new_privileges).
-        # With NNP on, the kernel ignores the setuid bit on
-        # halmasuit-spawn at exec time, breaking the session-spawn
-        # handoff entirely. halmasuit-spawn itself is audit-grade
-        # (microscopic, fuzzed, UID_MIN floor) and the only setuid
-        # binary in the closure — that's what we're trusting instead.
+        # No `SupplementaryGroups`: the compositor runs NO PAM and has
+        # no business reading /etc/shadow. PAM (and its `shadow`-group
+        # getspnam fast-path) lives in the privileged halmasuit-session
+        # broker unit only (Epic #1 R2/R14; least authority).
+        #
+        # Hardening posture. The primary defense is the privilege
+        # split: the compositor deprivileges to compositorUid, holds no
+        # PAM handle, and execs no setuid helper (all PAM/privileged
+        # work is the separate host-ns broker unit). The directives
+        # below are defense-in-depth. NNP-implying directives
+        # (MemoryDenyWriteExecute, RestrictNamespaces, SystemCallFilter,
+        # LockPersonality, RestrictSUIDSGID, …) are deliberately left
+        # OFF here: with the setuid helper gone NNP is no longer
+        # forbidden for correctness, but the compositor's DRM / libseat
+        # / dlopen'd Mesa surface under seccomp+NNP is unaudited —
+        # enabling them is a dedicated hardening pass, not part of the
+        # privilege-separation epic. Tracked as a follow-up.
         ProtectSystem          = "strict";
         ProtectHome            = true;
         PrivateTmp             = true;
@@ -380,10 +375,10 @@ in
         # Privilege-drop target. halmasuit reads this after binding
         # sockets and `setresuid`s to it in-process.
         HALMASUIT_COMPOSITOR_UID = toString cfg.compositorUid;
-        # Resolved path to halmasuit-spawn — the setuid wrapper
-        # declared above. halmasuit (deprivileged) execs this to
-        # launch user sessions.
-        HALMASUIT_SPAWN_BIN = "/run/wrappers/bin/halmasuit-spawn";
+        # No HALMASUIT_SPAWN_BIN: the compositor execs no helper. Its
+        # broker socket defaults to /run/halmasuit-session.sock — the
+        # ListenSequentialPacket the broker unit binds below — so no
+        # HALMASUIT_BROKER_SOCKET override is needed here.
         # Force Mesa to use llvmpipe (software rasterizer) until the
         # epic's real-hardware shakedown subtask validates virgl /
         # native GPU paths on gnomon. Deterministic, doesn't need
@@ -423,7 +418,12 @@ in
    # connection. There is no setuid helper anywhere in this path: the
    # broker is already root and forks-then-drops the session leader in
    # a non-setuid child (Epic R7/R15).
-   (lib.mkIf cfg.session.enable {
+   #
+   # Provisioned whenever the compositor is enabled (`cfg.enable`) OR
+   # the broker is requested on its own (`cfg.session.enable`): the
+   # compositor's only auth path is relaying to this broker (Epic #1
+   # R3/A4), so it is mandatory infrastructure, not an opt-in add-on.
+   (lib.mkIf (cfg.enable || cfg.session.enable) {
      systemd.sockets."halmasuit-session" = {
        description = "halmasuit-session privileged PAM-lifecycle broker socket";
        wantedBy    = [ "sockets.target" ];
@@ -436,7 +436,8 @@ in
          # connection.
          Accept = false;
          # SO_PEERCRED in the broker is the load-bearing authorization
-         # (only HALMASUIT_GREETER_UID may drive auth). The socket mode
+         # (only the HALMASUIT_BROKER_PEER_UID relay peer may drive
+         # auth). The socket mode
          # is defence-in-depth only; the compositor will broker greeter
          # connections through a tighter SocketUser/SocketGroup once
          # the G-layer lands. Until then a permissive mode lets the
@@ -491,9 +492,12 @@ in
 
        environment = {
          RUST_LOG = cfg.logLevel;
-         # SO_PEERCRED authorization: only this uid may drive auth
-         # (Epic R5/R8). Same env key the compositor module uses.
-         HALMASUIT_GREETER_UID = toString cfg.greeterUid;
+         # SO_PEERCRED authorization: only the trusted relay peer may
+         # drive auth (Epic R5/R8). In the live topology that is the
+         # unprivileged compositor (it owns its own greeter gate on the
+         # greetd socket); standalone it is whatever drives the broker
+         # directly. Identity is still independently PAM-derived (R8).
+         HALMASUIT_BROKER_PEER_UID = toString brokerPeerUid;
          # PAM service file lookup key — /etc/pam.d/<value>.
          HALMASUIT_PAM_SERVICE = cfg.pamService;
        };
@@ -505,8 +509,9 @@ in
          message   = ''
            services.halmasuit.session.enable requires
            services.halmasuit.greeterUid to be set: the broker's
-           SO_PEERCRED gate rejects every connection whose peer uid
-           does not match.
+           SO_PEERCRED relay-peer gate rejects every connection whose
+           peer uid is not the authorized relay peer (the compositor
+           when services.halmasuit.enable, else the greeter uid).
          '';
        }
      ];

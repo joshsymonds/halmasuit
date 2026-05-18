@@ -3,9 +3,11 @@
 # Proves the greetd-lifecycle-driven foreground swap on the REAL
 # mechanism: splash (BACKGROUND, persistent) + a layer-shell greeter
 # (halmasuit's tracked greeterCommand child) → halmasuit-vm-client
-# drives a real greetd full-auth → halmasuit kills the greeter and
-# `halmasuit-spawn` execs the session (an xdg_toplevel client) as the
-# authenticated user → the session toplevel becomes foreground.
+# drives a real greetd full-auth → the compositor relays it to the
+# privileged halmasuit-session broker (real pam_unix) → halmasuit
+# kills the greeter and the broker forks-then-drops the session (an
+# xdg_toplevel client) as the authenticated user → the session
+# toplevel becomes foreground.
 #
 # Asserts: ForegroundChanged ordering (greeter→session), halmasuit
 # PID continuous across the swap (login-flash invariant on the real
@@ -23,7 +25,7 @@
   system,
   nixpkgs,
   halmasuit,
-  halmasuit-spawn,
+  halmasuit-session,
   halmasuit-splash,
   halmasuit-layer-shell-test-client,
   halmasuit-toplevel-test-client,
@@ -34,9 +36,10 @@
 let
   pkgs = import nixpkgs { inherit system; };
   fixture = ./fixtures/splash-test.png;
-  # The session halmasuit-spawn execs as the authenticated user: a
-  # wrapper that gives it the wayland env then runs the xdg_toplevel
-  # client (a stand-in for niri — G wires the real one).
+  # The session the broker's session-leader child execs as the
+  # authenticated user: a wrapper that gives it the wayland env then
+  # runs the xdg_toplevel client (a stand-in for niri — G wires the
+  # real one).
   sessionCmd = pkgs.writeShellScript "halmasuit-test-session" ''
     export XDG_RUNTIME_DIR=/run/halmasuit
     export WAYLAND_DISPLAY=wayland-0
@@ -67,7 +70,9 @@ pkgs.testers.runNixOSTest {
       services.halmasuit = {
         enable         = true;
         package        = halmasuit; # halmasuit-debug via flake
-        spawnPackage   = halmasuit-spawn;
+        # Compositor relays auth to the privileged halmasuit-session
+        # broker (Epic R3/A4); enabling it auto-provisions the broker.
+        session.package = halmasuit-session;
         greeterUid     = 999;
         greeterGroup   = "halmasuit-greeter";
         compositorUid  = 998;
@@ -102,16 +107,16 @@ pkgs.testers.runNixOSTest {
         };
       };
 
-      # The authenticated session user. halmasuit-spawn's load-bearing
-      # UID floor refuses uid OR gid < 1000 — a normal NixOS user
-      # lands in group `users` (gid 100) which the floor (correctly!)
-      # rejects, so alice gets her own gid-1000 group (same pattern as
-      # halmasuit-vm.nix). Test-local `halmasuit-greeter` membership
-      # lets the session she spawns open halmasuit's 0660 wayland
-      # socket; the production session→compositor socket handover is
-      # layer G's concern.
+      # The authenticated session user. The broker session-leader's
+      # load-bearing UID floor (Epic R8/R11) refuses uid OR gid < 1000
+      # — a normal NixOS user lands in group `users` (gid 100) which
+      # the floor (correctly!) rejects, so alice gets her own gid-1000
+      # group (same pattern as halmasuit-vm.nix). Test-local
+      # `halmasuit-greeter` membership lets the session she spawns open
+      # halmasuit's 0660 wayland socket; the production
+      # session→compositor socket handover is layer G's concern.
       # uid/gid 1001 (not 1000): test-user.nix already takes uid 1000;
-      # 1001 still clears halmasuit-spawn's ≥1000 floor.
+      # 1001 still clears the broker's ≥1000 floor.
       users.users.alice = {
         isNormalUser = true;
         uid          = 1001;
@@ -196,8 +201,9 @@ pkgs.testers.runNixOSTest {
         "systemctl show -p MainPID --value halmasuit.service"
     ).strip()
 
-    # Drive a REAL greetd full-auth as the greeter uid; the session
-    # halmasuit-spawn execs is the xdg_toplevel client.
+    # Drive a REAL greetd full-auth as the greeter uid; the broker
+    # authenticates against real pam_unix and its session-leader child
+    # execs the xdg_toplevel client.
     machine.succeed("printf 'testpassword' > /tmp/alice.pw")
     machine.succeed("chown halmasuit-greeter:halmasuit-greeter /tmp/alice.pw")
     machine.succeed("chmod 600 /tmp/alice.pw")

@@ -1,48 +1,53 @@
-//! `BrokerSession` — the compositor's `PamSession` backed by the
-//! privileged `halmasuit-session` broker (Epic R3 / Amendments A4/A5).
+//! `BrokerEpisode` — the compositor's per-greeter-connection episode
+//! object (Epic R3 / Amendments A4/A5/A6/A7).
 //!
 //! This is `halmasuit-pam`'s successor on the live path: instead of
 //! running PAM in-process, the compositor relays the greetd auth
-//! conversation to the broker over a `SOCK_SEQPACKET` channel speaking
-//! the frozen `halmasuit-session-ipc` contract. The pure translation
-//! brain is [`crate::broker_relay::BrokerRelay`] (task #27); this file
-//! is only the I/O shell.
+//! conversation to the privileged `halmasuit-session` broker over a
+//! `SOCK_SEQPACKET` channel speaking the frozen `halmasuit-session-ipc`
+//! contract. The pure translation brain is
+//! [`crate::broker_relay::BrokerRelay`] (#27); the sans-IO greetd
+//! protocol machine is `halmasuit_greetd::server::Connection` (#30a);
+//! this file binds them to the broker channel.
 //!
-//! Scope (task #29): the AUTH conversation only —
-//! `PamStep::{Challenge,Success,Failure}`. The greetd `Spawning` →
-//! `StartSession` seam, the A5 `SessionOpened`/`SessionEnded`
-//! consumption + two-key flash-free swap, and the SCM_RIGHTS pidfd
-//! backstop are later R3 sub-tasks. The compositor links no libpam and
-//! never depends on the `halmasuit-session` crate (R2/R3/R14); only
-//! the pure `halmasuit-session-ipc` codec is shared (the SEQPACKET
-//! syscall wrapper is reimplemented locally, not the codec).
+//! # Single owner, sans-IO (A6 + A7)
 //!
-//! Built behind the `PamSessionFactory` trait and NOT constructed in
-//! `main()` yet — the live `PamThreadFactory`→`BrokerSessionFactory`
-//! swap is atomic with deleting `halmasuit-pam`/`halmasuit-spawn`
-//! (R10/R14/R15; the next task), never before.
+//! [`BrokerEpisode`] OWNS the [`SeqpacketChannel`] for the whole
+//! episode (A6 — no dup/Rc/Arc; the auth state never owns the fd). The
+//! drive methods perform NO blocking I/O (A7): every channel `send`/
+//! `recv` is `MSG_DONTWAIT`. The calloop layer multiplexes the greeter
+//! fd and the broker fd as two non-blocking sources and calls
+//! [`BrokerEpisode::on_greeter_bytes`] / [`BrokerEpisode::on_broker_readable`]
+//! on readiness; the compositor render/calloop thread never blocks on
+//! a privileged-peer round-trip. Broker death is a readable→EOF event
+//! ([`WireError::Closed`]) → greetd fail-closed auth failure (A7.4).
+//!
+//! The compositor links no libpam and never depends on the
+//! `halmasuit-session` crate (R2/R3/R14); only the pure
+//! `halmasuit-session-ipc` codec is shared (the SEQPACKET syscall
+//! wrapper is reimplemented locally).
 
-// reason: the live PamSessionFactory swap that constructs/drives this
-// is the next (atomic-with-deletion) R3 task; until then it is
-// exercised only by this module's tests, so the non-test build sees
-// it as unused. Removed when that swap lands (Amendment A4).
+// reason: `BrokerEpisode` is constructed + driven by the calloop
+// rewire (the next S1 bite, #31); until that lands it is exercised
+// only by this module's tests, so the non-test build sees it as
+// unused. The allowance is removed when the calloop wiring lands.
 #![allow(dead_code)]
 
 use std::fmt;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::path::Path;
 
-use halmasuit_greetd::server::PamSessionFactory;
-use halmasuit_greetd::{PamSession, PamStep};
+use halmasuit_greetd::server::{Connection, Demand, SpawnRequest};
 use halmasuit_session_ipc::{
     BrokerToCompositor, CodecError, CompositorToBroker, MAX_MESSAGE_SIZE, encode, try_decode,
 };
 use nix::sys::socket::{MsgFlags, recv, send};
 
-use crate::broker_relay::{BrokerRelay, RelayEvent};
+use crate::broker_relay::{BrokerRelay, RelayError, RelayEvent};
 
 /// SEQPACKET framing error. Internal — every variant is turned into a
-/// fail-closed [`PamStep::Failure`] by [`BrokerSession::step`]; it is
-/// never surfaced to the greeter as anything but an auth failure.
+/// fail-closed greeter auth failure by the episode; it is never
+/// surfaced to the greeter as anything but an auth error.
 #[derive(Debug)]
 pub enum WireError {
     /// `send`/`recv` syscall failed.
@@ -85,27 +90,30 @@ impl From<CodecError> for WireError {
 /// `halmasuit-session-ipc` messages, one datagram per logical message.
 ///
 /// The codec ([`encode`]/[`try_decode`]) is shared with the broker via
-/// the pure contract crate; only this ~thin syscall wrapper is local
+/// the pure contract crate; only this thin syscall wrapper is local
 /// (the compositor must not depend on the libpam-linking
-/// `halmasuit-session` crate — R14).
+/// `halmasuit-session` crate — R14). Both `send` and `recv` are
+/// `MSG_DONTWAIT` (A7: the compositor never blocks on broker IPC).
 pub struct SeqpacketChannel {
     fd: OwnedFd,
 }
 
 impl SeqpacketChannel {
+    #[must_use]
     pub const fn new(fd: OwnedFd) -> Self {
         Self { fd }
     }
 
-    /// Encode `msg` and write it as exactly one datagram.
+    /// Encode `msg` and write it as exactly one datagram, non-blocking.
     ///
     /// # Errors
     /// [`WireError::Codec`] on encode overflow; [`WireError::Io`] on
-    /// `send`; [`WireError::Malformed`] if the kernel accepted only
-    /// part of the datagram (a SEQPACKET message cannot be continued).
+    /// `send` (incl. `EAGAIN` — a wedged privileged peer is fail-closed,
+    /// A7.4); [`WireError::Malformed`] if the kernel accepted only part
+    /// of the datagram (a SEQPACKET message cannot be continued).
     pub fn send(&self, msg: &CompositorToBroker) -> Result<(), WireError> {
         let bytes = encode(msg)?;
-        let n = send(self.fd.as_raw_fd(), &bytes, MsgFlags::empty())?;
+        let n = send(self.fd.as_raw_fd(), &bytes, MsgFlags::MSG_DONTWAIT)?;
         if n == bytes.len() {
             Ok(())
         } else {
@@ -113,177 +121,268 @@ impl SeqpacketChannel {
         }
     }
 
-    /// Read exactly one datagram and decode it.
+    /// Read at most one datagram and decode it, non-blocking.
+    ///
+    /// `Ok(None)` means "no datagram ready" (`EAGAIN`/`EWOULDBLOCK`) —
+    /// a spurious calloop wakeup; the caller does nothing.
     ///
     /// # Errors
     /// [`WireError::Closed`] on peer hangup; [`WireError::Codec`] on a
     /// bad/oversized body; [`WireError::Malformed`] if the datagram is
-    /// not exactly one complete message; [`WireError::Io`] on `recv`.
-    pub fn recv(&self) -> Result<BrokerToCompositor, WireError> {
+    /// not exactly one complete message; [`WireError::Io`] on a `recv`
+    /// error other than would-block.
+    pub fn recv(&self) -> Result<Option<BrokerToCompositor>, WireError> {
         let mut buf = vec![0u8; std::mem::size_of::<u32>() + MAX_MESSAGE_SIZE as usize];
-        let n = recv(self.fd.as_raw_fd(), &mut buf, MsgFlags::empty())?;
+        let n = match recv(self.fd.as_raw_fd(), &mut buf, MsgFlags::MSG_DONTWAIT) {
+            Ok(n) => n,
+            Err(nix::errno::Errno::EAGAIN) => return Ok(None),
+            Err(e) => return Err(WireError::Io(e)),
+        };
         if n == 0 {
             return Err(WireError::Closed);
         }
         match try_decode::<BrokerToCompositor>(&buf[..n])? {
-            Some((msg, consumed)) if consumed == n => Ok(msg),
+            Some((msg, consumed)) if consumed == n => Ok(Some(msg)),
             _ => Err(WireError::Malformed),
         }
     }
 }
 
-/// A `PamSession` whose conversation is relayed to the broker.
+impl AsFd for SeqpacketChannel {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+/// Connect a client `SOCK_SEQPACKET` socket to the broker.
 ///
-/// `Broken` is the fail-closed state: a failed connect (or any
-/// transport/relay error mid-auth) makes every subsequent `step`
-/// return [`PamStep::Failure`] — never a panic, never a partial
-/// success. The greetd state machine treats that exactly like a PAM
-/// rejection.
-enum Inner {
-    Connected {
-        chan: SeqpacketChannel,
-        relay: BrokerRelay,
-    },
-    Broken(String),
+/// The compositor's per-greeter-connection [`BrokerEpisode`] calls
+/// this ONCE on greeter-accept and OWNS the returned channel for the
+/// whole episode (Amendment A6 single-owner).
+///
+/// # Errors
+/// [`WireError::Io`] if `socket`/`connect` fails.
+pub fn connect_broker(sock_path: &Path) -> Result<SeqpacketChannel, WireError> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+    let fd = socket(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        SockFlag::empty(),
+        None,
+    )?;
+    let addr = UnixAddr::new(sock_path).map_err(WireError::Io)?;
+    connect(fd.as_raw_fd(), &addr)?;
+    Ok(SeqpacketChannel::new(fd))
 }
 
-pub struct BrokerSession {
-    inner: Inner,
+/// What the calloop layer must do after driving the episode.
+///
+/// `greeter_reply` is always written to the greeter fd first. The two
+/// terminal flags model the two fds' distinct lifetimes (A6: the
+/// episode owns the broker socket the WHOLE episode — past the
+/// greeter's greetd connection, which ends at `Spawning`).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EpisodeOutcome {
+    /// Bytes to write to the greeter fd.
+    pub greeter_reply: Vec<u8>,
+    /// Set once, when greetd reached `Spawning` and `StartSession` was
+    /// forwarded to the broker. Carries the broker's PAM-resolved
+    /// identity (R8 — never the client hint) for the compositor's
+    /// session bookkeeping (`session_uid`, greeter teardown). The A5
+    /// two-key flash-free VISIBLE swap is a later task.
+    pub spawned: Option<SpawnRequest>,
+    /// The whole episode is over (greetd auth-fail close, broker
+    /// EOF/fail-closed, `SessionEnded`, or a fatal protocol error).
+    /// The calloop layer drains `greeter_reply` then removes BOTH the
+    /// greeter and broker sources.
+    pub terminate: bool,
 }
 
-impl BrokerSession {
-    /// Wrap an already-connected channel (the seam unit tests inject;
-    /// production builds it via [`BrokerSessionFactory::build`]).
-    pub const fn new(chan: SeqpacketChannel, service: String, username: String) -> Self {
-        Self {
-            inner: Inner::Connected {
-                chan,
-                relay: BrokerRelay::new(service, username),
-            },
-        }
-    }
-
-    /// A session that fails closed on first `step` with `reason`
-    /// (e.g. the broker socket could not be reached).
-    pub const fn broken(reason: String) -> Self {
-        Self {
-            inner: Inner::Broken(reason),
-        }
-    }
-}
-
-fn fail(reason: &str) -> PamStep {
-    PamStep::Failure {
-        reason: reason.to_owned(),
-    }
-}
-
-impl PamSession for BrokerSession {
-    fn step(&mut self, response: Option<String>) -> PamStep {
-        let (chan, relay) = match &mut self.inner {
-            Inner::Connected { chan, relay } => (chan, relay),
-            Inner::Broken(reason) => return fail(reason),
-        };
-        let outbound = match relay.on_pam_step(response) {
-            Ok(frame) => frame,
-            Err(e) => {
-                let reason = e.to_string();
-                self.inner = Inner::Broken(reason.clone());
-                return fail(&reason);
-            }
-        };
-        if let Err(e) = chan.send(&outbound) {
-            let reason = e.to_string();
-            self.inner = Inner::Broken(reason.clone());
-            return fail(&reason);
-        }
-        let frame = match chan.recv() {
-            Ok(f) => f,
-            Err(e) => {
-                let reason = e.to_string();
-                self.inner = Inner::Broken(reason.clone());
-                return fail(&reason);
-            }
-        };
-        match relay.on_broker_frame(frame) {
-            Ok(RelayEvent::Pam(step)) => step,
-            Ok(_) => {
-                // A lifecycle frame during the auth conversation is a
-                // protocol violation here (those are handled by the
-                // later Spawning/lifecycle seam, not by `step`).
-                let reason = "broker sent a non-conversation frame during auth".to_owned();
-                self.inner = Inner::Broken(reason.clone());
-                fail(&reason)
-            }
-            Err(e) => {
-                let reason = e.to_string();
-                self.inner = Inner::Broken(reason.clone());
-                fail(&reason)
-            }
-        }
-    }
-}
-
-/// `PamSessionFactory` that connects to the broker socket per greeter
-/// `CreateSession`. A failed connect yields a [`BrokerSession::broken`]
-/// — `build` cannot fail (the trait returns the boxed session), so the
-/// failure surfaces as a clean auth rejection on first `step`.
-pub struct BrokerSessionFactory {
-    /// PAM service hint forwarded in `BeginAuth`.
+/// Per-greeter-connection episode. Owns the broker
+/// [`SeqpacketChannel`], the lazily-built [`BrokerRelay`] phase
+/// machine, and the sans-IO greetd [`Connection`] for the whole
+/// episode (Amendments A6/A7).
+///
+/// The relay is built lazily on the first [`Demand::Pam`] because the
+/// broker `BeginAuth` hint needs the client-supplied `CreateSession`
+/// username, which the sans-IO greetd machine only surfaces (via
+/// [`Connection::pending_username`]) once it has parsed `CreateSession`.
+/// Per Epic R8 that name is ONLY a `pam_start` hint; the authoritative
+/// identity is the broker's PAM-resolved `Success`, relayed verbatim.
+///
+/// Fail-closed: any transport/relay error `poison`s the relay and
+/// drives greetd's `broker_closed()` so the greeter sees an auth
+/// failure and the episode terminates — never a panic, never a partial
+/// success (A7.4).
+pub struct BrokerEpisode {
+    chan: SeqpacketChannel,
     service: String,
-    /// Broker `SOCK_SEQPACKET` socket path
-    /// (`/run/halmasuit-session.sock`; overridable via the same env
-    /// the unit sets).
-    sock_path: std::path::PathBuf,
+    relay: Option<BrokerRelay>,
+    conn: Connection,
 }
 
-impl BrokerSessionFactory {
-    pub const fn new(service: String, sock_path: std::path::PathBuf) -> Self {
-        Self { service, sock_path }
-    }
-
-    /// Connect a client `SOCK_SEQPACKET` socket to `sock_path`.
-    ///
-    /// # Errors
-    /// [`WireError::Io`] if `socket`/`connect` fails.
-    fn connect(&self) -> Result<SeqpacketChannel, WireError> {
-        use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
-        let fd = socket(
-            AddressFamily::Unix,
-            SockType::SeqPacket,
-            SockFlag::empty(),
-            None,
-        )?;
-        let addr = UnixAddr::new(&self.sock_path).map_err(WireError::Io)?;
-        connect(fd.as_raw_fd(), &addr)?;
-        Ok(SeqpacketChannel::new(fd))
-    }
-}
-
-impl PamSessionFactory for BrokerSessionFactory {
-    fn build(&self, username: &str) -> Box<dyn PamSession + Send> {
-        match self.connect() {
-            Ok(chan) => Box::new(BrokerSession::new(
-                chan,
-                self.service.clone(),
-                username.to_owned(),
-            )),
-            Err(e) => Box::new(BrokerSession::broken(format!(
-                "cannot reach the halmasuit-session broker: {e}"
-            ))),
+impl BrokerEpisode {
+    /// `chan` — the broker channel (owned for the whole episode).
+    /// `service` — the PAM service (`/etc/pam.d/<service>`); the
+    /// `BeginAuth` hint's service field.
+    #[must_use]
+    pub fn new(chan: SeqpacketChannel, service: String) -> Self {
+        Self {
+            chan,
+            service,
+            relay: None,
+            conn: Connection::new(),
         }
+    }
+
+    /// The broker fd, for registering it as a calloop source.
+    #[must_use]
+    pub fn broker_fd(&self) -> BorrowedFd<'_> {
+        self.chan.as_fd()
+    }
+
+    /// Greeter bytes arrived: drive the sans-IO greetd machine, then
+    /// act on its [`Demand`] with NO blocking I/O.
+    pub fn on_greeter_bytes(&mut self, bytes: &[u8]) -> EpisodeOutcome {
+        let mut out = EpisodeOutcome::default();
+        match self.conn.feed_greeter(bytes) {
+            Ok(o) => self.act_on_demand(o.reply, o.demand, &mut out),
+            Err(_codec) => {
+                // The greeter is the untrusted nested client; a
+                // malformed greetd frame ends the episode (greetd
+                // would have closed the connection anyway). The broker
+                // peer is not at fault, so no fail-closed reply is
+                // owed — just tear the episode down.
+                out.terminate = true;
+            }
+        }
+        out
+    }
+
+    /// The broker fd is readable: read at most one frame, feed the
+    /// relay, resume the suspended greetd machine. NO blocking I/O.
+    pub fn on_broker_readable(&mut self) -> EpisodeOutcome {
+        let mut out = EpisodeOutcome::default();
+        let frame = match self.chan.recv() {
+            Ok(Some(f)) => f,
+            // Spurious calloop wakeup (no datagram): do nothing.
+            Ok(None) => return out,
+            // Peer hangup or any transport error → fail closed (A7.4).
+            Err(_e) => {
+                self.fail_closed(&mut out);
+                return out;
+            }
+        };
+        if self.relay.is_none() {
+            // A broker frame before any BeginAuth is out of sequence.
+            self.fail_closed(&mut out);
+            return out;
+        }
+        let ev = self.relay.as_mut().unwrap().on_broker_frame(frame);
+        match ev {
+            Ok(RelayEvent::Pam(step)) => match self.conn.resume_pam(step) {
+                Ok(o) => self.act_on_demand(o.reply, o.demand, &mut out),
+                Err(_codec) => self.fail_closed(&mut out),
+            },
+            Ok(RelayEvent::SessionOpened) => {
+                // Minimal lifecycle consumption (Epic #31 scope): the
+                // A5 two-key flash-free VISIBLE swap + SCM_RIGHTS pidfd
+                // are later tasks. The episode stays alive for
+                // SessionEnded; nothing to relay to the greeter (its
+                // greetd connection ended at Spawning).
+            }
+            Ok(RelayEvent::SessionEnded(_outcome)) => {
+                out.terminate = true;
+            }
+            Err(RelayError::OutOfPhase) => self.fail_closed(&mut out),
+        }
+        out
+    }
+
+    /// Apply a greetd outcome (`reply` bytes + [`Demand`]), performing
+    /// the broker side-effects a `Pam`/`Spawn` demand requires. Shared
+    /// by the greeter and broker entry points. NO blocking I/O.
+    fn act_on_demand(&mut self, reply: Vec<u8>, demand: Demand, out: &mut EpisodeOutcome) {
+        out.greeter_reply.extend(reply);
+        match demand {
+            Demand::Continue => {}
+            Demand::Close => out.terminate = true,
+            Demand::Pam { response } => {
+                if self.relay.is_none() {
+                    // First PAM round: build the relay now that greetd
+                    // has parsed CreateSession and surfaces the client
+                    // username (R8 — a pam_start hint only).
+                    let user = self.conn.pending_username().unwrap_or_default().to_owned();
+                    self.relay = Some(BrokerRelay::new(self.service.clone(), user));
+                }
+                let frame = self.relay.as_mut().unwrap().on_pam_step(response);
+                match frame {
+                    Ok(f) => {
+                        if self.chan.send(&f).is_err() {
+                            self.fail_closed(out);
+                        }
+                        // else: SUSPENDED — the broker reply arrives
+                        // via `on_broker_readable` (A7 sans-IO).
+                    }
+                    Err(RelayError::OutOfPhase) => self.fail_closed(out),
+                }
+            }
+            Demand::Spawn(spawn) => {
+                // greetd already appended Response::Success to `reply`.
+                if self.relay.is_none() {
+                    self.fail_closed(out);
+                    return;
+                }
+                let frame = self
+                    .relay
+                    .as_mut()
+                    .unwrap()
+                    .start_session(spawn.cmd.clone(), &spawn.env);
+                match frame {
+                    Ok(f) => {
+                        if self.chan.send(&f).is_err() {
+                            self.fail_closed(out);
+                        } else {
+                            // Surface the broker-resolved identity for
+                            // the compositor's session bookkeeping. The
+                            // greeter's greetd connection is terminal;
+                            // the episode continues on the broker
+                            // channel for SessionOpened/SessionEnded.
+                            out.spawned = Some(spawn);
+                        }
+                    }
+                    Err(RelayError::OutOfPhase) => self.fail_closed(out),
+                }
+            }
+        }
+    }
+
+    /// Poison the relay and drive greetd's `broker_closed()`
+    /// fail-closed path, then terminate the episode (A7.4).
+    fn fail_closed(&mut self, out: &mut EpisodeOutcome) {
+        if let Some(r) = self.relay.as_mut() {
+            r.poison();
+        }
+        let o = self.conn.broker_closed();
+        out.greeter_reply.extend(o.reply);
+        out.terminate = true;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use halmasuit_greetd::AuthMessageType;
-    use halmasuit_session_ipc::PromptStyle;
+    use halmasuit_greetd::{
+        AuthMessageType, Request, Response, encode as greetd_encode,
+        try_decode as greetd_try_decode,
+    };
+    use halmasuit_session_ipc::{PromptStyle, SessionOutcome};
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
-    use std::thread;
 
-    /// (compositor end, broker end) connected SEQPACKET pair.
+    /// (compositor channel, broker end) connected SEQPACKET pair. The
+    /// tests act as the broker SYNCHRONOUSLY on the broker end —
+    /// single-threaded, deterministic (socketpair buffers; the episode
+    /// drive methods are pure given buffered input).
     fn pair() -> (SeqpacketChannel, SeqpacketChannel) {
         let (a, b) = socketpair(
             AddressFamily::Unix,
@@ -295,11 +394,10 @@ mod tests {
         (SeqpacketChannel::new(a), SeqpacketChannel::new(b))
     }
 
-    /// Decode the next compositor→broker frame on the broker end.
     fn broker_recv(end: &SeqpacketChannel) -> CompositorToBroker {
         let mut buf = vec![0u8; std::mem::size_of::<u32>() + MAX_MESSAGE_SIZE as usize];
         let n = recv(end.fd.as_raw_fd(), &mut buf, MsgFlags::empty()).expect("recv");
-        assert!(n > 0, "compositor closed");
+        assert!(n > 0, "compositor closed the broker channel");
         let (msg, consumed): (CompositorToBroker, usize) =
             try_decode(&buf[..n]).expect("decode").expect("complete");
         assert_eq!(consumed, n);
@@ -307,161 +405,244 @@ mod tests {
     }
 
     fn broker_send(end: &SeqpacketChannel, msg: &BrokerToCompositor) {
-        let bytes = halmasuit_session_ipc::encode(msg).expect("encode");
+        let bytes = encode(msg).expect("encode");
         let nn = send(end.fd.as_raw_fd(), &bytes, MsgFlags::empty()).expect("send");
         assert_eq!(nn, bytes.len());
     }
 
-    #[test]
-    fn first_step_sends_begin_auth_and_prompt_becomes_challenge() {
+    fn greeter_responses(bytes: &[u8]) -> Vec<Response> {
+        let mut out = Vec::new();
+        let mut cur = bytes;
+        while let Some((r, n)) = greetd_try_decode::<Response>(cur).expect("decode") {
+            out.push(r);
+            cur = &cur[n..];
+        }
+        out
+    }
+
+    fn episode() -> (BrokerEpisode, SeqpacketChannel) {
         let (comp, broker) = pair();
-        let mut s = BrokerSession::new(comp, "halmasuit".into(), "alice".into());
-        let bt = thread::spawn(move || {
-            assert_eq!(
-                broker_recv(&broker),
-                CompositorToBroker::BeginAuth {
-                    service: "halmasuit".into(),
-                    username: "alice".into(),
-                }
-            );
-            broker_send(
-                &broker,
-                &BrokerToCompositor::ConvPrompt {
-                    style: PromptStyle::Secret,
-                    message: "Password: ".into(),
-                },
-            );
-        });
-        assert_eq!(
-            s.step(None),
-            PamStep::Challenge {
-                kind: AuthMessageType::Secret,
-                prompt: "Password: ".into(),
-            }
-        );
-        bt.join().unwrap();
+        (BrokerEpisode::new(comp, "halmasuit".into()), broker)
+    }
+
+    fn create(username: &str) -> Vec<u8> {
+        greetd_encode(&Request::CreateSession {
+            username: username.into(),
+        })
+        .unwrap()
     }
 
     #[test]
-    fn response_then_success_passes_identity_through_verbatim_r8() {
-        let (comp, broker) = pair();
-        let mut s = BrokerSession::new(comp, "halmasuit".into(), "alice".into());
-        let bt = thread::spawn(move || {
-            assert!(matches!(
-                broker_recv(&broker),
-                CompositorToBroker::BeginAuth { .. }
-            ));
-            broker_send(
-                &broker,
-                &BrokerToCompositor::ConvPrompt {
-                    style: PromptStyle::Secret,
-                    message: "pw".into(),
-                },
-            );
-            match broker_recv(&broker) {
-                CompositorToBroker::ConvResponse { response } => {
-                    assert_eq!(response.expose(), "hunter2");
-                }
-                other => panic!("expected ConvResponse, got {other:?}"),
-            }
-            broker_send(
-                &broker,
-                &BrokerToCompositor::Success {
-                    username: "alice.canonical".into(),
-                    uid: 1001,
-                    gid: 1001,
-                },
-            );
-        });
-        assert!(matches!(s.step(None), PamStep::Challenge { .. }));
+    fn create_emits_begin_auth_with_client_hint_and_suspends() {
+        let (mut ep, broker) = episode();
+        let o = ep.on_greeter_bytes(&create("alice"));
+        // Suspended for the PAM round: nothing for the greeter yet.
+        assert!(o.greeter_reply.is_empty());
+        assert!(!o.terminate);
+        assert_eq!(o.spawned, None);
+        // BeginAuth carries the client hint verbatim (R8 hint only).
         assert_eq!(
-            s.step(Some("hunter2".into())),
-            PamStep::Success {
+            broker_recv(&broker),
+            CompositorToBroker::BeginAuth {
+                service: "halmasuit".into(),
+                username: "alice".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn challenge_response_success_then_start_session_passes_pam_identity() {
+        let (mut ep, broker) = episode();
+        ep.on_greeter_bytes(&create("alice"));
+        assert!(matches!(
+            broker_recv(&broker),
+            CompositorToBroker::BeginAuth { .. }
+        ));
+
+        // Broker → challenge. Episode resumes greetd → AuthMessage.
+        broker_send(
+            &broker,
+            &BrokerToCompositor::ConvPrompt {
+                style: PromptStyle::Secret,
+                message: "Password: ".into(),
+            },
+        );
+        let o = ep.on_broker_readable();
+        assert_eq!(
+            greeter_responses(&o.greeter_reply),
+            vec![Response::AuthMessage {
+                auth_message_type: AuthMessageType::Secret,
+                auth_message: "Password: ".into(),
+            }]
+        );
+        assert!(!o.terminate);
+
+        // Greeter answers → episode forwards ConvResponse.
+        let pmr = greetd_encode(&Request::PostAuthMessageResponse {
+            response: Some("hunter2".into()),
+        })
+        .unwrap();
+        let o = ep.on_greeter_bytes(&pmr);
+        assert!(o.greeter_reply.is_empty());
+        match broker_recv(&broker) {
+            CompositorToBroker::ConvResponse { response } => {
+                assert_eq!(response.expose(), "hunter2");
+            }
+            other => panic!("expected ConvResponse, got {other:?}"),
+        }
+
+        // Broker → Success with the PAM-RESOLVED name (R8).
+        broker_send(
+            &broker,
+            &BrokerToCompositor::Success {
                 username: "alice.canonical".into(),
                 uid: 1001,
                 gid: 1001,
-            }
+            },
         );
-        bt.join().unwrap();
+        let o = ep.on_broker_readable();
+        assert_eq!(greeter_responses(&o.greeter_reply), vec![Response::Success]);
+        assert_eq!(o.spawned, None);
+        assert!(!o.terminate);
+
+        // Greeter → StartSession. Episode forwards StartSession and
+        // surfaces the broker-resolved identity (NOT "alice").
+        let ss = greetd_encode(&Request::StartSession {
+            cmd: vec!["niri".into()],
+            env: vec!["XDG_SESSION_TYPE=wayland".into()],
+        })
+        .unwrap();
+        let o = ep.on_greeter_bytes(&ss);
+        assert_eq!(greeter_responses(&o.greeter_reply), vec![Response::Success]);
+        let spawned = o.spawned.expect("StartSession surfaces spawn identity");
+        assert_eq!(spawned.username, "alice.canonical");
+        assert_eq!(spawned.uid, 1001);
+        assert_eq!(spawned.gid, 1001);
+        match broker_recv(&broker) {
+            CompositorToBroker::StartSession { cmd, env } => {
+                assert_eq!(cmd, vec!["niri".to_string()]);
+                assert_eq!(env, vec![("XDG_SESSION_TYPE".into(), "wayland".into())]);
+            }
+            other => panic!("expected StartSession, got {other:?}"),
+        }
+
+        // Lifecycle: SessionOpened keeps the episode alive (no visible
+        // swap here — that's a later task); SessionEnded terminates it.
+        broker_send(&broker, &BrokerToCompositor::SessionOpened);
+        let o = ep.on_broker_readable();
+        assert!(!o.terminate, "SessionOpened must not end the episode");
+        broker_send(
+            &broker,
+            &BrokerToCompositor::SessionEnded {
+                outcome: SessionOutcome::Exited { code: 0 },
+            },
+        );
+        let o = ep.on_broker_readable();
+        assert!(o.terminate, "SessionEnded ends the episode");
     }
 
     #[test]
-    fn broker_failure_frame_becomes_pam_failure() {
-        let (comp, broker) = pair();
-        let mut s = BrokerSession::new(comp, "halmasuit".into(), "bob".into());
-        let bt = thread::spawn(move || {
-            assert!(matches!(
-                broker_recv(&broker),
-                CompositorToBroker::BeginAuth { .. }
-            ));
-            broker_send(
-                &broker,
-                &BrokerToCompositor::Failure {
-                    reason: "authentication failed".into(),
-                },
-            );
-        });
-        assert_eq!(
-            s.step(None),
-            PamStep::Failure {
+    fn broker_failure_is_auth_error_and_keeps_greeter_open_for_retry() {
+        let (mut ep, broker) = episode();
+        ep.on_greeter_bytes(&create("alice"));
+        assert!(matches!(
+            broker_recv(&broker),
+            CompositorToBroker::BeginAuth { .. }
+        ));
+        broker_send(
+            &broker,
+            &BrokerToCompositor::Failure {
                 reason: "authentication failed".into(),
-            }
+            },
         );
-        bt.join().unwrap();
-    }
-
-    #[test]
-    fn broker_hangup_mid_auth_fails_closed() {
-        let (comp, broker) = pair();
-        let mut s = BrokerSession::new(comp, "halmasuit".into(), "alice".into());
-        // Broker reads BeginAuth then drops the socket without
-        // answering — recv sees peer-closed.
-        let bt = thread::spawn(move || {
-            assert!(matches!(
-                broker_recv(&broker),
-                CompositorToBroker::BeginAuth { .. }
-            ));
-            drop(broker);
-        });
-        match s.step(None) {
-            PamStep::Failure { .. } => {}
-            other => panic!("expected fail-closed Failure, got {other:?}"),
-        }
-        // Subsequent steps stay failed (Broken latch), never panic.
-        assert!(matches!(s.step(None), PamStep::Failure { .. }));
-        bt.join().unwrap();
-    }
-
-    #[test]
-    fn lifecycle_frame_during_auth_is_protocol_violation() {
-        let (comp, broker) = pair();
-        let mut s = BrokerSession::new(comp, "halmasuit".into(), "alice".into());
-        let bt = thread::spawn(move || {
-            assert!(matches!(
-                broker_recv(&broker),
-                CompositorToBroker::BeginAuth { .. }
-            ));
-            // Out of phase: a session-lifecycle frame before any auth
-            // conversation. Relay fails closed.
-            broker_send(&broker, &BrokerToCompositor::SessionOpened);
-        });
-        match s.step(None) {
-            PamStep::Failure { .. } => {}
-            other => panic!("expected Failure on out-of-phase frame, got {other:?}"),
-        }
-        bt.join().unwrap();
-    }
-
-    #[test]
-    fn broken_factory_session_fails_closed_without_panic() {
-        let mut s = BrokerSession::broken("cannot reach the broker".into());
+        let o = ep.on_broker_readable();
         assert_eq!(
-            s.step(None),
-            PamStep::Failure {
-                reason: "cannot reach the broker".into(),
-            }
+            greeter_responses(&o.greeter_reply),
+            vec![Response::Error {
+                error_type: halmasuit_greetd::ErrorType::AuthError,
+                description: "authentication failed".into(),
+            }]
         );
-        // Idempotent, never panics.
-        assert!(matches!(s.step(Some("x".into())), PamStep::Failure { .. }));
+        // greetd keeps the connection open after an auth failure — the
+        // greeter may retry with a fresh CreateSession on a NEW broker
+        // episode; the episode itself does not force-terminate here.
+        assert!(!o.terminate);
+    }
+
+    #[test]
+    fn broker_eof_mid_auth_fails_closed() {
+        let (mut ep, broker) = episode();
+        ep.on_greeter_bytes(&create("alice"));
+        assert!(matches!(
+            broker_recv(&broker),
+            CompositorToBroker::BeginAuth { .. }
+        ));
+        // Broker dies before answering (it is SIGKILL-able by design,
+        // Epic R5 / Amendment A7.4).
+        drop(broker);
+        let o = ep.on_broker_readable();
+        assert!(o.terminate, "broker EOF must fail the episode closed");
+        match &greeter_responses(&o.greeter_reply)[..] {
+            [Response::Error { error_type, .. }] => {
+                assert!(matches!(error_type, halmasuit_greetd::ErrorType::AuthError));
+            }
+            other => panic!("expected one AuthError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn immediate_success_no_challenge_then_spawn() {
+        let (mut ep, broker) = episode();
+        ep.on_greeter_bytes(&create("bob"));
+        assert!(matches!(
+            broker_recv(&broker),
+            CompositorToBroker::BeginAuth { .. }
+        ));
+        broker_send(
+            &broker,
+            &BrokerToCompositor::Success {
+                username: "bob".into(),
+                uid: 1000,
+                gid: 1000,
+            },
+        );
+        let o = ep.on_broker_readable();
+        assert_eq!(greeter_responses(&o.greeter_reply), vec![Response::Success]);
+
+        let ss = greetd_encode(&Request::StartSession {
+            cmd: vec!["sway".into()],
+            env: vec![],
+        })
+        .unwrap();
+        let o = ep.on_greeter_bytes(&ss);
+        let spawned = o.spawned.expect("spawn surfaced");
+        assert_eq!(spawned.username, "bob");
+        assert!(matches!(
+            broker_recv(&broker),
+            CompositorToBroker::StartSession { .. }
+        ));
+    }
+
+    #[test]
+    fn spurious_broker_wakeup_is_a_noop() {
+        // calloop can wake us with no datagram (level edge / race).
+        // recv → Ok(None) → the episode does nothing, stays alive.
+        let (mut ep, broker) = episode();
+        ep.on_greeter_bytes(&create("alice"));
+        assert!(matches!(
+            broker_recv(&broker),
+            CompositorToBroker::BeginAuth { .. }
+        ));
+        let o = ep.on_broker_readable();
+        assert_eq!(o, EpisodeOutcome::default());
+        // Channel still usable afterwards.
+        broker_send(
+            &broker,
+            &BrokerToCompositor::Failure {
+                reason: "no".into(),
+            },
+        );
+        let o = ep.on_broker_readable();
+        assert!(!o.greeter_reply.is_empty());
     }
 }

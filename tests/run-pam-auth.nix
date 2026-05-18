@@ -39,7 +39,7 @@ pkgs.testers.runNixOSTest {
       # Epic R8: the resolved gid must be >= the UID floor the broker
       # enforces. NixOS's default `users` group is GID 100 (< 1000);
       # give `test` a user-private group at GID 1000 (same convention
-      # as halmasuit-spawn.nix).
+      # as the other real-PAM VM gates, e.g. halmasuit-vm.nix).
       users.groups.test = { gid = 1000; };
       users.users.test = { group = "test"; };
 

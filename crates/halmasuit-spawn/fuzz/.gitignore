@@ -1,6 +1,0 @@
-# cargo-fuzz artifacts. The harness source + Cargo.toml is committed;
-# generated outputs are local-only.
-target/
-corpus/
-artifacts/
-coverage/

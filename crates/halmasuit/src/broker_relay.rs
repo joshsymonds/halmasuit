@@ -227,6 +227,18 @@ impl BrokerRelay {
         self.phase = Phase::Done;
         CompositorToBroker::Cancel
     }
+
+    /// Force the terminal phase WITHOUT emitting a frame.
+    ///
+    /// The episode (`BrokerEpisode`) calls this on any transport/relay
+    /// error so every subsequent `on_pam_step`/`on_broker_frame`
+    /// returns [`RelayError::OutOfPhase`]; the episode maps that to
+    /// greetd's `broker_closed()` fail-closed auth failure (A7.4). The
+    /// latch lives in the episode-owned relay, so it survives across
+    /// the calloop readiness callbacks that drive one episode.
+    pub const fn poison(&mut self) {
+        self.phase = Phase::Done;
+    }
 }
 
 /// Map a libpam conversation style to the greetd auth-message type the

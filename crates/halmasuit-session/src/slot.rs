@@ -1,18 +1,22 @@
 //! The GLOBAL single auth slot (Epic #1 R5).
 //!
 //! At most ONE `spawn_auth_worker` is in flight system-wide. A new
-//! `create` from the SO_PEERCRED-verified greeter peer EVICTS the
+//! `create` from the SO_PEERCRED-verified relay peer EVICTS the
 //! in-flight attempt — SIGKILL its fork (R4 `WorkerHandle::kill`, no
 //! SIGTERM) + reap it — then installs the fresh one. Two mitigations
 //! are BOTH non-negotiable (Epic R5; without either, evict-old is a
 //! legitimate-user-preemption DoS):
 //!
-//! 1. **SO_PEERCRED-greeter gate** — only the configured greeter uid
-//!    may drive `create` at all; a non-greeter peer is rejected and
-//!    any in-flight worker is left UNTOUCHED. (SO_PEERCRED
-//!    authenticates the peer; it never authorizes the action — the
-//!    caller obtains `peer_uid` via `transport::peer_uid` and passes
-//!    it here.)
+//! 1. **SO_PEERCRED relay-peer gate** — only the configured relay-peer
+//!    uid may drive `create` at all; any other peer is rejected and
+//!    any in-flight worker is left UNTOUCHED. The relay peer is the
+//!    unprivileged compositor in the live topology (it owns its own
+//!    SO_PEERCRED greeter gate on the greetd socket); in the
+//!    standalone/test topology it is whatever drives the broker
+//!    directly. (SO_PEERCRED authenticates the peer; it never
+//!    authorizes the action — identity is independently PAM-derived,
+//!    Epic R8; the caller obtains `peer_uid` via `transport::peer_uid`
+//!    and passes it here.)
 //! 2. **Churn throttle** — a sliding window bounds create/evict
 //!    cycling; over-rate is rejected with the in-flight worker
 //!    UNTOUCHED.
@@ -49,8 +53,9 @@ pub const DEFAULT_WINDOW: Duration = Duration::from_secs(10);
 #[derive(Debug)]
 pub enum SlotError {
     /// The requesting peer's SO_PEERCRED uid is not the configured
-    /// greeter uid. The action is not authorized (the peer may be
-    /// authenticated as *someone*, but only the greeter drives auth).
+    /// relay-peer uid. The action is not authorized (the peer may be
+    /// authenticated as *someone*, but only the trusted relay peer —
+    /// the compositor in the live topology — drives auth).
     Unauthorized,
     /// The create/evict churn bound for the window was exceeded —
     /// the reconnect-churn DoS guard (Epic R5).
@@ -78,12 +83,13 @@ impl InFlight {
     }
 }
 
-/// Epic #1 R5: the GLOBAL single auth slot. One in-flight
-/// `spawn_auth_worker` system-wide; a new create from the verified
-/// greeter peer evicts the prior one (SIGKILL + reap) under a churn
-/// bound.
+/// Epic #1 R5: the GLOBAL single auth slot.
+///
+/// One in-flight `spawn_auth_worker` system-wide; a new create from
+/// the verified relay peer (the compositor in the live topology)
+/// evicts the prior one (SIGKILL + reap) under a churn bound.
 pub struct AuthSlot {
-    greeter_uid: u32,
+    relay_peer_uid: u32,
     max_per_window: usize,
     window: Duration,
     inflight: Option<InFlight>,
@@ -92,9 +98,9 @@ pub struct AuthSlot {
 
 impl AuthSlot {
     #[must_use]
-    pub const fn new(greeter_uid: u32, max_per_window: usize, window: Duration) -> Self {
+    pub const fn new(relay_peer_uid: u32, max_per_window: usize, window: Duration) -> Self {
         Self {
-            greeter_uid,
+            relay_peer_uid,
             max_per_window,
             window,
             inflight: None,
@@ -104,8 +110,8 @@ impl AuthSlot {
 
     /// Production constructor with the default churn bound.
     #[must_use]
-    pub const fn with_defaults(greeter_uid: u32) -> Self {
-        Self::new(greeter_uid, DEFAULT_MAX_PER_WINDOW, DEFAULT_WINDOW)
+    pub const fn with_defaults(relay_peer_uid: u32) -> Self {
+        Self::new(relay_peer_uid, DEFAULT_MAX_PER_WINDOW, DEFAULT_WINDOW)
     }
 
     /// The in-flight worker, if any.
@@ -117,13 +123,13 @@ impl AuthSlot {
     /// Create a new auth worker, evicting any in-flight one.
     ///
     /// `peer_uid` is the SO_PEERCRED-attested uid of the requesting
-    /// greeter connection (obtain via [`crate::peer_uid`]). Returns
+    /// relay-peer connection (obtain via [`crate::peer_uid`]). Returns
     /// the reaped `WaitStatus` of the evicted prior worker, or `None`
     /// if the slot was empty.
     ///
     /// # Errors
     ///
-    /// [`SlotError::Unauthorized`] if `peer_uid` is not the greeter
+    /// [`SlotError::Unauthorized`] if `peer_uid` is not the relay-peer
     /// uid; [`SlotError::Throttled`] if the churn bound is exceeded;
     /// [`SlotError::Worker`] on a spawn/reap errno. On the first two,
     /// the in-flight worker is left untouched.
@@ -143,9 +149,9 @@ impl AuthSlot {
     where
         F: FnOnce() -> io::Result<(WorkerHandle, SeqpacketChannel)>,
     {
-        // 1. SO_PEERCRED greeter gate — FIRST, so a non-greeter never
+        // 1. SO_PEERCRED relay-peer gate — FIRST, so a non-relay-peer never
         //    perturbs the in-flight worker or the throttle state.
-        if peer_uid != self.greeter_uid {
+        if peer_uid != self.relay_peer_uid {
             return Err(SlotError::Unauthorized);
         }
         // 2. Churn throttle — prune entries older than the window,
@@ -277,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn non_greeter_peer_cannot_evict_inflight_untouched() {
+    fn non_authorized_peer_cannot_evict_inflight_untouched() {
         let mut slot = AuthSlot::new(GREETER, 5, Duration::from_secs(10));
         let t0 = Instant::now();
         slot.create_at(t0, GREETER, sleeper).unwrap();
@@ -298,13 +304,13 @@ mod tests {
     }
 
     #[test]
-    fn non_greeter_peer_cannot_create_on_empty_slot() {
+    fn non_authorized_peer_cannot_create_on_empty_slot() {
         let mut slot = AuthSlot::new(GREETER, 5, Duration::from_secs(10));
         let denied = slot.create_at(Instant::now(), 9999, sleeper);
         assert!(matches!(denied, Err(SlotError::Unauthorized)));
         assert!(
             slot.current().is_none(),
-            "no worker spawned for a non-greeter"
+            "no worker spawned for a non-authorized peer"
         );
     }
 

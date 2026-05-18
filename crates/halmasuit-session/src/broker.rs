@@ -2,7 +2,7 @@
 //! frame routing).
 //!
 //! Composes the already-built pieces — `AuthSlot` (R5 global single
-//! slot, evict-old, SO_PEERCRED greeter gate, churn throttle),
+//! slot, evict-old, SO_PEERCRED relay-peer gate, churn throttle),
 //! `spawn_session_worker` (the Amendment-A1 one-handle `run_session`
 //! fork), and the `ParentMessage` relay — into ONE lifecycle per
 //! accepted compositor↔broker connection. Pure composition:
@@ -85,7 +85,7 @@ pub enum Disposition {
 pub enum BrokerError {
     #[error("channel: {0}")]
     Transport(#[from] TransportError),
-    /// `AuthSlot::create` refused (non-greeter peer / churn throttle /
+    /// `AuthSlot::create` refused (non-relay-peer / churn throttle /
     /// spawn errno). `SlotError` has no `Display`; shown via `Debug`.
     #[error("auth slot refused: {0:?}")]
     Slot(SlotError),
@@ -303,7 +303,7 @@ pub(crate) fn relay(
 
 /// Handle ONE accepted compositor↔broker connection end to end.
 ///
-/// SO_PEERCRED-gated (via [`AuthSlot::create`]'s greeter gate),
+/// SO_PEERCRED-gated (via [`AuthSlot::create`]'s relay-peer gate),
 /// reads [`CompositorToBroker::BeginAuth`], spawns the
 /// Amendment-A1 full-lifecycle worker into the global single slot,
 /// then [`relay`]s. The `service`/`username` from `BeginAuth` are
@@ -503,7 +503,7 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
 /// Run the Epic-R6 / Amendment-A2 broker event loop.
 ///
 /// `listener_fd` is the validated systemd activation socket;
-/// `greeter_uid` is the SO_PEERCRED-authorized peer. Returns when
+/// `relay_peer_uid` is the SO_PEERCRED-authorized peer. Returns when
 /// SIGTERM/SIGINT or the idle-exit fires — the process then exits 0
 /// and the unit deactivates (no standing root; PID1's retained socket
 /// re-activates on the next connection).
@@ -512,7 +512,7 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
 ///
 /// [`io::Error`] on event-loop construction / source registration /
 /// a fatal `accept` errno.
-pub fn run_broker(listener_fd: RawFd, greeter_uid: u32) -> io::Result<()> {
+pub fn run_broker(listener_fd: RawFd, relay_peer_uid: u32) -> io::Result<()> {
     let mut event_loop: EventLoop<'static, BrokerLoop> =
         EventLoop::try_new().map_err(io::Error::other)?;
     let loop_handle = event_loop.handle();
@@ -564,7 +564,7 @@ pub fn run_broker(listener_fd: RawFd, greeter_uid: u32) -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("insert signal source: {e}")))?;
 
     let mut bl = BrokerLoop {
-        slot: AuthSlot::with_defaults(greeter_uid),
+        slot: AuthSlot::with_defaults(relay_peer_uid),
         listener_fd,
         active: None,
         idle_since: Some(Instant::now()),
@@ -891,9 +891,9 @@ mod tests {
     }
 
     #[test]
-    fn handle_connection_rejects_non_greeter_peer() {
+    fn handle_connection_rejects_non_authorized_peer() {
         // socketpair peers are the test process's own uid; configure a
-        // DIFFERENT greeter uid so the SO_PEERCRED gate (in
+        // DIFFERENT relay-peer uid so the SO_PEERCRED gate (in
         // AuthSlot::create) refuses without spawning anything.
         let my_uid = nix::unistd::getuid().as_raw();
         let mut slot = AuthSlot::new(my_uid.wrapping_add(1), 5, Duration::from_secs(10));
@@ -909,7 +909,7 @@ mod tests {
         let r = handle_connection(&mut slot, &broker_end);
         assert!(
             matches!(r, Err(BrokerError::Slot(_))),
-            "non-greeter peer refused: {r:?}"
+            "non-authorized peer refused: {r:?}"
         );
         assert!(slot.current().is_none(), "no worker spawned");
         gt.join().unwrap();

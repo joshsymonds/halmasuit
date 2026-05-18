@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,10 +37,11 @@ use calloop::signals::{Signal, Signals};
 use calloop::{
     EventLoop, Interest, LoopHandle, Mode as CalloopMode, PostAction, RegistrationToken,
 };
-use halmasuit_greetd::PamSession;
-use halmasuit_greetd::server::{
-    Connection, PamSessionFactory, SpawnRequest, bind_socket, peer_credentials,
-};
+use std::os::fd::AsRawFd;
+
+use halmasuit_greetd::server::{SpawnRequest, bind_socket, peer_credentials};
+
+use crate::broker_session::{BrokerEpisode, connect_broker};
 use halmasuit_introspect::{Event, Phase, ShutdownReason, emit};
 use smithay::backend::input::{Event as InputEventTrait, InputEvent, KeyboardKeyEvent};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
@@ -135,14 +136,17 @@ struct HalmasuitState {
     connections: HashMap<usize, ConnState>,
     /// Monotonic counter for fresh connection ids.
     next_conn_id: usize,
-    /// Factory that builds a `PamThread` for each `CreateSession`.
-    pam_factory: Arc<PamThreadFactory>,
+    /// PAM service (`/etc/pam.d/<service>`) — the `pam_start` hint sent
+    /// to the broker in `BeginAuth`. Authoritative identity is always
+    /// the broker's PAM-resolved `Success` (Epic R8), never this.
+    pam_service: String,
+    /// Path of the privileged `halmasuit-session` broker socket
+    /// (`SOCK_SEQPACKET`). Each greeter episode `connect`s a fresh
+    /// channel here and owns it for the whole episode (Amendment A6).
+    broker_socket: PathBuf,
     /// Authorised greeter UID; connections from any other uid are
     /// dropped by `handle_listener_ready`.
     greeter_uid: u32,
-    /// Path to the `halmasuit-spawn` setuid helper, invoked when a
-    /// connection reaches `SpawnRequest`.
-    spawn_bin: PathBuf,
     /// Held so the registered listener token survives for the lifetime
     /// of the compositor; calloop drops the source on shutdown.
     _greetd_listener_token: Option<RegistrationToken>,
@@ -179,7 +183,8 @@ struct HalmasuitState {
     greeter: Option<GreeterHandle>,
 
     /// uid of the authenticated user session, recorded by
-    /// `start_session` once `halmasuit-spawn` has been confirmed. The
+    /// `record_session_started` once the broker has accepted the
+    /// relayed `StartSession` (the broker-launched session). The
     /// Wayland accept path authorises a connecting peer when its
     /// SO_PEERCRED uid is `greeter_uid` (pre-auth) or this value
     /// (post-auth); the session connects under its own uid, distinct
@@ -550,31 +555,69 @@ impl BufferHandler for HalmasuitState {
 
 // ── greetd I/O integration ──────────────────────────────────────────────
 
-/// Per-greeter-connection state held in `HalmasuitState::connections`.
-/// The `UnixStream` itself lives inside its calloop `Generic` source; we
-/// only keep the per-fd state-machine driver and the outbound write
-/// buffer here.
+/// Per-greeter-connection EPISODE state held in
+/// `HalmasuitState::connections` (Amendments A6/A7/A8).
+///
+/// The greeter `UnixStream` lives inside its own calloop `Generic`
+/// source. The `BrokerEpisode` here is the SOLE owner of the broker
+/// `SeqpacketChannel` (`OwnedFd`) for the whole episode (A6); the
+/// broker fd is watched by a SECOND calloop `Generic` over a
+/// non-owning borrowed-fd newtype (A8) whose `RegistrationToken` is
+/// `broker_token`. Teardown order is load-bearing (A8.2): the greeter
+/// source's callback removes `broker_token` BEFORE `connections`
+/// removes this `ConnState` (which drops the episode and is the one
+/// `close(2)` of the broker fd).
 struct ConnState {
-    conn: Connection,
+    episode: BrokerEpisode,
+    /// Bytes pending to the greeter. Both the greeter source (from
+    /// `feed_greeter`) and the broker source (from `on_broker_readable`)
+    /// push here; the greeter source flushes it (A8.4: cross-source
+    /// coupling goes through this shared state, never source→source).
     write_buf: Vec<u8>,
-    /// Set when we want the source to be removed after the write buffer
-    /// drains. Triggered on `SpawnRequest`, EOF, codec errors, or
-    /// `ProcessOutput::close`.
-    close_after_drain: bool,
+    /// calloop token of the broker fd's borrowed-fd `Generic` source.
+    /// Removed before this `ConnState` drops (A8.2).
+    broker_token: Option<RegistrationToken>,
+    /// calloop token of the greeter `UnixStream` source. `None` once
+    /// the greeter source has detached (greeter killed at hand-off, or
+    /// disconnected) — the episode then runs to `SessionEnded` driven
+    /// solely by the broker source.
+    greeter_token: Option<RegistrationToken>,
+    /// The whole EPISODE is over (auth abort, broker EOF/fail-closed,
+    /// `SessionEnded`, fatal) ⇒ full teardown. Distinct from the
+    /// greeter connection merely ending at hand-off: the broker
+    /// channel must outlive the greeter (A5/A6 — transport lifetime ≥
+    /// PAM-handle lifetime ≥ auth-state lifetime).
+    terminate: bool,
+    /// The broker forked-then-dropped the session leader (greetd
+    /// reached `Spawning`); the greeter has been torn down. Past this
+    /// the greeter source only detaches itself; the episode lives on
+    /// the broker channel until `SessionEnded`.
+    spawned: bool,
 }
 
-/// `PamSessionFactory` implementation that returns a real `PamThread`
-/// per `CreateSession`. Stored behind `Arc` and cloned into each
-/// `Connection::new` call.
-struct PamThreadFactory {
-    /// PAM service name — looked up at `/etc/pam.d/<service>`. Defaults
-    /// to `"halmasuit"`; overridable via `HALMASUIT_PAM_SERVICE` env.
-    service: String,
-}
+/// Non-owning calloop fd wrapper for the broker `SeqpacketChannel`
+/// (Amendment A8.1). calloop's `Generic<F: AsFd>` only ever calls
+/// `as_fd()` (register/reregister/unregister) and NEVER `close(2)`s;
+/// holding a bare `RawFd` here means the source owns nothing and
+/// closes nothing. The sole `OwnedFd` lives in `ConnState::episode`;
+/// the single `close(2)` is that `OwnedFd`'s drop. Soundness of the
+/// borrow rests on the A8.2 invariant: the source is removed before
+/// the owning `ConnState` is dropped.
+struct BorrowedBrokerFd(std::os::fd::RawFd);
 
-impl PamSessionFactory for PamThreadFactory {
-    fn build(&self, username: &str) -> Box<dyn PamSession + Send> {
-        Box::new(halmasuit_pam::PamThread::new(&self.service, username))
+impl std::os::fd::AsFd for BorrowedBrokerFd {
+    #[expect(
+        unsafe_code,
+        reason = "A8.1: calloop needs an AsFd to arm epoll; we must NOT \
+                  give it an owning handle (no dup/Rc/Arc — A6/A8.3). \
+                  The RawFd outlives this source because the owning \
+                  OwnedFd in ConnState::episode is dropped only AFTER \
+                  loop_handle.remove(broker_token) (A8.2)."
+    )]
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        // SAFETY: see the #[expect] reason — the fd is live for as long
+        // as this source is registered (A8.2 teardown ordering).
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0) }
     }
 }
 
@@ -639,30 +682,67 @@ fn handle_listener_ready(
                 }
                 let id = state.next_conn_id;
                 state.next_conn_id += 1;
-                let conn =
-                    Connection::new(Arc::clone(&state.pam_factory) as Arc<dyn PamSessionFactory>);
-                let insert_result = state.loop_handle.insert_source(
+
+                // A6: connect a fresh broker channel; the episode owns
+                // it for the whole episode. A connect failure is
+                // recoverable — drop this greeter connection (the
+                // greeter retries); never proceed without the broker.
+                let episode = match connect_broker(&state.broker_socket) {
+                    Ok(chan) => BrokerEpisode::new(chan, state.pam_service.clone()),
+                    Err(e) => {
+                        tracing::warn!(error = %e, socket = ?state.broker_socket,
+                            "connect to halmasuit-session broker failed; dropping greeter connection");
+                        drop(stream);
+                        continue;
+                    }
+                };
+                // A8.1: register the broker fd as a NON-OWNING source.
+                let broker_raw = episode.broker_fd().as_raw_fd();
+
+                let greeter_tok = match state.loop_handle.insert_source(
                     Generic::new(stream, Interest::BOTH, CalloopMode::Level),
                     move |readiness, stream, state| {
                         handle_connection_ready(id, readiness, stream, state)
                     },
-                );
-                match insert_result {
-                    Ok(_token) => {
-                        state.connections.insert(
-                            id,
-                            ConnState {
-                                conn,
-                                write_buf: Vec::new(),
-                                close_after_drain: false,
-                            },
-                        );
-                        tracing::debug!(id, peer_uid = creds.uid, "accepted greeter connection");
-                    }
+                ) {
+                    Ok(t) => t,
                     Err(e) => {
-                        tracing::warn!(error = %e, "failed to register connection with calloop");
+                        tracing::warn!(error = %e, "failed to register greeter source; dropping");
+                        // `episode` drops here → the one close(2) of the
+                        // broker fd. No source registered yet (A8.2 n/a).
+                        continue;
                     }
-                }
+                };
+                let broker_tok = match state.loop_handle.insert_source(
+                    Generic::new(
+                        BorrowedBrokerFd(broker_raw),
+                        Interest::READ,
+                        CalloopMode::Level,
+                    ),
+                    move |readiness, _fd, state| handle_broker_ready(id, readiness, state),
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to register broker source; dropping");
+                        // Roll back the greeter source so no orphaned
+                        // source survives without a ConnState.
+                        state.loop_handle.remove(greeter_tok);
+                        // `episode` drops here → the one close(2).
+                        continue;
+                    }
+                };
+                state.connections.insert(
+                    id,
+                    ConnState {
+                        episode,
+                        write_buf: Vec::new(),
+                        broker_token: Some(broker_tok),
+                        greeter_token: Some(greeter_tok),
+                        terminate: false,
+                        spawned: false,
+                    },
+                );
+                tracing::debug!(id, peer_uid = creds.uid, "accepted greeter connection");
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) => {
@@ -712,77 +792,47 @@ fn handle_connection_ready(
         loop {
             match stream_ref.read(&mut buf) {
                 Ok(0) => {
-                    // EOF — greeter closed cleanly.
-                    connstate.close_after_drain = true;
+                    // Greeter closed. Post-hand-off this is expected
+                    // (the greeter was SIGKILLed) and ends ONLY the
+                    // greeter side — the episode lives on the broker
+                    // channel until SessionEnded (A5/A6: transport ≥
+                    // PAM-handle ≥ auth-state). Pre-hand-off a greeter
+                    // disconnect aborts the episode.
+                    if !connstate.spawned {
+                        connstate.terminate = true;
+                    }
                     break;
                 }
-                Ok(n) => match connstate.conn.process(&buf[..n]) {
-                    Ok(out) => {
-                        connstate.write_buf.extend(out.reply);
-                        if let Some(spawn) = out.spawn {
-                            emit(&Event::SessionRequested {
-                                uid: spawn.uid,
-                                gid: spawn.gid,
-                            });
-                            // Spawn FIRST, then kill the greeter — and
-                            // only if the spawn is confirmed (Epic #1
-                            // R3). The greeter is the recoverable
-                            // fallback: a spawn failure must leave it
-                            // alive (a dead greeter with no session is
-                            // the black screen this project exists to
-                            // eliminate). start_session records the
-                            // authenticated uid and SIGKILLs the greeter
-                            // on success (emitting GreeterTerminated /
-                            // GreeterKillFailed); on failure it retains
-                            // the live greeter and emits
-                            // SessionSpawnFailed. The SIGCHLD reaper
-                            // collects the resulting zombie.
-                            //
-                            // Foreground flips to Session ONLY on
-                            // success: on failure the greeter is still
-                            // alive, so foreground must stay Greeter —
-                            // flipping it would gate xdg_toplevel
-                            // compositing (req 17) onto a session that
-                            // does not exist.
-                            if start_session(
-                                &state.spawn_bin,
-                                &spawn,
-                                &mut state.greeter,
-                                &mut state.session_uid,
-                            )
-                            .is_ok()
-                            {
-                                // Greeter torn down, splash stays
-                                // beneath, halmasuit's PID is unchanged
-                                // (login-flash invariant); the session's
-                                // xdg_toplevel is composited + focused
-                                // when it maps (gated on this state).
-                                state.foreground = halmasuit_introspect::Foreground::Session;
-                                emit(&Event::ForegroundChanged {
-                                    to: halmasuit_introspect::Foreground::Session,
-                                });
-                            }
-                            connstate.close_after_drain = true;
-                        }
-                        if out.close {
-                            connstate.close_after_drain = true;
-                        }
+                Ok(n) => {
+                    let out = connstate.episode.on_greeter_bytes(&buf[..n]);
+                    connstate.write_buf.extend(out.greeter_reply);
+                    if let Some(spawn) = out.spawned {
+                        // The broker forked-then-dropped the leader
+                        // (R7); the compositor never execs anything
+                        // (R3/R15). Record identity + tear the greeter
+                        // process down. The A5 two-key flash-free
+                        // VISIBLE swap is a later task — keep the
+                        // immediate Session foreground flip (PID
+                        // continuous; login-flash invariant intact).
+                        connstate.spawned = true;
+                        record_session_started(
+                            &spawn,
+                            &mut state.greeter,
+                            &mut state.session_uid,
+                            &mut state.foreground,
+                        );
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, id, "greetd codec error; closing");
-                        connstate.close_after_drain = true;
+                    if out.terminate {
+                        connstate.terminate = true;
                         break;
                     }
-                },
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
-                    tracing::warn!(error = %e, id, "read failed on greetd connection");
-                    // Peer is gone; pending writes can never be delivered.
-                    // Clear so the close_after_drain predicate below fires
-                    // immediately instead of leaving the source registered
-                    // for a closed fd, which calloop would then keep firing
-                    // (POLLHUP) producing a tight error-log loop.
-                    connstate.close_after_drain = true;
+                    tracing::warn!(error = %e, id, "read failed on greeter connection");
+                    if !connstate.spawned {
+                        connstate.terminate = true;
+                    }
                     connstate.write_buf.clear();
                     break;
                 }
@@ -797,9 +847,9 @@ fn handle_connection_ready(
             }
             match stream_ref.write(&connstate.write_buf) {
                 Ok(0) => {
-                    // Peer closed write side with no progress; abandon the
-                    // remaining buffer rather than spinning on retries.
-                    connstate.close_after_drain = true;
+                    if !connstate.spawned {
+                        connstate.terminate = true;
+                    }
                     connstate.write_buf.clear();
                     break;
                 }
@@ -808,14 +858,10 @@ fn handle_connection_ready(
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
-                    tracing::warn!(error = %e, id, "write failed on greetd connection");
-                    // Peer is gone; the buffered reply can't reach it.
-                    // Without clearing write_buf, the close_after_drain
-                    // predicate below stays false, the source stays
-                    // registered, calloop re-fires on POLLHUP/POLLERR, we
-                    // loop. Clear so this single warning fires once and
-                    // the connection is reaped on the next predicate check.
-                    connstate.close_after_drain = true;
+                    tracing::warn!(error = %e, id, "write failed on greeter connection");
+                    if !connstate.spawned {
+                        connstate.terminate = true;
+                    }
                     connstate.write_buf.clear();
                     break;
                 }
@@ -823,11 +869,143 @@ fn handle_connection_ready(
         }
     }
 
-    if connstate.close_after_drain && connstate.write_buf.is_empty() {
+    // Read teardown decisions off `connstate` before its borrow ends.
+    let episode_over = connstate.terminate && connstate.write_buf.is_empty();
+    let detach_greeter_only = !connstate.terminate
+        && connstate.spawned
+        && connstate.greeter_token.is_some()
+        && connstate.write_buf.is_empty();
+    let broker_tok = connstate.broker_token;
+    // `connstate`'s borrow of `state.connections` ends here.
+
+    if episode_over {
+        // Full teardown. A8.2: deregister the broker source BEFORE the
+        // `ConnState` (its sole `OwnedFd`) drops.
+        if let Some(t) = broker_tok {
+            state.loop_handle.remove(t);
+        }
         state.connections.remove(&id);
+        return Ok(PostAction::Remove); // greeter source self-removes
+    }
+    if detach_greeter_only {
+        // greetd's connection is terminal after StartSession and the
+        // greeter process was SIGKILLed; drop ONLY this (greeter)
+        // source. The `ConnState` + broker source live on until
+        // `SessionEnded` (A5/A6).
+        if let Some(cs) = state.connections.get_mut(&id) {
+            cs.greeter_token = None;
+        }
         return Ok(PostAction::Remove);
     }
     Ok(PostAction::Continue)
+}
+
+/// calloop callback for the per-episode broker `SOCK_SEQPACKET` source
+/// (Amendment A7/A8). Readable → ONE non-blocking framed recv fed into
+/// the episode → greeter reply buffered (A8.4: flushed by the greeter
+/// source, never written here) + lifecycle consumed. Broker EOF /
+/// transport error → the episode fails closed (A7.4) as an ordinary
+/// source event — the render/calloop thread never blocks.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "calloop callback signature requires Result<PostAction, io::Error>"
+)]
+#[allow(
+    clippy::needless_pass_by_ref_mut,
+    reason = "calloop callback signature requires &mut NoIoDrop<T>; unused here"
+)]
+fn handle_broker_ready(
+    id: usize,
+    readiness: calloop::Readiness,
+    state: &mut HalmasuitState,
+) -> Result<PostAction, io::Error> {
+    let Some(connstate) = state.connections.get_mut(&id) else {
+        // ConnState already torn down. The broker source's borrowed-fd
+        // `Generic` owns nothing (A8.1) — dropping it closes no fd.
+        return Ok(PostAction::Remove);
+    };
+
+    if readiness.readable {
+        let out = connstate.episode.on_broker_readable();
+        connstate.write_buf.extend(out.greeter_reply);
+        if let Some(spawn) = out.spawned {
+            connstate.spawned = true;
+            record_session_started(
+                &spawn,
+                &mut state.greeter,
+                &mut state.session_uid,
+                &mut state.foreground,
+            );
+        }
+        if out.terminate {
+            connstate.terminate = true;
+        }
+    }
+
+    let terminate = connstate.terminate;
+    let greeter_attached = connstate.greeter_token.is_some();
+    // `connstate`'s borrow ends here.
+
+    if terminate {
+        if greeter_attached {
+            // The greeter source owns the write vehicle + the A8.2
+            // teardown ordering; it will flush any fail-closed reply
+            // then full-teardown. Nothing to do here.
+            return Ok(PostAction::Continue);
+        }
+        // Post-hand-off: the broker source is the sole driver. We
+        // cannot remove the current source synchronously and
+        // `PostAction::Remove` defers deregistration to end-of-dispatch
+        // — so DEFER the `ConnState` drop to an idle callback that runs
+        // AFTER this source is deregistered, keeping the A8.2 ordering
+        // (epoll-deregister before the one `close(2)`).
+        state.loop_handle.insert_idle(move |st| {
+            st.connections.remove(&id);
+        });
+        return Ok(PostAction::Remove);
+    }
+    Ok(PostAction::Continue)
+}
+
+/// Record that the broker has launched the session leader (it
+/// forked-then-dropped in a non-setuid child per R7 — the compositor
+/// never execs anything, R3/R15): set the session uid, SIGKILL the
+/// greeter process via its pidfd, flip the foreground to `Session`.
+/// Idempotent — a second `spawned` (e.g. seen from both the greeter
+/// and broker sources) is a no-op.
+fn record_session_started(
+    spawn: &SpawnRequest,
+    greeter: &mut Option<GreeterHandle>,
+    session_uid: &mut Option<u32>,
+    foreground: &mut halmasuit_introspect::Foreground,
+) {
+    if session_uid.is_some() {
+        return;
+    }
+    emit(&Event::SessionRequested {
+        uid: spawn.uid,
+        gid: spawn.gid,
+    });
+    *session_uid = Some(spawn.uid);
+    if let Some(g) = greeter.take() {
+        let pid = g.pid;
+        match pidfd_send_signal(&g.pidfd, libc::SIGKILL) {
+            Ok(()) => emit(&Event::GreeterTerminated { pid }),
+            Err(e) => {
+                let error = format!("{e}");
+                tracing::warn!(
+                    %error,
+                    greeter_pid = pid,
+                    "pidfd_send_signal greeter SIGKILL failed; session proceeds"
+                );
+                emit(&Event::GreeterKillFailed { pid, error });
+            }
+        }
+    }
+    *foreground = halmasuit_introspect::Foreground::Session;
+    emit(&Event::ForegroundChanged {
+        to: halmasuit_introspect::Foreground::Session,
+    });
 }
 
 /// Bind the greetd socket, register it as a calloop source, and emit
@@ -894,13 +1072,16 @@ fn pam_service_from_env() -> String {
     std::env::var("HALMASUIT_PAM_SERVICE").unwrap_or_else(|_| "halmasuit".into())
 }
 
-/// Path to the `halmasuit-spawn` setuid helper. Configurable via env
-/// (the NixOS module sets it to `/run/wrappers/bin/halmasuit-spawn`).
-/// Fallback resolves via `$PATH` — useful in dev / test where the
-/// build artifact is on the path.
-fn spawn_bin_from_env() -> PathBuf {
-    std::env::var_os("HALMASUIT_SPAWN_BIN")
-        .map_or_else(|| PathBuf::from("halmasuit-spawn"), PathBuf::from)
+/// Path of the privileged `halmasuit-session` broker `SOCK_SEQPACKET`
+/// socket. Defaults to `/run/halmasuit-session.sock` — the
+/// `ListenSequentialPacket` the socket-activated unit binds
+/// (`nix/module.nix`); overridable via `HALMASUIT_BROKER_SOCKET` for
+/// dev/test.
+fn broker_socket_path_from_env() -> PathBuf {
+    std::env::var_os("HALMASUIT_BROKER_SOCKET").map_or_else(
+        || PathBuf::from("/run/halmasuit-session.sock"),
+        PathBuf::from,
+    )
 }
 
 /// Brand clear color rendered before any wl_client connects: `#0a0014`
@@ -1141,27 +1322,30 @@ fn pidfd_send_signal(pidfd: &std::os::fd::OwnedFd, sig: i32) -> io::Result<()> {
 /// Called from the SIGCHLD handler: signal delivery is coalesced
 /// (multiple children dying between handler runs produce one signal),
 /// so a single SIGCHLD may correspond to multiple terminations. Loop
-/// until `waitpid` reports no more reapable children. Without this,
-/// dead halmasuit-spawn / greeter / session children accumulate as
-/// zombies and eventually exhaust the pid namespace.
+/// until `waitpid` reports no more reapable children. The compositor's
+/// only child is its greeter (the session leader is the privileged
+/// broker's child — the broker is its sole reaper, Epic R9); without
+/// this loop a dead greeter accumulates as a zombie.
 /// What a reaped child's pid means relative to the greeter lifecycle.
 #[derive(Debug, PartialEq, Eq)]
 enum ReapOutcome {
     /// The greeter exited before authentication completed — the wedge
     /// condition (no greeter client, no session, nothing else notices).
     GreeterDiedPreAuth,
-    /// The greeter exited after a session spawn was confirmed —
-    /// `start_session` already SIGKILLed it and emitted
+    /// The greeter exited after a session start was confirmed —
+    /// `record_session_started` already SIGKILLed it and emitted
     /// `GreeterTerminated`; the expected zombie.
     GreeterDiedExpected,
-    /// A non-greeter child (halmasuit-spawn, the session, or an
-    /// already-cleared greeter slot).
+    /// Not the tracked greeter pid (an already-cleared greeter slot).
+    /// The compositor has no other children — the session leader is
+    /// the broker's child, never reaped here (Epic R9).
     Other,
 }
 
 /// Classify a reaped pid against the tracked greeter pid and the
-/// authentication state (`session_uid` is `Some` once `start_session`
-/// confirmed a spawn). Pure so the wedge logic is unit-testable
+/// authentication state (`session_uid` is `Some` once
+/// `record_session_started` recorded the broker-launched session).
+/// Pure so the wedge logic is unit-testable
 /// without driving real children through `waitpid`.
 fn classify_reaped_child(
     reaped_pid: u32,
@@ -1220,38 +1404,30 @@ fn reap_zombie_children(state: &mut HalmasuitState) {
     }
 }
 
-/// Drop privileges to the configured compositor uid, preserving
-/// `CAP_KILL` so halmasuit retains signal authority over its greeter
-/// child (which runs under a different uid) on session start.
-/// Supplementary groups were pinned at unit-startup via systemd
-/// `SupplementaryGroups=` (`shadow` in production, so halmasuit-pam
-/// can `getspnam` directly without forking `unix_chkpwd`); they are
-/// intentionally NOT cleared.
+/// Drop privileges to the configured compositor uid. The compositor
+/// execs NO setuid helper and holds NO PAM handle — it relays auth to
+/// the privileged `halmasuit-session` broker (Epic R2/R3/R15). So it
+/// retains the absolute minimum: only `CAP_KILL`, to signal its
+/// greeter child (which runs under a different uid) on session start.
+/// The bounding set is emptied COMPLETELY — neither the compositor
+/// nor anything it execs can ever gain a capability. Supplementary
+/// groups pinned at unit-startup via systemd `SupplementaryGroups=`
+/// are intentionally NOT cleared.
 ///
 /// Order is load-bearing:
-///   1. Drop bounding-set bits except those `halmasuit-spawn` needs
-///      after its setuid-root execve. Per capabilities(7) for
-///      set-user-ID-root binaries with no file caps:
-///      `P'(permitted) = P(inheritable) | P(bounding)`. Keep
-///      `{CAP_SETUID, CAP_SETGID}` — exactly what halmasuit-spawn
-///      needs to `setresuid`/`setresgid` into the target user.
-///      `CAP_KILL` is NOT in bounding: halmasuit retains it via
-///      step 5's `capset`, and bounding only restricts caps
-///      *gained* via future execve/capset — not the runtime
-///      permitted set.
-///      `PR_CAPBSET_DROP` requires `CAP_SETPCAP` in the *effective*
-///      set, which is full at this point (we're still root, no
-///      `setresuid` yet). Doing this drop AFTER `setresuid` would
-///      fail with `EPERM` because the kernel clears `effective` on
-///      the root → non-root transition.
+///   1. Empty the bounding set entirely. `PR_CAPBSET_DROP` requires
+///      `CAP_SETPCAP` in the *effective* set, which is full here
+///      (still root, no `setresuid` yet); doing it AFTER `setresuid`
+///      would `EPERM` (the kernel clears `effective` on the
+///      root → non-root transition). The bounding set constrains only
+///      caps *gained later* (execve grants / capset→inheritable); it
+///      does not retroactively shrink halmasuit's own permitted set,
+///      so emptying it does not affect step 5's `CAP_KILL`.
 ///   2. `prctl(PR_SET_KEEPCAPS, 1)` — without this, `setresuid`
 ///      below would clear the permitted capability set entirely.
 ///      KeepCaps preserves permitted; effective is still cleared
 ///      and must be rebuilt via `capset` (step 5).
 ///   3. `setresgid(egid, egid, egid)` — pin all three gid components.
-///      Belt-and-suspenders; the `setresuid` below is what actually
-///      removes the ability to change gid (CAP_SETGID drops with
-///      the uid transition).
 ///   4. `setresuid(uid, uid, uid)` — drop uid. All three components
 ///      set to the same value so the process cannot resurrect root.
 ///      Permitted caps survive due to KeepCaps; effective caps are
@@ -1264,38 +1440,28 @@ fn reap_zombie_children(state: &mut HalmasuitState) {
 ///      that `capset(2)` updates atomically. We bypass `caps::set`
 ///      for that.
 ///
-/// We deliberately do NOT set `SECBIT_NOROOT` (it would prevent
-/// `halmasuit-spawn`'s setuid-root execve from gaining the caps
-/// listed in step 1) or `SECBIT_NO_SETUID_FIXUP` (it would
-/// suppress all cap changes on uid transitions, sidestepping the
-/// `KEEP_CAPS` + `capset` dance — but at the cost of leaving
-/// the permitted set at "everything halmasuit had as root,"
-/// which is the opposite of what we want).
+/// `SECBIT_NOROOT` / `SECBIT_NO_SETUID_FIXUP` are not set here. With
+/// the setuid helper deleted there is no setuid-root execve to reason
+/// about, but auditing those secbits against the libseat/DRM path is
+/// a dedicated hardening pass, out of the privilege-separation epic's
+/// scope (tracked as a follow-up, same as the systemd NNP posture —
+/// see nix/module.nix).
 fn drop_privileges(uid: u32) -> io::Result<()> {
-    use caps::{CapSet, Capability};
+    use caps::CapSet;
     use nix::unistd::{Uid, getegid, setresgid, setresuid};
 
-    // Step 1: shrink bounding set while we're still root with
-    // CAP_SETPCAP in effective. The bounding set is preserved
-    // across setresuid, fork, and execve — dropping bits here has
-    // the same effect on children as doing it post-drop, and is
-    // syscall-cheaper because PR_CAPBSET_DROP doesn't need the
-    // capset choreography otherwise required to re-raise
-    // CAP_SETPCAP after setresuid clears effective.
-    //
-    // We keep ONLY `{CAP_SETUID, CAP_SETGID}` in bounding — exactly
-    // what `halmasuit-spawn`'s setuid-root execve needs to inherit
-    // via `P'(permitted) = P(inheritable) | P(bounding)`. Note that
-    // CAP_KILL is NOT kept here: bounding only constrains caps
-    // gained later (capset additions to inheritable, or grants
-    // during execve), it does NOT retroactively shrink halmasuit's
-    // own permitted/effective sets. halmasuit's runtime `CAP_KILL`
-    // survives via `KEEP_CAPS + capset` below regardless of bounding.
-    let keep_in_bounding = [Capability::CAP_SETUID, Capability::CAP_SETGID];
+    // Step 1: empty the bounding set ENTIRELY while we're still root
+    // with CAP_SETPCAP in effective. Nothing is kept: the compositor
+    // execs no setuid helper (Epic R15), so no future execve should
+    // ever be permitted to gain a capability. The bounding set is
+    // preserved across setresuid/fork/execve and constrains only caps
+    // gained later — it never retroactively shrinks halmasuit's own
+    // permitted/effective sets, so the runtime `CAP_KILL` raised by
+    // step 5's `capset` is unaffected. Doing this here (still root,
+    // CAP_SETPCAP in effective) avoids the capset choreography
+    // otherwise needed to re-raise CAP_SETPCAP after setresuid clears
+    // effective.
     for cap in caps::all() {
-        if keep_in_bounding.contains(&cap) {
-            continue;
-        }
         caps::drop(None, CapSet::Bounding, cap)
             .map_err(|e| io::Error::other(format!("bounding drop {cap}: {e}")))?;
     }
@@ -1377,44 +1543,6 @@ fn capset_permitted_effective_cap_kill() -> io::Result<()> {
     Ok(())
 }
 
-/// Construct the `Command` that invokes `halmasuit-spawn` with the
-/// resolved spawn parameters. Argv shape (from halmasuit-spawn's
-/// `parse_argv` docstring):
-///
-/// ```text
-/// halmasuit-spawn <uid> <gid> <user> -- <cmd> [args...]
-/// ```
-///
-/// The child's environment is cleared and re-populated from
-/// `request.env` (each entry is a `KEY=VALUE` string per the greetd
-/// protocol). `halmasuit-spawn`'s allowlist filters the env before
-/// execve.
-fn build_spawn_command(spawn_bin: &Path, request: &SpawnRequest) -> Command {
-    let mut cmd = Command::new(spawn_bin);
-    cmd.arg(request.uid.to_string());
-    cmd.arg(request.gid.to_string());
-    cmd.arg(&request.username);
-    cmd.arg("--");
-    for c in &request.cmd {
-        cmd.arg(c);
-    }
-    cmd.env_clear();
-    for env in &request.env {
-        if let Some((k, v)) = env.split_once('=') {
-            cmd.env(k, v);
-        }
-    }
-    cmd
-}
-
-/// Fire-and-forget spawn of `halmasuit-spawn`. Returns the spawned
-/// `Child` (kept by the caller only for the PID; we never `wait`).
-/// The session running under the new user is the kernel's
-/// responsibility after `execve`.
-fn invoke_spawn(spawn_bin: &Path, request: &SpawnRequest) -> io::Result<Child> {
-    build_spawn_command(spawn_bin, request).spawn()
-}
-
 /// Whether a peer that just connected to the Wayland socket is
 /// authorised, given its SO_PEERCRED `peer_uid`.
 ///
@@ -1427,71 +1555,6 @@ fn invoke_spawn(spawn_bin: &Path, request: &SpawnRequest) -> io::Result<Child> {
 /// race the session connect. Mirrors the greetd listener's uid check.
 fn wayland_peer_authorized(peer_uid: u32, greeter_uid: u32, session_uid: Option<u32>) -> bool {
     peer_uid == greeter_uid || session_uid == Some(peer_uid)
-}
-
-/// Start the authenticated user session: invoke `halmasuit-spawn`,
-/// and *only if it succeeds* record the session uid and tear the
-/// greeter down.
-///
-/// Ordering is load-bearing (Epic #1 R3). Killing the greeter before
-/// invoking spawn meant a spawn failure left a dead greeter with no
-/// session — an unrecoverable black screen, the exact failure this
-/// project exists to eliminate. Here the greeter is the recoverable
-/// fallback: it is signalled strictly after the spawn is confirmed,
-/// so a spawn failure leaves the user at a live greeter they can
-/// retry from, and a `SessionSpawnFailed` event is emitted instead of
-/// `GreeterTerminated`.
-///
-/// `session_uid` is set before the greeter teardown so the Wayland
-/// accept path can authorise the session's own connection (which
-/// arrives under the authenticated uid, distinct from the greeter's)
-/// as soon as the session process exists.
-fn start_session(
-    spawn_bin: &Path,
-    request: &SpawnRequest,
-    greeter: &mut Option<GreeterHandle>,
-    session_uid: &mut Option<u32>,
-) -> io::Result<Child> {
-    let child = match invoke_spawn(spawn_bin, request) {
-        Ok(child) => child,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                spawn_bin = ?spawn_bin,
-                "failed to invoke halmasuit-spawn; greeter retained for retry"
-            );
-            emit(&Event::SessionSpawnFailed {
-                uid: request.uid,
-                error: format!("{e}"),
-            });
-            return Err(e);
-        }
-    };
-
-    *session_uid = Some(request.uid);
-    tracing::info!(
-        spawn_pid = child.id(),
-        uid = request.uid,
-        "halmasuit-spawn launched"
-    );
-
-    if let Some(greeter) = greeter.take() {
-        let pid = greeter.pid;
-        match pidfd_send_signal(&greeter.pidfd, libc::SIGKILL) {
-            Ok(()) => emit(&Event::GreeterTerminated { pid }),
-            Err(e) => {
-                let error = format!("{e}");
-                tracing::warn!(
-                    %error,
-                    greeter_pid = pid,
-                    "pidfd_send_signal greeter SIGKILL failed; session proceeds"
-                );
-                emit(&Event::GreeterKillFailed { pid, error });
-            }
-        }
-    }
-
-    Ok(child)
 }
 
 // ── Wayland event-loop integration ──────────────────────────────────────
@@ -1902,11 +1965,9 @@ fn main() -> io::Result<()> {
         loop_handle: loop_handle.clone(),
         connections: HashMap::new(),
         next_conn_id: 0,
-        pam_factory: Arc::new(PamThreadFactory {
-            service: pam_service,
-        }),
+        pam_service,
+        broker_socket: broker_socket_path_from_env(),
         greeter_uid,
-        spawn_bin: spawn_bin_from_env(),
         _greetd_listener_token: Some(greetd_listener_token),
         drm_backend,
         _drm_token: drm_token,
@@ -1954,10 +2015,10 @@ fn main() -> io::Result<()> {
 
     // Privilege drop. The DRM master FD and both Unix sockets are
     // acquired above while we still have euid==0; everything from
-    // here onwards runs as the configured compositor system user.
-    // The setuid wrapper for halmasuit-spawn (set up by the NixOS
-    // module's `security.wrappers`) is what allows us to still
-    // execve halmasuit-spawn after this drop.
+    // here onwards runs as the configured compositor system user with
+    // no capability the bounding set could grant. The compositor execs
+    // no setuid helper after this drop — it relays auth to the
+    // privileged halmasuit-session broker (Epic R3/R15).
     //
     // Fail-closed when running as root with no compositor uid
     // configured: a deploy that forgot to set HALMASUIT_COMPOSITOR_UID
@@ -2016,65 +2077,6 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
-
-    fn sample_request() -> SpawnRequest {
-        SpawnRequest {
-            username: "alice".into(),
-            uid: 1000,
-            gid: 1000,
-            cmd: vec!["niri".into(), "--session".into()],
-            env: vec![
-                "XDG_SESSION_TYPE=wayland".into(),
-                "WAYLAND_DISPLAY=wayland-0".into(),
-            ],
-        }
-    }
-
-    #[test]
-    fn build_spawn_command_constructs_correct_argv() {
-        let cmd = build_spawn_command(Path::new("/usr/bin/halmasuit-spawn"), &sample_request());
-        assert_eq!(cmd.get_program(), OsStr::new("/usr/bin/halmasuit-spawn"));
-        let args: Vec<&OsStr> = cmd.get_args().collect();
-        assert_eq!(args.len(), 6);
-        assert_eq!(args[0], OsStr::new("1000"));
-        assert_eq!(args[1], OsStr::new("1000"));
-        assert_eq!(args[2], OsStr::new("alice"));
-        assert_eq!(args[3], OsStr::new("--"));
-        assert_eq!(args[4], OsStr::new("niri"));
-        assert_eq!(args[5], OsStr::new("--session"));
-    }
-
-    #[test]
-    fn build_spawn_command_populates_env_from_greetd_request() {
-        let cmd = build_spawn_command(Path::new("/bin/true"), &sample_request());
-        // env_clear() then individual env() calls. get_envs() yields
-        // only what we explicitly set; verify both pairs are present
-        // and that we did NOT inherit PATH/HOME from the test process.
-        let map: std::collections::HashMap<_, _> = cmd.get_envs().collect();
-        assert_eq!(
-            map.get(OsStr::new("XDG_SESSION_TYPE")),
-            Some(&Some(OsStr::new("wayland")))
-        );
-        assert_eq!(
-            map.get(OsStr::new("WAYLAND_DISPLAY")),
-            Some(&Some(OsStr::new("wayland-0")))
-        );
-        assert!(!map.contains_key(OsStr::new("PATH")));
-        assert!(!map.contains_key(OsStr::new("HOME")));
-    }
-
-    #[test]
-    fn build_spawn_command_ignores_env_entries_without_equals() {
-        // Defensive: a malformed greetd peer might send a `MALFORMED`
-        // string. We split at the first `=`; entries without one are
-        // silently dropped.
-        let mut req = sample_request();
-        req.env.push("MALFORMED_NO_EQUALS".into());
-        let cmd = build_spawn_command(Path::new("/bin/true"), &req);
-        let map: std::collections::HashMap<_, _> = cmd.get_envs().collect();
-        assert!(!map.contains_key(OsStr::new("MALFORMED_NO_EQUALS")));
-    }
 
     // R4 port: the SIGCHLD reaper must distinguish which child died.
     // Greeter exit pre-auth (session_uid still None) is the wedge
@@ -2223,78 +2225,5 @@ mod tests {
     fn wayland_peer_root_rejected() {
         assert!(!wayland_peer_authorized(0, 1000, Some(1001)));
         assert!(!wayland_peer_authorized(0, 1000, None));
-    }
-
-    // R2/R3 port: spawn must be invoked and confirmed BEFORE the
-    // greeter is killed. Spawn failure must leave the greeter running
-    // (recoverable) and emit SessionSpawnFailed, never GreeterTerminated.
-    #[test]
-    fn start_session_spawn_failure_retains_greeter_and_records_no_uid() {
-        let bin = Path::new("/nonexistent/halmasuit-spawn-does-not-exist");
-        let req = sample_request(); // uid 1000
-        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
-        let mut greeter = Some(GreeterHandle {
-            pid: 4242,
-            pidfd: devnull.into(),
-        });
-        let mut session_uid: Option<u32> = None;
-
-        let result = start_session(bin, &req, &mut greeter, &mut session_uid);
-
-        assert!(result.is_err(), "spawn of a nonexistent bin must fail");
-        assert!(
-            greeter.is_some(),
-            "greeter MUST be retained when the session spawn fails"
-        );
-        assert_eq!(
-            session_uid, None,
-            "session_uid MUST NOT be recorded when the spawn fails"
-        );
-    }
-
-    #[test]
-    fn start_session_success_records_uid_then_kills_greeter() {
-        if !Path::new("/bin/sh").exists() {
-            return;
-        }
-        let mut greeter_child = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("sleep 30")
-            .spawn()
-            .expect("spawn greeter stand-in");
-        let pidfd = pidfd_open_for(greeter_child.id()).expect("pidfd_open greeter stand-in");
-        let mut greeter = Some(GreeterHandle {
-            pid: greeter_child.id(),
-            pidfd,
-        });
-        let mut session_uid: Option<u32> = None;
-        let req = sample_request(); // uid 1000
-
-        let result = start_session(Path::new("/bin/sh"), &req, &mut greeter, &mut session_uid);
-
-        let mut session_child = result.expect("spawn of /bin/sh must succeed");
-        assert_eq!(
-            session_uid,
-            Some(1000),
-            "authenticated uid MUST be recorded once the spawn is confirmed"
-        );
-        assert!(
-            greeter.is_none(),
-            "greeter MUST be taken (killed) after a confirmed spawn"
-        );
-
-        let _ = session_child.wait();
-        let _ = greeter_child.wait();
-    }
-
-    #[test]
-    fn spawn_bin_from_env_falls_back_to_path_lookup() {
-        // With no env override set (this test relies on nextest's
-        // per-test isolation; we don't mutate env in this module),
-        // the resolved path is the bare "halmasuit-spawn" — a
-        // relative PathBuf the OS resolves via $PATH at spawn time.
-        if std::env::var_os("HALMASUIT_SPAWN_BIN").is_none() {
-            assert_eq!(spawn_bin_from_env(), PathBuf::from("halmasuit-spawn"));
-        }
     }
 }

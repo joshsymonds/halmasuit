@@ -368,6 +368,29 @@ impl Connection {
         }
     }
 
+    /// The client-supplied `CreateSession` username while authentication
+    /// is in flight: `Some` in [`SessionState::AuthPending`] (a PAM
+    /// round suspended) and [`SessionState::Authenticating`] (a
+    /// challenge pending); `None` when idle, after `Success`
+    /// (`AuthSuccess`/`Spawning` carry PAM's resolved name, a different
+    /// thing), or terminal.
+    ///
+    /// The compositor's broker episode reads this on the first
+    /// [`Demand::Pam`] to build the broker `BeginAuth` hint. Per Epic
+    /// R8 this is ONLY a `pam_start` hint — the authoritative identity
+    /// is the broker's PAM-resolved `Success`, never this string.
+    #[must_use]
+    pub fn pending_username(&self) -> Option<&str> {
+        match &self.state {
+            SessionState::AuthPending { username } | SessionState::Authenticating { username } => {
+                Some(username)
+            }
+            SessionState::Idle
+            | SessionState::AuthSuccess { .. }
+            | SessionState::Spawning { .. } => None,
+        }
+    }
+
     /// Append `new_bytes` to the read buffer and process every
     /// complete greeter message that's now decodable, advancing the
     /// state machine with NO I/O.
@@ -675,6 +698,50 @@ mod tests {
         // Terminal: any further feed is Close.
         let o4 = conn.feed_greeter(&start).expect("post-spawn feed");
         assert_eq!(o4.demand, Demand::Close);
+    }
+
+    #[test]
+    fn connection_pending_username_tracks_in_flight_client_name() {
+        let mut conn = Connection::new();
+        assert_eq!(conn.pending_username(), None, "idle: no in-flight name");
+
+        let create = encode(&Request::CreateSession {
+            username: "alice".into(),
+        })
+        .unwrap();
+        conn.feed_greeter(&create).unwrap();
+        // AuthPending: the episode reads this to build BeginAuth.
+        assert_eq!(conn.pending_username(), Some("alice"));
+
+        conn.resume_pam(PamStep::Challenge {
+            kind: AuthMessageType::Secret,
+            prompt: "pw:".into(),
+        })
+        .unwrap();
+        // Authenticating: still the client hint.
+        assert_eq!(conn.pending_username(), Some("alice"));
+
+        // Answer → AuthPending again, still the client hint.
+        let pmr = encode(&Request::PostAuthMessageResponse {
+            response: Some("hunter2".into()),
+        })
+        .unwrap();
+        conn.feed_greeter(&pmr).unwrap();
+        assert_eq!(conn.pending_username(), Some("alice"));
+
+        // Success carries PAM's RESOLVED name; the client hint is no
+        // longer "pending" (R8: a different, authoritative thing).
+        conn.resume_pam(PamStep::Success {
+            username: "alice.canonical".into(),
+            uid: 1000,
+            gid: 1000,
+        })
+        .unwrap();
+        assert_eq!(
+            conn.pending_username(),
+            None,
+            "post-success: not a pending client hint"
+        );
     }
 
     #[test]

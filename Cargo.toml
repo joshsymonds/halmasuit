@@ -5,7 +5,6 @@ members = [
     "crates/halmasuit-protocols",
     "crates/halmasuit-introspect",
     "crates/halmasuit-greetd",
-    "crates/halmasuit-pam",
     "crates/halmasuit-ipc",
     # Pure wire contract for the compositor↔halmasuit-session PAM relay
     # (Epic: unified session/pamd). Types + codec only.
@@ -15,7 +14,6 @@ members = [
     # Test-only: real-PAM VM gate driver for halmasuit-session (R12).
     "crates/halmasuit-session-pam-testdriver",
     "crates/halmasuit-cli",
-    "crates/halmasuit-spawn",
     "crates/halmasuit-test",
     "crates/halmasuit-vm-client",
     # Research probe — not v2 production. See RESEARCH.md.
@@ -32,9 +30,6 @@ members = [
     "crates/halmasuit-toplevel-test-client",
     "xtask",
 ]
-# cargo-fuzz subworkspace needs nightly rustc + libfuzzer-sys; isolated
-# from the main workspace which pins stable 1.95.
-exclude = ["crates/halmasuit-spawn/fuzz"]
 
 [workspace.package]
 version       = "0.1.0"
@@ -53,9 +48,10 @@ authors       = ["Josh Symonds <veraticus@gmail.com>"]
 # `thiserror` for error enums that benefit from Display derives. Used
 # by halmasuit-greetd's StateMachineError.
 thiserror          = "2"
-# PAM FFI for halmasuit-pam. Direct thin FFI (no wrapper crate) per
-# ARCHITECTURE.md "Open decisions" row 1 — wrappers flatten PAM's
-# message-style enum that our AuthMessageType already mirrors.
+# PAM FFI for the privileged halmasuit-session broker (the sole
+# libpam-linking crate, Epic #1 R2/R14). Direct thin FFI (no wrapper
+# crate) per ARCHITECTURE.md "Open decisions" row 1 — wrappers flatten
+# PAM's message-style enum that our AuthMessageType already mirrors.
 #
 # NOTE: 1.0.0-alpha5 is a pre-release (last released 2023-11) at a
 # privilege-critical FFI boundary. The crate has shipped alphas for
@@ -65,7 +61,7 @@ thiserror          = "2"
 # advisories before each release tag; if a stable 1.0 ships, update
 # the pin and re-audit any signature changes (esp. pam_conv).
 pam-sys            = "1.0.0-alpha5"
-# C types and constants for the halmasuit-pam FFI surface.
+# C types and constants for the halmasuit-session libpam FFI surface.
 libc               = "0.2"
 # Zero-on-drop for password buffers handed back to PAM. Used by the
 # conv-callback bridge to wipe response strings after libc::strdup
@@ -106,8 +102,9 @@ nix                = "0.30"
 # used by halmasuit's drop_privileges to retain CAP_KILL across the
 # in-process setresuid. Pure-Rust over libc syscalls; no C deps.
 caps               = "0.5"
-# Property-based testing. halmasuit-spawn argv parser + the future greetd
-# state machine both lean on it for boundary-condition coverage.
+# Property-based testing. The greetd state machine + the
+# halmasuit-session privilege-drop primitives lean on it for
+# boundary-condition coverage.
 proptest           = "1"
 # halmasuit-splash (the system background wl_client) deps. NOT used by
 # the halmasuit compositor binary — these never enter halmasuit's

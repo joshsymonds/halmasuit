@@ -16,7 +16,7 @@
   system,
   nixpkgs,
   halmasuit,
-  halmasuit-spawn,
+  halmasuit-session,
 }:
 
 let
@@ -78,8 +78,9 @@ let
 
     # Session command: `sleep infinity` as the test user. The
     # architectural assertion (halmasuit's PID is continuous) doesn't
-    # depend on what the session command IS — just that halmasuit-spawn
-    # launches it without restarting halmasuit.
+    # depend on what the session command IS — just that the privileged
+    # halmasuit-session broker forks-then-drops it (Epic R7) without
+    # restarting halmasuit.
     print("test-greeter: start_session with sleep", file=sys.stderr)
     send({
         "type": "start_session",
@@ -118,7 +119,11 @@ pkgs.testers.runNixOSTest {
       services.halmasuit = {
         enable         = true;
         package        = halmasuit;
-        spawnPackage   = halmasuit-spawn;
+        # The compositor's only auth path is relaying to the privileged
+        # halmasuit-session broker (Epic R3/A4); enabling the compositor
+        # auto-provisions the broker unit. Pin its package to the
+        # flake-built broker (the default needs the overlay).
+        session.package = halmasuit-session;
         greeterUid     = 999;
         greeterGroup   = "halmasuit-greeter";
         compositorUid  = 998;
@@ -139,8 +144,9 @@ pkgs.testers.runNixOSTest {
       };
 
       # test-user.nix sets uid=1000 with default group `users` (gid 100),
-      # but halmasuit-spawn's UID_MIN floor refuses gid < 1000. Give the
-      # test user a primary group with gid 1000 so spawn proceeds.
+      # but the broker's session-leader UID_MIN floor refuses gid < 1000
+      # (Epic R8/R11). Give the test user a primary group with gid 1000
+      # so the fork-then-drop proceeds.
       users.users.test.group = "test";
       users.groups.test.gid  = 1000;
 
@@ -176,11 +182,11 @@ pkgs.testers.runNixOSTest {
     )
     print(f"GREETER PHASE: halmasuit pid={halmasuit_pid_before}")
 
-    # Wait for the session. halmasuit-spawn execs the command with
-    # argv[0] = absolute store path, so the kernel's `comm` field is
-    # the truncated full path ("/nix/store/jjxn…") rather than the
-    # basename. We can't usefully `pgrep -x sleep`; matching against
-    # the full cmdline via `-f` works.
+    # Wait for the session. The broker's session-leader child execs the
+    # command with argv[0] = absolute store path, so the kernel's
+    # `comm` field is the truncated full path ("/nix/store/jjxn…")
+    # rather than the basename. We can't usefully `pgrep -x sleep`;
+    # matching against the full cmdline via `-f` works.
     machine.wait_until_succeeds(
         "pgrep -u test -f /bin/sleep",
         timeout=60,

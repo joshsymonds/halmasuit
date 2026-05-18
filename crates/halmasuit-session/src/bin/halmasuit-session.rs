@@ -63,13 +63,17 @@ fn listen_fd(var: impl Fn(&str) -> Option<String>, my_pid: i32) -> Result<RawFd,
     Ok(SD_LISTEN_FDS_START)
 }
 
-/// Greeter uid the SO_PEERCRED gate authorizes (Epic R5/R8). Same env
-/// key the compositor module already sets.
-fn greeter_uid(var: impl Fn(&str) -> Option<String>) -> Result<u32, String> {
-    var("HALMASUIT_GREETER_UID")
-        .ok_or_else(|| "HALMASUIT_GREETER_UID is unset".to_owned())?
+/// The relay-peer uid the broker's SO_PEERCRED gate authorizes (Epic
+/// R5/R8): the unprivileged compositor in the live topology (it owns
+/// its own greeter gate on the greetd socket), or whatever drives the
+/// broker directly in the standalone/test topology. Identity is still
+/// independently PAM-derived (R8) — this only authenticates the peer.
+/// Set by `nix/module.nix`'s broker unit.
+fn relay_peer_uid(var: impl Fn(&str) -> Option<String>) -> Result<u32, String> {
+    var("HALMASUIT_BROKER_PEER_UID")
+        .ok_or_else(|| "HALMASUIT_BROKER_PEER_UID is unset".to_owned())?
         .parse::<u32>()
-        .map_err(|e| format!("HALMASUIT_GREETER_UID is not a u32: {e}"))
+        .map_err(|e| format!("HALMASUIT_BROKER_PEER_UID is not a u32: {e}"))
 }
 
 fn main() -> std::process::ExitCode {
@@ -83,7 +87,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let guid = match greeter_uid(|k| std::env::var(k).ok()) {
+    let guid = match relay_peer_uid(|k| std::env::var(k).ok()) {
         Ok(u) => u,
         Err(e) => {
             eprintln!("halmasuit-session: {e}");
@@ -164,12 +168,12 @@ mod tests {
     }
 
     #[test]
-    fn greeter_uid_parsed_or_explained() {
+    fn relay_peer_uid_parsed_or_explained() {
         assert_eq!(
-            greeter_uid(env_of(&[("HALMASUIT_GREETER_UID", "1000")])),
+            relay_peer_uid(env_of(&[("HALMASUIT_BROKER_PEER_UID", "1000")])),
             Ok(1000)
         );
-        assert!(greeter_uid(env_of(&[])).is_err());
-        assert!(greeter_uid(env_of(&[("HALMASUIT_GREETER_UID", "-1")])).is_err());
+        assert!(relay_peer_uid(env_of(&[])).is_err());
+        assert!(relay_peer_uid(env_of(&[("HALMASUIT_BROKER_PEER_UID", "-1")])).is_err());
     }
 }

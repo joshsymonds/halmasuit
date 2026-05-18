@@ -33,14 +33,11 @@ halmasuit-introspect = { path = "../halmasuit-introspect", version = "0.1" }
 # PamSessionFactory. Compositor binds the socket and drives the
 # per-connection state machine from calloop callbacks.
 halmasuit-greetd     = { path = "../halmasuit-greetd",     version = "0.1" }
-# PAM FFI quarantine: the PamSessionFactory impl in this binary
-# returns a PamThread for each accepted greeter session. INTERIM —
-# replaced by the broker-relay adapter (R3) and deleted with the
-# setuid halmasuit-spawn once the relay is live (Amendment A4).
-halmasuit-pam        = { path = "../halmasuit-pam",        version = "0.1" }
 # Frozen compositor↔broker wire contract (Epic R3). The broker-relay
-# adapter translates the greetd PamSession conversation to/from these
-# frames; it is halmasuit-pam's successor (Amendment A4/A5).
+# adapter translates the greetd auth conversation to/from these
+# frames; the privileged halmasuit-session broker is the live PAM
+# path (halmasuit-pam, the in-compositor C1 model, is deleted with
+# setuid halmasuit-spawn in the atomic R10/R14/R15 commit).
 halmasuit-session-ipc = { path = "../halmasuit-session-ipc", version = "0.1" }
 tracing.workspace            = true
 tracing-subscriber.workspace = true

@@ -40,9 +40,6 @@ test-vm:
     echo "── halmasuit-vm ──"
     nix build .#checks.x86_64-linux.halmasuit-vm -L --print-build-logs --no-link
     echo
-    echo "── halmasuit-spawn ──"
-    nix build .#checks.x86_64-linux.halmasuit-spawn -L --print-build-logs --no-link
-    echo
     echo "── run-pam-auth ──"
     nix build .#checks.x86_64-linux.run-pam-auth -L --print-build-logs --no-link
     echo
@@ -216,14 +213,3 @@ miri:
 semver:
     cargo semver-checks check-release
 
-# Fuzz halmasuit-spawn's parse_argv for `seconds` seconds (default 10).
-# Requires `cargo install cargo-fuzz` + `rustup toolchain install nightly`
-# locally; not run in CI (cargo-fuzz needs nightly and is hostile to
-# sandboxes). The fuzz/ subworkspace is excluded from the main workspace,
-# so `just check` is unaffected.
-#
-# Mutation-verify by inserting `panic!("seed")` into parse_argv and
-# running for 30s — libfuzzer should crash within seconds.
-fuzz-spawn seconds="10":
-    cd crates/halmasuit-spawn/fuzz && \
-        cargo +nightly fuzz run parse_argv -- -max_total_time={{seconds}}

@@ -15,7 +15,7 @@
   system,
   nixpkgs,
   halmasuit,
-  halmasuit-spawn,
+  halmasuit-session,
   halmasuit-splash,
   halmasuit-toplevel-test-client,
   ssimulacra2-cli,
@@ -48,7 +48,7 @@ pkgs.testers.runNixOSTest {
       services.halmasuit = {
         enable         = true;
         package        = halmasuit; # halmasuit-debug (frame_audit) via flake
-        spawnPackage   = halmasuit-spawn;
+        session.package   = halmasuit-session;
         greeterUid     = 999;
         greeterGroup   = "halmasuit-greeter";
         compositorUid  = 998;

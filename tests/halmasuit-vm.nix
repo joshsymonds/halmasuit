@@ -10,7 +10,9 @@
 #   3. Wayland globals advertised (wl_compositor + xdg_wm_base + wl_seat
 #      + wl_output + wl_shm) — verified by a real wayland-info client
 #   4. Full greetd auth round-trip via halmasuit-vm-client →
-#      Event::SessionRequested → halmasuit-spawn invocation
+#      compositor relays to the halmasuit-session broker (real
+#      pam_unix) → Event::SessionRequested → broker forks the
+#      session leader → Event::ForegroundChanged{to: session}
 #   5. Clean shutdown via systemctl stop
 #
 # The greeter peer in suite 4 runs as a real non-root system user
@@ -26,7 +28,7 @@
   system,
   nixpkgs,
   halmasuit,
-  halmasuit-spawn,
+  halmasuit-session,
   halmasuit-vm-client,
 }:
 
@@ -47,7 +49,10 @@ pkgs.testers.runNixOSTest {
       services.halmasuit = {
         enable        = true;
         package       = halmasuit;
-        spawnPackage  = halmasuit-spawn;
+        # The compositor relays auth to the privileged halmasuit-session
+        # broker (Epic R3/A4); enabling the compositor auto-provisions
+        # the broker unit. Pin its package to the flake build.
+        session.package = halmasuit-session;
         greeterUid    = 999;
         greeterGroup  = "halmasuit-greeter";
         compositorUid = 998;
@@ -82,11 +87,10 @@ pkgs.testers.runNixOSTest {
       # halmasuit-greeter so the post-drop process retains the group
       # ownership that lets it accept() on the sockets it bound (the
       # sockets are root:halmasuit-greeter mode 0660 from suite 2).
-      # `shadow` as an extra group gives pam_unix.so the direct
-      # read access to /etc/shadow it needs to skip the unix_chkpwd
-      # helper fork — see ARCHITECTURE.md / nix/module.nix for
-      # the rationale (shadow-group membership is more reliable and
-      # auditable than the cross-namespace setuid-helper dance).
+      # The compositor runs NO PAM (it relays the auth conversation to
+      # the privileged halmasuit-session broker — Epic R2/R14), so it
+      # needs no `shadow` access; /etc/shadow is read only by the
+      # broker's own root unit.
       users.users.halmasuit-compositor = {
         isSystemUser = true;
         uid          = 998;
@@ -95,10 +99,11 @@ pkgs.testers.runNixOSTest {
       };
 
       # The user halmasuit-greetd will authenticate. Both uid AND gid
-      # must be ≥ UID_MIN (1000) — halmasuit-spawn's load-bearing floor
-      # refuses anything below. Default NixOS normal-users land in
-      # group `users` (gid 100), which the floor rejects (correctly!).
-      # Give alice her own group with gid 1000.
+      # must be ≥ UID_MIN (1000) — the broker session-leader's
+      # load-bearing floor (Epic R8/R11) refuses anything below.
+      # Default NixOS normal-users land in group `users` (gid 100),
+      # which the floor rejects (correctly!). Give alice her own group
+      # with gid 1000.
       users.users.alice = {
         isNormalUser = true;
         uid          = 1000;
@@ -112,9 +117,9 @@ pkgs.testers.runNixOSTest {
       # - halmasuit-vm-client: drives the greetd protocol from the
       #   testScript via a stable CLI (separate package; built from
       #   crates/halmasuit-vm-client).
-      # - halmasuit-spawn here is reachable on the closure via the
-      #   module's spawnPackage option — no need to add it to
-      #   systemPackages separately.
+      # The privileged session launch is the halmasuit-session broker
+      # (auto-provisioned by the module, socket-activated) — no spawn
+      # helper on the closure to add here.
       environment.systemPackages = [
         pkgs.wayland-utils
         halmasuit-vm-client
@@ -339,18 +344,26 @@ pkgs.testers.runNixOSTest {
 
         # Capability sets — the load-bearing architectural state of
         # `drop_privileges`. Bit positions per `<linux/capability.h>`:
-        #   CAP_KILL   = 5 → 0x0000000000000020
-        #   CAP_SETGID = 6 → 0x0000000000000040
-        #   CAP_SETUID = 7 → 0x0000000000000080
+        #   CAP_KILL = 5 → 0x0000000000000020
         # Post-drop halmasuit should hold exactly:
-        #   CapPrm/CapEff = {CAP_KILL}                   = 0x20
-        #   CapBnd        = {CAP_SETUID, CAP_SETGID}     = 0xc0
-        #   CapInh/CapAmb = ∅                            = 0x00
-        # CAP_KILL is intentionally NOT in bounding — bounding only
-        # constrains caps *gained* via execve/capset, not the
-        # current permitted set. Locking these strings in catches
-        # any drift in drop_privileges (cap added/removed silently,
-        # ordering bug that loses caps, etc.).
+        #   CapPrm/CapEff = {CAP_KILL}  = 0x20  (signal the greeter
+        #                                        child, which runs
+        #                                        under a different uid)
+        #   CapBnd        = ∅           = 0x00  (Epic R15: the
+        #                                        compositor execs NO
+        #                                        setuid helper — it
+        #                                        relays to the broker —
+        #                                        so the bounding set is
+        #                                        emptied entirely;
+        #                                        nothing it execs can
+        #                                        ever gain a capability)
+        #   CapInh/CapAmb = ∅           = 0x00
+        # CAP_KILL survives via the step-5 `capset`, NOT via bounding
+        # (bounding only constrains caps *gained later* via
+        # execve/capset). Locking these strings in catches any drift in
+        # drop_privileges (cap added/removed silently, ordering bug that
+        # loses caps, a regression that re-introduces an escalation
+        # surface in the bounding set, etc.).
         caps_raw = machine.succeed(
             f"awk '/^Cap(Bnd|Eff|Inh|Prm|Amb):/' /proc/{pid}/status"
         ).strip()
@@ -364,9 +377,10 @@ pkgs.testers.runNixOSTest {
         assert caps.get("CapEff") == "0000000000000020", (
             f"halmasuit CapEff must be exactly {{CAP_KILL}}, got {caps.get('CapEff')!r}"
         )
-        assert caps.get("CapBnd") == "00000000000000c0", (
-            f"halmasuit CapBnd must be exactly {{CAP_SETUID, CAP_SETGID}}, "
-            f"got {caps.get('CapBnd')!r}"
+        assert caps.get("CapBnd") == "0000000000000000", (
+            f"halmasuit CapBnd must be EMPTY — the compositor execs no "
+            f"setuid helper (Epic R15), so the bounding set retains no "
+            f"escalation surface; got {caps.get('CapBnd')!r}"
         )
         assert caps.get("CapInh") == "0000000000000000", (
             f"halmasuit CapInh must be empty, got {caps.get('CapInh')!r}"
@@ -460,10 +474,10 @@ pkgs.testers.runNixOSTest {
         # this is the production shape, not root-as-greeter.
         #
         # /run/current-system/sw/bin/true is NixOS's stable path to
-        # coreutils' true — alice will exec it (via halmasuit-spawn)
-        # and exit 0. We don't track that child; the test asserts
-        # halmasuit reached the spawn invocation, which is what the
-        # event surface tells us.
+        # coreutils' true — the broker's session-leader child execs it
+        # as alice (fork-then-drop, Epic R7) and it exits 0. We don't
+        # track that child; the test asserts halmasuit reached the
+        # broker spawn path, which the event surface tells us.
         machine.succeed(
             "runuser -u halmasuit-greeter -- "
             "halmasuit-vm-client full-auth /run/halmasuit/greetd.sock alice "
@@ -472,9 +486,10 @@ pkgs.testers.runNixOSTest {
             "--timeout 15"
         )
 
-        # halmasuit emits SessionRequested right before it forks the
-        # halmasuit-spawn child. Wait for it explicitly because the
-        # auth flow is asynchronous from the daemon's perspective.
+        # halmasuit emits SessionRequested right before it relays
+        # StartSession to the broker (which forks the session leader).
+        # Wait for it explicitly because the auth flow is asynchronous
+        # from the daemon's perspective.
         machine.wait_until_succeeds(
             "journalctl -u halmasuit | grep -qF 'session_requested'",
             timeout=10,
@@ -491,20 +506,53 @@ pkgs.testers.runNixOSTest {
             f"session_requested.gid must be alice's 1000, got: {session}"
         )
 
-        # The 'halmasuit-spawn launched' tracing log line is emitted
-        # AFTER the SessionRequested event, from the Ok arm of
-        # Command::spawn. Its presence proves the halmasuit-spawn fork
-        # actually fired (a failure would log a `warn!` line we'd grep
-        # for separately).
+        # Proof the broker spawn path actually fired, on the event
+        # surface (the old in-compositor `halmasuit-spawn launched`
+        # log is gone with the setuid helper — R15). The compositor
+        # emits ForegroundChanged{to: session} ONLY after it has
+        # successfully relayed StartSession to the broker; and the
+        # privileged halmasuit-session broker is socket-activated by
+        # that relay, so its unit must have run — real pam_unix, no
+        # mock (R12).
+        # There are TWO foreground_changed events: `to:greeter` at
+        # greeter spawn (startup), then `to:session` after the broker
+        # accepted StartSession. `find` returns the first match, so we
+        # scan for the session flip explicitly below.
+        #
+        # `record_session_started` emits, in order: SessionRequested →
+        # GreeterTerminated → ForegroundChanged{to:session} — all
+        # synchronously in one function before it returns. So once
+        # `greeter_terminated` is in the journal, the session flip is
+        # too. Wait on that robust unbroken substring rather than the
+        # structured event JSON (journald escapes the inner quotes, so
+        # a `"event":"…"` grep never matches — that was the round-4
+        # false timeout; the product had already flipped correctly).
         machine.wait_until_succeeds(
-            "journalctl -u halmasuit | grep -qF 'halmasuit-spawn launched'",
-            timeout=5,
+            "journalctl -u halmasuit | grep -qF 'greeter_terminated'",
+            timeout=10,
+        )
+        events = captured_events()
+        fg_session = [
+            inner
+            for (_, inner) in events
+            if inner.get("event") == "foreground_changed"
+            and inner.get("to") == "session"
+        ]
+        assert fg_session, (
+            f"compositor must flip foreground to the broker-launched "
+            f"session; got foreground_changed events: "
+            f"{[i for (_, i) in events if i.get('event') == 'foreground_changed']}. "
+            f"Events tail: {[i for (_, i) in events[-10:]]}"
+        )
+        machine.wait_until_succeeds(
+            "journalctl -u halmasuit-session.service | grep -q .",
+            timeout=10,
         )
 
-        # The greeter must be killed BEFORE niri (the session) takes
-        # the foreground slot — see Epic #1's immutable requirement.
+        # The greeter must be killed BEFORE the session takes the
+        # foreground slot — see Epic #1's immutable requirement.
         # halmasuit emits `greeter_terminated` between
-        # `session_requested` and the halmasuit-spawn invocation.
+        # `session_requested` and the ForegroundChanged{session} flip.
         machine.wait_until_succeeds(
             "journalctl -u halmasuit | grep -qF 'greeter_terminated'",
             timeout=5,

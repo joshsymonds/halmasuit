@@ -64,11 +64,12 @@ pub enum Event {
         message: String,
     },
     /// A greeter session reached the `Spawning` state — PAM authentication
-    /// completed and `StartSession` was received. The compositor hands
-    /// the resolved uid/gid to `halmasuit-spawn` (the corresponding `cmd`
-    /// and `env` from the greetd protocol are not emitted on this event
-    /// surface because they carry user-influenced strings; the redaction
-    /// policy lives in the snapshot-socket task).
+    /// completed and `StartSession` was received. The compositor relays
+    /// the resolved uid/gid to the privileged `halmasuit-session`
+    /// broker, which forks-then-drops the session leader (the
+    /// corresponding `cmd` and `env` from the greetd protocol are not
+    /// emitted on this event surface because they carry user-influenced
+    /// strings; the redaction policy lives in the snapshot-socket task).
     SessionRequested {
         /// Resolved Linux uid for the authenticated user, as returned by
         /// PAM + pwent lookup.
@@ -87,10 +88,11 @@ pub enum Event {
     },
     /// halmasuit sent SIGKILL to the greeter child as part of the
     /// session-start handover. Per ARCHITECTURE.md / Epic #1: "the
-    /// greeter wl_client is killed before niri becomes foreground" —
-    /// emitted between `SessionRequested` and the `halmasuit-spawn`
-    /// invocation so the greeter releases halmasuit's foreground
-    /// slot before the user session asks for it.
+    /// greeter wl_client is killed before the session becomes
+    /// foreground" — emitted between `SessionRequested` and the
+    /// `ForegroundChanged { to: session }` flip so the greeter
+    /// releases halmasuit's foreground slot before the user session
+    /// asks for it.
     GreeterTerminated {
         /// PID of the greeter we killed.
         pid: u32,
@@ -105,20 +107,6 @@ pub enum Event {
         /// PID we attempted to signal.
         pid: u32,
         /// `Display` form of the kernel error.
-        error: String,
-    },
-    /// halmasuit reached `SpawnRequest` (PAM succeeded, `StartSession`
-    /// received) but invoking `halmasuit-spawn` failed. The greeter is
-    /// deliberately left running and is NOT signalled — a live greeter
-    /// is a recoverable state the user can retry from; a dead greeter
-    /// with no session is the black screen the spawn-before-kill
-    /// ordering exists to prevent. No `GreeterTerminated` /
-    /// `GreeterKillFailed` accompanies this event because the greeter
-    /// was never touched on this path.
-    SessionSpawnFailed {
-        /// Resolved Linux uid the session would have run as.
-        uid: u32,
-        /// `Display` form of the spawn failure.
         error: String,
     },
     /// The greeter process exited BEFORE authentication completed
@@ -405,17 +393,6 @@ mod tests {
         assert_eq!(v["event"], "greeter_kill_failed");
         assert_eq!(v["pid"], 1234);
         assert_eq!(v["error"], "No such process (os error 3)");
-    }
-
-    #[test]
-    fn event_session_spawn_failed_carries_uid_and_error() {
-        let v = round_trip(&Event::SessionSpawnFailed {
-            uid: 1000,
-            error: "No such file or directory (os error 2)".to_owned(),
-        });
-        assert_eq!(v["event"], "session_spawn_failed");
-        assert_eq!(v["uid"], 1000);
-        assert_eq!(v["error"], "No such file or directory (os error 2)");
     }
 
     #[test]
