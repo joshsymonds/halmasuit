@@ -106,6 +106,11 @@ test-vm:
     echo
     echo "── visual-pidfd-revert ──"
     nix build .#checks.x86_64-linux.visual-pidfd-revert -L --print-build-logs --no-link
+    # visual-niri-session is NOT in the sweep yet: real niri needs a
+    # working GL/EGL renderer the headless virtio-gpu-pci VM lacks
+    # (CLAUDE.md "Test-VM rendering gotcha"). Runnable on demand via
+    # `nix build .#checks.x86_64-linux.visual-niri-session`; added to
+    # the sweep once the headless-niri-render strategy is decided.
 
 # Regenerate one or all visual-test goldens. Runs the named test
 # interactively (driverInteractive), with HALMASUIT_GOLDEN_REGEN=1 and

@@ -603,6 +603,17 @@
           halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Epic G-layer R2/R4: the REAL niri as the broker-launched
+        # session (niri-flake pinned via nix-config; unpatched).
+        visual-niri-session = import ./tests/visual-niri-session.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # Amendment A5.6: poll-only leader pidfd backstop — SCM_RIGHTS
         # worker→broker→compositor armed + fires on leader exit.
         visual-pidfd-revert = import ./tests/visual-pidfd-revert.nix {
