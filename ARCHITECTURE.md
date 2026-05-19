@@ -522,6 +522,36 @@ from kernel handoff to user login, and from user logout back to
 power-off. This is the layer that makes a Linux desktop feel like
 intentional industrial design instead of an apology for booting.
 
+### Phase-B foundation (the in-repo instrument)
+
+The in-repo G-layer mechanism is built as the structural foundation
+the Phase-B initramfs prepend extends *backward* — through
+`switch_root` and DRM-master-fd survival — without rework. Three
+pieces compose tier-agnostically:
+
+- **The witness plane is a halmasuit-internal full-output element
+  composited from frame 0** (no external client, no pre-client solid
+  phase — amendment G1). The Phase-B initramfs path inherits the same
+  internal plane; `switch_root`/re-exec changes *when* halmasuit
+  starts, not *what* it composites.
+- **`assert_no_flash_stream` is anchored at frame 0**, not at a
+  later client-first-frame: the witness `ClientFirstFrame{Background}`
+  must precede every `frame_rendered`, and every frame is
+  witness-covered. The assertion makes no rootfs-only assumption, so
+  Phase-B's `full-boot-flash` gate prepends the initramfs→rootfs
+  frames onto the same stream and the same predicate holds across the
+  `switch_root` seam without weakening it. The contract is pinned by
+  the no-VM `just vis-selftest` synthetic proof.
+- **The offscreen GLES + `ExportMem` readback** is headless and
+  Mesa-llvmpipe-deterministic with no GPU/GBM dependency, so the
+  pixel-exact witness assertion runs identically wherever halmasuit
+  runs — initramfs or rootfs, CI or hardware.
+
+Phase-B is therefore an *extension* of this instrument, not a
+reimplementation: the witness, the frame-0 invariant, and the readback
+already exist and are gated; Phase-B adds the earlier tier in front of
+them.
+
 ### Capability and cost
 
 The GPU is fully capable from the moment its KMS driver loads. amdgpu,

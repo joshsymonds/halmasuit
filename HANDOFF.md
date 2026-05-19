@@ -952,7 +952,20 @@ Memory: [[pam-killable-subprocess-direction]],
 §0 is shipped; the namespace blocker is gone. The visual G-layer is what
 remains: prove the no-flash compositor on the *real* greeter→session path
 with the *real* software, now running through the broker-launched
-session. Strict order, each blocked by the previous, **except the
+session.
+
+**Mechanism foundation (complete).** The in-repo G-layer instrument is
+done and gated: halmasuit composites the locked witness internally from
+frame 0 (the `halmasuit-splash` client is deleted; config is
+`witnessImage`/`HALMASUIT_WITNESS_IMAGE`); `assert_no_flash_stream` is
+frame-0-anchored and pinned by the no-VM `just vis-selftest` synthetic
+proof; the offscreen GLES readback gives headless deterministic
+pixel-exact assertion (`visual-halmasuit-clear` vs the human-inspected
+witness golden). Full `just test-vm` is green incl. `login-flash` and
+the three broker gates. This instrument is the Phase-B-prepend
+foundation — see ARCHITECTURE.md "### Phase-B foundation (the in-repo
+instrument)". What remains below is the *real-software* tranche on top
+of it. Strict order, each blocked by the previous, **except the
 sidecar** (independent — do it anytime):
 
 1. **G1 — real niri nested as the broker-launched session.** Build
