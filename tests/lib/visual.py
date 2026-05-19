@@ -318,27 +318,36 @@ def assert_no_flash_stream(machine, events=None) -> None:
     A sampled `Snapshot()` golden is taken at a SETTLED scene and
     cannot observe a transient one-frame flash mid-transition; this
     parses every `frame_rendered` halmasuit emitted and checks, with
-    zero tolerance:
+    zero tolerance.
 
-    - From the first `client_first_frame{role:background}` onward,
-      every `frame_rendered` must have ``clear_pixel_count == 0`` — the
-      backdrop fully covers; even a single sentinel-clear pixel
-      showing through is a flash (exact integer count, zero tolerance).
-    - From the first `client_first_frame` of ANY role onward, no
-      `frame_rendered` may be ``degenerate`` (all-clear, all-black, or
-      empty/dropped) — the exact boolean flash predicate, with no
-      luminance/coverage threshold.
-    - The backdrop surface is mapped exactly once and never
-      resized/recreated mid-stream: exactly one
-      `client_first_frame{role:background}` event, and `pixel_count`
-      is constant across every post-background `frame_rendered`.
+    Anchored at FRAME 0 (epic amendment G1/R3): halmasuit composites
+    the witness plane internally from the very first frame — there is
+    no pre-client solid phase — so EVERY `frame_rendered`, from the
+    first, must already be witness-covered:
 
-    Requires at least one post-background `frame_rendered` so an empty
-    or audit-less stream cannot vacuously pass. Fails loudly, naming
-    the offending event(s) and their index.
+    - Exactly one `client_first_frame{role:background}` (the internal
+      witness plane, emitted before the first composited frame). Zero
+      ⇒ the witness never composited; >1 ⇒ the backdrop was
+      recreated. Both fail.
+    - That witness cff must PRECEDE every `frame_rendered`: a frame
+      rendered before it means frame 0 was not witness-covered — a
+      pre-client solid phase / flash. Strictly stronger than the
+      pre-4c cff-SUFFIX anchor, which silently excluded such frames
+      (see the synthetic proof's "frame_rendered precedes the witness
+      bg cff" case).
+    - Then EVERY `frame_rendered` (frame 0 onward, not a suffix) must
+      have ``clear_pixel_count == 0`` (no sentinel-clear pixel — even
+      one is a flash), ``degenerate == False`` (no all-clear,
+      all-black, or empty/dropped frame), and ``pixel_count`` constant
+      across the whole stream (the backdrop was never resized).
 
-    `events` may be passed pre-parsed (used by the synthetic-stream
-    negative proof); otherwise it is read from the machine journal.
+    Requires at least one `frame_rendered` so an empty or audit-less
+    stream cannot vacuously pass. Fails loudly, naming the offending
+    event(s) and their index.
+
+    `events` may be passed pre-parsed (the synthetic negative proof in
+    `_selftest`, run by `just vis-selftest`); otherwise it is read
+    from the machine journal.
     """
     if events is None:
         events = introspect_events(machine)
@@ -348,72 +357,154 @@ def assert_no_flash_stream(machine, events=None) -> None:
         for i, ev in enumerate(events)
         if ev["event"] == "client_first_frame" and ev.get("role") == "background"
     ]
-    first_any = next(
-        (i for i, ev in enumerate(events) if ev["event"] == "client_first_frame"),
-        None,
-    )
     if not bg_cff:
         raise AssertionError(
             "no client_first_frame{role:background} in the halmasuit "
-            "event stream — splash never composited a background frame.\n"
+            "event stream — the internal witness plane never "
+            "composited a frame.\n"
             f"events seen: {[e['event'] for e in events]}"
         )
     if len(bg_cff) != 1:
         raise AssertionError(
             "background surface was mapped/recreated more than once: "
             f"{len(bg_cff)} client_first_frame{{role:background}} events "
-            f"at indices {bg_cff} (expected exactly 1 — the backdrop "
-            "must be mapped once and never recreated)."
+            f"at indices {bg_cff} (expected exactly 1 — the witness "
+            "plane is created once and never recreated)."
         )
     first_bg = bg_cff[0]
-    # A background cff is itself an "any" cff, so first_any is set and
-    # first_any <= first_bg.
-    assert first_any is not None and first_any <= first_bg
 
-    post_bg = [
+    fr = [
         (i, ev)
         for i, ev in enumerate(events)
-        if i >= first_bg and ev["event"] == "frame_rendered"
+        if ev["event"] == "frame_rendered"
     ]
-    if not post_bg:
+    if not fr:
         raise AssertionError(
-            "no frame_rendered events after the background's first "
-            f"frame (@#{first_bg}); the exact no-flash stream gate "
+            "no frame_rendered events; the exact no-flash stream gate "
             "cannot vacuously pass — frame_audit must be live and the "
-            "backdrop must have composited at least one frame.\n"
+            "witness must have composited at least one frame.\n"
             f"events seen: {[e['event'] for e in events]}"
         )
+    first_fr = fr[0][0]
 
-    clear_viol = [
-        (i, ev) for i, ev in post_bg if ev["clear_pixel_count"] != 0
-    ]
-    degen_viol = [
-        (i, ev)
-        for i, ev in enumerate(events)
-        if i >= first_any
-        and ev["event"] == "frame_rendered"
-        and ev["degenerate"]
-    ]
-    # Backdrop never resized/recreated: pixel_count constant post-bg.
-    sizes = sorted({ev["pixel_count"] for _, ev in post_bg})
+    # FRAME-0 anchor (epic G1/R3): the witness cff must precede every
+    # composited frame. A frame_rendered before it means frame 0 was
+    # not witness-covered — a pre-client solid phase / flash. Strictly
+    # stronger than the pre-4c suffix anchor (which excluded it).
+    if first_bg > first_fr:
+        raise AssertionError(
+            f"frame_rendered @#{first_fr} precedes the witness "
+            f"client_first_frame{{background}} @#{first_bg}: frame 0 "
+            "was NOT witness-covered — a pre-client solid phase / "
+            "flash, the exact thing epic G1/R3 forbids."
+        )
+
+    clear_viol = [(i, ev) for i, ev in fr if ev["clear_pixel_count"] != 0]
+    degen_viol = [(i, ev) for i, ev in fr if ev["degenerate"]]
+    sizes = sorted({ev["pixel_count"] for _, ev in fr})
     size_viol = sizes if len(sizes) != 1 else []
 
     if clear_viol or degen_viol or size_viol:
         raise AssertionError(
             "frame_rendered no-flash invariant VIOLATED "
-            f"({len(post_bg)} post-bg frames; first bg cff @#{first_bg}, "
-            f"first any cff @#{first_any}):\n"
-            f"  clear_pixel_count != 0 after bg: {clear_viol[:5]}\n"
-            f"  degenerate frame after first commit: {degen_viol[:5]}\n"
-            f"  pixel_count not constant post-bg: {size_viol}"
+            f"({len(fr)} frames; witness bg cff @#{first_bg}, first "
+            f"frame_rendered @#{first_fr}):\n"
+            f"  clear_pixel_count != 0: {clear_viol[:5]}\n"
+            f"  degenerate frame: {degen_viol[:5]}\n"
+            f"  pixel_count not constant: {size_viol}"
         )
     print(
         json.dumps(
             {
                 "no_flash_stream": "OK",
-                "post_bg_frames": len(post_bg),
+                "frames": len(fr),
                 "first_background_cff_index": first_bg,
+                "first_frame_rendered_index": first_fr,
                 "pixel_count": sizes[0],
             }
         )
     )
+
+
+# ───────────────────────────────────────────────────────────────────
+# Synthetic negative-stream proof for `assert_no_flash_stream`.
+#
+# `assert_no_flash_stream` is the load-bearing no-flash invariant
+# (epic R3/R9); it must never silently weaken. This is an executable
+# contract test feeding it synthetic event streams (the `events=`
+# parameter), run as a hard gate by `just vis-selftest` (wired into
+# `just check`) — no VM, no GPU. It pins, in particular, the FRAME-0
+# anchor (epic G1): the witness is composited from frame 0, so a
+# `frame_rendered` that precedes the witness
+# `client_first_frame{background}` is a flash and MUST fail — the
+# pre-4c cff-suffix anchor silently excluded such frames.
+# ───────────────────────────────────────────────────────────────────
+
+
+def _cff(role):
+    return {"event": "client_first_frame", "role": role}
+
+
+def _fr(clear=0, degenerate=False, pixel_count=1024000):
+    return {
+        "event": "frame_rendered",
+        "clear_pixel_count": clear,
+        "degenerate": degenerate,
+        "pixel_count": pixel_count,
+    }
+
+
+def _raises(events) -> bool:
+    try:
+        assert_no_flash_stream(None, events=events)
+        return False
+    except AssertionError:
+        return True
+
+
+def _selftest() -> None:
+    # Clean frame-0-anchored stream: bg cff precedes every frame,
+    # every frame witness-covered, one bg cff, constant size → PASS.
+    clean = [_cff("background"), _fr(), _fr(), _fr()]
+    assert_no_flash_stream(None, events=clean)  # must NOT raise
+
+    cases = {
+        "clear_pixel_count != 0 on a post-bg frame": [
+            _cff("background"), _fr(), _fr(clear=1)
+        ],
+        "a degenerate frame": [
+            _cff("background"), _fr(), _fr(degenerate=True)
+        ],
+        "two background cff (backdrop recreated)": [
+            _cff("background"), _fr(), _cff("background"), _fr()
+        ],
+        "zero background cff": [_cff("top"), _fr(), _fr()],
+        "no frame_rendered (non-vacuous: cannot vacuously pass)": [
+            _cff("background")
+        ],
+        "pixel_count not constant (backdrop resized)": [
+            _cff("background"), _fr(pixel_count=1024000), _fr(pixel_count=999)
+        ],
+        # STRICTLY-STRONGER (epic G1/4c): a frame_rendered BEFORE the
+        # witness bg cff. The pre-4c cff-suffix anchor (post_bg = i >=
+        # first_bg) silently EXCLUDED this frame and PASSED the stream.
+        # Frame 0 must already be witness-covered — this is a flash and
+        # MUST now fail.
+        "frame_rendered precedes the witness bg cff (frame 0 not covered)": [
+            _fr(), _cff("background"), _fr(), _fr()
+        ],
+    }
+    failed = [name for name, ev in cases.items() if not _raises(ev)]
+    if failed:
+        raise SystemExit(
+            "assert_no_flash_stream FAILED to reject:\n  - "
+            + "\n  - ".join(failed)
+        )
+    print(
+        f"vis-selftest OK: clean stream accepted; {len(cases)} "
+        "flaw classes rejected (incl. the frame-0-anchor strengthening)."
+    )
+
+
+if __name__ == "__main__":
+    _selftest()

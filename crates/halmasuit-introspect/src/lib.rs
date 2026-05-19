@@ -132,14 +132,17 @@ pub enum Event {
     /// The no-flash invariant in `tests/visual-backdrop.nix` and
     /// `tests/visual-foreground.nix` is asserted over the WHOLE stream
     /// of these events (`visual.assert_no_flash_stream`), as EXACT
-    /// integer/boolean facts — never fuzzy aggregate float thresholds:
-    /// after the first `client_first_frame{role:background}`, every
-    /// frame must have `clear_pixel_count == 0` (the backdrop fully
-    /// covers — no sentinel-clear pixel leaked through) and, from the
-    /// first committed frame onward, `degenerate == false` (no
-    /// all-clear, all-black, or empty/dropped frame). `pixel_count`
-    /// must stay constant post-background (the composited target is
-    /// never resized/recreated under the live output mode).
+    /// integer/boolean facts — never fuzzy aggregate float thresholds.
+    /// Anchored at FRAME 0 (epic amendment G1/R3): halmasuit
+    /// composites the witness plane internally from the first frame,
+    /// so the single `client_first_frame{role:background}` precedes
+    /// every `FrameRendered` and EVERY frame (frame 0 onward, not a
+    /// suffix) must have `clear_pixel_count == 0` (no sentinel-clear
+    /// pixel leaked through — there is no pre-client solid phase) and
+    /// `degenerate == false` (no all-clear, all-black, or
+    /// empty/dropped frame). `pixel_count` stays constant across the
+    /// whole stream (the composited target is never resized/recreated
+    /// under the live output mode).
     FrameRendered {
         /// Monotonic per-process frame counter, starting at 0 on the
         /// first composited frame.
@@ -169,15 +172,19 @@ pub enum Event {
         /// gross content shifts without pixel-exact comparison.
         phash: u64,
     },
-    /// The first time a wlr-layer-shell client of a given role
-    /// committed a buffer halmasuit composited. Emitted once per role
-    /// per process lifetime. Unconditional (NOT `frame_audit`-gated):
-    /// it is a cheap state-transition marker in the normal event
-    /// stream, like `GreeterSpawned`. The exact no-flash stream gate
-    /// (`visual.assert_no_flash_stream`) uses
-    /// `ClientFirstFrame { role: Background }` as the point from which
-    /// every subsequent `FrameRendered` must have
-    /// `clear_pixel_count == 0` (Epic #1 req 11).
+    /// First composite of a given layer role. For `Background` this
+    /// is halmasuit's INTERNAL witness plane (epic amendment G1/R3) —
+    /// emitted once, before the first composited frame, since the
+    /// witness is composited from frame 0 (there is no external
+    /// background client). `Bottom`/`Top`/`Overlay` are the first
+    /// buffer a real wlr-layer-shell client of that role committed.
+    /// Emitted once per role per process lifetime. Unconditional (NOT
+    /// `frame_audit`-gated): a cheap state-transition marker, like
+    /// `GreeterSpawned`. The exact no-flash stream gate
+    /// (`visual.assert_no_flash_stream`) requires the single
+    /// `ClientFirstFrame { role: Background }` to precede every
+    /// `FrameRendered`, each of which must then have
+    /// `clear_pixel_count == 0` (Epic #1 req 11 / R3).
     ClientFirstFrame {
         /// Which layer-shell role first painted.
         role: LayerRole,
