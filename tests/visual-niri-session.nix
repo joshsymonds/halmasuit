@@ -78,8 +78,29 @@ let
   # F2 stand-in; the rest of the env (HOME etc.) is the broker's
   # pam_open_session environment — no carve-out.
   sessionCmd = pkgs.writeShellScript "halmasuit-niri-session" ''
-    export XDG_RUNTIME_DIR=/run/halmasuit
-    export WAYLAND_DISPLAY=wayland-0
+    # niri is a COMPOSITOR: it binds its OWN wayland-N listening
+    # socket in $XDG_RUNTIME_DIR for its children. That dir must be
+    # niri-writable — NOT halmasuit's /run/halmasuit (owned by the
+    # compositor uid; niri runs as the authed user → bind EPERM).
+    # niri gets its own runtime dir (tmpfiles, alice-owned); it reaches
+    # halmasuit UPSTREAM via an absolute-path WAYLAND_DISPLAY (libwayland
+    # treats a '/'-containing value as an absolute socket path), so the
+    # two sockets never collide. In production this is the broker's
+    # pam_open_session/pam_systemd /run/user/$UID; provisioned
+    # deterministically here so the gate doesn't depend on pam_systemd.
+    export XDG_RUNTIME_DIR=/run/halmasuit-niri
+    export WAYLAND_DISPLAY=/run/halmasuit/wayland-0
+    # Strategy A (headless real-niri render): force Mesa software
+    # rasterization. The headless virtio-gpu-pci VM has no working
+    # GL/EGL device (vdrm/radv/zink/dri2 all fail); llvmpipe makes
+    # niri's smithay GLES renderer run on CPU, deterministically —
+    # the same software-render thesis as halmasuit's offscreen path.
+    export LIBGL_ALWAYS_SOFTWARE=1
+    export GALLIUM_DRIVER=llvmpipe
+    export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+    # Don't let Mesa probe the virtio-gpu DRI device at all (the
+    # vdrm_device_connect failure that preceded niri's panic).
+    export LIBGL_DRI3_DISABLE=1
     exec ${niri}/bin/niri --config ${niriConfig}
   '';
 in
@@ -150,7 +171,12 @@ pkgs.testers.runNixOSTest {
 
       environment.systemPackages = [ halmasuit-vm-client ];
 
-      systemd.tmpfiles.rules = [ "d /run/hsnap 0777 root root -" ];
+      systemd.tmpfiles.rules = [
+        "d /run/hsnap 0777 root root -"
+        # niri's own XDG_RUNTIME_DIR for its listening socket — owned
+        # by the authed session user (alice, uid/gid 1001), 0700.
+        "d /run/halmasuit-niri 0700 alice alice -"
+      ];
       systemd.services.halmasuit.serviceConfig.ReadWritePaths = [ "/run/hsnap" ];
 
       virtualisation = {
