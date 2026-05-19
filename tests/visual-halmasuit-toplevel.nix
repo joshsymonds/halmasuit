@@ -110,7 +110,7 @@ pkgs.testers.runNixOSTest {
 
     sys.path.insert(0, "${./lib}")
     os.environ["PATH"] = "${ssimulacra2-cli}/bin:" + os.environ.get("PATH", "")
-    os.environ["GOLDENS_DIR"] = "${./goldens}"
+    os.environ.setdefault("GOLDENS_DIR", "${./goldens}")
 
     import visual
 
