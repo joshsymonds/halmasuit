@@ -402,8 +402,13 @@ in
         HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
       } // lib.optionalAttrs (cfg.witnessImage != null) {
         # Decoded by halmasuit at startup as the internal witness
-        # plane. See `services.halmasuit.witnessImage`.
-        HALMASUIT_WITNESS_IMAGE = toString cfg.witnessImage;
+        # plane. See `services.halmasuit.witnessImage`. String
+        # interpolation (NOT `toString`) so a path literal is realized
+        # into the store and is guaranteed present at this path in
+        # halmasuit's closure — `witnessImage` is self-sufficient, not
+        # reliant on some other unit pulling the file in. An absolute
+        # runtime-path string interpolates to itself unchanged.
+        HALMASUIT_WITNESS_IMAGE = "${cfg.witnessImage}";
       };
     };
    })
