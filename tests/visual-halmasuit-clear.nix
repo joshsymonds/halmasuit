@@ -1,20 +1,31 @@
-# tests/visual-halmasuit-clear.nix — first visual gate against the real
-# halmasuit binary (halmasuit-debug, frame_audit on).
+# tests/visual-halmasuit-clear.nix — the witness gate: the real
+# halmasuit binary (halmasuit-debug, frame_audit on) compositing the
+# LOCKED witness art.
 #
-# Pins the precondition that halmasuit alone — no wl_client connected —
-# composites the brand color #0a0014. Capture is the in-process
-# `Snapshot()` D-Bus method: a CPU readback of the OFFSCREEN GLES
-# render target (Mesa llvmpipe, no GPU, no GBM scanout), NOT a QMP
-# screendump of QEMU's display. The offscreen path renders the exact
-# same scene the production pipeline composites into a CPU-mappable
-# `GlesTexture`, so it is pixel-correct and deterministic run-to-run
-# even fully headless (virtio-gpu-pci). This is why the gate is
-# exact-image: `assert_matches_witness` compares the PNG to the
-# checked-in witness with ssimulacra2 ≥ 95.0.
+# Pins that halmasuit alone — no greeter, no session, no external
+# client — composites the locked witness (`tests/fixtures/witness.png`,
+# the Ḫalmašuit emblem) as its internal bottom plane from frame 0
+# (epic amendment G1/R3/R6: there is no pre-client solid phase). Two
+# orthogonal, always-live gates:
 #
-# Greeter is `sleep infinity` — we never drive auth here; the test
-# waits for halmasuit's `scanout_active` event and for the D-Bus name
-# to be owned, then calls Snapshot().
+#   * Exact-image content: `assert_matches_witness` compares the
+#     in-process `Snapshot()` PNG — a CPU readback of the OFFSCREEN
+#     GLES render target (Mesa llvmpipe, no GPU, no GBM scanout; the
+#     exact scene the production pipeline composites, deterministic
+#     run-to-run even fully headless on virtio-gpu-pci) — to the
+#     checked-in `halmasuit-witness` golden with ssimulacra2 ≥ 95.0.
+#     The golden is the 1280×800 render itself, HUMAN-INSPECTED
+#     against the 2560×1600 `tests/fixtures/witness.png` source before
+#     commit (the human bridges fixture→golden faithfulness; the gate
+#     then pins regression). Never CI-regenerated.
+#
+#   * 100%-stream no-flash: `assert_no_flash_stream` over every
+#     `frame_rendered` — the witness cff precedes frame 0 and every
+#     frame is witness-covered (epic G1/R3, frame-0 anchor). This
+#     gate uniquely proves the witness-ALONE no-flash from frame 0.
+#
+# Greeter is `sleep infinity` — no auth is driven here; the test
+# waits for `scanout_active` + the D-Bus name, then Snapshot().
 
 {
   system,
@@ -57,9 +68,12 @@ pkgs.testers.runNixOSTest {
         greeterUid     = 999;
         greeterGroup   = "halmasuit-greeter";
         compositorUid  = 998;
-        # No greeter activity needed — we test halmasuit's
-        # standalone clear-color paint, not greeter flow.
-        greeterCommand = "${pkgs.writeShellScript "halmasuit-clear-test-greeter" ''
+        # The locked witness, composited by halmasuit internally as
+        # its bottom plane from frame 0 (epic G1/R3/R6).
+        witnessImage   = ./fixtures/witness.png;
+        # No greeter activity — this gate tests halmasuit's own
+        # witness compositing, not greeter flow.
+        greeterCommand = "${pkgs.writeShellScript "halmasuit-witness-test-greeter" ''
           exec ${pkgs.coreutils}/bin/sleep infinity
         ''}";
       };
@@ -133,11 +147,18 @@ pkgs.testers.runNixOSTest {
         f"Snapshot method missing from Introspect interface:\n{introspect}"
     )
 
-    # Exact-image gate (ssimulacra2 >= 95.0) against the offscreen
-    # readback of the deterministic clear scene. Headless llvmpipe;
-    # no GPU, no GBM scanout — the offscreen GLES target is what makes
-    # this pixel-correct and reproducible.
-    visual.assert_matches_witness(machine, "halmasuit-clear-color")
+    # Exact-image gate (ssimulacra2 >= 95.0): the offscreen readback
+    # of halmasuit's internal witness plane vs the human-inspected
+    # `halmasuit-witness` golden. Headless llvmpipe; no GPU, no GBM
+    # scanout — the offscreen GLES target is what makes this
+    # pixel-correct and reproducible run-to-run.
+    visual.assert_matches_witness(machine, "halmasuit-witness")
+
+    # 100%-stream no-flash, frame-0 anchored (epic G1/R3): the witness
+    # is composited from frame 0, so every frame_rendered must already
+    # be witness-covered. This gate uniquely exercises the
+    # witness-ALONE stream (no greeter/session frames in it).
+    visual.assert_no_flash_stream(machine)
 
     print("visual-halmasuit-clear: ALL ASSERTIONS PASSED")
   '';

@@ -3,13 +3,14 @@
 # Boots halmasuit (halmasuit-debug, frame_audit on), then runs
 # `halmasuit-layer-shell-test-client` as a wl_client. The client binds
 # wlr-layer-shell BACKGROUND with a fullscreen solid-green (`#16C44E`)
-# shm buffer; halmasuit imports it, composites it over the brand clear,
-# and scans it out. Capture is the in-process `Snapshot()` D-Bus method
-# (a CPU readback of the exact composited frame), NOT a QMP screendump.
+# shm buffer; halmasuit imports it, composites it, and scans it out.
+# Capture is the in-process `Snapshot()` D-Bus method (a CPU readback
+# of the exact composited frame), NOT a QMP screendump.
 #
-# The golden differs from `halmasuit-clear-color.png` (uniform brand
-# purple) — proving halmasuit actually composites the client rather
-# than falling back to clear-only.
+# No `witnessImage` is configured here — this gate isolates the
+# layer-shell compositing path (the legacy clear-only base, preserved
+# for non-witness mechanism tests). The golden is uniform green,
+# proving halmasuit actually composites the client.
 
 {
   system,
