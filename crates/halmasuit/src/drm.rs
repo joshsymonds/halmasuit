@@ -143,6 +143,21 @@ fn decode_witness(path: &Path) -> io::Result<(Vec<u8>, i32, i32)> {
     ))
 }
 
+/// The imported witness texture plus its own logical pixel size.
+///
+/// The size is load-bearing for the render element's source rect:
+/// `TextureRenderElement::from_texture_buffer` with `src = None`
+/// defaults the source to the DESTINATION logical size (the full
+/// output), NOT the texture's extent — so the sampler reads far
+/// outside the texture and clamps every output pixel to the edge
+/// texel (a uniform smear of the bottom-right pixel). We therefore
+/// pass an explicit `src` of exactly this texture rectangle so the
+/// whole image is sampled and stretched to the output.
+struct Witness {
+    buffer: TextureBuffer<GlesTexture>,
+    size: smithay::utils::Size<i32, smithay::utils::Logical>,
+}
+
 /// The full GLES + GBM + DrmCompositor stack wrapped around a single
 /// DRM device + connector + CRTC. Pinned for the process lifetime in
 /// `HalmasuitState`. Dropping this value releases the master, tears
@@ -167,7 +182,7 @@ pub struct DrmBackend {
     /// every frame (epic G1/R3/R6). `None` when no witness is
     /// configured — the legacy clear-only path for non-visual
     /// integration tests; production/visual deployments always set it.
-    witness: Option<TextureBuffer<GlesTexture>>,
+    witness: Option<Witness>,
     /// Monotonic frame counter for the `frame_audit` `FrameRendered`
     /// stream. Only exists in `halmasuit-debug`.
     #[cfg(feature = "frame_audit")]
@@ -396,7 +411,11 @@ where
                 None,
             )
             .map_err(|e| io::Error::other(format!("witness texture import: {e}")))?;
-            Some(buffer)
+            // scale=1, transform=Normal ⇒ logical size == pixel size.
+            Some(Witness {
+                buffer,
+                size: smithay::utils::Size::from((iw, ih)),
+            })
         }
         None => None,
     };
@@ -502,14 +521,21 @@ impl DrmBackend {
                 .as_ref()
                 .expect("witness_slot returns Some only when witness is_some");
             let osize = output.current_mode().map(|m| m.size).unwrap_or_default();
+            // Destination = the full output (stretch, no aspect
+            // preservation). Source = the witness texture's OWN extent
+            // (NOT None — see `Witness`): smithay scales src→dst, so
+            // this samples the whole image and stretches it to fill.
             let dst =
                 smithay::utils::Size::<i32, smithay::utils::Logical>::from((osize.w, osize.h));
+            let src = smithay::utils::Rectangle::<f64, smithay::utils::Logical>::from_size(
+                witness.size.to_f64(),
+            );
             elements.push(SceneElement::Witness(
                 TextureRenderElement::from_texture_buffer(
                     smithay::utils::Point::<f64, smithay::utils::Physical>::from((0.0, 0.0)),
-                    witness,
+                    &witness.buffer,
                     None,
-                    None,
+                    Some(src),
                     Some(dst),
                     Kind::Unspecified,
                 ),
