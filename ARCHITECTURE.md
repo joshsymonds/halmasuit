@@ -201,14 +201,15 @@ process — *not* a process restart.
 ```
 Phase                  Foreground wl_client          Adapters active
 ─────────────────────────────────────────────────────────────────────────
-INITRAMFS_SPLASH       halmasuit-splash              halmasuit-luks (if
-                                                      cryptsetup needs a
+INITRAMFS_SPLASH       halmasuit (internal           halmasuit-luks (if
+                        witness plane)                cryptsetup needs a
                                                       passphrase),
                                                       halmasuit-fsck (if
                                                       fsck needs interaction)
 
-ROOTFS_SPLASH          halmasuit-splash              (none — just waiting
-                       (re-attached post-              for system readiness)
+ROOTFS_SPLASH          halmasuit (internal           (none — just waiting
+                        witness plane;                 for system readiness)
+                        re-attached post-
                         re-exec; same surface
                         on screen as before)
 
@@ -224,8 +225,9 @@ LOCKED                 ext-session-lock-v1 client    (lock client itself
                        (swaylock / hyprlock / …)      drives re-auth via PAM
                                                       brokered by halmasuit)
 
-SHUTDOWN_SPLASH        halmasuit-splash              (none — awaits poweroff)
-                       (different scene)
+SHUTDOWN_SPLASH        halmasuit (internal           (none — awaits poweroff)
+                        witness plane;
+                        different scene)
 ```
 
 Transitions:
@@ -287,9 +289,9 @@ Transitions:
   running in the background but is hidden. On successful re-auth, lock
   client exits and niri returns to foreground.
 - **`SESSION → SHUTDOWN_SPLASH`**: triggered by `PrepareForShutdown` signal
-  from logind. halmasuit asks niri to exit; once niri has, halmasuit hosts
-  halmasuit-splash again with a "shutting down" scene and awaits the
-  logind-driven power-off.
+  from logind. halmasuit asks niri to exit; once niri has, halmasuit
+  presents its internal witness plane again with a "shutting down" scene
+  and awaits the logind-driven power-off.
 
 Two invariants hold across every transition:
 
@@ -325,7 +327,7 @@ threshold across any transition.
 │       └─ halmasuit (as root — no userdb yet in initramfs)            │
 │          • opens /dev/dri/card0, becomes DRM master directly         │
 │          • Wayland server   /run/halmasuit/wayland-0                 │
-│          • foreground wl_client: halmasuit-splash                    │
+│          • foreground: halmasuit (internal witness plane)            │
 │          • adapter listening: halmasuit-luks (systemd password agent)│
 └──────────────────────────────────────────────────────────────────────┘
                               │
@@ -349,14 +351,14 @@ threshold across any transition.
 │                                       Lock signals)                  │
 │          • D-Bus server     → org.halmasuit.Compositor1              │
 │          • foreground wl_client over time:                            │
-│             ├─ PHASE rootfs-splash  halmasuit-splash                 │
+│             ├─ PHASE rootfs-splash  halmasuit (witness, internal)    │
 │             ├─ PHASE greeter        DankGreeter / regreet / …        │
 │             │                       (as 'greeter' user)              │
 │             ├─ PHASE session        niri                             │
 │             │                       (as authenticated user, launched │
 │             │                        by the halmasuit-session broker)│
 │             ├─ PHASE locked         ext-session-lock-v1 client       │
-│             └─ PHASE shutdown       halmasuit-splash                  │
+│             └─ PHASE shutdown       halmasuit (witness, internal)     │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -511,10 +513,11 @@ unmodified.
 
 ## Visual identity
 
-`halmasuit-splash` is **not** "a logo on a background." It is a full
-GPU-accelerated `wl_client` running shader-driven rendering, starting in
-the initramfs and persisting across every phase where halmasuit hosts
-no other foreground client. It is the visible signature of the system
+The witness plane is **not** "a logo on a background." It is composited
+internally by halmasuit (no separate client) and persists across every
+phase where halmasuit hosts no other foreground client; the Phase-B
+vision evolves it into a full GPU-accelerated shader-driven render path,
+starting in the initramfs. It is the visible signature of the system
 from kernel handoff to user login, and from user logout back to
 power-off. This is the layer that makes a Linux desktop feel like
 intentional industrial design instead of an apology for booting.
@@ -528,8 +531,8 @@ ship:
 
 - Mesa, trimmed to the driver(s) for target hardware — ~80 MB compressed.
 - `vulkan-loader` + the Vulkan ICD for the target GPU — ~10 MB.
-- `wgpu` (or direct `ash`) statically linked into `halmasuit-splash`
-  — ~20 MB.
+- `wgpu` (or direct `ash`) statically linked into `halmasuit` (the
+  Phase-B GPU witness path) — ~20 MB.
 
 ~100 MB initramfs addition, decompressed once per boot. Trivially
 affordable on any 2026 system; Steam Deck's initramfs is larger and
@@ -597,13 +600,12 @@ These constrain the form, not the ambition.
 
 ### Implementation sketch (deferred to v2 implementation)
 
-What the splash actually *renders* is a design question separate from
-the architecture and lives in `halmasuit-splash`'s own design notes
-(TBD when the crate is implemented). The architecture's only constraint
-is that it be a `wl_client` that uses the standard Wayland buffer-
-sharing protocols (`linux-dmabuf-v1`) to submit GPU-rendered frames to
-halmasuit, at the display's native refresh rate, with no special
-privileges. Anything that fits inside those constraints is in scope.
+What the witness plane actually *renders* is a design question separate
+from the architecture and is deferred to the Phase-B visual design notes
+(TBD). halmasuit composites it internally; the architecture's only
+constraint is that the Phase-B GPU path render at the display's native
+refresh rate with no special privileges. Anything that fits inside those
+constraints is in scope.
 
 ---
 
@@ -1047,7 +1049,6 @@ halmasuit/
 │   ├── halmasuit-greetd/       # greetd wire-protocol server + state machine; relays to the broker, links no libpam (v2)
 │   ├── halmasuit-session/      # LIVE privileged host-ns PAM/session broker — one pam_handle_t whole lifecycle, killable auth fork, fork-then-drop non-setuid session leader, relay-peer SO_PEERCRED gate (epic §0)
 │   ├── halmasuit-session-ipc/  # frozen SOCK_SEQPACKET compositor↔broker wire contract (pure, no_std-friendly)
-│   ├── halmasuit-splash/       # GPU-accelerated splash wl_client (Vulkan via wgpu/ash, shader-driven). Used during INITRAMFS / ROOTFS / LOCKED-backdrop / SHUTDOWN phases (v2). See "Visual identity" section. (v2)
 │   ├── halmasuit-luks/         # systemd password-agent wl_client adapter (v2)
 │   ├── halmasuit-fsck/         # systemd-fsckd progress wl_client adapter (v2)
 │   ├── halmasuit-emergency/    # emergency-shell wl_client adapter (v2)
@@ -1205,12 +1206,13 @@ Scope:
   `ply-renderer-drm.c`.
 - `halmasuit` binary that runs in **both** initramfs and rootfs. Comes
   up early in initramfs, takes DRM master, brings up Wayland server,
-  hosts `halmasuit-splash` as foreground `wl_client`. Re-execs itself
-  across `switch_root` from the rootfs binary path, preserving DRM
-  master fd and Wayland-socket fd across the exec, and drops privileges
-  from root to `compositor` system user post-exec.
-- `halmasuit-splash`: logo + background `wl_client`. Same crate used in
-  `INITRAMFS_SPLASH`, `ROOTFS_SPLASH`, and `SHUTDOWN_SPLASH` phases.
+  composites its internal witness plane as the foreground. Re-execs
+  itself across `switch_root` from the rootfs binary path, preserving
+  DRM master fd and Wayland-socket fd across the exec, and drops
+  privileges from root to `compositor` system user post-exec.
+- The witness plane: a logo + background composited internally by
+  halmasuit (no separate client). Present in the `INITRAMFS_SPLASH`,
+  `ROOTFS_SPLASH`, and `SHUTDOWN_SPLASH` phases.
 - `halmasuit-luks`: systemd password-agent adapter `wl_client`.
   Required for any encrypted-rootfs system to boot through halmasuit
   without dropping to a TTY prompt.
@@ -1268,8 +1270,8 @@ matches running niri natively.
 
 - **Graceful crash recovery.** When niri (or whichever inner WM is
   configured) crashes, halmasuit survives — its sole `wl_client` just
-  disconnected. Halmasuit swaps the foreground back to halmasuit-splash
-  rendering a "session ended" scene, then transitions to `GREETER`
+  disconnected. Halmasuit swaps the foreground back to its internal
+  witness plane rendering a "session ended" scene, then transitions to `GREETER`
   phase for re-login. The apps that were running under niri are gone
   (same as today), but the user experience is a clean recovery UI
   rather than a black screen with leaked kernel text. Costs almost
@@ -1323,8 +1325,9 @@ These exist so the scope cannot creep without an explicit decision.
   *True* client preservation is explicitly not on the roadmap (it would
   require forking niri into a non-compositor policy daemon).
 - **NOT in v2:** multi-seat, HDR, VRR pass-through.
-- **NOT in v2:** the animated / shader-driven `halmasuit-splash`. v2 ships
-  a static logo so "the system didn't brick" is visually obvious. The
+- **NOT in v2:** the animated / shader-driven witness plane. v2 ships
+  a static witness image so "the system didn't brick" is visually
+  obvious. The
   Vulkan/wgpu "Visual identity" section's full ambition is a Phase B
   polish pass once the static path works.
 - **NOT in v2 (happy path only):** advanced UX in the adapter crates —

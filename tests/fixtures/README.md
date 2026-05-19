@@ -2,11 +2,12 @@
 
 ## `splash-test.png`
 
-A deterministic 256×256 four-colour quadrant image used by
-`tests/visual-halmasuit-splash.nix` as `HALMASUIT_SPLASH_IMAGE`. It is
-deliberately **non-uniform** so the resulting golden proves
-halmasuit-splash actually textured the image, not that it fell back to
-a clear colour.
+A deterministic 256×256 four-colour quadrant image consumed by
+halmasuit as its internal witness plane in
+`tests/visual-halmasuit-splash.nix` (via `witnessImage` →
+`HALMASUIT_WITNESS_IMAGE`). It is deliberately **non-uniform** so the
+resulting golden proves halmasuit actually textured the image
+internally, not that it fell back to a clear colour.
 
 Quadrants (top-left, top-right, bottom-left, bottom-right):
 
@@ -29,9 +30,9 @@ magick \( /tmp/q_tl.png /tmp/q_tr.png +append \) \
        -append -strip tests/fixtures/splash-test.png
 ```
 
-halmasuit-splash stretches it to fill the output (v1 = no aspect
-preservation), so at 1280×800 it still reads as four equal colour
-quadrants — a stable, recognisable golden.
+halmasuit stretches it to fill the output (no aspect preservation),
+so at 1280×800 it still reads as four equal colour quadrants — a
+stable, recognisable golden.
 
 ## `witness.png`
 

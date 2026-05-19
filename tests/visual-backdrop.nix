@@ -1,16 +1,16 @@
 # tests/visual-backdrop.nix — epic layer D.
 #
 # The no-flash proof harness on stand-in clients. Boots
-# halmasuit-debug + halmasuit-splash (BACKGROUND, the 4-quadrant
-# fixture) and drives four scenes by starting/stopping extra
-# layer-shell clients (the env-parametrised test client) as systemd
-# services that connect to halmasuit's wayland socket as the greeter
-# uid:
+# halmasuit-debug with its internal witness plane (composited from
+# frame 0, the 4-quadrant fixture) and drives four scenes by
+# starting/stopping extra layer-shell clients (the env-parametrised
+# test client) as systemd services that connect to halmasuit's
+# wayland socket as the greeter uid:
 #
-#   splash-only          — only splash (background fixture)
+#   splash-only          — only the witness (background fixture)
 #   greeter-over-splash  — + a centred opaque rect on the TOP layer
 #   session-fullscreen   — + a fullscreen opaque OVERLAY client
-#   post-session-splash  — session client stopped; splash visible again
+#   post-session-splash  — session client stopped; witness visible again
 #
 # Two orthogonal gates run together:
 #
@@ -32,7 +32,6 @@
   nixpkgs,
   halmasuit,
   halmasuit-session,
-  halmasuit-splash,
   halmasuit-layer-shell-test-client,
   ssimulacra2-cli,
 }:
@@ -85,13 +84,7 @@ pkgs.testers.runNixOSTest {
         greeterUid     = 999;
         greeterGroup   = "halmasuit-greeter";
         compositorUid  = 998;
-        splashImage    = fixture;
-        # Splash is the BACKGROUND client (the persistent system
-        # background) — launched as the greeter.
-        greeterCommand = "${pkgs.writeShellScript "halmasuit-splash-launch" ''
-          export HALMASUIT_SPLASH_IMAGE=${fixture}
-          exec ${halmasuit-splash}/bin/halmasuit-splash
-        ''}";
+        witnessImage   = fixture;
       };
 
       # Scene clients — NOT auto-started; the testScript starts/stops
@@ -172,9 +165,6 @@ pkgs.testers.runNixOSTest {
 
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF 'scanout_active'", timeout=30
-    )
-    machine.wait_until_succeeds(
-        "journalctl -u halmasuit | grep -qF 'halmasuit-splash: presented'", timeout=90
     )
     machine.wait_until_succeeds("busctl --system status org.halmasuit", timeout=30)
     introspect = machine.succeed(

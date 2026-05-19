@@ -1,8 +1,9 @@
 # tests/visual-foreground.nix — epic layer F2 gate.
 #
 # Proves the greetd-lifecycle-driven foreground swap on the REAL
-# mechanism: splash (BACKGROUND, persistent) + a layer-shell greeter
-# (halmasuit's tracked greeterCommand child) → halmasuit-vm-client
+# mechanism: halmasuit's internal witness plane (composited from
+# frame 0, persistent) + a layer-shell greeter (halmasuit's tracked
+# greeterCommand child) → halmasuit-vm-client
 # drives a real greetd full-auth → the compositor relays it to the
 # privileged halmasuit-session broker (real pam_unix) → halmasuit
 # kills the greeter and the broker forks-then-drops the session (an
@@ -37,7 +38,6 @@
   nixpkgs,
   halmasuit,
   halmasuit-session,
-  halmasuit-splash,
   halmasuit-layer-shell-test-client,
   halmasuit-toplevel-test-client,
   halmasuit-vm-client,
@@ -87,35 +87,16 @@ pkgs.testers.runNixOSTest {
         greeterUid     = 999;
         greeterGroup   = "halmasuit-greeter";
         compositorUid  = 998;
+        witnessImage   = fixture;
         # The greeter: a fullscreen keyboard-interactive layer client
-        # over the splash. halmasuit's tracked child — killed on
-        # start_session.
+        # over halmasuit's internal witness plane. halmasuit's tracked
+        # child — killed on start_session.
         greeterCommand = "${pkgs.writeShellScript "halmasuit-fg-greeter" ''
           export HALMASUIT_TESTCLIENT_KEYBOARD=1
           export HALMASUIT_TESTCLIENT_LAYER=top
           export HALMASUIT_TESTCLIENT_COLOR=#2255FF
           exec ${halmasuit-layer-shell-test-client}/bin/halmasuit-layer-shell-test-client
         ''}";
-      };
-
-      # Splash: persistent BACKGROUND, independent of the greeter
-      # (must survive the greeter being killed). testScript-launched.
-      systemd.services.test-splash = {
-        description = "halmasuit F2 splash background";
-        after = [ "halmasuit.service" ];
-        serviceConfig = {
-          User  = "halmasuit-greeter";
-          Group = "halmasuit-greeter";
-          ExecStart = "${pkgs.writeShellScript "fg-splash" ''
-            export HALMASUIT_SPLASH_IMAGE=${fixture}
-            exec ${halmasuit-splash}/bin/halmasuit-splash
-          ''}";
-          Environment = [
-            "XDG_RUNTIME_DIR=/run/halmasuit"
-            "WAYLAND_DISPLAY=wayland-0"
-          ];
-          Restart = "no";
-        };
       };
 
       # The authenticated session user. The broker session-leader's
@@ -190,11 +171,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF scanout_active", timeout=30
     )
-    # Splash first (persistent background).
-    machine.succeed("systemctl start test-splash.service")
-    machine.wait_until_succeeds(
-        "journalctl -u test-splash | grep -qF 'halmasuit-splash: presented'", timeout=90
-    )
+    # The witness plane is composited internally from frame 0.
     machine.wait_until_succeeds(
         "journalctl -u halmasuit -o cat | grep -qF client_first_frame", timeout=30
     )

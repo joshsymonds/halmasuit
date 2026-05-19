@@ -746,8 +746,9 @@ empirically**, both visually and over a per-frame event stream, across the
 Design constraints that matter for everything below (full text in
 `ARCHITECTURE.md`, `CLAUDE.md`):
 
-- halmasuit composites; it never paints its own UI. The background is a
-  separate client (`halmasuit-splash`); the greeter and niri are unmodified
+- halmasuit composites. The background is its internal witness plane —
+  halmasuit decodes the configured PNG and composites it itself from
+  frame 0 (no separate client); the greeter and niri are unmodified
   upstream clients.
 - The single privileged surface is the `halmasuit-session` broker (§0):
   it owns one `pam_handle_t` for the whole lifecycle, runs
@@ -782,9 +783,10 @@ down):
 - **Renderer**: real DRM scanout via `GlesRenderer` + `DrmCompositor`;
   z-ordered `wlr-layer-shell` compositing; brand clear-color `#0a0014` before
   any client commits.
-- **`halmasuit-splash`**: separate wl_client, wgpu, one shader, a PNG as a
-  fullscreen layer-shell BACKGROUND surface; image via `HALMASUIT_SPLASH_IMAGE`
-  / `services.halmasuit.splashImage`.
+- **Witness plane**: halmasuit decodes a configured PNG and composites
+  it itself as its bottom-most internal background plane from frame 0
+  (no separate client); image via `HALMASUIT_WITNESS_IMAGE` /
+  `services.halmasuit.witnessImage`.
 - **Visual proof**: `frame_audit` Cargo feature gates per-frame
   `Event::FrameRendered` + the `Snapshot()` D-Bus method (production halmasuit
   has zero audit code — verified by `cargo tree`). Goldens in
@@ -831,7 +833,7 @@ on **`main`** @ `17ae692` and gate-verified.
 |---|---|---|---|---|
 | A | Visual-test infra: `visual.py`, `ssimulacra2_rs`, Snapshot()-based capture | (infra) | `b3f100d`… | #2 ✓ |
 | B | Renderer: DRM+GBM+GlesRenderer+DrmCompositor, layer-shell, wl_shm, `#0a0014`, `frame_audit` split | `visual-halmasuit-clear/-layer/-splash` | `1a01f63`→`35c521e` | #3–8 ✓ |
-| C | `halmasuit-splash` v1 (wgpu PNG layer-shell BACKGROUND) | `visual-halmasuit-splash` | `996f7c4` | #9 ✓ |
+| C | Witness plane: halmasuit composites the configured PNG internally as its bottom-most background from frame 0 | `visual-halmasuit-splash` | `996f7c4` | #9 ✓ |
 | D | `visual-backdrop.nix` 4 stand-in scenes + FrameRendered continuity invariant | `visual-backdrop` | `6b73459` | #10 ✓ |
 | E1 | DRM acquisition via `LibSeatSession`/seatd | `drm-master-probe-phase4`, all visual | `482dc1c` (+`2b58e10`) | #11,#14 ✓ |
 | E2 | libinput + `wl_seat` keyboard/pointer + focus routing | `halmasuit-input` | `745e8e9` | #15 ✓ |

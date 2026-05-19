@@ -1,23 +1,22 @@
 # tests/visual-halmasuit-splash.nix — epic layer C visual gate
 # (Snapshot()).
 #
-# Boots halmasuit (halmasuit-debug, frame_audit on) and runs
-# `halmasuit-splash` as a wl_client. Splash binds wlr-layer-shell
-# BACKGROUND and renders the HALMASUIT_SPLASH_IMAGE PNG fullscreen via
-# wgpu (GL backend over Mesa swrast → wl_shm buffers, which halmasuit
-# composites). Capture is the in-process `Snapshot()` D-Bus method.
+# Boots halmasuit (halmasuit-debug, frame_audit on) and proves it
+# composites the configured `HALMASUIT_WITNESS_IMAGE` PNG as its
+# bottom-most internal background plane from frame 0 — no separate
+# client. Capture is the in-process `Snapshot()` D-Bus method.
 #
 # The fixture is a deterministic four-colour quadrant image (see
 # tests/fixtures/README.md), stretched to fill — so the golden proves
-# halmasuit-splash actually textured a PNG, distinct from both the
-# brand clear and the solid-colour layer client.
+# halmasuit actually textured a PNG internally, distinct from both
+# the brand clear and the solid-colour layer client. This gate stays
+# distinct from the future witness.png/ssimulacra2 gate.
 
 {
   system,
   nixpkgs,
   halmasuit,
   halmasuit-session,
-  halmasuit-splash,
   ssimulacra2-cli,
 }:
 
@@ -53,17 +52,10 @@ pkgs.testers.runNixOSTest {
         greeterGroup   = "halmasuit-greeter";
         compositorUid  = 998;
         # Exercises the module option's option→unit-Environment
-        # wiring (Epic #1 req 4). halmasuit sanitizes the greeter's
-        # env to an allowlist, so the splash client below ALSO gets
-        # the path explicitly via its wrapper — the test stays
-        # deterministic regardless of the env-allowlist policy.
-        splashImage    = fixture;
-        # Launch halmasuit-splash AS the greeter (uid 999), with the
-        # image path set in its own environment.
-        greeterCommand = "${pkgs.writeShellScript "halmasuit-splash-launch" ''
-          export HALMASUIT_SPLASH_IMAGE=${fixture}
-          exec ${halmasuit-splash}/bin/halmasuit-splash
-        ''}";
+        # wiring (Epic #1 req 4): the path is exported as
+        # HALMASUIT_WITNESS_IMAGE and decoded by halmasuit itself at
+        # startup as its internal witness plane.
+        witnessImage   = fixture;
       };
 
       # Snapshot() writes post-privilege-drop (uid 998) under
@@ -113,12 +105,6 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF 'scanout_active'",
         timeout=30,
-    )
-    # wgpu init + first present is heavier than the shm test client;
-    # give it a generous window.
-    machine.wait_until_succeeds(
-        "journalctl -u halmasuit | grep -qF 'halmasuit-splash: presented'",
-        timeout=90,
     )
     machine.wait_until_succeeds(
         "busctl --system status org.halmasuit",
