@@ -114,6 +114,10 @@ test-vm:
     # Convergence epic R2: wl_surface.frame callbacks (no Mesa-EGL wedge).
     echo "── visual-frame-callbacks ──"
     nix build .#checks.x86_64-linux.visual-frame-callbacks -L --print-build-logs --no-link
+    echo
+    # Convergence epic R3: sync-subsurface commits aggregate to parent.
+    echo "── visual-sync-subsurface ──"
+    nix build .#checks.x86_64-linux.visual-sync-subsurface -L --print-build-logs --no-link
 
 # Regenerate one or all visual-test goldens. Runs the named test
 # interactively (driverInteractive), with HALMASUIT_GOLDEN_REGEN=1 and

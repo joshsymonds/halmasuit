@@ -25,6 +25,9 @@ members = [
     # Throwaway xdg_toplevel test client — exercises halmasuit's F1
     # xdg-shell compositing path.
     "crates/halmasuit-toplevel-test-client",
+    # Throwaway sync-subsurface test client — exercises halmasuit's
+    # wl_compositor commit aggregation per the wl_subsurface contract.
+    "crates/halmasuit-subsurface-test-client",
     "xtask",
 ]
 

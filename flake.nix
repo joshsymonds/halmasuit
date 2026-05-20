@@ -434,6 +434,30 @@
             };
           };
 
+          # halmasuit-subsurface-test-client — exercises halmasuit's
+          # wl_compositor commit-aggregation contract (R3): an
+          # xdg_toplevel parent + a sync wl_subsurface child, driven
+          # through a deterministic commit sequence the regression
+          # test asserts against.
+          halmasuit-subsurface-test-client = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-subsurface-test-client";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [ "-p" "halmasuit-subsurface-test-client" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [ pkgs.libxkbcommon pkgs.wayland ];
+            doCheck = false;
+            meta = {
+              description = "wl_subsurface sync-semantics test client (R3)";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-subsurface-test-client";
+            };
+          };
+
           # ssimulacra2_rs — pure-Rust port of the SSIMULACRA2
           # perceptual image-diff metric. Used by visual VM tests as
           # the golden-comparison engine. Chosen over the C++
@@ -622,6 +646,17 @@
           halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
           ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Convergence epic R3: sync wl_subsurface commits are
+        # aggregated to the parent atomic state, NOT applied
+        # immediately (smithay smallvil pattern).
+        visual-sync-subsurface = import ./tests/visual-sync-subsurface.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                        = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-subsurface-test-client = self.packages.x86_64-linux.halmasuit-subsurface-test-client;
+          ssimulacra2-cli                  = self.packages.x86_64-linux.ssimulacra2-cli;
         };
         # Amendment A5.6: poll-only leader pidfd backstop — SCM_RIGHTS
         # worker→broker→compositor armed + fires on leader exit.

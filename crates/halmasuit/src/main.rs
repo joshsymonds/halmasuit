@@ -369,8 +369,32 @@ impl CompositorHandler for HalmasuitState {
         // is what makes committed shm buffers visible to the renderer
         // when WaylandSurfaceRenderElement is built. Without this,
         // render_elements_from_surface_tree sees no current buffer
-        // and the surface paints nothing.
+        // and the surface paints nothing. Must be called on the
+        // ORIGINAL committed surface (smithay caches per-surface).
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
+
+        // R3 (convergence epic): wl_subsurface contract — a
+        // synchronized subsurface's committed state is CACHED at the
+        // parent and applied only when the parent surface commits.
+        // The compositor MUST NOT make it visible before then. Skip
+        // all downstream rendering / focus / first-frame work for
+        // sync-subsurface commits; smithay holds the state until the
+        // parent's commit propagates it. (Smithay's `smallvil` is
+        // the canonical example of this pattern.)
+        if smithay::wayland::compositor::is_sync_subsurface(surface) {
+            return;
+        }
+
+        // Non-sync (root surface or a desync subsurface): walk to the
+        // root before running the rest of the handler. A commit on a
+        // desync subsurface implicitly commits the root tree, so
+        // halmasuit's compositor work (re-render, focus, first-frame
+        // detection) acts on the root.
+        let mut root = surface.clone();
+        while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
+            root = parent;
+        }
+        let surface = &root;
 
         // wlr-layer-shell initial configure. The spec requires the
         // initial configure to be sent in response to the client's

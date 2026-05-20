@@ -833,6 +833,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "halmasuit-subsurface-test-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "smithay-client-toolkit",
+ "wayland-client",
+]
+
+[[package]]
 name = "halmasuit-test"
 version = "0.1.0"
 
