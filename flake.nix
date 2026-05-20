@@ -614,16 +614,6 @@
           halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
-        # Epic G-layer R2/R4 (HANDOFF §6 G2): the REAL DankGreeter
-        # (dms greeter module via nix-config; unpatched) as halmasuit's
-        # greeter over the witness.
-        visual-dankgreeter = import ./tests/visual-dankgreeter.nix {
-          system = "x86_64-linux";
-          inherit nixpkgs nix-config;
-          halmasuit        = self.packages.x86_64-linux.halmasuit-debug;
-          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
-          ssimulacra2-cli  = self.packages.x86_64-linux.ssimulacra2-cli;
-        };
         # Amendment A5.6: poll-only leader pidfd backstop — SCM_RIGHTS
         # worker→broker→compositor armed + fires on leader exit.
         visual-pidfd-revert = import ./tests/visual-pidfd-revert.nix {

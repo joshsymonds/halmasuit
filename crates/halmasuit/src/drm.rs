@@ -136,11 +136,19 @@ fn decode_witness(path: &Path) -> io::Result<(Vec<u8>, i32, i32)> {
         .map_err(|e| io::Error::other(format!("decode witness {}: {e}", path.display())))?
         .to_rgba8();
     let (w, h) = img.dimensions();
-    Ok((
-        img.into_raw(),
-        i32::try_from(w).unwrap_or(i32::MAX),
-        i32::try_from(h).unwrap_or(i32::MAX),
-    ))
+    let w = i32::try_from(w).map_err(|_| {
+        io::Error::other(format!(
+            "witness {} width {w} exceeds i32::MAX",
+            path.display()
+        ))
+    })?;
+    let h = i32::try_from(h).map_err(|_| {
+        io::Error::other(format!(
+            "witness {} height {h} exceeds i32::MAX",
+            path.display()
+        ))
+    })?;
+    Ok((img.into_raw(), w, h))
 }
 
 /// The imported witness texture plus its own logical pixel size.
