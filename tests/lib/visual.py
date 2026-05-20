@@ -27,6 +27,26 @@ The module wraps three concerns:
     supplied to the helper via the `GOLDENS_DIR` environment variable
     so the helper doesn't have to guess.
 
+  * `assert_matches_witness(machine, name, threshold=95.0)` — the
+    sampled exact-IMAGE gate. Same capture + ssimulacra2 path as
+    `assert_matches_golden`, but the default threshold is the tighter
+    95.0 (deterministic offscreen llvmpipe readback of a known scene
+    must match its checked-in witness near-exactly; only sub-JND
+    swrast rounding is tolerated). A pixel-exact comparison against a
+    reference image at a SETTLED scene — never a "is it dark enough /
+    mostly covered" guess. Never bit-exact (epic anti-pattern); never
+    below the repo-wide 90.0 floor. This is content correctness; it is
+    NOT the no-flash proof (a sampled settled-scene image cannot see a
+    transient one-frame flash mid-transition).
+
+  * `assert_no_flash_stream(machine)` — the 100%-of-`frame_rendered`-
+    stream no-flash gate, asserted as EXACT integer/boolean facts
+    (`clear_pixel_count == 0` post-background; never `degenerate`;
+    backdrop mapped once and never resized). This is the no-flash
+    proof; it runs over EVERY composited frame, not a sample, with
+    zero tolerance. Orthogonal to and live ALONGSIDE the sampled
+    witness/golden image gates, never instead of them.
+
 Two environment variables tune behavior:
 
   * `HALMASUIT_GOLDEN_REGEN=1` — `assert_matches_golden` copies the
@@ -225,6 +245,39 @@ def assert_matches_golden(
         )
 
 
+# The exact-image floor. Tighter than DEFAULT_THRESHOLD because the
+# offscreen llvmpipe readback of a deterministic, known scene must match
+# its checked-in witness near-exactly — only sub-JND software-rasterizer
+# rounding is allowed. Still strictly above the repo-wide 90.0 floor;
+# never bit-exact (epic anti-pattern).
+WITNESS_THRESHOLD = 95.0
+
+
+def assert_matches_witness(
+    machine,
+    name: str,
+    *,
+    threshold: float = WITNESS_THRESHOLD,
+) -> None:
+    """Exact-image gate: capture the real composited frame via the
+    offscreen GLES readback and assert it matches the checked-in
+    witness `${GOLDENS_DIR}/{name}.png` with ssimulacra2 ≥ `threshold`
+    (default 95.0).
+
+    This is the sampled CONTENT-correctness gate: it compares the
+    exact pixels of halmasuit's own composited frame against a known
+    reference image at a settled scene. Deterministic (llvmpipe + a
+    fixed scene), so the tolerance is tight. The no-flash proof is a
+    separate, always-live gate (`assert_no_flash_stream`), asserted
+    over 100% of the frame stream, not a sample.
+
+    Capture / regen / missing-golden semantics are identical to
+    `assert_matches_golden`; only the default threshold differs and the
+    intent is documented as exact-image rather than perceptual-golden.
+    """
+    assert_matches_golden(machine, name, threshold=threshold)
+
+
 def introspect_events(machine) -> list:
     """Return halmasuit's introspection Event stream, in journal
     (chronological) order, as a list of dicts.
@@ -257,68 +310,267 @@ def introspect_events(machine) -> list:
     return events
 
 
-def assert_frame_continuity(machine) -> None:
-    """The no-flash invariant (Epic #1 req 11), asserted over the
-    full `FrameRendered` stream — NOT sampled screenshots.
+def assert_no_flash_stream(machine, events=None) -> None:
+    """The no-flash invariant (Epic #1 req 11 / R3), asserted over
+    100% of the `frame_rendered` stream as EXACT integer/boolean facts
+    — NOT sampled screenshots, NOT fuzzy aggregate float thresholds.
 
-    - From the first `client_first_frame{role:background}` onward,
-      every `frame_rendered` must have ``backdrop_coverage > 0.95``.
-    - From the first `client_first_frame` of ANY role onward, no
-      `frame_rendered` may have ``mean_luminance < 0.01`` (no black
-      frame once a client has committed; pre-commit clear frames are
-      exempt).
+    A sampled `Snapshot()` golden is taken at a SETTLED scene and
+    cannot observe a transient one-frame flash mid-transition; this
+    parses every `frame_rendered` halmasuit emitted and checks, with
+    zero tolerance.
 
-    Fails loudly, naming the offending event(s) and their index.
+    Anchored at FRAME 0 (epic amendment G1/R3): halmasuit composites
+    the witness plane internally from the very first frame — there is
+    no pre-client solid phase — so EVERY `frame_rendered`, from the
+    first, must already be witness-covered:
+
+    - Exactly one `client_first_frame{role:background}` (the internal
+      witness plane, emitted before the first composited frame). Zero
+      ⇒ the witness never composited; >1 ⇒ the backdrop was
+      recreated. Both fail.
+    - That witness cff must PRECEDE every `frame_rendered`: a frame
+      rendered before it means frame 0 was not witness-covered — a
+      pre-client solid phase / flash. Strictly stronger than the
+      pre-4c cff-SUFFIX anchor, which silently excluded such frames
+      (see the synthetic proof's "frame_rendered precedes the witness
+      bg cff" case).
+    - Then EVERY `frame_rendered` (frame 0 onward, not a suffix) must
+      have ``clear_pixel_count == 0`` (no sentinel-clear pixel — even
+      one is a flash), ``degenerate == False`` (no all-clear,
+      all-black, or empty/dropped frame), and ``pixel_count`` constant
+      across the whole stream (the backdrop was never resized).
+
+    Requires at least one `frame_rendered` so an empty or audit-less
+    stream cannot vacuously pass. Fails loudly, naming the offending
+    event(s) and their index.
+
+    `events` may be passed pre-parsed (the synthetic negative proof in
+    `_selftest`, run by `just vis-selftest`); otherwise it is read
+    from the machine journal.
     """
-    events = introspect_events(machine)
+    if events is None:
+        events = introspect_events(machine)
 
-    first_bg = None
-    first_any = None
-    for i, ev in enumerate(events):
-        if ev["event"] == "client_first_frame":
-            if first_any is None:
-                first_any = i
-            if ev.get("role") == "background" and first_bg is None:
-                first_bg = i
-    if first_bg is None:
+    bg_cff = [
+        i
+        for i, ev in enumerate(events)
+        if ev["event"] == "client_first_frame" and ev.get("role") == "background"
+    ]
+    if not bg_cff:
         raise AssertionError(
             "no client_first_frame{role:background} in the halmasuit "
-            "event stream — splash never composited a background frame.\n"
+            "event stream — the internal witness plane never "
+            "composited a frame.\n"
             f"events seen: {[e['event'] for e in events]}"
         )
-    # A background cff is itself an "any" cff, so first_any is set and
-    # first_any <= first_bg.
-    assert first_any is not None
-
-    cov_viol = [
-        (i, ev)
-        for i, ev in enumerate(events)
-        if i >= first_bg
-        and ev["event"] == "frame_rendered"
-        and ev["backdrop_coverage"] <= 0.95
-    ]
-    lum_viol = [
-        (i, ev)
-        for i, ev in enumerate(events)
-        if i >= first_any
-        and ev["event"] == "frame_rendered"
-        and ev["mean_luminance"] < 0.01
-    ]
-    frames = sum(1 for e in events if e["event"] == "frame_rendered")
-    if cov_viol or lum_viol:
+    if len(bg_cff) != 1:
         raise AssertionError(
-            "FrameRendered continuity invariant VIOLATED "
-            f"({frames} frames; first bg cff @#{first_bg}, "
-            f"first any cff @#{first_any}):\n"
-            f"  backdrop_coverage<=0.95 after bg: {cov_viol[:5]}\n"
-            f"  mean_luminance<0.01 after first commit: {lum_viol[:5]}"
+            "background surface was mapped/recreated more than once: "
+            f"{len(bg_cff)} client_first_frame{{role:background}} events "
+            f"at indices {bg_cff} (expected exactly 1 — the witness "
+            "plane is created once and never recreated)."
+        )
+    first_bg = bg_cff[0]
+
+    fr = [
+        (i, ev)
+        for i, ev in enumerate(events)
+        if ev["event"] == "frame_rendered"
+    ]
+    if not fr:
+        raise AssertionError(
+            "no frame_rendered events; the exact no-flash stream gate "
+            "cannot vacuously pass — frame_audit must be live and the "
+            "witness must have composited at least one frame.\n"
+            f"events seen: {[e['event'] for e in events]}"
+        )
+    first_fr = fr[0][0]
+
+    # FRAME-0 anchor (epic G1/R3): the witness cff must precede every
+    # composited frame. A frame_rendered before it means frame 0 was
+    # not witness-covered — a pre-client solid phase / flash. Strictly
+    # stronger than the pre-4c suffix anchor (which excluded it).
+    if first_bg > first_fr:
+        raise AssertionError(
+            f"frame_rendered @#{first_fr} precedes the witness "
+            f"client_first_frame{{background}} @#{first_bg}: frame 0 "
+            "was NOT witness-covered — a pre-client solid phase / "
+            "flash, the exact thing epic G1/R3 forbids."
+        )
+
+    clear_viol = [(i, ev) for i, ev in fr if ev["clear_pixel_count"] != 0]
+    degen_viol = [(i, ev) for i, ev in fr if ev["degenerate"]]
+    sizes = sorted({ev["pixel_count"] for _, ev in fr})
+    size_viol = sizes if len(sizes) != 1 else []
+
+    if clear_viol or degen_viol or size_viol:
+        raise AssertionError(
+            "frame_rendered no-flash invariant VIOLATED "
+            f"({len(fr)} frames; witness bg cff @#{first_bg}, first "
+            f"frame_rendered @#{first_fr}):\n"
+            f"  clear_pixel_count != 0: {clear_viol[:5]}\n"
+            f"  degenerate frame: {degen_viol[:5]}\n"
+            f"  pixel_count not constant: {size_viol}"
         )
     print(
         json.dumps(
             {
-                "continuity": "OK",
-                "frames": frames,
+                "no_flash_stream": "OK",
+                "frames": len(fr),
                 "first_background_cff_index": first_bg,
+                "first_frame_rendered_index": first_fr,
+                "pixel_count": sizes[0],
             }
         )
     )
+
+
+def record_boot(
+    machine,
+    name: str,
+    *,
+    seconds: float = 45.0,
+    fps: int = 3,
+) -> None:
+    """Diagnostic: record a headless "video" of what halmasuit
+    composites over `seconds`, by polling the offscreen `Snapshot()`
+    readback at `fps` and ffmpeg-encoding the frames into
+    ``$out/{name}.mp4`` (kept in the test's build output).
+
+    The Snapshot readback is the SAME deterministic offscreen GLES
+    path the goldens use — a faithful, headless-valid record of the
+    real composited frame stream (no QMU screendump, no GPU). Reusable
+    by ANY visual test: add ``pkgs.ffmpeg`` to the machine's
+    `environment.systemPackages` and call this from the testScript at
+    the point you want to film from. NOT an assertion — purely a
+    human-inspection artifact for diagnosing render/timing issues.
+
+    Fixed cadence is correct here: this is frame SAMPLING, not an
+    assertion race, so a sleep between frames is the right tool (it is
+    the inter-frame interval, not a wait-for-state).
+    """
+    # Frames go FLAT into GUEST_SNAPSHOT_DIR (the 0777 tmpfiles dir
+    # halmasuit-the-compositor-uid can write), NOT a subdir — a
+    # root-owned subdir is not writable by the compositor uid and
+    # every Snapshot would EACCES (this is the proven `capture()`
+    # path's directory).
+    prefix = f"{GUEST_SNAPSHOT_DIR}/vidf_{name}_"
+    frames = int(seconds * fps)
+    for i in range(frames):
+        # Best-effort: a transient Snapshot failure must not abort the
+        # capture — we want to SEE failures in the video, not crash.
+        machine.execute(
+            "busctl --system call org.halmasuit "
+            "/org/halmasuit/Debug/Introspect "
+            "org.halmasuit.Debug.Introspect Snapshot s "
+            f"{prefix}{i:05d}.png"
+        )
+        machine.sleep(1.0 / fps)
+    # How many frames actually landed (early ones fail until the
+    # Snapshot D-Bus surface is up — that's expected and tolerated;
+    # a near-zero count means the capture is meaningless, fail loudly).
+    written = int(
+        machine.succeed(f"ls -1 {prefix}*.png 2>/dev/null | wc -l").strip()
+    )
+    print(f"record_boot[{name}]: {written}/{frames} frames captured")
+    if written < max(2, frames // 10):
+        raise AssertionError(
+            f"record_boot[{name}]: only {written}/{frames} Snapshot "
+            "frames written — capture is not representative (D-Bus "
+            "never came up, or Snapshot is failing). Not encoding."
+        )
+    out = f"{GUEST_SNAPSHOT_DIR}/{name}.mp4"
+    machine.succeed(
+        f"ffmpeg -y -framerate {fps} -pattern_type glob "
+        f"-i '{prefix}*.png' -c:v libx264 -pix_fmt yuv420p "
+        f"-vf 'pad=ceil(iw/2)*2:ceil(ih/2)*2' {out} "
+        f"2>/tmp/ffmpeg_{name}.log || (cat /tmp/ffmpeg_{name}.log; false)"
+    )
+    # Lands in the test's $out (nixos-test default copy_from_vm target).
+    machine.copy_from_vm(out)
+    print(f"record_boot: wrote {name}.mp4 ({frames} frames @ {fps}fps) to $out")
+
+
+# ───────────────────────────────────────────────────────────────────
+# Synthetic negative-stream proof for `assert_no_flash_stream`.
+#
+# `assert_no_flash_stream` is the load-bearing no-flash invariant
+# (epic R3/R9); it must never silently weaken. This is an executable
+# contract test feeding it synthetic event streams (the `events=`
+# parameter), run as a hard gate by `just vis-selftest` (wired into
+# `just check`) — no VM, no GPU. It pins, in particular, the FRAME-0
+# anchor (epic G1): the witness is composited from frame 0, so a
+# `frame_rendered` that precedes the witness
+# `client_first_frame{background}` is a flash and MUST fail — the
+# pre-4c cff-suffix anchor silently excluded such frames.
+# ───────────────────────────────────────────────────────────────────
+
+
+def _cff(role):
+    return {"event": "client_first_frame", "role": role}
+
+
+def _fr(clear=0, degenerate=False, pixel_count=1024000):
+    return {
+        "event": "frame_rendered",
+        "clear_pixel_count": clear,
+        "degenerate": degenerate,
+        "pixel_count": pixel_count,
+    }
+
+
+def _raises(events) -> bool:
+    try:
+        assert_no_flash_stream(None, events=events)
+        return False
+    except AssertionError:
+        return True
+
+
+def _selftest() -> None:
+    # Clean frame-0-anchored stream: bg cff precedes every frame,
+    # every frame witness-covered, one bg cff, constant size → PASS.
+    clean = [_cff("background"), _fr(), _fr(), _fr()]
+    assert_no_flash_stream(None, events=clean)  # must NOT raise
+
+    cases = {
+        "clear_pixel_count != 0 on a post-bg frame": [
+            _cff("background"), _fr(), _fr(clear=1)
+        ],
+        "a degenerate frame": [
+            _cff("background"), _fr(), _fr(degenerate=True)
+        ],
+        "two background cff (backdrop recreated)": [
+            _cff("background"), _fr(), _cff("background"), _fr()
+        ],
+        "zero background cff": [_cff("top"), _fr(), _fr()],
+        "no frame_rendered (non-vacuous: cannot vacuously pass)": [
+            _cff("background")
+        ],
+        "pixel_count not constant (backdrop resized)": [
+            _cff("background"), _fr(pixel_count=1024000), _fr(pixel_count=999)
+        ],
+        # STRICTLY-STRONGER (epic G1/4c): a frame_rendered BEFORE the
+        # witness bg cff. The pre-4c cff-suffix anchor (post_bg = i >=
+        # first_bg) silently EXCLUDED this frame and PASSED the stream.
+        # Frame 0 must already be witness-covered — this is a flash and
+        # MUST now fail.
+        "frame_rendered precedes the witness bg cff (frame 0 not covered)": [
+            _fr(), _cff("background"), _fr(), _fr()
+        ],
+    }
+    failed = [name for name, ev in cases.items() if not _raises(ev)]
+    if failed:
+        raise SystemExit(
+            "assert_no_flash_stream FAILED to reject:\n  - "
+            + "\n  - ".join(failed)
+        )
+    print(
+        f"vis-selftest OK: clean stream accepted; {len(cases)} "
+        "flaw classes rejected (incl. the frame-0-anchor strengthening)."
+    )
+
+
+if __name__ == "__main__":
+    _selftest()

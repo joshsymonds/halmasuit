@@ -1,31 +1,37 @@
 # tests/visual-backdrop.nix — epic layer D.
 #
 # The no-flash proof harness on stand-in clients. Boots
-# halmasuit-debug + halmasuit-splash (BACKGROUND, the 4-quadrant
-# fixture) and drives four scenes by starting/stopping extra
-# layer-shell clients (the env-parametrised test client) as systemd
-# services that connect to halmasuit's wayland socket as the greeter
-# uid:
+# halmasuit-debug with its internal witness plane (composited from
+# frame 0, the 4-quadrant fixture) and drives four scenes by
+# starting/stopping extra layer-shell clients (the env-parametrised
+# test client) as systemd services that connect to halmasuit's
+# wayland socket as the greeter uid:
 #
-#   splash-only          — only splash (background fixture)
+#   splash-only          — only the witness (background fixture)
 #   greeter-over-splash  — + a centred opaque rect on the TOP layer
 #   session-fullscreen   — + a fullscreen opaque OVERLAY client
-#   post-session-splash  — session client stopped; splash visible again
+#   post-session-splash  — session client stopped; witness visible again
 #
-# Each scene is gated by a Snapshot() golden. Across the WHOLE run the
-# `FrameRendered` stream is asserted to satisfy the continuity
-# invariant (Epic #1 req 11): from the first
-# client_first_frame{role:background} every frame has
-# backdrop_coverage>0.95, and no frame is black once any client
-# committed. That stream assertion — not the snapshots — is the
-# actual no-flash proof.
+# Two orthogonal gates run together:
+#
+#   * Per-scene sampled exact-IMAGE goldens (ssimulacra2) — content
+#     correctness at each SETTLED scene: splash-only →
+#     greeter-over-splash → session-fullscreen → splash-only again.
+#
+#   * The 100%-of-`frame_rendered`-stream no-flash gate
+#     (`visual.assert_no_flash_stream`, Epic #1 req 11 / R3) — asserted
+#     over EVERY composited frame as EXACT facts (clear_pixel_count==0
+#     post-background, never degenerate, backdrop mapped once and never
+#     resized). A sampled settled-scene golden cannot observe a
+#     transient one-frame flash mid-transition; the stream gate can,
+#     with zero tolerance. Both gates are live — neither replaces the
+#     other.
 
 {
   system,
   nixpkgs,
   halmasuit,
   halmasuit-session,
-  halmasuit-splash,
   halmasuit-layer-shell-test-client,
   ssimulacra2-cli,
 }:
@@ -78,13 +84,7 @@ pkgs.testers.runNixOSTest {
         greeterUid     = 999;
         greeterGroup   = "halmasuit-greeter";
         compositorUid  = 998;
-        splashImage    = fixture;
-        # Splash is the BACKGROUND client (the persistent system
-        # background) — launched as the greeter.
-        greeterCommand = "${pkgs.writeShellScript "halmasuit-splash-launch" ''
-          export HALMASUIT_SPLASH_IMAGE=${fixture}
-          exec ${halmasuit-splash}/bin/halmasuit-splash
-        ''}";
+        witnessImage   = fixture;
       };
 
       # Scene clients — NOT auto-started; the testScript starts/stops
@@ -135,7 +135,7 @@ pkgs.testers.runNixOSTest {
 
     sys.path.insert(0, "${./lib}")
     os.environ["PATH"] = "${ssimulacra2-cli}/bin:" + os.environ.get("PATH", "")
-    os.environ["GOLDENS_DIR"] = "${./goldens}"
+    os.environ.setdefault("GOLDENS_DIR", "${./goldens}")
 
     import visual
 
@@ -165,9 +165,6 @@ pkgs.testers.runNixOSTest {
 
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF 'scanout_active'", timeout=30
-    )
-    machine.wait_until_succeeds(
-        "journalctl -u halmasuit | grep -qF 'halmasuit-splash: presented'", timeout=90
     )
     machine.wait_until_succeeds("busctl --system status org.halmasuit", timeout=30)
     introspect = machine.succeed(
@@ -210,8 +207,14 @@ pkgs.testers.runNixOSTest {
     time.sleep(2)
     visual.assert_matches_golden(machine, "backdrop-post-session-splash")
 
-    # ── the actual no-flash proof: continuity over the whole run ────
-    visual.assert_frame_continuity(machine)
+    # The 100%-stream no-flash proof: EVERY frame_rendered halmasuit
+    # emitted across all four scenes and the three transitions between
+    # them is checked as exact facts (clear_pixel_count==0 once the
+    # background mapped, never degenerate, backdrop mapped once and
+    # never resized), zero tolerance. This catches a transient
+    # one-frame flash at a layer transition that the sampled
+    # settled-scene goldens above cannot observe.
+    visual.assert_no_flash_stream(machine)
 
     print("visual-backdrop: ALL ASSERTIONS PASSED")
   '';

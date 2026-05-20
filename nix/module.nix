@@ -116,16 +116,17 @@ in
       '';
     };
 
-    splashImage = lib.mkOption {
+    witnessImage = lib.mkOption {
       type        = lib.types.nullOr lib.types.path;
       default     = null;
-      example     = lib.literalExpression ''./branding/wallpaper.png'';
+      example     = lib.literalExpression ''./branding/witness.png'';
       description = ''
-        Absolute path to a PNG `halmasuit-splash` paints fullscreen as
-        the system background. When set, exported to halmasuit's unit
-        environment as `HALMASUIT_SPLASH_IMAGE`; `halmasuit-splash`
-        (run as a wlr-layer-shell BACKGROUND client of halmasuit)
-        reads it. `null` runs halmasuit with no splash configured.
+        Absolute path to a PNG halmasuit composites as its bottom-most
+        internal background plane from frame 0 (epic G1/R3/R6). When
+        set, exported to halmasuit's unit environment as
+        `HALMASUIT_WITNESS_IMAGE` and decoded by halmasuit itself at
+        startup — there is no separate client. `null` runs halmasuit
+        with no witness (legacy clear-only — non-visual tests).
       '';
     };
 
@@ -399,9 +400,15 @@ in
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.
         HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
-      } // lib.optionalAttrs (cfg.splashImage != null) {
-        # Read by halmasuit-splash. See `services.halmasuit.splashImage`.
-        HALMASUIT_SPLASH_IMAGE = toString cfg.splashImage;
+      } // lib.optionalAttrs (cfg.witnessImage != null) {
+        # Decoded by halmasuit at startup as the internal witness
+        # plane. See `services.halmasuit.witnessImage`. String
+        # interpolation (NOT `toString`) so a path literal is realized
+        # into the store and is guaranteed present at this path in
+        # halmasuit's closure — `witnessImage` is self-sufficient, not
+        # reliant on some other unit pulling the file in. An absolute
+        # runtime-path string interpolates to itself unchanged.
+        HALMASUIT_WITNESS_IMAGE = "${cfg.witnessImage}";
       };
     };
    })

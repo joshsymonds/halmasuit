@@ -129,37 +129,62 @@ pub enum Event {
     /// feature (the analysis costs a GPU readback per frame, which is
     /// unacceptable in the production binary — see Epic #1 req 6/7).
     ///
-    /// Continuity invariants in `tests/visual-backdrop.nix` are
-    /// asserted over the stream of these events: after the first
-    /// background client commits, every frame must have
-    /// `mean_luminance >= 0.01` (no black frame) and, once a
-    /// BACKGROUND client has painted, `backdrop_coverage > 0.95`.
+    /// The no-flash invariant in `tests/visual-backdrop.nix` and
+    /// `tests/visual-foreground.nix` is asserted over the WHOLE stream
+    /// of these events (`visual.assert_no_flash_stream`), as EXACT
+    /// integer/boolean facts — never fuzzy aggregate float thresholds.
+    /// Anchored at FRAME 0 (epic amendment G1/R3): halmasuit
+    /// composites the witness plane internally from the first frame,
+    /// so the single `client_first_frame{role:background}` precedes
+    /// every `FrameRendered` and EVERY frame (frame 0 onward, not a
+    /// suffix) must have `clear_pixel_count == 0` (no sentinel-clear
+    /// pixel leaked through — there is no pre-client solid phase) and
+    /// `degenerate == false` (no all-clear, all-black, or
+    /// empty/dropped frame). `pixel_count` stays constant across the
+    /// whole stream (the composited target is never resized/recreated
+    /// under the live output mode).
     FrameRendered {
         /// Monotonic per-process frame counter, starting at 0 on the
         /// first composited frame.
         frame_id: u64,
-        /// Mean Rec.709 perceptual luma over the whole frame,
-        /// normalized to `0.0..=1.0`. A black frame is `~0.0`.
-        mean_luminance: f64,
-        /// Fraction of pixels (`0.0..=1.0`) that differ from the brand
-        /// clear color `#0a0014` — i.e. the share of the frame a
-        /// wl_client actually painted over halmasuit's clear.
-        backdrop_coverage: f64,
+        /// Total pixels in the composited frame readback
+        /// (`width * height`). Constant once the output mode is set;
+        /// the stream gate uses its stability to prove the backdrop
+        /// surface was not resized/recreated mid-stream.
+        pixel_count: u64,
+        /// EXACT count of pixels byte-equal to the brand clear color
+        /// `#0a0014` (the uncovered-sentinel). After the background
+        /// client's first frame this must be exactly `0`: any nonzero
+        /// count is the clear sentinel showing through — a flash.
+        clear_pixel_count: u64,
+        /// EXACT count of pixels byte-equal to pure black `#000000`.
+        /// Used to detect an all-black frame (`== pixel_count`), the
+        /// canonical flash this project exists to prevent.
+        black_pixel_count: u64,
+        /// EXACT boolean: the frame is degenerate — all clear, all
+        /// black, or empty/dropped (`pixel_count == 0`). After the
+        /// first composited frame this must be `false`. This is the
+        /// zero-tolerance flash predicate (no luminance threshold).
+        degenerate: bool,
         /// 64-bit average-hash perceptual fingerprint of the frame
-        /// (8x8 luma downscale, thresholded at the mean). Lets tests
-        /// detect "the frame stopped changing" / gross content shifts
-        /// without pixel-exact comparison.
+        /// (8x8 luma downscale, thresholded at the mean). An exact
+        /// integer; lets tests detect "the frame stopped changing" /
+        /// gross content shifts without pixel-exact comparison.
         phash: u64,
     },
-    /// The first time a wlr-layer-shell client of a given role
-    /// committed a buffer halmasuit composited. Emitted once per role
-    /// per process lifetime. Unconditional (NOT `frame_audit`-gated):
-    /// it is a cheap state-transition marker in the normal event
-    /// stream, like `GreeterSpawned`. The visual-continuity assertion
-    /// in `tests/visual-backdrop.nix` uses
-    /// `ClientFirstFrame { role: Background }` as the point from which
-    /// every subsequent `FrameRendered` must show full backdrop
-    /// coverage (Epic #1 req 11).
+    /// First composite of a given layer role. For `Background` this
+    /// is halmasuit's INTERNAL witness plane (epic amendment G1/R3) —
+    /// emitted once, before the first composited frame, since the
+    /// witness is composited from frame 0 (there is no external
+    /// background client). `Bottom`/`Top`/`Overlay` are the first
+    /// buffer a real wlr-layer-shell client of that role committed.
+    /// Emitted once per role per process lifetime. Unconditional (NOT
+    /// `frame_audit`-gated): a cheap state-transition marker, like
+    /// `GreeterSpawned`. The exact no-flash stream gate
+    /// (`visual.assert_no_flash_stream`) requires the single
+    /// `ClientFirstFrame { role: Background }` to precede every
+    /// `FrameRendered`, each of which must then have
+    /// `clear_pixel_count == 0` (Epic #1 req 11 / R3).
     ClientFirstFrame {
         /// Which layer-shell role first painted.
         role: LayerRole,
@@ -467,18 +492,51 @@ mod tests {
     }
 
     #[test]
-    fn event_frame_rendered_carries_audit_fields() {
+    fn event_frame_rendered_carries_exact_audit_fields() {
+        // The no-flash stream gate is EXACT integer/boolean facts, not
+        // fuzzy float thresholds. A frame that is 1920x1080 with three
+        // sentinel-clear pixels still present and no all-clear/all-black
+        // degeneracy must serialize those exact counts.
         let v = round_trip(&Event::FrameRendered {
             frame_id: 42,
-            mean_luminance: 0.375,
-            backdrop_coverage: 0.987,
+            pixel_count: 1920 * 1080,
+            clear_pixel_count: 3,
+            black_pixel_count: 0,
+            degenerate: false,
             phash: 0xDEAD_BEEF_0000_1234,
         });
         assert_eq!(v["event"], "frame_rendered");
         assert_eq!(v["frame_id"], 42);
-        assert_eq!(v["mean_luminance"], 0.375);
-        assert_eq!(v["backdrop_coverage"], 0.987);
+        assert_eq!(v["pixel_count"], 1920u64 * 1080);
+        assert_eq!(v["clear_pixel_count"], 3);
+        assert_eq!(v["black_pixel_count"], 0);
+        assert_eq!(v["degenerate"], false);
         assert_eq!(v["phash"], 0xDEAD_BEEF_0000_1234u64);
+        // No fuzzy aggregate floats remain on the schema.
+        assert!(v.get("mean_luminance").is_none());
+        assert!(v.get("backdrop_coverage").is_none());
+    }
+
+    #[test]
+    fn event_frame_rendered_marks_all_clear_and_all_black_degenerate() {
+        let all_clear = round_trip(&Event::FrameRendered {
+            frame_id: 0,
+            pixel_count: 256,
+            clear_pixel_count: 256,
+            black_pixel_count: 0,
+            degenerate: true,
+            phash: 0,
+        });
+        assert_eq!(all_clear["degenerate"], true);
+        let all_black = round_trip(&Event::FrameRendered {
+            frame_id: 1,
+            pixel_count: 256,
+            clear_pixel_count: 0,
+            black_pixel_count: 256,
+            degenerate: true,
+            phash: 0,
+        });
+        assert_eq!(all_black["degenerate"], true);
     }
 
     #[test]

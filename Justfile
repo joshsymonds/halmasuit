@@ -8,7 +8,7 @@ default:
 # ── Top-level gates ─────────────────────────────────────────────────────────
 
 # Full local CI gate. Run before every push.
-check: lint r14-gate test
+check: lint r14-gate vis-selftest test
 
 # R14 epic close-gate (Amendment A9 fold-in, review G3/F3): the
 # unprivileged compositor must never transitively link libpam. Exactly
@@ -27,6 +27,16 @@ r14-gate:
         exit 1
     fi
     echo "R14 close-gate OK: halmasuit (no features) links no pam-sys."
+
+# Synthetic negative-stream proof for the no-flash invariant
+# (`assert_no_flash_stream`, epic R3/R9). Runs the contract test in
+# tests/lib/visual.py with NO VM/GPU: a clean frame-0-anchored stream
+# must pass and every flaw class (incl. the frame-0-anchor
+# strengthening — a frame_rendered preceding the witness cff) must be
+# rejected. A hard gate so the load-bearing assertion can never
+# silently weaken.
+vis-selftest:
+    python3 tests/lib/visual.py
 
 # Lint everything (format + clippy + dep policy + spelling + dead deps).
 lint:
@@ -96,6 +106,10 @@ test-vm:
     echo
     echo "── visual-pidfd-revert ──"
     nix build .#checks.x86_64-linux.visual-pidfd-revert -L --print-build-logs --no-link
+    echo
+    # Real broker-launched niri, software-rendered headless (llvmpipe).
+    echo "── visual-niri-session ──"
+    nix build .#checks.x86_64-linux.visual-niri-session -L --print-build-logs --no-link
 
 # Regenerate one or all visual-test goldens. Runs the named test
 # interactively (driverInteractive), with HALMASUIT_GOLDEN_REGEN=1 and

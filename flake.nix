@@ -392,8 +392,7 @@
           # wl_client that binds wlr-layer-shell BACKGROUND, paints a
           # known solid color via wl_shm, holds. Used by
           # tests/visual-halmasuit-layer.nix to verify halmasuit
-          # composites layer-shell clients. Retired once halmasuit-splash
-          # exists (B.4).
+          # composites layer-shell clients.
           halmasuit-layer-shell-test-client = rustPlatform.buildRustPackage {
             pname   = "halmasuit-layer-shell-test-client";
             version = "0.1.0";
@@ -432,40 +431,6 @@
               description = "xdg_toplevel test client for halmasuit F1 visual gate";
               license     = pkgs.lib.licenses.asl20;
               mainProgram = "halmasuit-toplevel-test-client";
-            };
-          };
-
-          # halmasuit-splash — the real system background wl_client.
-          # wgpu (GL backend) renders the HALMASUIT_SPLASH_IMAGE PNG
-          # fullscreen on a wlr-layer-shell BACKGROUND surface. wgpu
-          # and wayland-client(dlopen) dlopen libEGL/libGL/libwayland
-          # at runtime; like halmasuit those are dropped from RPATH
-          # because nothing link-references them, so re-add them with
-          # patchelf (same treatment as the halmasuit package).
-          halmasuit-splash = rustPlatform.buildRustPackage {
-            pname   = "halmasuit-splash";
-            version = "0.1.0";
-            src     = ./.;
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-              allowBuiltinFetchGit = true;
-            };
-            cargoBuildFlags   = [ "-p" "halmasuit-splash" ];
-            nativeBuildInputs = [ pkgs.pkg-config ];
-            buildInputs       = [
-              pkgs.libxkbcommon
-              pkgs.wayland
-              pkgs.libGL
-            ];
-            doCheck = false;
-            postFixup = ''
-              patchelf --add-rpath "${pkgs.libGL}/lib:${pkgs.wayland}/lib" \
-                $out/bin/halmasuit-splash
-            '';
-            meta = {
-              description = "halmasuit system background (wgpu PNG layer-shell BACKGROUND client)";
-              license     = pkgs.lib.licenses.asl20;
-              mainProgram = "halmasuit-splash";
             };
           };
 
@@ -606,7 +571,6 @@
           inherit nixpkgs;
           halmasuit        = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session  = self.packages.x86_64-linux.halmasuit-session;
-          halmasuit-splash = self.packages.x86_64-linux.halmasuit-splash;
           ssimulacra2-cli  = self.packages.x86_64-linux.ssimulacra2-cli;
         };
         visual-backdrop = import ./tests/visual-backdrop.nix {
@@ -614,18 +578,16 @@
           inherit nixpkgs;
           halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session                   = self.packages.x86_64-linux.halmasuit-session;
-          halmasuit-splash                  = self.packages.x86_64-linux.halmasuit-splash;
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
         # Epic layer F1: real xdg_toplevel composited fullscreen
-        # over the splash background.
+        # over halmasuit's internal witness plane.
         visual-halmasuit-toplevel = import ./tests/visual-halmasuit-toplevel.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
           halmasuit                      = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session                = self.packages.x86_64-linux.halmasuit-session;
-          halmasuit-splash               = self.packages.x86_64-linux.halmasuit-splash;
           halmasuit-toplevel-test-client = self.packages.x86_64-linux.halmasuit-toplevel-test-client;
           ssimulacra2-cli                = self.packages.x86_64-linux.ssimulacra2-cli;
         };
@@ -636,9 +598,19 @@
           inherit nixpkgs;
           halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session                   = self.packages.x86_64-linux.halmasuit-session;
-          halmasuit-splash                  = self.packages.x86_64-linux.halmasuit-splash;
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
           halmasuit-toplevel-test-client    = self.packages.x86_64-linux.halmasuit-toplevel-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Epic G-layer R2/R4: the REAL niri as the broker-launched
+        # session (niri-flake pinned via nix-config; unpatched).
+        visual-niri-session = import ./tests/visual-niri-session.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
           halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
@@ -649,7 +621,6 @@
           inherit nixpkgs;
           halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
-          halmasuit-splash                  = self.packages.x86_64-linux.halmasuit-splash;
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
           halmasuit-toplevel-test-client    = self.packages.x86_64-linux.halmasuit-toplevel-test-client;
           halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
@@ -661,7 +632,6 @@
           inherit nixpkgs;
           halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
-          halmasuit-splash                  = self.packages.x86_64-linux.halmasuit-splash;
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
           halmasuit-toplevel-test-client    = self.packages.x86_64-linux.halmasuit-toplevel-test-client;
           halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;

@@ -1,8 +1,9 @@
 # tests/visual-foreground.nix — epic layer F2 gate.
 #
 # Proves the greetd-lifecycle-driven foreground swap on the REAL
-# mechanism: splash (BACKGROUND, persistent) + a layer-shell greeter
-# (halmasuit's tracked greeterCommand child) → halmasuit-vm-client
+# mechanism: halmasuit's internal witness plane (composited from
+# frame 0, persistent) + a layer-shell greeter (halmasuit's tracked
+# greeterCommand child) → halmasuit-vm-client
 # drives a real greetd full-auth → the compositor relays it to the
 # privileged halmasuit-session broker (real pam_unix) → halmasuit
 # kills the greeter and the broker forks-then-drops the session (an
@@ -11,9 +12,20 @@
 #
 # Asserts: ForegroundChanged ordering (greeter→session), halmasuit
 # PID continuous across the swap (login-flash invariant on the real
-# path), and — the point — the FrameRendered continuity invariant
-# holds across the WHOLE transition (no black frame, splash coverage
-# never lost). Snapshots gate the greeter and session scenes.
+# path), and — the point — no-flash continuity across the WHOLE
+# transition, via TWO orthogonal live gates:
+#
+#   * Per-scene sampled exact-IMAGE goldens (ssimulacra2) — the
+#     greeter scene and the post-swap session scene each compared
+#     pixel-for-pixel against their checked-in goldens (content
+#     correctness at the settled phases).
+#
+#   * The 100%-of-`frame_rendered`-stream no-flash gate
+#     (`visual.assert_no_flash_stream`) — EVERY composited frame
+#     across the real greeter→session swap checked as EXACT facts,
+#     zero tolerance. A sampled settled-scene golden cannot see a
+#     transient one-frame flash at the swap instant; the stream gate
+#     can. Both are live; neither replaces the other.
 #
 # NOTE: the session user reaching halmasuit's wayland socket is
 # arranged test-locally (group membership). The production
@@ -26,7 +38,6 @@
   nixpkgs,
   halmasuit,
   halmasuit-session,
-  halmasuit-splash,
   halmasuit-layer-shell-test-client,
   halmasuit-toplevel-test-client,
   halmasuit-vm-client,
@@ -76,35 +87,16 @@ pkgs.testers.runNixOSTest {
         greeterUid     = 999;
         greeterGroup   = "halmasuit-greeter";
         compositorUid  = 998;
+        witnessImage   = fixture;
         # The greeter: a fullscreen keyboard-interactive layer client
-        # over the splash. halmasuit's tracked child — killed on
-        # start_session.
+        # over halmasuit's internal witness plane. halmasuit's tracked
+        # child — killed on start_session.
         greeterCommand = "${pkgs.writeShellScript "halmasuit-fg-greeter" ''
           export HALMASUIT_TESTCLIENT_KEYBOARD=1
           export HALMASUIT_TESTCLIENT_LAYER=top
           export HALMASUIT_TESTCLIENT_COLOR=#2255FF
           exec ${halmasuit-layer-shell-test-client}/bin/halmasuit-layer-shell-test-client
         ''}";
-      };
-
-      # Splash: persistent BACKGROUND, independent of the greeter
-      # (must survive the greeter being killed). testScript-launched.
-      systemd.services.test-splash = {
-        description = "halmasuit F2 splash background";
-        after = [ "halmasuit.service" ];
-        serviceConfig = {
-          User  = "halmasuit-greeter";
-          Group = "halmasuit-greeter";
-          ExecStart = "${pkgs.writeShellScript "fg-splash" ''
-            export HALMASUIT_SPLASH_IMAGE=${fixture}
-            exec ${halmasuit-splash}/bin/halmasuit-splash
-          ''}";
-          Environment = [
-            "XDG_RUNTIME_DIR=/run/halmasuit"
-            "WAYLAND_DISPLAY=wayland-0"
-          ];
-          Restart = "no";
-        };
       };
 
       # The authenticated session user. The broker session-leader's
@@ -161,7 +153,7 @@ pkgs.testers.runNixOSTest {
 
     sys.path.insert(0, "${./lib}")
     os.environ["PATH"] = "${ssimulacra2-cli}/bin:" + os.environ.get("PATH", "")
-    os.environ["GOLDENS_DIR"] = "${./goldens}"
+    os.environ.setdefault("GOLDENS_DIR", "${./goldens}")
 
     import visual
 
@@ -179,11 +171,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF scanout_active", timeout=30
     )
-    # Splash first (persistent background).
-    machine.succeed("systemctl start test-splash.service")
-    machine.wait_until_succeeds(
-        "journalctl -u test-splash | grep -qF 'halmasuit-splash: presented'", timeout=90
-    )
+    # The witness plane is composited internally from frame 0.
     machine.wait_until_succeeds(
         "journalctl -u halmasuit -o cat | grep -qF client_first_frame", timeout=30
     )
@@ -237,8 +225,14 @@ pkgs.testers.runNixOSTest {
     time.sleep(1)
     visual.assert_matches_golden(machine, "foreground-session")
 
-    # The point: no black/uncovered frame across the REAL transition.
-    visual.assert_frame_continuity(machine)
+    # The point: no black/uncovered/degenerate frame ANYWHERE across
+    # the REAL greeter→session swap. Asserted over 100% of the
+    # frame_rendered stream as exact facts (clear_pixel_count==0 once
+    # the background mapped, never degenerate, backdrop mapped once and
+    # never resized), zero tolerance — catches a transient one-frame
+    # flash at the swap instant that the two sampled settled-scene
+    # goldens above cannot observe.
+    visual.assert_no_flash_stream(machine)
 
     print("visual-foreground: ALL ASSERTIONS PASSED")
   '';

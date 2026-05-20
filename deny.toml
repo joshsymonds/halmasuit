@@ -8,17 +8,7 @@ all-features = true
 version             = 2
 yanked              = "deny"
 # RustSec advisory IDs to ignore (with written justification).
-ignore = [
-  # RUSTSEC-2024-0436: `paste` is unmaintained (NOT a vulnerability —
-  # the author archived it; no security defect). It is a build-time
-  # proc-macro with zero runtime/attack surface, pulled transitively
-  # by wgpu/naga and reached ONLY by the `halmasuit-splash` client
-  # crate — never by the `halmasuit` compositor binary or the
-  # privileged `halmasuit-session` broker. No drop-in replacement is
-  # wired through
-  # wgpu/naga upstream yet. Re-evaluate when wgpu drops the dep.
-  "RUSTSEC-2024-0436",
-]
+ignore = []
 
 [licenses]
 version    = 2
