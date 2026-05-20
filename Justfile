@@ -110,6 +110,10 @@ test-vm:
     # Real broker-launched niri, software-rendered headless (llvmpipe).
     echo "── visual-niri-session ──"
     nix build .#checks.x86_64-linux.visual-niri-session -L --print-build-logs --no-link
+    echo
+    # Convergence epic R2: wl_surface.frame callbacks (no Mesa-EGL wedge).
+    echo "── visual-frame-callbacks ──"
+    nix build .#checks.x86_64-linux.visual-frame-callbacks -L --print-build-logs --no-link
 
 # Regenerate one or all visual-test goldens. Runs the named test
 # interactively (driverInteractive), with HALMASUIT_GOLDEN_REGEN=1 and

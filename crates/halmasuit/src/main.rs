@@ -207,6 +207,13 @@ struct HalmasuitState {
     /// the session client commits many frames; the introspect marker
     /// and the gate input fire on the first non-empty one only.
     session_first_frame_emitted: bool,
+    /// Compositor-monotonic baseline for `wl_callback.done(uint time)`.
+    /// `start_time.elapsed()` is `CLOCK_MONOTONIC`-by-construction, so
+    /// the timestamps we hand to `wl_surface.frame` callbacks satisfy
+    /// the spec's monotonic-non-decreasing requirement (Wayland
+    /// Appendix A). Truncated to u32 ms at the call site (~49.7-day
+    /// wrap, per the protocol wire format).
+    start_time: std::time::Instant,
 }
 
 /// Greeter identity post-spawn. The pidfd is the load-bearing
@@ -2073,6 +2080,36 @@ fn main() -> io::Result<()> {
                     {
                         tracing::warn!(error = %e, "DRM frame_submitted failed");
                     }
+                    // R2 (convergence epic): post-present frame-callback
+                    // emission. Wayland spec Appendix A `wl_surface::frame`
+                    // requires the server to notify clients when it's a
+                    // good time to draw the next frame; Mesa's
+                    // `dri2_wl_surface_throttle` (in `libEGL_mesa`) blocks
+                    // `eglSwapBuffers` until that callback arrives, so a
+                    // server that never fires wedges every EGL client on
+                    // its second swap. Walk the surfaces visible on the
+                    // just-presented output and send via smithay's
+                    // canonical helpers; explicit clones drop the
+                    // `LayerMap` guard before send_frame iterates.
+                    let time = state.start_time.elapsed();
+                    let output = state.output.clone();
+                    let layers: Vec<smithay::desktop::LayerSurface> =
+                        smithay::desktop::layer_map_for_output(&output)
+                            .layers()
+                            .cloned()
+                            .collect();
+                    for layer in &layers {
+                        layer.send_frame(&output, time, None, |_, _| Some(output.clone()));
+                    }
+                    if let Some(toplevel) = state.foreground_toplevel.as_ref() {
+                        smithay::desktop::utils::send_frames_surface_tree(
+                            toplevel.wl_surface(),
+                            &output,
+                            time,
+                            None,
+                            |_, _| Some(output.clone()),
+                        );
+                    }
                 }
                 smithay::backend::drm::DrmEvent::Error(e) => {
                     tracing::warn!(error = %e, "DRM device error");
@@ -2299,6 +2336,7 @@ fn main() -> io::Result<()> {
         session_uid: None,
         swap: swap_gate::SwapGate::new(),
         session_first_frame_emitted: false,
+        start_time: std::time::Instant::now(),
     };
 
     // The witness plane is composited from frame 0 (epic G1/R3/R6):

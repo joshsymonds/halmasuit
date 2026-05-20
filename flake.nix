@@ -614,6 +614,15 @@
           halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Convergence epic R2: wl_surface.frame callbacks fire so
+        # Mesa-EGL clients don't wedge in dri2_wl_surface_throttle.
+        visual-frame-callbacks = import ./tests/visual-frame-callbacks.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+          ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # Amendment A5.6: poll-only leader pidfd backstop — SCM_RIGHTS
         # worker→broker→compositor armed + fires on leader exit.
         visual-pidfd-revert = import ./tests/visual-pidfd-revert.nix {
