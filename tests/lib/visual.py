@@ -426,6 +426,72 @@ def assert_no_flash_stream(machine, events=None) -> None:
     )
 
 
+def record_boot(
+    machine,
+    name: str,
+    *,
+    seconds: float = 45.0,
+    fps: int = 3,
+) -> None:
+    """Diagnostic: record a headless "video" of what halmasuit
+    composites over `seconds`, by polling the offscreen `Snapshot()`
+    readback at `fps` and ffmpeg-encoding the frames into
+    ``$out/{name}.mp4`` (kept in the test's build output).
+
+    The Snapshot readback is the SAME deterministic offscreen GLES
+    path the goldens use — a faithful, headless-valid record of the
+    real composited frame stream (no QMU screendump, no GPU). Reusable
+    by ANY visual test: add ``pkgs.ffmpeg`` to the machine's
+    `environment.systemPackages` and call this from the testScript at
+    the point you want to film from. NOT an assertion — purely a
+    human-inspection artifact for diagnosing render/timing issues.
+
+    Fixed cadence is correct here: this is frame SAMPLING, not an
+    assertion race, so a sleep between frames is the right tool (it is
+    the inter-frame interval, not a wait-for-state).
+    """
+    # Frames go FLAT into GUEST_SNAPSHOT_DIR (the 0777 tmpfiles dir
+    # halmasuit-the-compositor-uid can write), NOT a subdir — a
+    # root-owned subdir is not writable by the compositor uid and
+    # every Snapshot would EACCES (this is the proven `capture()`
+    # path's directory).
+    prefix = f"{GUEST_SNAPSHOT_DIR}/vidf_{name}_"
+    frames = int(seconds * fps)
+    for i in range(frames):
+        # Best-effort: a transient Snapshot failure must not abort the
+        # capture — we want to SEE failures in the video, not crash.
+        machine.execute(
+            "busctl --system call org.halmasuit "
+            "/org/halmasuit/Debug/Introspect "
+            "org.halmasuit.Debug.Introspect Snapshot s "
+            f"{prefix}{i:05d}.png"
+        )
+        machine.sleep(1.0 / fps)
+    # How many frames actually landed (early ones fail until the
+    # Snapshot D-Bus surface is up — that's expected and tolerated;
+    # a near-zero count means the capture is meaningless, fail loudly).
+    written = int(
+        machine.succeed(f"ls -1 {prefix}*.png 2>/dev/null | wc -l").strip()
+    )
+    print(f"record_boot[{name}]: {written}/{frames} frames captured")
+    if written < max(2, frames // 10):
+        raise AssertionError(
+            f"record_boot[{name}]: only {written}/{frames} Snapshot "
+            "frames written — capture is not representative (D-Bus "
+            "never came up, or Snapshot is failing). Not encoding."
+        )
+    out = f"{GUEST_SNAPSHOT_DIR}/{name}.mp4"
+    machine.succeed(
+        f"ffmpeg -y -framerate {fps} -pattern_type glob "
+        f"-i '{prefix}*.png' -c:v libx264 -pix_fmt yuv420p "
+        f"-vf 'pad=ceil(iw/2)*2:ceil(ih/2)*2' {out} "
+        f"2>/tmp/ffmpeg_{name}.log || (cat /tmp/ffmpeg_{name}.log; false)"
+    )
+    # Lands in the test's $out (nixos-test default copy_from_vm target).
+    machine.copy_from_vm(out)
+    print(f"record_boot: wrote {name}.mp4 ({frames} frames @ {fps}fps) to $out")
+
+
 # ───────────────────────────────────────────────────────────────────
 # Synthetic negative-stream proof for `assert_no_flash_stream`.
 #
