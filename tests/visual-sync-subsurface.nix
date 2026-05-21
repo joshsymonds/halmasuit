@@ -118,30 +118,32 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF scanout_active", timeout=30
     )
-    # Initial parent toplevel mapped — client has committed parent
-    # and child surfaces once each.
+
+    # Anchor samples on the test client's own journal markers, not
+    # on wall-clock sleeps. The test client emits three log lines
+    # marking its commit-sequence phases:
+    #   - "initial mapping committed"   (parent + child first commit)
+    #   - "PHASE 2 — sync subsurface commit"   (sync-only commit)
+    #   - "PHASE 3 — parent commit"      (parent commit applies cache)
+    # Each phase boundary blocks until the client log appears, then
+    # a short settle pause lets any in-flight VBlank propagate to
+    # the introspection event stream. No timing race with the client.
+
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF "
-        "'xdg_toplevel mapped as fullscreen foreground'",
+        "'subsurface-test-client: initial mapping committed'",
         timeout=30,
     )
-
-    # The client's deterministic timeline (mirrored by the test driver
-    # below) starts ~when the client begins; 'xdg_toplevel mapped'
-    # fires shortly after the client's initial parent commit. Sleep
-    # past the initial settle and just before client's PHASE 2 commit
-    # (at client t=3s).
-    time.sleep(2)
+    time.sleep(1)
     phase1 = count_frame_rendered()
     print(f"PHASE 1 (initial mapping done): frame_rendered count = {phase1}")
 
-    # Client's PHASE 2 commit (sync subsurface only) is at client
-    # t=3s; PHASE 3 commit is at client t=12s. Record PHASE 2 at
-    # client t≈7s — well past the sync-subsurface commit, well before
-    # the parent commit. The wide gap is deliberate (eliminates
-    # race between the sync-subsurface commit's downstream effects
-    # and the test-driver's measurement).
-    time.sleep(5)
+    machine.wait_until_succeeds(
+        "journalctl -u halmasuit | grep -qF "
+        "'subsurface-test-client: PHASE 2'",
+        timeout=30,
+    )
+    time.sleep(1)
     phase2 = count_frame_rendered()
     print(f"PHASE 2 (after sync-subsurface-only commit): frame_rendered count = {phase2}")
 
@@ -157,10 +159,12 @@ pkgs.testers.runNixOSTest {
         f"parent atomic state (wl_subsurface spec)."
     )
 
-    # Client's PHASE 3 commit (parent commit, applies cached child
-    # state) is at client t=12s; we're now at client t≈7s. Wait past
-    # t=14s for the parent commit to be processed.
-    time.sleep(8)
+    machine.wait_until_succeeds(
+        "journalctl -u halmasuit | grep -qF "
+        "'subsurface-test-client: PHASE 3'",
+        timeout=30,
+    )
+    time.sleep(2)
     phase3 = count_frame_rendered()
     print(f"PHASE 3 (after parent commit): frame_rendered count = {phase3}")
 

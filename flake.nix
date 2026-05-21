@@ -458,6 +458,31 @@
             };
           };
 
+          # halmasuit-deferred-configure-test-client — observes the
+          # protocol-level timing of halmasuit's initial
+          # xdg_surface.configure (R4): raw wayland-client (no SCTK
+          # Window), drives a deterministic two-phase observation
+          # (pre-commit, post-commit) emitting two stderr markers the
+          # VM test asserts against.
+          halmasuit-deferred-configure-test-client = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-deferred-configure-test-client";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [ "-p" "halmasuit-deferred-configure-test-client" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [ pkgs.wayland ];
+            doCheck = false;
+            meta = {
+              description = "xdg-shell deferred-configure timing observer (R4)";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-deferred-configure-test-client";
+            };
+          };
+
           # ssimulacra2_rs — pure-Rust port of the SSIMULACRA2
           # perceptual image-diff metric. Used by visual VM tests as
           # the golden-comparison engine. Chosen over the C++
@@ -657,6 +682,18 @@
           halmasuit-session                = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-subsurface-test-client = self.packages.x86_64-linux.halmasuit-subsurface-test-client;
           ssimulacra2-cli                  = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Convergence epic R4: halmasuit defers the initial
+        # xdg_surface.configure to the commit handler (per xdg-shell
+        # spec: configure is sent in response to the client's first
+        # wl_surface.commit, not eagerly at xdg_toplevel creation).
+        visual-deferred-configure = import ./tests/visual-deferred-configure.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                                 = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                         = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-deferred-configure-test-client  = self.packages.x86_64-linux.halmasuit-deferred-configure-test-client;
+          ssimulacra2-cli                           = self.packages.x86_64-linux.ssimulacra2-cli;
         };
         # Amendment A5.6: poll-only leader pidfd backstop — SCM_RIGHTS
         # worker→broker→compositor armed + fires on leader exit.

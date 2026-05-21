@@ -1,0 +1,23 @@
+[package]
+name        = "halmasuit-deferred-configure-test-client"
+description = "Raw-protocol wl_client that observes the timing of the initial xdg_surface.configure relative to its own first wl_surface.commit. Used by tests/visual-deferred-configure.nix to assert R4: halmasuit defers the initial configure to the commit handler."
+
+version.workspace        = true
+edition.workspace        = true
+license.workspace        = true
+repository.workspace     = true
+authors.workspace        = true
+
+rust-version       = "1.87"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow             = "1"
+# Raw wayland-client + wayland-protocols xdg-shell client bindings.
+# Bypasses SCTK's high-level Window abstraction, which manages the
+# configure/ack handshake internally and would hide protocol-level
+# timing of the initial configure event from the test.
+wayland-client     = "0.31"
+wayland-protocols  = { version = "0.32", features = ["client"] }

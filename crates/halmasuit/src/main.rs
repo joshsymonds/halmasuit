@@ -365,156 +365,207 @@ impl CompositorHandler for HalmasuitState {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        // Advance smithay's per-surface buffer tracking state. This
-        // is what makes committed shm buffers visible to the renderer
-        // when WaylandSurfaceRenderElement is built. Without this,
-        // render_elements_from_surface_tree sees no current buffer
-        // and the surface paints nothing. Must be called on the
-        // ORIGINAL committed surface (smithay caches per-surface).
+        // Advance smithay's per-surface buffer tracking state — must
+        // be called on the ORIGINAL committed surface so smithay's
+        // per-surface cache sees the right key. Without it,
+        // `render_elements_from_surface_tree` sees no current buffer
+        // and the surface paints nothing.
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
 
-        // R3 (convergence epic): wl_subsurface contract — a
-        // synchronized subsurface's committed state is CACHED at the
-        // parent and applied only when the parent surface commits.
-        // The compositor MUST NOT make it visible before then. Skip
-        // all downstream rendering / focus / first-frame work for
-        // sync-subsurface commits; smithay holds the state until the
-        // parent's commit propagates it. (Smithay's `smallvil` is
-        // the canonical example of this pattern.)
+        // R3 (convergence epic): a synchronized subsurface's commit
+        // is CACHED at the parent and applied only when the parent
+        // commits (wl_subsurface contract). Skip downstream work —
+        // smithay holds the state until the parent's commit
+        // propagates it (smallvil pattern).
         if smithay::wayland::compositor::is_sync_subsurface(surface) {
             return;
         }
-
-        // Non-sync (root surface or a desync subsurface): walk to the
-        // root before running the rest of the handler. A commit on a
-        // desync subsurface implicitly commits the root tree, so
-        // halmasuit's compositor work (re-render, focus, first-frame
-        // detection) acts on the root.
+        // A commit on a desync subsurface implicitly commits the root
+        // tree, so all remaining work acts on the root.
         let mut root = surface.clone();
         while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
             root = parent;
         }
         let surface = &root;
 
-        // wlr-layer-shell initial configure. The spec requires the
-        // initial configure to be sent in response to the client's
-        // first commit (which carries its anchor/exclusive-zone/size
-        // requests). `arrange` here therefore sees the committed
-        // anchor state — for a fully-anchored background that yields
-        // the full output size instead of the half-output fallback
-        // `arrange` uses for unanchored zero-size surfaces.
-        {
-            let mut map = layer_map_for_output(&self.output);
-            if let Some(layer) = map
-                .layer_for_surface(surface, smithay::desktop::WindowSurfaceType::TOPLEVEL)
-                .cloned()
-            {
-                let initial_configure_sent =
-                    smithay::wayland::compositor::with_states(surface, |states| {
-                        states
-                            .data_map
-                            .get::<smithay::wayland::shell::wlr_layer::LayerSurfaceData>()
-                            .is_some_and(|d| d.lock().unwrap().initial_configure_sent)
-                    });
-                map.arrange();
-                // Release the LayerMap lock before `send_configure` /
-                // the render path below: `render_layer_elements` calls
-                // `layer_map_for_output` again on the same output and
-                // would re-borrow this same map.
-                drop(map);
-                if !initial_configure_sent {
-                    layer.layer_surface().send_configure();
-                }
+        self.send_deferred_xdg_initial_configure(surface);
+        self.handle_layer_shell_commit(surface);
+        self.maybe_emit_session_first_frame(surface);
+        self.maybe_focus_session_toplevel(surface);
+        self.repaint();
+    }
+}
 
-                // Emit `ClientFirstFrame { role }` once per layer
-                // role, the first time a surface of that role has a
-                // committed buffer halmasuit will composite. Drives
-                // the visual-backdrop continuity assertion (Epic #1
-                // req 11). Unconditional (not frame_audit-gated) — a
-                // cheap state-transition marker.
-                let has_buffer =
-                    smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
-                        s.buffer().is_some()
-                    })
-                    .unwrap_or(false);
-                if has_buffer {
-                    let role = match layer.layer() {
-                        Layer::Background => halmasuit_introspect::LayerRole::Background,
-                        Layer::Bottom => halmasuit_introspect::LayerRole::Bottom,
-                        Layer::Top => halmasuit_introspect::LayerRole::Top,
-                        Layer::Overlay => halmasuit_introspect::LayerRole::Overlay,
-                    };
-                    if self.seen_layer_roles.insert(role) {
-                        emit(&Event::ClientFirstFrame { role });
-                    }
-                    // Focus-follows-foreground (req 17): a
-                    // keyboard-interactive layer client (the greeter)
-                    // gets keyboard focus only while the foreground is
-                    // `Greeter`. After `start_session` the foreground
-                    // is `Session`, so a lingering/teardown greeter
-                    // layer never steals focus from the session.
-                    if self.foreground == halmasuit_introspect::Foreground::Greeter
-                        && layer.cached_state().keyboard_interactivity
-                            != smithay::wayland::shell::wlr_layer::KeyboardInteractivity::None
-                    {
-                        self.set_keyboard_focus(Some(surface.clone()));
-                    }
-                }
-            }
+impl HalmasuitState {
+    /// R4 (convergence epic): send the deferred initial xdg-shell
+    /// configure on the client's first commit, per xdg-shell.xml
+    /// `xdg_surface`: "The client must call wl_surface.commit ...
+    /// before it will receive the initial configure event." Smithay
+    /// canonical pattern (smallvil `handlers/xdg_shell.rs:152-189`):
+    /// inventory the xdg-shell surface, check
+    /// `is_initial_configure_sent()`, send once.
+    fn send_deferred_xdg_initial_configure(&self, surface: &WlSurface) {
+        if let Some(toplevel) = self
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .find(|t| t.wl_surface() == surface)
+            .cloned()
+            && !toplevel.is_initial_configure_sent()
+        {
+            toplevel.send_configure();
+        }
+        if let Some(popup) = self
+            .xdg_shell_state
+            .popup_surfaces()
+            .iter()
+            .find(|p| p.wl_surface() == surface)
+            .cloned()
+            && !popup.is_initial_configure_sent()
+        {
+            // Initial popup configure is always allowed (smithay only
+            // returns `NotReactive` on RE-configure of a non-reactive
+            // popup). PopupManager + positioner-driven geometry lands
+            // in R5.
+            let _ = popup.send_configure();
+        }
+    }
+
+    /// wlr-layer-shell commit work: send the deferred initial
+    /// configure (the spec requires it in response to the client's
+    /// first commit, which carries anchor/exclusive-zone/size — so
+    /// `arrange` sees the committed anchor state), arrange the layer
+    /// map, then emit `ClientFirstFrame` and apply
+    /// focus-follows-foreground on the first buffered commit per
+    /// role.
+    fn handle_layer_shell_commit(&mut self, surface: &WlSurface) {
+        let mut map = layer_map_for_output(&self.output);
+        let Some(layer) = map
+            .layer_for_surface(surface, smithay::desktop::WindowSurfaceType::TOPLEVEL)
+            .cloned()
+        else {
+            return;
+        };
+        let initial_configure_sent = smithay::wayland::compositor::with_states(surface, |states| {
+            states
+                .data_map
+                .get::<smithay::wayland::shell::wlr_layer::LayerSurfaceData>()
+                .is_some_and(|d| d.lock().unwrap().initial_configure_sent)
+        });
+        map.arrange();
+        // Release the LayerMap lock before `send_configure` and any
+        // downstream render path — `render_layer_elements` calls
+        // `layer_map_for_output` again on the same output and would
+        // re-borrow this same map.
+        drop(map);
+        if !initial_configure_sent {
+            layer.layer_surface().send_configure();
         }
 
-        // Amendment A5 key 2: the session Wayland client's first
-        // committed buffer of non-zero size. The client is identified
-        // by its SO_PEERCRED uid == `session_uid` — connection
-        // identity is NOT authority (that is PAM-derived, R8), but it
-        // IS how the compositor knows WHOSE pixels just arrived.
-        // Emit-once; feeds the two-key `SwapGate` (key 1 is the
-        // broker's `SessionOpened`). Swapping before this point would
-        // show the session "window" before it has painted — the exact
-        // flash this project deletes.
-        if !self.session_first_frame_emitted
-            && let Some(suid) = self.session_uid
-            && surface_client_uid(surface) == Some(suid)
-        {
-            let non_empty =
-                smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
-                    s.buffer_size().is_some_and(|sz| sz.w > 0 && sz.h > 0)
-                })
-                .unwrap_or(false);
-            if non_empty {
-                self.session_first_frame_emitted = true;
-                emit(&Event::SessionClientFirstFrame);
-                let a = self.swap.session_first_frame();
-                self.apply_swap_action(a);
-            }
+        let has_buffer =
+            smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
+                s.buffer().is_some()
+            })
+            .unwrap_or(false);
+        if !has_buffer {
+            return;
         }
 
-        // Focus-follows-foreground (req 17): the session's
-        // xdg_toplevel gets keyboard focus on its first buffered
-        // commit, but only once the greetd lifecycle has put the
-        // foreground in `Session` (set by the A5 swap gate) — never on
-        // connection identity alone.
+        // Emit `ClientFirstFrame { role }` once per layer role, the
+        // first time a surface of that role has a committed buffer
+        // halmasuit will composite. Drives the visual-backdrop
+        // continuity assertion (Epic #1 req 11). Cheap
+        // state-transition marker (not frame_audit-gated).
+        let role = match layer.layer() {
+            Layer::Background => halmasuit_introspect::LayerRole::Background,
+            Layer::Bottom => halmasuit_introspect::LayerRole::Bottom,
+            Layer::Top => halmasuit_introspect::LayerRole::Top,
+            Layer::Overlay => halmasuit_introspect::LayerRole::Overlay,
+        };
+        if self.seen_layer_roles.insert(role) {
+            emit(&Event::ClientFirstFrame { role });
+        }
+        // Focus-follows-foreground (req 17): a keyboard-interactive
+        // layer client (the greeter) gets keyboard focus only while
+        // the foreground is `Greeter`. After `start_session` the
+        // foreground is `Session`, so a lingering/teardown greeter
+        // layer never steals focus from the session.
+        if self.foreground == halmasuit_introspect::Foreground::Greeter
+            && layer.cached_state().keyboard_interactivity
+                != smithay::wayland::shell::wlr_layer::KeyboardInteractivity::None
+        {
+            self.set_keyboard_focus(Some(surface.clone()));
+        }
+    }
+
+    /// Amendment A5 key 2: the session Wayland client's first
+    /// committed buffer of non-zero size. The client is identified
+    /// by its SO_PEERCRED uid == `session_uid` — connection identity
+    /// is NOT authority (that is PAM-derived, R8), but it IS how the
+    /// compositor knows WHOSE pixels just arrived. Emit-once; feeds
+    /// the two-key `SwapGate` (key 1 is the broker's
+    /// `SessionOpened`). Swapping before this point would show the
+    /// session "window" before it has painted — the exact flash this
+    /// project deletes.
+    fn maybe_emit_session_first_frame(&mut self, surface: &WlSurface) {
+        if self.session_first_frame_emitted {
+            return;
+        }
+        let Some(suid) = self.session_uid else {
+            return;
+        };
+        if surface_client_uid(surface) != Some(suid) {
+            return;
+        }
+        let non_empty =
+            smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
+                s.buffer_size().is_some_and(|sz| sz.w > 0 && sz.h > 0)
+            })
+            .unwrap_or(false);
+        if !non_empty {
+            return;
+        }
+        self.session_first_frame_emitted = true;
+        emit(&Event::SessionClientFirstFrame);
+        let a = self.swap.session_first_frame();
+        self.apply_swap_action(a);
+    }
+
+    /// Focus-follows-foreground (req 17): the session's xdg_toplevel
+    /// gets keyboard focus on its first buffered commit, but only
+    /// once the greetd lifecycle has put the foreground in `Session`
+    /// (set by the A5 swap gate) — never on connection identity
+    /// alone.
+    fn maybe_focus_session_toplevel(&mut self, surface: &WlSurface) {
+        if self.foreground != halmasuit_introspect::Foreground::Session {
+            return;
+        }
+        let fg = self
+            .foreground_toplevel
+            .as_ref()
+            .map(|t| t.wl_surface().clone());
+        if fg.as_ref() != Some(surface) {
+            return;
+        }
+        let has_buffer =
+            smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
+                s.buffer().is_some()
+            })
+            .unwrap_or(false);
+        if has_buffer {
+            self.set_keyboard_focus(Some(surface.clone()));
+        }
+    }
+
+    /// Re-render the scene with the now-current buffers (synchronous
+    /// one-frame-per-commit; fine for these low-frequency scenes).
+    /// The foreground toplevel is composited above the layer
+    /// background by `render_layer_elements`.
+    fn repaint(&mut self) {
         let fg_surface = self
             .foreground_toplevel
             .as_ref()
             .map(|t| t.wl_surface().clone());
-        if self.foreground == halmasuit_introspect::Foreground::Session
-            && fg_surface.as_ref() == Some(surface)
-        {
-            let has_buffer =
-                smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
-                    s.buffer().is_some()
-                })
-                .unwrap_or(false);
-            if has_buffer {
-                self.set_keyboard_focus(Some(surface.clone()));
-            }
-        }
-
-        // Re-render the scene with the now-current buffers (synchronous
-        // one-frame-per-commit; fine for these low-frequency scenes).
-        // The foreground toplevel is composited above the layer
-        // background by `render_layer_elements`.
         if let Some(backend) = self.drm_backend.as_mut()
             && let Err(e) = backend.render_layer_elements(
                 &self.output,
@@ -609,8 +660,11 @@ impl XdgShellHandler for HalmasuitState {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         // halmasuit hosts exactly one fullscreen toplevel above the
         // splash (the greeter, then the session — F2 makes the swap
-        // greetd-driven). Configure it to the output mode, fullscreen
-        // + activated, so the client paints full-screen immediately.
+        // greetd-driven). Stage the pending state (output mode,
+        // fullscreen + activated) — the initial `xdg_surface.configure`
+        // is sent from the commit handler on the client's first
+        // wl_surface.commit, per xdg-shell spec (smithay smallvil
+        // pattern; see commit handler R4 block).
         use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
         let (w, h): (i32, i32) = self
             .output
@@ -621,7 +675,6 @@ impl XdgShellHandler for HalmasuitState {
             state.states.set(xdg_toplevel::State::Activated);
             state.states.set(xdg_toplevel::State::Fullscreen);
         });
-        surface.send_configure();
         tracing::info!(w, h, "xdg_toplevel mapped as fullscreen foreground");
         self.foreground_toplevel = Some(surface);
     }
@@ -654,11 +707,14 @@ impl XdgShellHandler for HalmasuitState {
         }
     }
 
-    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
-        tracing::debug!("new xdg_popup");
-        // Popups need a `send_configure` once we have geometry; for
-        // now ack the surface so the client doesn't stall.
-        let _ = surface.send_configure();
+    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
+        // Per xdg-shell spec the initial `xdg_popup.configure` is
+        // sent in response to the client's first wl_surface.commit
+        // (see commit handler R4 block). PopupManager wiring + full
+        // positioner-driven geometry is R5; until then halmasuit
+        // doesn't host any popup-using clients (greeter + session
+        // tree under it use toplevels + layer surfaces).
+        tracing::debug!("new xdg_popup (initial configure deferred to commit handler)");
     }
 
     fn grab(

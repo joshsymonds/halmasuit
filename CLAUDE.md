@@ -145,9 +145,37 @@ Do not relax them without explicit user direction:
   via a FIFO command file — use this when debugging a VM test, not
   bare `nix build`. The drive shape is documented inline in the
   `Justfile`.
+- **Test cost discipline.** `just check` (fast, ~30s, covers lints +
+  every unit test) is the iteration loop; `just test-vm` (slow, ~3-4
+  min per single test on a warm cache, longer for the full sweep) is
+  the comprehensive sweep and is run ONLY at task boundaries — never
+  as the inner loop for "does this change still work." The full
+  `just test-vm` sweep must keep covering as much of halmasuit's
+  surface as possible (every observable behavior worth a regression
+  gate gets a VM test), AND no individual change should trigger more
+  than one sweep — if you need to iterate, iterate on `just check` /
+  `cargo build` / a single targeted VM test, then run the full sweep
+  once when the change is settled. New per-protocol / per-contract
+  tests belong as targeted VM tests on the existing
+  `tests/visual-*.nix` pattern; new pure-Rust invariants belong as
+  unit tests in the relevant crate.
+- **TDD loop for compositor changes.** RED via the targeted VM test
+  is the right shape when the contract is protocol-observable
+  (xdg-shell configure timing, wl_surface.frame callbacks, etc.) —
+  drive it with a focused raw-protocol test client and assert via
+  introspection events / journal markers. Avoid using the full
+  `just test-vm` sweep as the RED-GREEN-loop signal; reserve it for
+  the regression sweep after the targeted test is green.
 - **Workspace lints live in `[workspace.lints]`.** Add per-crate
   `#![allow]` only with a `// reason: …` comment justifying it; do not
-  add per-crate lint overrides in `Cargo.toml` to silence noise.
+  add per-crate lint overrides in `Cargo.toml` to silence noise. The
+  bar for an allow is "this lint flags a genuine false positive on
+  this exact code, and the cost of restructuring exceeds the value of
+  the rule" — convenience under deadline doesn't clear it. Default is
+  to restructure; `try_from` over `as`, dedicated unit-state patterns
+  over `_`, extracted helpers over `too_many_lines` allows. If
+  reaching for an `#![allow]`, ask the user first — they're a
+  judgment call that survives the immediate task.
 - **Edition 2024, Rust 1.95 pin** (see `rust-toolchain.toml`). Don't
   bump the channel without coordinating; CI caches key on it.
 - **Cargo workspace, monorepo, atomic commits.** A change touching the
