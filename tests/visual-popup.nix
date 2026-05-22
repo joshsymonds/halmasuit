@@ -139,16 +139,37 @@ pkgs.testers.runNixOSTest {
     x, y, w, h = (int(v) for v in match.groups())
     print(f"parsed: x={x} y={y} w={w} h={h}")
 
-    # The CONTRACT under test (R5 / xdg-shell positioner pipeline):
-    # the popup configure MUST carry positioner-derived geometry, not
-    # zeros. Pre-fix: w=0, h=0 (halmasuit forwards default geometry).
-    # Post-fix: w>0, h>0 (smithay PopupManager + positioner-driven
-    # geometry).
+    # Contract 1 (xdg-shell positioner): popup configure carries
+    # positioner-derived geometry. Pre-fix: w=0, h=0. Post-fix: w>0,
+    # h>0. NOTE: smithay's `PopupSurface::send_configure` already
+    # consults the staged positioner state, so this alone would pass
+    # even with `PopupManager::track_popup` ripped out — see
+    # Contract 2 for the load-bearing R5 signal.
     assert w > 0 and h > 0, (
         f"R5 violated: popup configure carries zero-size geometry "
         f"({w}x{h}). halmasuit must wire the smithay PopupManager + "
         f"positioner-driven geometry pipeline so clients can map "
         f"popups."
+    )
+
+    # Contract 2 (R5 / PopupManager wiring — load-bearing): halmasuit
+    # MUST insert the popup into smithay's `PopupManager` tree on
+    # `new_popup`. The emitted marker is wired ONLY to the `Ok(())`
+    # branch of `popups.track_popup(...)` (see
+    # crates/halmasuit/src/main.rs `XdgShellHandler::new_popup`). If
+    # PopupManager is removed, this assertion fires; if track_popup
+    # fails, the warn-branch fires instead and this assertion fires.
+    # find_popup / popups.cleanup / popup-grab routing all key off
+    # this tree.
+    popup_tracked = next(
+        (l for l in journal.splitlines() if "POPUP_TRACKED:" in l),
+        None,
+    )
+    assert popup_tracked is not None, (
+        "R5 violated: halmasuit's new_popup handler did not insert "
+        "the popup into PopupManager (no POPUP_TRACKED journal line "
+        "from track_popup's Ok-branch). find_popup / cleanup / grab "
+        "routing all depend on this tree."
     )
 
     visual.assert_no_flash_stream(machine)

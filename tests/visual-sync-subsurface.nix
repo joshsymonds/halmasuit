@@ -134,6 +134,11 @@ pkgs.testers.runNixOSTest {
         "'subsurface-test-client: initial mapping committed'",
         timeout=30,
     )
+    # Quiescence pause (PHASE 1 baseline must be a stable count).
+    # MEMORY rule carve-out: state-based polling cannot prove a
+    # negative ("no more events will arrive"). 1 s is many VBlanks
+    # at 60Hz; comfortably above any commit→VBlank→introspect
+    # propagation delay.
     time.sleep(1)
     phase1 = count_frame_rendered()
     print(f"PHASE 1 (initial mapping done): frame_rendered count = {phase1}")
@@ -143,6 +148,9 @@ pkgs.testers.runNixOSTest {
         "'subsurface-test-client: PHASE 2'",
         timeout=30,
     )
+    # Quiescence pause (PHASE 2 is the must-be-flat assertion; we
+    # are asserting NO event arrives, which is fundamentally a
+    # negative — same carve-out as the PHASE 1 baseline above).
     time.sleep(1)
     phase2 = count_frame_rendered()
     print(f"PHASE 2 (after sync-subsurface-only commit): frame_rendered count = {phase2}")
@@ -164,8 +172,17 @@ pkgs.testers.runNixOSTest {
         "'subsurface-test-client: PHASE 3'",
         timeout=30,
     )
-    time.sleep(2)
-    phase3 = count_frame_rendered()
+    # State-based poll: PHASE 3 asserts a POSITIVE delta (parent
+    # commit triggers a render), so we can poll for the count to
+    # exceed phase2 rather than sleep blindly. 10s ceiling fails
+    # fast if the parent commit silently dropped.
+    deadline = time.monotonic() + 10
+    phase3 = phase2
+    while time.monotonic() < deadline:
+        phase3 = count_frame_rendered()
+        if phase3 > phase2:
+            break
+        time.sleep(0.1)
     print(f"PHASE 3 (after parent commit): frame_rendered count = {phase3}")
 
     # The POSITIVE half of the contract: a parent commit that

@@ -158,33 +158,39 @@ pkgs.testers.runNixOSTest {
         timeout=30,
     )
 
-    # SAMPLING WINDOW: 5 seconds for niri to render frames against
-    # halmasuit. With the wedge, niri parks in dri2_wl_surface_throttle
-    # after 1-2 commits and the stream stops. With the fix, niri
-    # renders continuously (its idle backdrop), halmasuit re-composites
-    # on each commit, and frame_rendered fires continuously.
-    # Let niri's initial render burst complete. With the wedge, niri
-    # commits 1-3 buffers and parks in dri2_wl_surface_throttle; without
-    # it, niri renders many frames as the callback cycle releases each
-    # swap. (niri naturally idles once its initial setup is steady —
-    # no clients of its own, no animations — which is correct
-    # compositor behavior. The CONTRACT under test is "no wedge before
-    # the third swap," NOT "rendering forever.")
-    time.sleep(5)
+    # State-based poll for ≥60 frame_rendered events. With the wedge,
+    # niri parks in dri2_wl_surface_throttle after 1-2 commits and the
+    # stream stops at 1-3 events. With the fix, niri renders many
+    # frames as the callback cycle releases each swap; 60 events
+    # arrive in well under 1.5 seconds at any reasonable refresh.
+    # 30s ceiling fails fast on the wedge; healthy paths return
+    # quickly. (niri naturally idles once its initial setup is steady
+    # — no clients of its own, no animations — which is correct
+    # compositor behavior. The CONTRACT under test is "no wedge
+    # before the third swap," NOT "rendering forever.")
+    def count_frame_rendered() -> int:
+        return sum(
+            1 for e in visual.introspect_events(machine)
+            if e["event"] == "frame_rendered"
+        )
+    machine.wait_until_succeeds(
+        # `wait_until_succeeds` polls a shell command. We need to
+        # execute the Python predicate in the host's Python — use the
+        # `lambda` form via a tiny inline check.
+        "true", timeout=1,  # noop probe; actual poll is the loop below
+    )
+    deadline = time.monotonic() + 30
+    total = 0
+    while time.monotonic() < deadline:
+        total = count_frame_rendered()
+        if total >= 60:
+            break
+        time.sleep(0.25)  # 4Hz poll — well below the 60Hz frame rate
+    print(f"frame_rendered events observed: {total}")
 
-    frame_events = [
-        e for e in visual.introspect_events(machine)
-        if e["event"] == "frame_rendered"
-    ]
-    total = len(frame_events)
-    print(f"frame_rendered events at 5s after niri started: {total}")
-
-    # Pre-fix: 1-3 events (wedge at second swap). Post-fix: dozens to
-    # hundreds. 60 is comfortably above the wedge ceiling and below
-    # any reasonable post-fix floor.
     assert total >= 60, (
         f"wl_surface.frame callbacks not firing: only {total} "
-        f"frame_rendered events 5s after niri started (expected ≥60). "
+        f"frame_rendered events after 30s wait (expected ≥60). "
         f"Mesa-EGL clients are wedging in dri2_wl_surface_throttle."
     )
 

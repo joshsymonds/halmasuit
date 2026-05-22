@@ -1,18 +1,33 @@
 // halmasuit — Linux system compositor.
 //
-// v2 Phase A spine. This binary lives from `multi-user.target` to shutdown
-// and will host greeter + session as nested wl_clients. Today it brings
-// up smithay's Wayland-server event loop, binds a Wayland socket, and
-// advertises foundational protocol globals: `wl_compositor`,
-// `wl_subcompositor`, `xdg_wm_base`, `wl_seat`, `wl_output`, `wl_shm`.
-// Connecting clients can create surfaces, top-levels, software buffers,
-// and discover inputs/outputs. Scanout is via a dumb-buffer clear color
-// (`#0a0014` brand purple); the GLES + DrmCompositor renderer is a
-// subsequent subtask. The advertised wl_output stays at a synthesized
-// 1920×1080@60Hz placeholder until smithay's output state is wired to
-// real DRM mode info (also a subsequent subtask). Additional globals
-// (`linux-dmabuf-v1`, `presentation-time`, `ext-session-lock-v1`, …)
-// land later. See ARCHITECTURE.md.
+// Long-lived display-server process owning the GPU from
+// `graphical.target` to shutdown. Hosts the greeter and the user
+// session as nested wayland clients of itself, replacing greetd
+// entirely. The convergence epic (#12) made halmasuit's protocol
+// surface conformant for arbitrary Qt 6 + GTK 4 toolkits:
+//
+//   wayland.xml core (6):   wl_compositor, wl_subcompositor, wl_shm,
+//                           wl_output, wl_seat (kbd/ptr/touch),
+//                           wl_data_device_manager
+//   stable (5):             xdg_wm_base, wp_viewporter, wp_presentation,
+//                           zwp_linux_dmabuf_v1, zwp_tablet_manager_v2
+//   unstable (4):           zxdg_output_manager_v1, zxdg_exporter_v2,
+//                           zwp_pointer_gestures_v1,
+//                           zwp_primary_selection_device_manager_v1
+//   staging (5):            xdg_activation_v1, wp_fractional_scale_v1,
+//                           wp_cursor_shape_manager_v1, xdg_wm_dialog_v1,
+//                           xdg_toplevel_icon_manager_v1
+//   Qt parity (2):          zxdg_decoration_manager_v1,
+//                           zwp_text_input_manager_v3
+//   GTK parity (3):         zwp_idle_inhibit_manager_v1,
+//                           zwp_keyboard_shortcuts_inhibit_manager_v1,
+//                           wp_single_pixel_buffer_manager_v1
+//   wlr family (1):         zwlr_layer_shell_v1
+//
+// Render path: GLES + DrmCompositor via smithay. Output mode is the
+// real DRM mode from the kernel; on the SKIP/no-DRM test bypass a
+// synthesized 1280×800@60 Hz placeholder stands in. See
+// ARCHITECTURE.md for the full design and roadmap.
 
 mod broker_relay;
 mod broker_session;
@@ -35,6 +50,7 @@ use std::time::Duration;
 
 use calloop::generic::Generic;
 use calloop::signals::{Signal, Signals};
+use calloop::timer::{TimeoutAction, Timer};
 // calloop's `Mode` and smithay's `output::Mode` collide; rename calloop's
 // to keep the smithay one as `Mode` (used more often).
 use calloop::{
@@ -141,6 +157,20 @@ struct HalmasuitState {
     /// rendered — clients' `set_cursor` succeeds (no protocol error)
     /// but no visible cursor appears.
     cursor_status: CursorImageStatus,
+    /// Cached output mode (width, height in logical pixels).
+    /// `Output::current_mode()` is an Arc-locked lookup; pointer +
+    /// touch input handlers call it at libinput event rate (up to
+    /// 1000/s for gaming mice) for clamping / absolute-coord
+    /// transform. v1's output mode is fixed at startup (no hot-plug),
+    /// so caching here removes the lock from every input event. The
+    /// `(1280, 800)` default mirrors the SKIP/no-DRM bypass mode.
+    output_size: (i32, i32),
+    /// Cached VBlank refresh period derived once from the output's
+    /// `current_mode()`. Recomputing `1_000_000_000_000 / refresh_mhz`
+    /// every VBlank closure runs is wasteful and pointless — the mode
+    /// is stable across the compositor's lifetime in v1. Used by the
+    /// presentation-feedback `Refresh::fixed(...)` payload.
+    refresh_period: std::time::Duration,
     /// `wp_viewporter` state (Phase B). Smithay handles all the
     /// crop+scale logic via the protocol's own state; this field
     /// just owns the global. Both Qt 6 and GTK 4 bind viewporter
@@ -438,9 +468,8 @@ impl HalmasuitState {
         &self,
         pos: smithay::utils::Point<f64, smithay::utils::Logical>,
     ) -> smithay::utils::Point<f64, smithay::utils::Logical> {
-        let (w, h) = self.output.current_mode().map_or((1280_f64, 800_f64), |m| {
-            (f64::from(m.size.w), f64::from(m.size.h))
-        });
+        let (w_i, h_i) = self.output_size;
+        let (w, h) = (f64::from(w_i), f64::from(h_i));
         smithay::utils::Point::from((pos.x.clamp(0.0, w), pos.y.clamp(0.0, h)))
     }
 
@@ -472,10 +501,7 @@ impl HalmasuitState {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
-        let (w, h) = self
-            .output
-            .current_mode()
-            .map_or((1280_i32, 800_i32), |m| (m.size.w, m.size.h));
+        let (w, h) = self.output_size;
         let location = evt.position_transformed((w, h).into());
         let focus = self.pointer_focus();
         pointer.motion(
@@ -525,7 +551,13 @@ impl HalmasuitState {
                 .relative_direction(Axis::Horizontal, evt.relative_direction(Axis::Horizontal))
                 .value(Axis::Horizontal, h);
             if let Some(d) = evt.amount_v120(Axis::Horizontal) {
-                #[allow(clippy::cast_possible_truncation)]
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "wl_pointer.axis_v120 is i32 per protocol; smithay's libinput \
+                              backend returns f64 but the source is an integer scancode \
+                              from the kernel evdev REL_WHEEL_HI_RES axis, always small \
+                              and well within i32"
+                )]
                 let discrete = d as i32;
                 frame = frame.v120(Axis::Horizontal, discrete);
             }
@@ -535,7 +567,13 @@ impl HalmasuitState {
                 .relative_direction(Axis::Vertical, evt.relative_direction(Axis::Vertical))
                 .value(Axis::Vertical, v);
             if let Some(d) = evt.amount_v120(Axis::Vertical) {
-                #[allow(clippy::cast_possible_truncation)]
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "wl_pointer.axis_v120 is i32 per protocol; smithay's libinput \
+                              backend returns f64 but the source is an integer scancode \
+                              from the kernel evdev REL_WHEEL_HI_RES axis, always small \
+                              and well within i32"
+                )]
                 let discrete = d as i32;
                 frame = frame.v120(Axis::Vertical, discrete);
             }
@@ -567,10 +605,7 @@ impl HalmasuitState {
         let Some(touch) = self.seat.get_touch() else {
             return;
         };
-        let (w, h) = self
-            .output
-            .current_mode()
-            .map_or((1280_i32, 800_i32), |m| (m.size.w, m.size.h));
+        let (w, h) = self.output_size;
         let location = evt.position_transformed((w, h).into());
         let focus = self.pointer_focus();
         touch.down(
@@ -609,10 +644,7 @@ impl HalmasuitState {
         let Some(touch) = self.seat.get_touch() else {
             return;
         };
-        let (w, h) = self
-            .output
-            .current_mode()
-            .map_or((1280_i32, 800_i32), |m| (m.size.w, m.size.h));
+        let (w, h) = self.output_size;
         let location = evt.position_transformed((w, h).into());
         let focus = self.pointer_focus();
         touch.motion(
@@ -1111,8 +1143,21 @@ impl XdgShellHandler for HalmasuitState {
             state.geometry = positioner.get_geometry();
             state.positioner = positioner;
         });
-        if let Err(e) = self.popups.track_popup(PopupKind::Xdg(surface)) {
-            tracing::warn!(error = %e, "PopupManager::track_popup failed");
+        match self.popups.track_popup(PopupKind::Xdg(surface)) {
+            Ok(()) => {
+                // R5 observable: visual-popup.nix grep's for this exact
+                // string to assert PopupManager has accepted the popup
+                // into its tracking tree. Without `track_popup`, smithay's
+                // `PopupSurface::send_configure` still answers from the
+                // staged positioner state — so a "configure geometry was
+                // non-zero" assertion would pass even with track_popup
+                // ripped out. The marker here is the load-bearing R5
+                // signal: it is emitted ONLY on successful track_popup,
+                // and find_popup / popups.cleanup / popup-grab routing
+                // all depend on the surface being in this tree.
+                tracing::info!("POPUP_TRACKED: PopupManager::track_popup ok");
+            }
+            Err(e) => tracing::warn!(error = %e, "PopupManager::track_popup failed"),
         }
     }
 
@@ -1240,24 +1285,22 @@ impl smithay::wayland::tablet_manager::TabletSeatHandler for HalmasuitState {}
 // `ServerSide` — its single fullscreen toplevel needs no decoration,
 // and `ServerSide` means "no client-side draws contribute either"
 // (which is what fullscreen-greeter / fullscreen-session want).
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 impl smithay::wayland::shell::xdg::decoration::XdgDecorationHandler for HalmasuitState {
     fn new_decoration(&mut self, toplevel: smithay::wayland::shell::xdg::ToplevelSurface) {
-        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
-        toplevel.with_pending_state(|s| s.decoration_mode = Some(Mode::ServerSide));
+        toplevel.with_pending_state(|s| s.decoration_mode = Some(DecorationMode::ServerSide));
         toplevel.send_pending_configure();
     }
     fn request_mode(
         &mut self,
         toplevel: smithay::wayland::shell::xdg::ToplevelSurface,
-        _mode: smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode,
+        _mode: DecorationMode,
     ) {
-        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
-        toplevel.with_pending_state(|s| s.decoration_mode = Some(Mode::ServerSide));
+        toplevel.with_pending_state(|s| s.decoration_mode = Some(DecorationMode::ServerSide));
         toplevel.send_pending_configure();
     }
     fn unset_mode(&mut self, toplevel: smithay::wayland::shell::xdg::ToplevelSurface) {
-        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
-        toplevel.with_pending_state(|s| s.decoration_mode = Some(Mode::ServerSide));
+        toplevel.with_pending_state(|s| s.decoration_mode = Some(DecorationMode::ServerSide));
         toplevel.send_pending_configure();
     }
 }
@@ -1466,8 +1509,23 @@ impl std::os::fd::AsFd for BorrowedBrokerFd {
                   loop_handle.remove(broker_token) (A8.2)."
     )]
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        // SAFETY: see the #[expect] reason — the fd is live for as long
-        // as this source is registered (A8.2 teardown ordering).
+        // SAFETY: `self.0` is a live OS fd for the duration of any
+        // call to this method. Soundness:
+        //  - The sole `OwnedFd` for this fd lives in
+        //    `ConnState::episode`'s broker `SeqpacketChannel` (A6: one
+        //    owner per episode).
+        //  - calloop only ever invokes `as_fd()` on this borrow during
+        //    epoll register/reregister/unregister; it never calls
+        //    `close(2)` on a `BorrowedFd`.
+        //  - The `RegistrationToken` for this source is removed via
+        //    `loop_handle.remove(broker_token)` BEFORE the owning
+        //    `OwnedFd` drops at end-of-episode (A8.2 teardown order).
+        //  - No `dup`/`Rc`/`Arc` of this fd exists anywhere (A8.3),
+        //    so no race where another path closes it early can occur.
+        // Consequence: the fd referenced by `self.0` is valid every
+        // time `as_fd()` runs, satisfying `BorrowedFd::borrow_raw`'s
+        // contract that the caller guarantees fd validity for the
+        // returned `BorrowedFd<'_>`'s lifetime.
         unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0) }
     }
 }
@@ -1493,8 +1551,23 @@ impl std::os::fd::AsFd for BorrowedLeaderPidfd {
                   (A8.2)."
     )]
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        // SAFETY: see the #[expect] reason — the fd is live as long as
-        // this source is registered (A8.2 teardown ordering).
+        // SAFETY: `self.0` is a live OS pidfd for the duration of any
+        // call to this method. Soundness:
+        //  - The sole `OwnedFd` for this pidfd lives in
+        //    `ConnState::leader_pidfd`, received once from the broker
+        //    via SCM_RIGHTS on `SessionOpened` (A5.6).
+        //  - calloop only ever invokes `as_fd()` on this borrow during
+        //    epoll register/reregister/unregister; it never calls
+        //    `close(2)` on a `BorrowedFd`.
+        //  - The one-shot calloop callback returns `PostAction::Remove`
+        //    on EPOLLIN, deregistering the source BEFORE the owning
+        //    `OwnedFd` is dropped (A8.2). Full-teardown paths also
+        //    remove the token before dropping `ConnState`.
+        //  - The compositor only ever EPOLL-WATCHES this pidfd; it
+        //    never `waitid`/`pidfd_send_signal`s it (R9/A5 — broker is
+        //    the sole reaper). The borrow's read-only nature combined
+        //    with A8.2 teardown order keeps the underlying fd valid
+        //    for every `as_fd()` call.
         unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0) }
     }
 }
@@ -2845,12 +2918,8 @@ fn main() -> io::Result<()> {
                             |_, _| kind,
                         );
                     }
-                    let refresh_mhz = output.current_mode().map_or(60_000_i32, |m| m.refresh);
-                    #[allow(clippy::cast_sign_loss)]
-                    let refresh_period = std::time::Duration::from_nanos(
-                        1_000_000_000_000_u64 / (refresh_mhz.max(1) as u64),
-                    );
-                    let refresh = smithay::wayland::presentation::Refresh::fixed(refresh_period);
+                    let refresh =
+                        smithay::wayland::presentation::Refresh::fixed(state.refresh_period);
                     state.presentation_seq = state.presentation_seq.wrapping_add(1);
                     feedback.presented::<_, smithay::utils::Monotonic>(
                         time,
@@ -3025,10 +3094,10 @@ fn main() -> io::Result<()> {
     // what halmasuit's start_time / VBlank timestamps use, so the
     // client's `presented` event timestamps are directly comparable
     // to its other monotonic samples.
-    #[allow(clippy::cast_sign_loss)]
     let presentation_state = smithay::wayland::presentation::PresentationState::new::<HalmasuitState>(
         &display_handle,
-        libc::CLOCK_MONOTONIC as u32,
+        u32::try_from(libc::CLOCK_MONOTONIC)
+            .expect("CLOCK_MONOTONIC is c_int=1 on Linux; fits u32"),
     );
 
     let mut dmabuf_state = smithay::wayland::dmabuf::DmabufState::new();
@@ -3147,6 +3216,25 @@ fn main() -> io::Result<()> {
         )
         .map_err(io::Error::other)?;
 
+    // R5 fallback: PopupManager cleanup runs from the DRM VBlank
+    // handler at ~60Hz on the production path. The SKIP/no-DRM test
+    // bypass has no VBlank source, so without this timer popups
+    // would accumulate across the compositor's lifetime if a client
+    // creates+disconnects without destroying them. The timer is
+    // always-armed (production AND SKIP); on production the VBlank
+    // path still does the dominant per-frame cleanup, this timer is
+    // a coarse safety net. 1 s cadence is well below any visible-
+    // popup lifetime; cleanup() over an empty tree is O(1).
+    loop_handle
+        .insert_source(
+            Timer::from_duration(Duration::from_secs(1)),
+            |_deadline, (), state: &mut HalmasuitState| {
+                state.popups.cleanup();
+                TimeoutAction::ToDuration(Duration::from_secs(1))
+            },
+        )
+        .map_err(|e| io::Error::other(format!("insert popup-cleanup timer: {e}")))?;
+
     // greetd socket setup. Production: NixOS module sets
     // HALMASUIT_GREETD_SOCKET to `/run/halmasuit/greetd.sock` and
     // HALMASUIT_GREETER_UID to the greeter system user's uid.
@@ -3187,6 +3275,19 @@ fn main() -> io::Result<()> {
         None
     };
 
+    // Cache output-mode-derived constants once; the mode is stable
+    // across the compositor's lifetime in v1 (no hot-plug), so input
+    // and VBlank hot paths read these cached values rather than
+    // re-locking `output.current_mode()` per event/frame.
+    let output_size = output
+        .current_mode()
+        .map_or((1280_i32, 800_i32), |m| (m.size.w, m.size.h));
+    let refresh_period = std::time::Duration::from_nanos(
+        1_000_000_000_000_u64
+            / u64::try_from(output.current_mode().map_or(60_000, |m| m.refresh).max(1))
+                .expect("refresh clamped to >=1"),
+    );
+
     let mut state = HalmasuitState {
         running: true,
         display_handle,
@@ -3203,6 +3304,8 @@ fn main() -> io::Result<()> {
         _presentation_state: presentation_state,
         presentation_seq: 0,
         cursor_status: CursorImageStatus::default_named(),
+        output_size,
+        refresh_period,
         _viewporter_state: viewporter_state,
         _fractional_scale_state: fractional_scale_state,
         _single_pixel_buffer_state: single_pixel_buffer_state,

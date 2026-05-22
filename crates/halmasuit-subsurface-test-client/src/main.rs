@@ -28,8 +28,13 @@
 // tree). Not production code.
 
 #![deny(unsafe_code)]
-#![allow(clippy::struct_field_names)]
-#![allow(clippy::cast_possible_wrap)]
+#![allow(
+    clippy::struct_field_names,
+    reason = "test-client `State` has multiple parent_* / sub_* dimension \
+              fields that share the parent/sub prefix; renaming to \
+              avoid the prefix clash would hurt readability for a \
+              throwaway protocol probe"
+)]
 
 use std::time::{Duration, Instant};
 
@@ -191,7 +196,8 @@ struct State {
 
 impl State {
     fn paint_parent(&mut self, color: [u8; 4]) {
-        let (w, h) = (self.parent_width as i32, self.parent_height as i32);
+        let w = i32::try_from(self.parent_width).expect("test-driver-set width fits i32");
+        let h = i32::try_from(self.parent_height).expect("test-driver-set height fits i32");
         let stride = w * 4;
         let (buffer, canvas) = self
             .pool

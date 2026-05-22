@@ -206,7 +206,13 @@ struct State {
     live: Vec<LiveResource>,
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "variants are RAII keep-alives for wayland-client resources \
+              (wl_shm_pool, wl_buffer); constructed and held by the State \
+              vec but never read — destructor running on State drop is \
+              the entire point"
+)]
 enum LiveResource {
     Pool(wl_shm_pool::WlShmPool),
     Buffer(wl_buffer::WlBuffer),
