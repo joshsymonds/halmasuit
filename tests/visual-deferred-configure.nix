@@ -243,6 +243,25 @@ pkgs.testers.runNixOSTest {
         f"Observed line: {feedback_line!r}"
     )
 
+    # PHASE 6 (Phase B - wp_viewporter): VIEWPORTER_GLOBAL_BOUND
+    # MUST be true. Qt 6 and GTK 4 both bind viewporter for HiDPI
+    # fractional-scale composition / subsurface scaling. Smithay
+    # provides ViewporterState; advertising is one line on halmasuit's
+    # side. Failure here means the global is missing from registry.
+    viewporter_line = next(
+        (line for line in journal.splitlines()
+         if "VIEWPORTER_GLOBAL_BOUND:" in line),
+        None,
+    )
+    assert viewporter_line is not None, (
+        "VIEWPORTER_GLOBAL_BOUND not observed in halmasuit journal."
+    )
+    print(f"PHASE 6: {viewporter_line.strip()}")
+    assert "VIEWPORTER_GLOBAL_BOUND: true" in viewporter_line, (
+        f"wp_viewporter not advertised. Observed line: "
+        f"{viewporter_line!r}"
+    )
+
     # No black/uncovered/degenerate frame across the run — the
     # witness threads continuously underneath. R4+R6 must NOT regress
     # the no-flash invariant.

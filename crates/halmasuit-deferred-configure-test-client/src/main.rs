@@ -48,6 +48,7 @@ use wayland_client::{
 };
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1;
 use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
+use wayland_protocols::wp::viewporter::client::wp_viewporter;
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 const SURFACE_W: u32 = 128;
@@ -82,6 +83,12 @@ fn main() -> anyhow::Result<()> {
         .bind::<wp_presentation::WpPresentation, _, _>(&qh, 1..=2, ())
         .ok();
     eprintln!("PRESENTATION_GLOBAL_BOUND: {}", presentation.is_some());
+    // Phase B: probe wp_viewporter. Bind succeeds if halmasuit
+    // advertised the global.
+    let viewporter_bound = globals
+        .bind::<wp_viewporter::WpViewporter, _, _>(&qh, 1..=1, ())
+        .is_ok();
+    eprintln!("VIEWPORTER_GLOBAL_BOUND: {viewporter_bound}");
 
     let wl_surface = compositor.create_surface(&qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&wl_surface, &qh, ());
@@ -449,5 +456,17 @@ impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ()> for State {
         ) {
             state.set(OBS_PRESENTATION_FEEDBACK);
         }
+    }
+}
+
+impl Dispatch<wp_viewporter::WpViewporter, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &wp_viewporter::WpViewporter,
+        _: wp_viewporter::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
     }
 }

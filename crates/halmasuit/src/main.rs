@@ -141,6 +141,11 @@ struct HalmasuitState {
     /// rendered — clients' `set_cursor` succeeds (no protocol error)
     /// but no visible cursor appears.
     cursor_status: CursorImageStatus,
+    /// `wp_viewporter` state (Phase B). Smithay handles all the
+    /// crop+scale logic via the protocol's own state; this field
+    /// just owns the global. Both Qt 6 and GTK 4 bind viewporter
+    /// for HiDPI fractional-scale composition / subsurface scaling.
+    _viewporter_state: smithay::wayland::viewporter::ViewporterState,
     /// Layer roles for which `Event::ClientFirstFrame` has already
     /// been emitted (emit-once-per-role). The visual-backdrop
     /// continuity assertion keys off the first
@@ -1027,6 +1032,7 @@ impl smithay::wayland::dmabuf::DmabufHandler for HalmasuitState {
 }
 smithay::delegate_dmabuf!(HalmasuitState);
 smithay::delegate_presentation!(HalmasuitState);
+smithay::delegate_viewporter!(HalmasuitState);
 
 impl BufferHandler for HalmasuitState {
     fn buffer_destroyed(
@@ -2564,6 +2570,12 @@ fn main() -> io::Result<()> {
     // SKIP path (no renderer) we don't advertise the global at all
     // (advertising a global we can't serve is the
     // `linux-dmabuf-v1`-lie anti-pattern the epic codifies).
+    // Phase B: wp_viewporter — crop+scale-to-output (subsurface
+    // scaling, HiDPI fractional-scale composition). Both Qt 6 and
+    // GTK 4 bind this; smithay handles all the per-surface logic.
+    let viewporter_state =
+        smithay::wayland::viewporter::ViewporterState::new::<HalmasuitState>(&display_handle);
+
     // R9 (convergence): wp_presentation global. CLOCK_MONOTONIC is
     // what halmasuit's start_time / VBlank timestamps use, so the
     // client's `presented` event timestamps are directly comparable
@@ -2746,6 +2758,7 @@ fn main() -> io::Result<()> {
         _presentation_state: presentation_state,
         presentation_seq: 0,
         cursor_status: CursorImageStatus::default_named(),
+        _viewporter_state: viewporter_state,
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
         popups: PopupManager::default(),
