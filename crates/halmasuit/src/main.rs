@@ -57,7 +57,7 @@ use smithay::backend::session::libseat::LibSeatSession;
 use smithay::desktop::layer_map_for_output;
 use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::keyboard::FilterResult;
-use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
+use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
@@ -133,6 +133,14 @@ struct HalmasuitState {
     /// Monotonic counter for the presentation `sequence` field —
     /// increments once per VBlank. R9.
     presentation_seq: u64,
+    /// Cursor image state — the latest `wl_pointer.set_cursor` from
+    /// the focused client. R8b tracks this; R8b-render will
+    /// composite the `Surface` variant as an overlay above the
+    /// foreground tree at `PointerHandle::current_location()` minus
+    /// the surface's hotspot. Today the field is set but not
+    /// rendered — clients' `set_cursor` succeeds (no protocol error)
+    /// but no visible cursor appears.
+    cursor_status: CursorImageStatus,
     /// Layer roles for which `Event::ClientFirstFrame` has already
     /// been emitted (emit-once-per-role). The visual-backdrop
     /// continuity assertion keys off the first
@@ -962,9 +970,23 @@ impl SeatHandler for HalmasuitState {
     }
 
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&Self::KeyboardFocus>) {
-        // Focus tracking lands when there are multiple foreground
-        // clients to switch between. Phase A hosts at most one
-        // wl_client at a time.
+        // R7 (convergence epic): full focus_changed expands this to
+        // update data-device / primary-selection / text-input focus
+        // atomically with keyboard focus. Those subsystems are not
+        // yet implemented (Phase B), so R7 is currently a no-op
+        // beyond the keyboard path. When Phase B brings those
+        // protocols online, replicate anvil's pattern: call
+        // `set_data_device_focus` / `set_primary_selection_focus` /
+        // text-input focus update here.
+    }
+
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        // R8b (convergence epic): track the latest cursor surface.
+        // Visible-cursor rendering is the R8b-render follow-up; for
+        // now we accept and store the request so clients don't get
+        // protocol errors and so the future render path has the
+        // data it needs.
+        self.cursor_status = image;
     }
 }
 
@@ -2723,6 +2745,7 @@ fn main() -> io::Result<()> {
         _dmabuf_global: dmabuf_global,
         _presentation_state: presentation_state,
         presentation_seq: 0,
+        cursor_status: CursorImageStatus::default_named(),
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
         popups: PopupManager::default(),
