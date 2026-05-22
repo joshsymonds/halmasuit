@@ -57,7 +57,10 @@ use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_manager_v2;
 use wayland_protocols::wp::viewporter::client::wp_viewporter;
 use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1;
+use wayland_protocols::xdg::dialog::v1::client::xdg_wm_dialog_v1;
+use wayland_protocols::xdg::foreign::zv2::client::{zxdg_exporter_v2, zxdg_importer_v2};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols::xdg::toplevel_icon::v1::client::xdg_toplevel_icon_manager_v1;
 
 const SURFACE_W: u32 = 128;
 const SURFACE_H: u32 = 128;
@@ -298,6 +301,27 @@ fn probe_phase_b_globals(globals: &wayland_client::globals::GlobalList, qh: &Que
                 _,
                 _,
             >(qh, 1..=1, ())
+            .is_ok()
+    );
+    // xdg-foreign-v2 advertises two globals (exporter + importer). Both
+    // must be bindable — `XDG_FOREIGN_GLOBAL_BOUND` reflects the AND.
+    let exporter_ok = globals
+        .bind::<zxdg_exporter_v2::ZxdgExporterV2, _, _>(qh, 1..=1, ())
+        .is_ok();
+    let importer_ok = globals
+        .bind::<zxdg_importer_v2::ZxdgImporterV2, _, _>(qh, 1..=1, ())
+        .is_ok();
+    eprintln!("XDG_FOREIGN_GLOBAL_BOUND: {}", exporter_ok && importer_ok);
+    eprintln!(
+        "XDG_WM_DIALOG_GLOBAL_BOUND: {}",
+        globals
+            .bind::<xdg_wm_dialog_v1::XdgWmDialogV1, _, _>(qh, 1..=1, ())
+            .is_ok()
+    );
+    eprintln!(
+        "XDG_TOPLEVEL_ICON_GLOBAL_BOUND: {}",
+        globals
+            .bind::<xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1, _, _>(qh, 1..=1, ())
             .is_ok()
     );
 }
@@ -633,6 +657,54 @@ impl Dispatch<zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInh
         _: &mut Self,
         _: &zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
         _: zwp_keyboard_shortcuts_inhibit_manager_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zxdg_exporter_v2::ZxdgExporterV2, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &zxdg_exporter_v2::ZxdgExporterV2,
+        _: zxdg_exporter_v2::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zxdg_importer_v2::ZxdgImporterV2, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &zxdg_importer_v2::ZxdgImporterV2,
+        _: zxdg_importer_v2::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<xdg_wm_dialog_v1::XdgWmDialogV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &xdg_wm_dialog_v1::XdgWmDialogV1,
+        _: xdg_wm_dialog_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1,
+        _: xdg_toplevel_icon_manager_v1::Event,
         (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,

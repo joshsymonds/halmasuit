@@ -185,6 +185,23 @@ struct HalmasuitState {
     /// no-ops. `pub`(crate) because the handler returns a `&mut`.
     keyboard_shortcuts_inhibit_state:
         smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState,
+    /// `xdg_foreign_v2` state (Phase B). KDE / GNOME settings panels
+    /// and dialog-spawning toolkit code use this to export/import
+    /// toplevel handles across processes. halmasuit hosts a single
+    /// fullscreen toplevel per phase so cross-client embedding is
+    /// inert in v1; smithay tracks handles via the handler's
+    /// `xdg_foreign_state()` accessor.
+    xdg_foreign_state: smithay::wayland::xdg_foreign::XdgForeignState,
+    /// `xdg_wm_dialog_v1` state (Phase B). GTK 4 / Qt 6 use this to
+    /// mark a toplevel as a modal/non-modal dialog. halmasuit takes
+    /// no action on the hint — smithay's default no-op
+    /// `dialog_hint_changed` is fine.
+    _xdg_dialog_state: smithay::wayland::shell::xdg::dialog::XdgDialogState,
+    /// `xdg_toplevel_icon_manager_v1` state (Phase B). Modern Qt 6 /
+    /// GTK 4 set toplevel icons via this protocol. halmasuit shows
+    /// no titlebars or task list in v1 so the icon is unused; smithay
+    /// caches the request, default no-op `set_icon` handler is fine.
+    _xdg_toplevel_icon_manager: smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager,
     /// Layer roles for which `Event::ClientFirstFrame` has already
     /// been emitted (emit-once-per-role). The visual-backdrop
     /// continuity assertion keys off the first
@@ -1148,6 +1165,28 @@ impl smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitHandl
     }
 }
 smithay::delegate_keyboard_shortcuts_inhibit!(HalmasuitState);
+
+// Phase B: xdg_foreign_v2 — cross-client toplevel handle export/import.
+// halmasuit hosts one fullscreen toplevel per phase so cross-client
+// embedding is inert in v1; smithay tracks handle bookkeeping.
+impl smithay::wayland::xdg_foreign::XdgForeignHandler for HalmasuitState {
+    fn xdg_foreign_state(&mut self) -> &mut smithay::wayland::xdg_foreign::XdgForeignState {
+        &mut self.xdg_foreign_state
+    }
+}
+smithay::delegate_xdg_foreign!(HalmasuitState);
+
+// Phase B: xdg_wm_dialog_v1 — GTK 4 / Qt 6 mark toplevels as
+// modal/non-modal dialogs via this. halmasuit takes no action on the
+// hint; smithay's default no-op `dialog_hint_changed` is fine.
+impl smithay::wayland::shell::xdg::dialog::XdgDialogHandler for HalmasuitState {}
+smithay::delegate_xdg_dialog!(HalmasuitState);
+
+// Phase B: xdg_toplevel_icon_manager_v1 — toolkits set toplevel icons
+// via this protocol. halmasuit shows no titlebars/task list in v1;
+// smithay caches the request, default no-op `set_icon` is fine.
+impl smithay::wayland::xdg_toplevel_icon::XdgToplevelIconHandler for HalmasuitState {}
+smithay::delegate_xdg_toplevel_icon!(HalmasuitState);
 
 impl BufferHandler for HalmasuitState {
     fn buffer_destroyed(
@@ -2738,6 +2777,23 @@ fn main() -> io::Result<()> {
         smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState::new::<
             HalmasuitState,
         >(&display_handle);
+    // Phase B: xdg_foreign_v2 — cross-client toplevel handle
+    // export/import. v1 hosts one fullscreen toplevel per phase so
+    // embedding is inert; smithay tracks handle bookkeeping.
+    let xdg_foreign_state =
+        smithay::wayland::xdg_foreign::XdgForeignState::new::<HalmasuitState>(&display_handle);
+    // Phase B: xdg_wm_dialog_v1 — GTK 4 / Qt 6 mark dialog toplevels
+    // via this. halmasuit takes no action on the hint.
+    let xdg_dialog_state = smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<
+        HalmasuitState,
+    >(&display_handle);
+    // Phase B: xdg_toplevel_icon_manager_v1 — toolkits attach icons
+    // to toplevels via this protocol. halmasuit shows no titlebar/
+    // task list in v1; icon is cached but unused.
+    let xdg_toplevel_icon_manager =
+        smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager::new::<HalmasuitState>(
+            &display_handle,
+        );
 
     // R9 (convergence): wp_presentation global. CLOCK_MONOTONIC is
     // what halmasuit's start_time / VBlank timestamps use, so the
@@ -2930,6 +2986,9 @@ fn main() -> io::Result<()> {
         xdg_activation_state,
         _idle_inhibit_state: idle_inhibit_state,
         keyboard_shortcuts_inhibit_state,
+        xdg_foreign_state,
+        _xdg_dialog_state: xdg_dialog_state,
+        _xdg_toplevel_icon_manager: xdg_toplevel_icon_manager,
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
         popups: PopupManager::default(),
