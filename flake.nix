@@ -742,6 +742,20 @@
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
           ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # R13(b) keystroke auth arc via a minimal Qt6 Widgets greeter
+        # that uses xdg-toplevel (NOT wlr-layer-shell). Same load-bearing
+        # assertion as visual-dankgreeter-auth (Qt6 keystrokes → broker
+        # → real pam_unix → real niri session) but routes around the
+        # Round-4b Qt+wlr-layer-shell blockage by using a Qt protocol
+        # surface (xdg-toplevel) that QtWayland fully supports.
+        visual-qt6-greeter-auth = import ./tests/visual-qt6-greeter-auth.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit          = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session  = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli    = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # Convergence epic R2: wl_surface.frame callbacks fire so
         # Mesa-EGL clients don't wedge in dri2_wl_surface_throttle.
         visual-frame-callbacks = import ./tests/visual-frame-callbacks.nix {

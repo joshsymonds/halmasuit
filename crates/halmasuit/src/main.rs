@@ -1132,14 +1132,24 @@ impl XdgShellHandler for HalmasuitState {
         self.output.leave(surface.wl_surface());
 
         if self.foreground_toplevel.as_ref() == Some(&surface) {
-            // Post-`spawned` the foreground toplevel IS the session
-            // client (its toplevel replaced the greeter's in
-            // `new_toplevel`); its destruction = the session Wayland
-            // client disconnected — Amendment A5.5 revert trigger (the
-            // authoritative signal is still the broker's `SessionEnded`
-            // frame; whichever arrives first reverts, the gate makes
-            // the other inert).
-            let was_session = self.session_uid.is_some();
+            // The destroyed toplevel was the foreground. If it
+            // belongs to the SESSION client (matched via SO_PEERCRED
+            // uid == session_uid), it's the A5.5 revert trigger —
+            // the session Wayland client disconnected, and the
+            // authoritative signal (broker's `SessionEnded`) will
+            // arrive too (whichever first reverts, the gate makes
+            // the other inert). If the surface belongs to the
+            // greeter (different uid), this is just the greeter
+            // exiting at the swap point — already-paired with
+            // session_first_frame elsewhere; do NOT call
+            // session_client_gone (which would inappropriately
+            // disarm the swap gate while session_opened or
+            // session_first_frame is still pending).
+            let surface_uid = surface_client_uid(surface.wl_surface());
+            let was_session = match (self.session_uid, surface_uid) {
+                (Some(sid), Some(suid)) => sid == suid,
+                _ => false,
+            };
             self.foreground_toplevel = None;
             // The foreground is gone — clear keyboard focus and
             // re-composite so the layers beneath (splash) reappear
