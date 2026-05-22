@@ -218,6 +218,15 @@ struct HalmasuitState {
     /// because `PrimarySelectionHandler::primary_selection_state`
     /// returns `&mut`.
     primary_selection_state: smithay::wayland::selection::primary_selection::PrimarySelectionState,
+    /// `zwp_text_input_manager_v3` state (Phase B — third and final
+    /// focus-bearing protocol). Qt-mandatory IME protocol. halmasuit
+    /// hosts no input-method server (input-method-v2 is out of the
+    /// 25-protocol scope), so clients that bind text-input-v3 won't
+    /// get IM service — but they bind successfully, can call
+    /// `enable`/`disable`, and the compositor tracks focus through
+    /// `TextInputSeat::text_input().set_focus(...)`. Stored as a
+    /// field (anvil discards) so the global's lifetime is explicit.
+    _text_input_manager_state: smithay::wayland::text_input::TextInputManagerState,
     /// Layer roles for which `Event::ClientFirstFrame` has already
     /// been emitted (emit-once-per-role). The visual-backdrop
     /// continuity assertion keys off the first
@@ -1047,15 +1056,16 @@ impl SeatHandler for HalmasuitState {
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&Self::KeyboardFocus>) {
-        // R7 (convergence epic): focus_changed updates EVERY focus
-        // subsystem atomically with keyboard focus. Currently wired:
+        // R7 (convergence epic) — COMPLETE. focus_changed updates
+        // every focus subsystem atomically with keyboard focus:
         //   - data-device (selection/clipboard owner)
         //   - primary-selection (X11-style middle-click buffer)
-        // Pending (will join here as each lands):
-        //   - text-input-v3 focus
-        // Pattern is anvil's: derive the kernel-validated Client from
-        // the focused WlSurface and pass it through to each focus
-        // setter.
+        //   - text-input-v3 (IME focus; clients see enter/leave)
+        // The data-device and primary-selection setters take a
+        // kernel-validated Client (resolved from the focused
+        // WlSurface). text-input takes the surface directly via the
+        // seat's lazily-initialized TextInputHandle.
+        use smithay::wayland::text_input::TextInputSeat;
         let client = focused.and_then(|surface| self.display_handle.get_client(surface.id()).ok());
         smithay::wayland::selection::data_device::set_data_device_focus(
             &self.display_handle,
@@ -1067,6 +1077,7 @@ impl SeatHandler for HalmasuitState {
             seat,
             client,
         );
+        seat.text_input().set_focus(focused.cloned());
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
@@ -1253,6 +1264,13 @@ impl smithay::wayland::selection::primary_selection::PrimarySelectionHandler for
     }
 }
 smithay::delegate_primary_selection!(HalmasuitState);
+
+// Phase B: zwp_text_input_manager_v3 — Qt-mandatory IME protocol.
+// No explicit handler trait; the delegate macro provides all dispatch.
+// halmasuit hosts no input-method-v2 server, so text-input clients
+// bind successfully and track focus via TextInputHandle in seat
+// user_data, but never receive preedit/commit events.
+smithay::delegate_text_input_manager!(HalmasuitState);
 
 impl BufferHandler for HalmasuitState {
     fn buffer_destroyed(
@@ -2876,6 +2894,13 @@ fn main() -> io::Result<()> {
         smithay::wayland::selection::primary_selection::PrimarySelectionState::new::<HalmasuitState>(
             &display_handle,
         );
+    // Phase B: zwp_text_input_manager_v3 — Qt-mandatory IME protocol.
+    // No input-method-v2 paired (out of scope), so clients bind and
+    // track focus but receive no preedit/commit_string events. Per-
+    // seat TextInputHandle is lazily inserted into Seat user_data on
+    // first GetTextInput request.
+    let text_input_manager_state =
+        smithay::wayland::text_input::TextInputManagerState::new::<HalmasuitState>(&display_handle);
 
     // R9 (convergence): wp_presentation global. CLOCK_MONOTONIC is
     // what halmasuit's start_time / VBlank timestamps use, so the
@@ -3073,6 +3098,7 @@ fn main() -> io::Result<()> {
         _xdg_toplevel_icon_manager: xdg_toplevel_icon_manager,
         data_device_state,
         primary_selection_state,
+        _text_input_manager_state: text_input_manager_state,
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
         popups: PopupManager::default(),

@@ -58,6 +58,7 @@ use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_prese
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_device_manager_v1;
 use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1;
 use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_manager_v2;
+use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3;
 use wayland_protocols::wp::viewporter::client::wp_viewporter;
 use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1;
@@ -242,9 +243,21 @@ fn attach_solid_buffer(
 }
 
 /// Phase B advertise-and-delegate global probes — one journal
-/// marker per global so the VM test can grep for each. Extracted
-/// from `main` to keep it under the 100-line clippy ceiling.
+/// marker per global so the VM test can grep for each. Themed splits
+/// keep each function under the 100-line clippy ceiling and group
+/// related protocols (visual / input / xdg-shell extensions /
+/// selection-and-IME) together.
 fn probe_phase_b_globals(globals: &wayland_client::globals::GlobalList, qh: &QueueHandle<State>) {
+    probe_phase_b_visual_globals(globals, qh);
+    probe_phase_b_input_globals(globals, qh);
+    probe_phase_b_xdg_globals(globals, qh);
+    probe_phase_b_selection_globals(globals, qh);
+}
+
+fn probe_phase_b_visual_globals(
+    globals: &wayland_client::globals::GlobalList,
+    qh: &QueueHandle<State>,
+) {
     eprintln!(
         "VIEWPORTER_GLOBAL_BOUND: {}",
         globals
@@ -267,6 +280,12 @@ fn probe_phase_b_globals(globals: &wayland_client::globals::GlobalList, qh: &Que
             )
             .is_ok()
     );
+}
+
+fn probe_phase_b_input_globals(
+    globals: &wayland_client::globals::GlobalList,
+    qh: &QueueHandle<State>,
+) {
     eprintln!(
         "POINTER_GESTURES_GLOBAL_BOUND: {}",
         globals
@@ -277,18 +296,6 @@ fn probe_phase_b_globals(globals: &wayland_client::globals::GlobalList, qh: &Que
         "TABLET_MANAGER_GLOBAL_BOUND: {}",
         globals
             .bind::<zwp_tablet_manager_v2::ZwpTabletManagerV2, _, _>(qh, 1..=1, ())
-            .is_ok()
-    );
-    eprintln!(
-        "XDG_DECORATION_GLOBAL_BOUND: {}",
-        globals
-            .bind::<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _, _>(qh, 1..=1, ())
-            .is_ok()
-    );
-    eprintln!(
-        "XDG_ACTIVATION_GLOBAL_BOUND: {}",
-        globals
-            .bind::<xdg_activation_v1::XdgActivationV1, _, _>(qh, 1..=1, ())
             .is_ok()
     );
     eprintln!(
@@ -305,6 +312,24 @@ fn probe_phase_b_globals(globals: &wayland_client::globals::GlobalList, qh: &Que
                 _,
                 _,
             >(qh, 1..=1, ())
+            .is_ok()
+    );
+}
+
+fn probe_phase_b_xdg_globals(
+    globals: &wayland_client::globals::GlobalList,
+    qh: &QueueHandle<State>,
+) {
+    eprintln!(
+        "XDG_DECORATION_GLOBAL_BOUND: {}",
+        globals
+            .bind::<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _, _>(qh, 1..=1, ())
+            .is_ok()
+    );
+    eprintln!(
+        "XDG_ACTIVATION_GLOBAL_BOUND: {}",
+        globals
+            .bind::<xdg_activation_v1::XdgActivationV1, _, _>(qh, 1..=1, ())
             .is_ok()
     );
     // xdg-foreign-v2 advertises two globals (exporter + importer). Both
@@ -328,6 +353,12 @@ fn probe_phase_b_globals(globals: &wayland_client::globals::GlobalList, qh: &Que
             .bind::<xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1, _, _>(qh, 1..=1, ())
             .is_ok()
     );
+}
+
+fn probe_phase_b_selection_globals(
+    globals: &wayland_client::globals::GlobalList,
+    qh: &QueueHandle<State>,
+) {
     eprintln!(
         "WL_DATA_DEVICE_MANAGER_GLOBAL_BOUND: {}",
         globals
@@ -342,6 +373,12 @@ fn probe_phase_b_globals(globals: &wayland_client::globals::GlobalList, qh: &Que
                 _,
                 _,
             >(qh, 1..=1, ())
+            .is_ok()
+    );
+    eprintln!(
+        "TEXT_INPUT_GLOBAL_BOUND: {}",
+        globals
+            .bind::<zwp_text_input_manager_v3::ZwpTextInputManagerV3, _, _>(qh, 1..=1, ())
             .is_ok()
     );
 }
@@ -751,6 +788,18 @@ impl Dispatch<zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDevice
         _: &mut Self,
         _: &zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
         _: zwp_primary_selection_device_manager_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_text_input_manager_v3::ZwpTextInputManagerV3, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &zwp_text_input_manager_v3::ZwpTextInputManagerV3,
+        _: zwp_text_input_manager_v3::Event,
         (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,

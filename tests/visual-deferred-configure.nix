@@ -261,6 +261,7 @@ pkgs.testers.runNixOSTest {
         "XDG_TOPLEVEL_ICON_GLOBAL_BOUND",
         "WL_DATA_DEVICE_MANAGER_GLOBAL_BOUND",
         "PRIMARY_SELECTION_GLOBAL_BOUND",
+        "TEXT_INPUT_GLOBAL_BOUND",
     ):
         line = next(
             (l for l in journal.splitlines() if f"{marker}:" in l),
