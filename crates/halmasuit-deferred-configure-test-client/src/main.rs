@@ -53,6 +53,7 @@ use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_prese
 use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1;
 use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_manager_v2;
 use wayland_protocols::wp::viewporter::client::wp_viewporter;
+use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1;
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
@@ -273,6 +274,12 @@ fn probe_phase_b_globals(globals: &wayland_client::globals::GlobalList, qh: &Que
         "XDG_DECORATION_GLOBAL_BOUND: {}",
         globals
             .bind::<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _, _>(qh, 1..=1, ())
+            .is_ok()
+    );
+    eprintln!(
+        "XDG_ACTIVATION_GLOBAL_BOUND: {}",
+        globals
+            .bind::<xdg_activation_v1::XdgActivationV1, _, _>(qh, 1..=1, ())
             .is_ok()
     );
 }
@@ -570,6 +577,18 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for State
         _: &mut Self,
         _: &zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
         _: zxdg_decoration_manager_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<xdg_activation_v1::XdgActivationV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &xdg_activation_v1::XdgActivationV1,
+        _: xdg_activation_v1::Event,
         (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,

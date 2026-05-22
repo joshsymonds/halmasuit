@@ -253,6 +253,7 @@ pkgs.testers.runNixOSTest {
         "POINTER_GESTURES_GLOBAL_BOUND",
         "TABLET_MANAGER_GLOBAL_BOUND",
         "XDG_DECORATION_GLOBAL_BOUND",
+        "XDG_ACTIVATION_GLOBAL_BOUND",
     ):
         line = next(
             (l for l in journal.splitlines() if f"{marker}:" in l),

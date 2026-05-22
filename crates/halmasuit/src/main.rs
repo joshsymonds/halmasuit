@@ -167,6 +167,13 @@ struct HalmasuitState {
     /// we always answer `ServerSide` (= "no decoration is the
     /// server's contribution"; client also draws none).
     _xdg_decoration_state: smithay::wayland::shell::xdg::decoration::XdgDecorationState,
+    /// `xdg_activation_v1` state (Phase B). Qt 6 / GTK 4 use this
+    /// to ask for window activation. halmasuit's foreground is
+    /// driven by the greeter→session lifecycle, not by client
+    /// activation requests — we accept tokens (default) and
+    /// log+ignore the activation requests themselves. Field is
+    /// `pub`(crate) because the handler returns a `&mut` to it.
+    xdg_activation_state: smithay::wayland::xdg_activation::XdgActivationState,
     /// Layer roles for which `Event::ClientFirstFrame` has already
     /// been emitted (emit-once-per-role). The visual-backdrop
     /// continuity assertion keys off the first
@@ -1090,6 +1097,24 @@ impl smithay::wayland::shell::xdg::decoration::XdgDecorationHandler for Halmasui
     }
 }
 smithay::delegate_xdg_decoration!(HalmasuitState);
+
+impl smithay::wayland::xdg_activation::XdgActivationHandler for HalmasuitState {
+    fn activation_state(&mut self) -> &mut smithay::wayland::xdg_activation::XdgActivationState {
+        &mut self.xdg_activation_state
+    }
+    fn request_activation(
+        &mut self,
+        _token: smithay::wayland::xdg_activation::XdgActivationToken,
+        _token_data: smithay::wayland::xdg_activation::XdgActivationTokenData,
+        _surface: WlSurface,
+    ) {
+        // halmasuit's foreground is greeter→session lifecycle driven.
+        // Client activation requests are accepted (token tracked) but
+        // do not switch focus or surface visibility in v1.
+        tracing::debug!("xdg_activation: request_activation (ignored in v1)");
+    }
+}
+smithay::delegate_xdg_activation!(HalmasuitState);
 
 impl BufferHandler for HalmasuitState {
     fn buffer_destroyed(
@@ -2661,6 +2686,13 @@ fn main() -> io::Result<()> {
     let xdg_decoration_state = smithay::wayland::shell::xdg::decoration::XdgDecorationState::new::<
         HalmasuitState,
     >(&display_handle);
+    // Phase B: xdg_activation_v1 — Qt 6 / GTK 4 use this for
+    // window activation requests. halmasuit's foreground is
+    // greeter→session lifecycle driven; we accept tokens (smithay
+    // default) and log+ignore activations.
+    let xdg_activation_state = smithay::wayland::xdg_activation::XdgActivationState::new::<
+        HalmasuitState,
+    >(&display_handle);
 
     // R9 (convergence): wp_presentation global. CLOCK_MONOTONIC is
     // what halmasuit's start_time / VBlank timestamps use, so the
@@ -2850,6 +2882,7 @@ fn main() -> io::Result<()> {
         _pointer_gestures_state: pointer_gestures_state,
         _tablet_manager_state: tablet_manager_state,
         _xdg_decoration_state: xdg_decoration_state,
+        xdg_activation_state,
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
         popups: PopupManager::default(),
