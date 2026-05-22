@@ -111,6 +111,11 @@ test-vm:
     echo "── visual-niri-session ──"
     nix build .#checks.x86_64-linux.visual-niri-session -L --print-build-logs --no-link
     echo
+    # R13 forcing function: real DMS DankGreeter (Quickshell+Qt6) as
+    # halmasuit's greeter over the witness, no-flash invariant intact.
+    echo "── visual-dankgreeter ──"
+    nix build .#checks.x86_64-linux.visual-dankgreeter -L --print-build-logs --no-link
+    echo
     # Convergence epic R2: wl_surface.frame callbacks (no Mesa-EGL wedge).
     echo "── visual-frame-callbacks ──"
     nix build .#checks.x86_64-linux.visual-frame-callbacks -L --print-build-logs --no-link
