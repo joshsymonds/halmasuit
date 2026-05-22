@@ -713,15 +713,35 @@
         # R13(b) — currently NOT a gated check. visual-dankgreeter-auth
         # exists in tests/ as a documented attempt at the G3 keystroke
         # arc by running Quickshell directly against halmasuit (no
-        # greeter-niri in the chain). The test gets further than the
-        # niri-nested path — Quickshell launches, maps an Overlay
-        # wlr-layer-shell surface, renders the DMS UI — but injected
-        # keystrokes still do not visibly reach the DMS QML
-        # TextFields. The deeper investigation is tracked in Task #37
-        # and is outside this epic's halmasuit-code scope (the
-        # downstream chain is Qt's wl_keyboard handling /
-        # Quickshell's QML focus / DMS's input bindings, all
-        # upstream). Re-add this check once R13(b) is resolved.
+        # greeter-niri in the chain). Diagnostic traces during the
+        # Round-4 investigation proved:
+        #
+        #   1. halmasuit's libinput receives every injected QEMU
+        #      keystroke.
+        #   2. halmasuit observes DMS's wlr-layer-shell Overlay
+        #      surface with `keyboard_interactivity = Exclusive`,
+        #      foreground = Greeter, and correctly calls
+        #      set_keyboard_focus on that surface (`LAYER_SHELL_KI_
+        #      OBSERVED` trace fired every commit at ~60Hz).
+        #   3. Despite halmasuit setting the wl_keyboard focus on
+        #      Quickshell's layer surface, injected keystrokes do
+        #      not visibly reach the DMS QML TextFields — the
+        #      composited phash stays static through the keystroke
+        #      window.
+        #
+        # The break is upstream of halmasuit, specifically in
+        # Qt's QtWayland platform plugin OR Quickshell's
+        # WlrLayershell integration — both of which are upstream
+        # (not in the user's fork inventory) and forbidden by
+        # CLAUDE.md's no-patch-upstream rule. Re-add this check
+        # once R13(b) is resolved.
+        visual-dankgreeter-auth = import ./tests/visual-dankgreeter-auth.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+          ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # Convergence epic R2: wl_surface.frame callbacks fire so
         # Mesa-EGL clients don't wedge in dri2_wl_surface_throttle.
         visual-frame-callbacks = import ./tests/visual-frame-callbacks.nix {
