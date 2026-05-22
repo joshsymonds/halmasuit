@@ -157,6 +157,20 @@ struct HalmasuitState {
     /// rendered — clients' `set_cursor` succeeds (no protocol error)
     /// but no visible cursor appears.
     cursor_status: CursorImageStatus,
+    /// P1 (review-round-3): coalesce per-commit repaints.
+    /// `commit()` is called once per `wl_surface.commit` — a single
+    /// logical frame from a Qt/GTK client commonly fires 10+ commits
+    /// (root + N subsurfaces + cursor + popups). Pre-fix the commit
+    /// handler synchronously called `repaint()` each time, burning
+    /// the GPU on a tree that wouldn't update visibly until the next
+    /// VBlank anyway. Now the commit handler just sets this flag;
+    /// the main loop drains it once between dispatch and
+    /// flush_clients, doing one repaint per dispatch cycle regardless
+    /// of how many commits arrived. Swap / layer-destroy /
+    /// toplevel-destroy still render synchronously because those are
+    /// rare visible-state transitions that benefit from immediate
+    /// feedback.
+    frame_pending: bool,
     /// Cached output mode (width, height in logical pixels).
     /// `Output::current_mode()` is an Arc-locked lookup; pointer +
     /// touch input handlers call it at libinput event rate (up to
@@ -793,7 +807,10 @@ impl CompositorHandler for HalmasuitState {
         self.handle_layer_shell_commit(surface);
         self.maybe_emit_session_first_frame(surface);
         self.maybe_focus_foreground_toplevel(surface);
-        self.repaint();
+        // P1: coalesce per-commit repaints. The main loop drains
+        // `frame_pending` once per dispatch cycle, doing one repaint
+        // per N commits instead of N repaints. See the field doc.
+        self.frame_pending = true;
     }
 }
 
@@ -816,13 +833,28 @@ impl HalmasuitState {
     fn send_deferred_xdg_initial_configure(&mut self, surface: &WlSurface) {
         self.popups.commit(surface);
 
-        if let Some(toplevel) = self
-            .xdg_shell_state
-            .toplevel_surfaces()
-            .iter()
-            .find(|t| t.wl_surface() == surface)
-            .cloned()
-            && !toplevel.is_initial_configure_sent()
+        // P3: O(1) toplevel-role + initial-configure-sent check via
+        // the surface's data map, before the O(N)
+        // toplevel_surfaces().iter().find — which is the only place
+        // we can recover the `ToplevelSurface` to call
+        // `send_configure()`. The common case (post-initial-configure
+        // commits) short-circuits at the data-map check; the rare
+        // case (first commit of a toplevel) does one linear scan
+        // (over the in-scope toplevel count, currently 1 in v1).
+        let needs_initial_configure =
+            smithay::wayland::compositor::with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                    .is_some_and(|d| !d.lock().unwrap().initial_configure_sent)
+            });
+        if needs_initial_configure
+            && let Some(toplevel) = self
+                .xdg_shell_state
+                .toplevel_surfaces()
+                .iter()
+                .find(|t| t.wl_surface() == surface)
+                .cloned()
         {
             toplevel.send_configure();
         }
@@ -2872,6 +2904,19 @@ fn main() -> io::Result<()> {
                     // canonical helpers; explicit clones drop the
                     // `LayerMap` guard before send_frame iterates.
                     let time = state.start_time.elapsed();
+                    // P2 (review-round-3): the per-VBlank allocations
+                    // below are bounded by design:
+                    //  - `Vec<LayerSurface>::collect()` size ≤ 4
+                    //    (Layer enum cardinality: Background / Bottom
+                    //    / Top / Overlay). One heap alloc / 16 ms.
+                    //  - `output.clone()` is an Arc bump (~50 ns).
+                    //    Per-surface invocations inside the closures
+                    //    below are bounded by the foreground tree
+                    //    size; smithay's `Output` is internally
+                    //    Arc-counted.
+                    // Explicit collect-then-iter drops the LayerMap
+                    // guard before `send_frame` runs (re-entering the
+                    // LayerMap inside send_frame would deadlock).
                     let output = state.output.clone();
                     let layers: Vec<smithay::desktop::LayerSurface> =
                         smithay::desktop::layer_map_for_output(&output)
@@ -3304,6 +3349,7 @@ fn main() -> io::Result<()> {
         _presentation_state: presentation_state,
         presentation_seq: 0,
         cursor_status: CursorImageStatus::default_named(),
+        frame_pending: false,
         output_size,
         refresh_period,
         _viewporter_state: viewporter_state,
@@ -3445,6 +3491,13 @@ fn main() -> io::Result<()> {
             event_loop
                 .dispatch(Some(Duration::from_millis(16)), &mut state)
                 .map_err(io::Error::other)?;
+            // P1: drain coalesced commit-driven repaints. Many
+            // wl_surface.commits in one dispatch cycle (root +
+            // subsurfaces + popups) become a single repaint here.
+            if state.frame_pending {
+                state.frame_pending = false;
+                state.repaint();
+            }
             state
                 .display_handle
                 .flush_clients()
