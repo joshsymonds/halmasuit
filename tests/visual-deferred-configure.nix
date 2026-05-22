@@ -1,7 +1,6 @@
-# tests/visual-deferred-configure.nix — convergence epic R4: regression
-# test for deferred initial xdg_surface.configure.
+# tests/visual-deferred-configure.nix — convergence epic R4 + R6.
 #
-# xdg-shell spec (xdg-shell.xml, `xdg_surface`): "The client must call
+# R4 contract (xdg-shell.xml, `xdg_surface`): "The client must call
 # wl_surface.commit ... before it will receive the initial configure
 # event." The compositor sends the initial configure in response to
 # the client's first wl_surface.commit on the surface — NOT eagerly
@@ -11,26 +10,30 @@
 # initial configure once on first matching commit (smallvil pattern at
 # `~/.cargo/git/checkouts/smithay-*/ff5fa7d/smallvil/src/handlers/xdg_shell.rs:152-189`).
 #
+# R6 contract (wayland.xml, `wl_surface::enter`): the server emits
+# `wl_surface.enter` when a surface enters an output, so the client
+# can pick buffer scale / transform / frame timing for that output.
+# Pre-R6: halmasuit emitted enter for layer-shell surfaces (via
+# `LayerMap::arrange`) but NOT for xdg-toplevels — multi-output-aware
+# clients and HiDPI-aware toolkits (Qt 6, GTK 4) defaulted to wrong
+# scale.
+#
 # The gate: `halmasuit-deferred-configure-test-client` is a raw-protocol
 # wl_client (no SCTK Window abstraction — that auto-acks the
-# configure, which would mask the contract). It drives two phase
-# observations to stderr:
+# configure, which would mask the contract). It drives:
 #
 #   PHASE 1 — after xdg_toplevel creation, before any wl_surface.commit:
 #     emits `DEFERRED_CONFIGURE_PHASE1: configure_received=<bool>`
-#     CONTRACT: must be `false` (a conformant compositor has not
-#     yet sent the initial configure — it's waiting for the client's
-#     first commit per spec).
+#     R4 CONTRACT: must be `false`.
 #
 #   PHASE 2 — after the first empty wl_surface.commit:
 #     emits `DEFERRED_CONFIGURE_PHASE2: configure_received=<bool>`
-#     CONTRACT: must be `true` (the deferred initial configure
-#     fires now, in response to the client's first commit).
+#     R4 CONTRACT: must be `true`.
 #
-# The test driver greps the test client's stderr (via the journal of
-# halmasuit, which captures its child's stderr) and asserts both
-# contracts hold. No `frame_audit`, no goldens — protocol-conformance
-# only.
+#   PHASE 3 — after ACK + buffered commit + roundtrip:
+#     emits `SURFACE_ENTER_OBSERVED: <bool>`
+#     R6 CONTRACT: must be `true` (halmasuit called `Output::enter`
+#     on the toplevel and the client received `wl_surface.enter`).
 
 {
   system,
@@ -122,19 +125,19 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF scanout_active", timeout=30
     )
-    # The test client emits both phase markers very quickly (no
-    # network IO, single roundtrip each). Wait for the PHASE 2
-    # marker — the slower one — which signals the full observation
-    # is done.
+    # The test client emits all three markers very quickly (no
+    # network IO, single roundtrip each). Wait for the SURFACE_ENTER
+    # marker — the last one — which signals the full observation is
+    # done.
     machine.wait_until_succeeds(
-        "journalctl -u halmasuit | grep -qF DEFERRED_CONFIGURE_PHASE2",
+        "journalctl -u halmasuit | grep -qF SURFACE_ENTER_OBSERVED",
         timeout=30,
     )
 
     journal = machine.succeed("journalctl -u halmasuit --no-pager")
 
-    # PHASE 1: configure_received MUST be false (compositor MUST NOT
-    # send initial configure before client's first commit).
+    # PHASE 1 (R4): configure_received MUST be false (compositor MUST
+    # NOT send initial configure before client's first commit).
     phase1_line = next(
         (line for line in journal.splitlines()
          if "DEFERRED_CONFIGURE_PHASE1:" in line),
@@ -153,7 +156,7 @@ pkgs.testers.runNixOSTest {
         f"commit. Observed line: {phase1_line!r}"
     )
 
-    # PHASE 2: configure_received MUST be true (deferred initial
+    # PHASE 2 (R4): configure_received MUST be true (deferred initial
     # configure fires in response to the first commit).
     phase2_line = next(
         (line for line in journal.splitlines()
@@ -170,8 +173,26 @@ pkgs.testers.runNixOSTest {
         f"will hang. Observed line: {phase2_line!r}"
     )
 
+    # PHASE 3 (R6): SURFACE_ENTER_OBSERVED MUST be true.
+    enter_line = next(
+        (line for line in journal.splitlines()
+         if "SURFACE_ENTER_OBSERVED:" in line),
+        None,
+    )
+    assert enter_line is not None, (
+        "SURFACE_ENTER_OBSERVED not observed in halmasuit journal."
+    )
+    print(f"PHASE 3: {enter_line.strip()}")
+    assert "SURFACE_ENTER_OBSERVED: true" in enter_line, (
+        f"R6 violated: halmasuit did NOT emit wl_surface.enter for "
+        f"the xdg_toplevel. wayland.xml requires the compositor to "
+        f"send `enter` so the client can pick buffer scale / "
+        f"transform / frame timing per-output. Observed line: "
+        f"{enter_line!r}"
+    )
+
     # No black/uncovered/degenerate frame across the run — the
-    # witness threads continuously underneath. R4 must NOT regress
+    # witness threads continuously underneath. R4+R6 must NOT regress
     # the no-flash invariant.
     visual.assert_no_flash_stream(machine)
 

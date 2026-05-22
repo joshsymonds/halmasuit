@@ -44,7 +44,7 @@ use std::time::Duration;
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle,
     globals::{GlobalListContents, registry_queue_init},
-    protocol::{wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface},
+    protocol::{wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface},
 };
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
@@ -61,6 +61,11 @@ fn main() -> anyhow::Result<()> {
     let compositor: wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let shm: wl_shm::WlShm = globals.bind(&qh, 1..=2, ())?;
     let wm_base: xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    // R6: bind wl_output so the compositor's `Output::enter` includes
+    // an output object in the `wl_surface.enter` event for this
+    // client. Smithay's `Output::enter` walks `client_outputs_internal`
+    // — a client that hasn't bound wl_output gets nothing.
+    let _output: wl_output::WlOutput = globals.bind(&qh, 1..=4, ())?;
 
     let wl_surface = compositor.create_surface(&qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&wl_surface, &qh, ());
@@ -101,6 +106,17 @@ fn main() -> anyhow::Result<()> {
         wl_surface.commit();
         event_queue.flush()?;
     }
+
+    // R6 (convergence epic): observe `wl_surface.enter`. The
+    // compositor MUST send wl_surface.enter for the toplevel after
+    // it maps onto the output, so the client can pick buffer scale,
+    // transform, and frame timing per-output. Pre-R6: halmasuit
+    // never called `Output::enter` for xdg-toplevels (layer-shell
+    // got it from `LayerMap::arrange`, but toplevels did not).
+    // Roundtrip once more to let the server flush its post-map
+    // events, then emit the journal marker.
+    event_queue.roundtrip(&mut state)?;
+    eprintln!("SURFACE_ENTER_OBSERVED: {}", state.surface_enter_observed);
 
     // Sleep — the test driver kills us when its assertions have run.
     // The wait must be long enough to cover the test's full sampling
@@ -190,6 +206,7 @@ fn tempfile() -> anyhow::Result<std::fs::File> {
 struct State {
     configure_received: bool,
     latest_configure_serial: Option<u32>,
+    surface_enter_observed: bool,
     closed: bool,
     live_resources: Vec<LiveResource>,
 }
@@ -262,9 +279,24 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for State {
 
 impl Dispatch<wl_surface::WlSurface, ()> for State {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &wl_surface::WlSurface,
-        _: wl_surface::Event,
+        event: wl_surface::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if matches!(event, wl_surface::Event::Enter { .. }) {
+            state.surface_enter_observed = true;
+        }
+    }
+}
+
+impl Dispatch<wl_output::WlOutput, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &wl_output::WlOutput,
+        _: wl_output::Event,
         (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,

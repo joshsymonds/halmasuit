@@ -684,11 +684,27 @@ impl XdgShellHandler for HalmasuitState {
             state.states.set(xdg_toplevel::State::Activated);
             state.states.set(xdg_toplevel::State::Fullscreen);
         });
+        // R6 (convergence epic): emit `wl_surface.enter` for the
+        // toplevel so the client picks the correct buffer scale,
+        // transform, and frame timing for this output. Layer-shell
+        // surfaces already receive this via `LayerMap::arrange`;
+        // xdg-toplevels were missing it. Sub-tree walks (subsurfaces
+        // under the toplevel) are out of scope until a client needs
+        // them (the root surface is sufficient for HiDPI / scale
+        // negotiation in Qt 6 / GTK 4).
+        self.output.enter(surface.wl_surface());
         tracing::info!(w, h, "xdg_toplevel mapped as fullscreen foreground");
         self.foreground_toplevel = Some(surface);
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // R6 (convergence epic): mirror of the `enter` in
+        // `new_toplevel` — pair the wl_surface.enter sent at mapping
+        // with a wl_surface.leave on destruction. Smithay's
+        // `Output::leave` is idempotent (no-op if not in the set), so
+        // this is safe even when the toplevel never reached mapping.
+        self.output.leave(surface.wl_surface());
+
         if self.foreground_toplevel.as_ref() == Some(&surface) {
             // Post-`spawned` the foreground toplevel IS the session
             // client (its toplevel replaced the greeter's in
