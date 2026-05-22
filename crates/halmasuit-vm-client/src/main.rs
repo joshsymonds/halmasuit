@@ -145,7 +145,17 @@ fn parse_argv(args: &[String]) -> Result<Subcommand, ClientError> {
                         let path = it.next().ok_or_else(|| {
                             ClientError::Usage("--password-file: missing PATH".into())
                         })?;
-                        let pw = std::fs::read_to_string(path).map_err(ClientError::Io)?;
+                        // Zeroize the initial-read buffer on drop —
+                        // it holds the password plus any trailing
+                        // newline. The trimmed copy pushed below is a
+                        // separate small heap allocation; it's
+                        // dropped at the end of `full_auth` when
+                        // `responses` goes out of scope. Consistent
+                        // with the broker's CLAUDE.md zeroize rule
+                        // even though this is test-only.
+                        let pw: zeroize::Zeroizing<String> = zeroize::Zeroizing::new(
+                            std::fs::read_to_string(path).map_err(ClientError::Io)?,
+                        );
                         responses.push(pw.trim_end_matches('\n').to_owned());
                     }
                     "--response" => {

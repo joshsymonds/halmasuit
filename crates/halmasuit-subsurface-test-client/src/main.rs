@@ -140,9 +140,18 @@ fn main() -> anyhow::Result<()> {
     state.paint_child(CHILD_INITIAL_BGRA);
     eprintln!("subsurface-test-client: initial mapping committed");
 
-    // Drive the rest of the deterministic timeline. Use
-    // blocking_dispatch with a per-iteration deadline so we sleep on
-    // epoll rather than burning CPU on a sleep+poll loop.
+    // Drive the rest of the deterministic timeline. Each iteration:
+    // flush outgoing buffers, drain any pending events
+    // (`dispatch_pending` is non-blocking), then yield to the kernel
+    // via `park_timeout(50ms)` until the deadline. 50ms is well above
+    // libwayland's typical event latency and below halmasuit's per-
+    // VBlank (16ms) cadence enough that we coalesce a few VBlanks per
+    // wake. `park_timeout` on an unparked thread is equivalent to
+    // `sleep` here but lets a notified thread wake early; for this
+    // single-threaded test client there's no actual `unpark` source,
+    // so it's effectively a 50ms sleep loop with a deadline gate.
+    // CPU stays near zero because the thread is sleeping for ~98% of
+    // each iteration.
     let t0 = Instant::now();
     let pump = |conn: &Connection,
                 eq: &mut wayland_client::EventQueue<State>,
@@ -151,16 +160,7 @@ fn main() -> anyhow::Result<()> {
      -> anyhow::Result<()> {
         while t0.elapsed() < until {
             conn.flush()?;
-            // dispatch a batch (returns when at least one event was
-            // processed or the connection has no pending data — for a
-            // throughput pump we keep iterating until our timestamp
-            // gate fires).
             eq.dispatch_pending(s)?;
-            // Yield to the kernel: 50ms is well above libwayland's
-            // typical event latency and below halmasuit's per-VBlank
-            // (16ms) cadence enough that we coalesce a few VBlanks
-            // per wake. Using park-with-timeout rather than a
-            // spin-loop keeps CPU near zero for an idle test client.
             std::thread::park_timeout(Duration::from_millis(50));
         }
         Ok(())

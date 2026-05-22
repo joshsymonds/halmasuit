@@ -988,6 +988,21 @@ impl HalmasuitState {
             })
             .unwrap_or(false);
         if has_buffer {
+            // Emit a transition marker ONCE per focus change. The
+            // current_focus check avoids spamming the log on every
+            // VBlank-driven commit. VM tests poll this marker to
+            // synchronize on "halmasuit has delivered wl_keyboard.
+            // enter to the greeter" instead of sleeping a wall-clock
+            // window.
+            let already_focused = self
+                .seat
+                .get_keyboard()
+                .and_then(|kb| kb.current_focus())
+                .as_ref()
+                == Some(surface);
+            if !already_focused {
+                tracing::info!("FOREGROUND_TOPLEVEL_KEYBOARD_FOCUSED");
+            }
             self.set_keyboard_focus(Some(surface.clone()));
         }
     }

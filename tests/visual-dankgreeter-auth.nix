@@ -1,5 +1,14 @@
 # tests/visual-dankgreeter-auth.nix — R13(b) G3 keystroke auth arc.
 #
+# NOT a gated check — superseded by visual-qt6-greeter-auth.nix.
+#
+# This file is retained as documentation of the Round-4/4b
+# investigation into the R13(b) blockage on the DMS+Quickshell path.
+# It is NOT imported into flake.nix's `checks` attrset; running it
+# requires manual nix-build invocation. The full diagnostic narrative
+# is in the commit log + Task #37 — short summary below.
+#
+# Background:
 # visual-dankgreeter (G2) renders the DMS DankGreeter UI under
 # halmasuit and asserts the no-flash invariant. It deliberately
 # stops short of driving keystrokes through the UI — diagnostic

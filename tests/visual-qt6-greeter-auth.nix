@@ -87,6 +87,7 @@ let
   # ordinary Qt6 desktop app.
   qt6GreeterSrc = pkgs.writeText "halmasuit-qt6-greeter.cpp" ''
     #include <QApplication>
+    #include <QByteArray>
     #include <QDebug>
     #include <QFile>
     #include <QLineEdit>
@@ -94,7 +95,11 @@ let
     #include <QPushButton>
     #include <QVBoxLayout>
     #include <QWidget>
+    #include <cstring>
+    #include <fcntl.h>
     #include <iostream>
+    #include <sys/stat.h>
+    #include <unistd.h>
 
     int main(int argc, char *argv[]) {
         QApplication app(argc, argv);
@@ -132,12 +137,32 @@ let
         auto doLogin = [&]() {
             std::cerr << "QT_LOGIN_TRIGGERED" << std::endl;
             std::cerr.flush();
-            QFile pwf("/run/halmasuit-greeter/.qt-pw");
-            if (pwf.open(QIODevice::WriteOnly)) {
-                pwf.write(pass->text().toUtf8());
-                pwf.close();
-                pwf.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
+            // Write the password to /run/halmasuit-greeter/.qt-pw with
+            // O_CREAT|O_EXCL|O_WRONLY + mode 0600 — atomic creation
+            // with the correct mode in one syscall, no chmod-after
+            // race window. /run/halmasuit-greeter is 0700 (parent-dir
+            // gate), but using O_EXCL+mode is safe-by-construction in
+            // case the pattern is reused with a broader parent.
+            const char *pwPath = "/run/halmasuit-greeter/.qt-pw";
+            QByteArray pwUtf8 = pass->text().toUtf8();
+            int fd = ::open(pwPath, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+            if (fd >= 0) {
+                ssize_t n = 0;
+                while (n < pwUtf8.size()) {
+                    ssize_t w = ::write(fd, pwUtf8.constData() + n, pwUtf8.size() - n);
+                    if (w < 0) break;
+                    n += w;
+                }
+                ::close(fd);
             }
+            // Zeroize the password buffer in our address space before
+            // launching the subprocess. The QString backing is UTF-16
+            // and lives in Qt's heap; we also zero our local UTF-8
+            // byte array. CLAUDE.md zeroize rule binds the broker for
+            // production, but consistent test posture: don't leave
+            // credential bytes resident any longer than needed.
+            std::memset(pwUtf8.data(), 0, pwUtf8.size());
+            pass->clear();
             std::cerr << "QT_SPAWN_VM_CLIENT user=" << user->text().toStdString()
                       << std::endl;
             std::cerr.flush();
@@ -145,12 +170,12 @@ let
                 "halmasuit-vm-client",
                 {"full-auth", "/run/halmasuit/greetd.sock",
                  user->text(),
-                 "--password-file", "/run/halmasuit-greeter/.qt-pw",
+                 "--password-file", QString::fromLatin1(pwPath),
                  "--cmd", "${sessionCmd}",
                  "--timeout", "20"});
             std::cerr << "QT_VM_CLIENT_DONE rc=" << rc << std::endl;
             std::cerr.flush();
-            QFile::remove("/run/halmasuit-greeter/.qt-pw");
+            ::unlink(pwPath);
             QApplication::quit();
         };
         QObject::connect(btn, &QPushButton::clicked, doLogin);
@@ -291,7 +316,6 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     import os
     import sys
-    import time
 
     sys.path.insert(0, "${./lib}")
     os.environ["PATH"] = "${ssimulacra2-cli}/bin:" + os.environ.get("PATH", "")
@@ -343,11 +367,15 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "journalctl | grep -qF QT_GREETER_READY", timeout=60
     )
-    # Sleep an additional second for halmasuit's commit-driven
-    # focus-follows-foreground (maybe_focus_foreground_toplevel) to
-    # fire on Qt6's first buffer commit, so wl_keyboard.enter has
-    # landed before we begin send_chars.
-    time.sleep(2)
+    # State-based gate (MEMORY.md feedback rule): poll for halmasuit
+    # to set keyboard focus on Qt6's xdg-toplevel. The marker is
+    # emitted once per focus transition by maybe_focus_foreground_
+    # toplevel; once it fires, halmasuit has sent wl_keyboard.enter
+    # to Qt6 and subsequent send_chars will land in QLineEdit input.
+    machine.wait_until_succeeds(
+        "journalctl -u halmasuit | grep -qF FOREGROUND_TOPLEVEL_KEYBOARD_FOCUSED",
+        timeout=30,
+    )
 
     machine.send_chars("alice")
     machine.send_key("tab")

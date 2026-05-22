@@ -18,6 +18,9 @@ thiserror.workspace  = true
 # `emit_io_log` serializes each tx/rx message to JSON.
 serde.workspace      = true
 serde_json.workspace = true
+# Zeroize the password buffer between read and send; consistent with
+# the broker's CLAUDE.md rule even though this is test-only.
+zeroize.workspace    = true
 
 [dev-dependencies]
 tempfile.workspace = true
