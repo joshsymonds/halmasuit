@@ -55,6 +55,7 @@ use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1;
 use wayland_protocols::wp::pointer_gestures::zv1::client::zwp_pointer_gestures_v1;
 use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
+use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_device_manager_v1;
 use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1;
 use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_manager_v2;
 use wayland_protocols::wp::viewporter::client::wp_viewporter;
@@ -331,6 +332,16 @@ fn probe_phase_b_globals(globals: &wayland_client::globals::GlobalList, qh: &Que
         "WL_DATA_DEVICE_MANAGER_GLOBAL_BOUND: {}",
         globals
             .bind::<wl_data_device_manager::WlDataDeviceManager, _, _>(qh, 1..=3, ())
+            .is_ok()
+    );
+    eprintln!(
+        "PRIMARY_SELECTION_GLOBAL_BOUND: {}",
+        globals
+            .bind::<
+                zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
+                _,
+                _,
+            >(qh, 1..=1, ())
             .is_ok()
     );
 }
@@ -726,6 +737,20 @@ impl Dispatch<wl_data_device_manager::WlDataDeviceManager, ()> for State {
         _: &mut Self,
         _: &wl_data_device_manager::WlDataDeviceManager,
         _: wl_data_device_manager::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1, ()>
+    for State
+{
+    fn event(
+        _: &mut Self,
+        _: &zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
+        _: zwp_primary_selection_device_manager_v1::Event,
         (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,

@@ -210,6 +210,14 @@ struct HalmasuitState {
     /// handler returns `&mut` from `data_device_state()`, so the
     /// field is `pub`(crate)-visible without the leading underscore.
     data_device_state: smithay::wayland::selection::data_device::DataDeviceState,
+    /// `zwp_primary_selection_device_manager_v1` state (Phase B —
+    /// second focus-bearing protocol). X11-style middle-click primary
+    /// buffer. Shares the single `SelectionHandler` impl with
+    /// `data_device_state` (smithay routes both via
+    /// `SelectionTarget::{Primary,Clipboard}`). Field is `pub`(crate)
+    /// because `PrimarySelectionHandler::primary_selection_state`
+    /// returns `&mut`.
+    primary_selection_state: smithay::wayland::selection::primary_selection::PrimarySelectionState,
     /// Layer roles for which `Event::ClientFirstFrame` has already
     /// been emitted (emit-once-per-role). The visual-backdrop
     /// continuity assertion keys off the first
@@ -1041,15 +1049,20 @@ impl SeatHandler for HalmasuitState {
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&Self::KeyboardFocus>) {
         // R7 (convergence epic): focus_changed updates EVERY focus
         // subsystem atomically with keyboard focus. Currently wired:
-        //   - data-device (selection/clipboard owner) — this call.
+        //   - data-device (selection/clipboard owner)
+        //   - primary-selection (X11-style middle-click buffer)
         // Pending (will join here as each lands):
-        //   - primary-selection-v1 focus
         //   - text-input-v3 focus
         // Pattern is anvil's: derive the kernel-validated Client from
         // the focused WlSurface and pass it through to each focus
         // setter.
         let client = focused.and_then(|surface| self.display_handle.get_client(surface.id()).ok());
         smithay::wayland::selection::data_device::set_data_device_focus(
+            &self.display_handle,
+            seat,
+            client.clone(),
+        );
+        smithay::wayland::selection::primary_selection::set_primary_focus(
             &self.display_handle,
             seat,
             client,
@@ -1225,6 +1238,21 @@ impl smithay::wayland::selection::SelectionHandler for HalmasuitState {
     type SelectionUserData = ();
 }
 smithay::delegate_data_device!(HalmasuitState);
+
+// Phase B: zwp_primary_selection_device_manager_v1 — X11-style
+// middle-click primary buffer. Shares the SelectionHandler with
+// data-device; smithay routes via SelectionTarget::{Primary,Clipboard}
+// at the single entry point. Only the state accessor is required;
+// `new_selection` / `send_selection` defaults from SelectionHandler
+// are reused (halmasuit does no xwayland forwarding).
+impl smithay::wayland::selection::primary_selection::PrimarySelectionHandler for HalmasuitState {
+    fn primary_selection_state(
+        &mut self,
+    ) -> &mut smithay::wayland::selection::primary_selection::PrimarySelectionState {
+        &mut self.primary_selection_state
+    }
+}
+smithay::delegate_primary_selection!(HalmasuitState);
 
 impl BufferHandler for HalmasuitState {
     fn buffer_destroyed(
@@ -2841,6 +2869,13 @@ fn main() -> io::Result<()> {
     let data_device_state = smithay::wayland::selection::data_device::DataDeviceState::new::<
         HalmasuitState,
     >(&display_handle);
+    // Phase B: zwp_primary_selection_device_manager_v1 — X11-style
+    // middle-click primary buffer. Shares the SelectionHandler with
+    // data-device (smithay routes via SelectionTarget::Primary).
+    let primary_selection_state =
+        smithay::wayland::selection::primary_selection::PrimarySelectionState::new::<HalmasuitState>(
+            &display_handle,
+        );
 
     // R9 (convergence): wp_presentation global. CLOCK_MONOTONIC is
     // what halmasuit's start_time / VBlank timestamps use, so the
@@ -3037,6 +3072,7 @@ fn main() -> io::Result<()> {
         _xdg_dialog_state: xdg_dialog_state,
         _xdg_toplevel_icon_manager: xdg_toplevel_icon_manager,
         data_device_state,
+        primary_selection_state,
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
         popups: PopupManager::default(),
