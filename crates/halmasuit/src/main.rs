@@ -46,13 +46,18 @@ use halmasuit_greetd::server::{SpawnRequest, bind_socket, peer_credentials};
 
 use crate::broker_session::{BrokerEpisode, connect_broker};
 use halmasuit_introspect::{Event, Phase, ShutdownReason, emit};
-use smithay::backend::input::{Event as InputEventTrait, InputEvent, KeyboardKeyEvent};
+use smithay::backend::input::{
+    AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState,
+    Event as InputEventTrait, InputEvent, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+    PointerMotionEvent,
+};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::session::Session;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::desktop::layer_map_for_output;
 use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::keyboard::FilterResult;
+use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
@@ -255,26 +260,172 @@ impl ClientData for ClientState {
 
 impl HalmasuitState {
     /// Route one libinput event to the seat. Keyboard keys go to the
-    /// keyboard-focused client (focus is set by
-    /// [`Self::set_keyboard_focus`], driven by the layer-shell
-    /// keyboard-interactivity policy in the commit handler — layer F
-    /// replaces that with the greeter→session machine). Pointer
-    /// capability exists; full pointer routing (focus-follows,
-    /// cursor) is layer F's concern, so non-keyboard events are
-    /// accepted but not yet dispatched.
+    /// keyboard-focused client; pointer events (motion, button, axis)
+    /// go to the keyboard-focused client as well — halmasuit hosts
+    /// one fullscreen surface at a time, so the surface under the
+    /// pointer trivially equals the keyboard focus. Per-protocol
+    /// `frame()` batching is emitted after each event group.
     fn dispatch_libinput(&mut self, event: InputEvent<LibinputInputBackend>) {
-        if let InputEvent::Keyboard { event } = event {
-            let Some(keyboard) = self.seat.get_keyboard() else {
-                return;
-            };
-            let serial = SERIAL_COUNTER.next_serial();
-            let time = event.time_msec();
-            let code = event.key_code();
-            let key_state = event.state();
-            keyboard.input::<(), _>(self, code, key_state, serial, time, |_, _, _| {
-                FilterResult::Forward
-            });
+        match event {
+            InputEvent::Keyboard { event } => {
+                let Some(keyboard) = self.seat.get_keyboard() else {
+                    return;
+                };
+                let serial = SERIAL_COUNTER.next_serial();
+                let time = event.time_msec();
+                let code = event.key_code();
+                let key_state = event.state();
+                keyboard.input::<(), _>(self, code, key_state, serial, time, |_, _, _| {
+                    FilterResult::Forward
+                });
+            }
+            InputEvent::PointerMotion { event } => self.on_pointer_relative_motion(&event),
+            InputEvent::PointerMotionAbsolute { event } => {
+                self.on_pointer_absolute_motion(&event);
+            }
+            InputEvent::PointerButton { event } => self.on_pointer_button(&event),
+            InputEvent::PointerAxis { event } => self.on_pointer_axis(&event),
+            _ => {
+                // Tablet, touch, switch — not in v1 scope. Future epics.
+            }
         }
+    }
+
+    /// Output-local pointer focus + coordinates for the foreground
+    /// surface. Returns `None` if no input-accepting surface exists.
+    /// halmasuit hosts one fullscreen surface, so the location is
+    /// always the output origin (0, 0).
+    fn pointer_focus(
+        &self,
+    ) -> Option<(
+        WlSurface,
+        smithay::utils::Point<f64, smithay::utils::Logical>,
+    )> {
+        let keyboard = self.seat.get_keyboard()?;
+        keyboard
+            .current_focus()
+            .map(|s| (s, smithay::utils::Point::from((0.0_f64, 0.0_f64))))
+    }
+
+    /// Clamp absolute pointer coords to the output extents.
+    fn clamp_pointer(
+        &self,
+        pos: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) -> smithay::utils::Point<f64, smithay::utils::Logical> {
+        let (w, h) = self.output.current_mode().map_or((1280_f64, 800_f64), |m| {
+            (f64::from(m.size.w), f64::from(m.size.h))
+        });
+        smithay::utils::Point::from((pos.x.clamp(0.0, w), pos.y.clamp(0.0, h)))
+    }
+
+    fn on_pointer_relative_motion<E: PointerMotionEvent<LibinputInputBackend>>(&mut self, evt: &E) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        let delta = evt.delta();
+        let mut location = pointer.current_location() + delta;
+        location = self.clamp_pointer(location);
+        let focus = self.pointer_focus();
+        pointer.motion(
+            self,
+            focus,
+            &MotionEvent {
+                location,
+                serial,
+                time: evt.time_msec(),
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn on_pointer_absolute_motion<E: AbsolutePositionEvent<LibinputInputBackend>>(
+        &mut self,
+        evt: &E,
+    ) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let (w, h) = self
+            .output
+            .current_mode()
+            .map_or((1280_i32, 800_i32), |m| (m.size.w, m.size.h));
+        let location = evt.position_transformed((w, h).into());
+        let focus = self.pointer_focus();
+        pointer.motion(
+            self,
+            focus,
+            &MotionEvent {
+                location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time: evt.time_msec(),
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn on_pointer_button<E: PointerButtonEvent<LibinputInputBackend>>(&mut self, evt: &E) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        let button = evt.button_code();
+        let state: ButtonState = evt.state();
+        pointer.button(
+            self,
+            &ButtonEvent {
+                button,
+                state,
+                serial,
+                time: evt.time_msec(),
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn on_pointer_axis<E: PointerAxisEvent<LibinputInputBackend>>(&mut self, evt: &E) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let h = evt
+            .amount(Axis::Horizontal)
+            .unwrap_or_else(|| evt.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.0);
+        let v = evt
+            .amount(Axis::Vertical)
+            .unwrap_or_else(|| evt.amount_v120(Axis::Vertical).unwrap_or(0.0) * 15.0 / 120.0);
+        let mut frame = AxisFrame::new(evt.time_msec()).source(evt.source());
+        if h != 0.0 {
+            frame = frame
+                .relative_direction(Axis::Horizontal, evt.relative_direction(Axis::Horizontal))
+                .value(Axis::Horizontal, h);
+            if let Some(d) = evt.amount_v120(Axis::Horizontal) {
+                #[allow(clippy::cast_possible_truncation)]
+                let discrete = d as i32;
+                frame = frame.v120(Axis::Horizontal, discrete);
+            }
+        }
+        if v != 0.0 {
+            frame = frame
+                .relative_direction(Axis::Vertical, evt.relative_direction(Axis::Vertical))
+                .value(Axis::Vertical, v);
+            if let Some(d) = evt.amount_v120(Axis::Vertical) {
+                #[allow(clippy::cast_possible_truncation)]
+                let discrete = d as i32;
+                frame = frame.v120(Axis::Vertical, discrete);
+            }
+        }
+        if evt.source() == AxisSource::Finger {
+            if evt.amount(Axis::Horizontal) == Some(0.0) {
+                frame = frame.stop(Axis::Horizontal);
+            }
+            if evt.amount(Axis::Vertical) == Some(0.0) {
+                frame = frame.stop(Axis::Vertical);
+            }
+        }
+        // Suppress unused-import warning when no axis source is Finger:
+        let _ = AxisRelativeDirection::Identical;
+        pointer.axis(self, frame);
+        pointer.frame(self);
     }
 
     /// Point keyboard focus at `surface` (or clear it). No-op if it is
