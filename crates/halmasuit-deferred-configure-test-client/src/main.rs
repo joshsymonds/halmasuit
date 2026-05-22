@@ -47,6 +47,7 @@ use wayland_client::{
     protocol::{wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface},
 };
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1;
+use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 const SURFACE_W: u32 = 128;
@@ -74,6 +75,13 @@ fn main() -> anyhow::Result<()> {
         .bind::<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _, _>(&qh, 3..=4, ())
         .is_ok();
     eprintln!("DMABUF_GLOBAL_BOUND: {dmabuf_bound}");
+    // R9: probe for wp_presentation. Bind succeeds if halmasuit
+    // advertised the global. Saved so we can request feedback once
+    // we have a surface.
+    let presentation = globals
+        .bind::<wp_presentation::WpPresentation, _, _>(&qh, 1..=2, ())
+        .ok();
+    eprintln!("PRESENTATION_GLOBAL_BOUND: {}", presentation.is_some());
 
     let wl_surface = compositor.create_surface(&qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&wl_surface, &qh, ());
@@ -90,7 +98,7 @@ fn main() -> anyhow::Result<()> {
     event_queue.roundtrip(&mut state)?;
     eprintln!(
         "DEFERRED_CONFIGURE_PHASE1: configure_received={}",
-        state.configure_received
+        state.has(OBS_CONFIGURE_RECEIVED)
     );
 
     // PHASE 2: send our first wl_surface.commit (empty per spec),
@@ -101,7 +109,7 @@ fn main() -> anyhow::Result<()> {
     event_queue.roundtrip(&mut state)?;
     eprintln!(
         "DEFERRED_CONFIGURE_PHASE2: configure_received={}",
-        state.configure_received
+        state.has(OBS_CONFIGURE_RECEIVED)
     );
 
     // Post-observation: complete the handshake so halmasuit's render
@@ -124,7 +132,32 @@ fn main() -> anyhow::Result<()> {
     // Roundtrip once more to let the server flush its post-map
     // events, then emit the journal marker.
     event_queue.roundtrip(&mut state)?;
-    eprintln!("SURFACE_ENTER_OBSERVED: {}", state.surface_enter_observed);
+    eprintln!("SURFACE_ENTER_OBSERVED: {}", state.has(OBS_SURFACE_ENTER));
+
+    // R9 (convergence epic): request wp_presentation_feedback for
+    // the next commit, then commit (with damage) to trigger a
+    // re-render. After the next VBlank, halmasuit MUST emit
+    // `presented` (or `discarded`) on the feedback object.
+    if let Some(p) = presentation.as_ref() {
+        let _feedback = p.feedback(&wl_surface, &qh, ());
+        // Touch the surface so the commit actually re-renders and
+        // the feedback fires on the next VBlank.
+        wl_surface.damage_buffer(
+            0,
+            0,
+            SURFACE_W.try_into().unwrap_or(i32::MAX),
+            SURFACE_H.try_into().unwrap_or(i32::MAX),
+        );
+        wl_surface.commit();
+        event_queue.flush()?;
+        // Give halmasuit a moment to render + present.
+        std::thread::sleep(Duration::from_millis(500));
+        event_queue.roundtrip(&mut state)?;
+    }
+    eprintln!(
+        "PRESENTATION_FEEDBACK_OBSERVED: {}",
+        state.has(OBS_PRESENTATION_FEEDBACK)
+    );
 
     // Sleep — the test driver kills us when its assertions have run.
     // The wait must be long enough to cover the test's full sampling
@@ -133,7 +166,7 @@ fn main() -> anyhow::Result<()> {
         if event_queue.dispatch_pending(&mut state).is_err() {
             break;
         }
-        if state.closed {
+        if state.has(OBS_CLOSED) {
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -210,13 +243,30 @@ fn tempfile() -> anyhow::Result<std::fs::File> {
     Ok(file)
 }
 
+// Observation flags packed into a bitfield. Each phase the test
+// client observes flips one bit; the test driver greps for the
+// corresponding `<NAME>: <bool>` journal marker.
+const OBS_CONFIGURE_RECEIVED: u8 = 1 << 0;
+const OBS_SURFACE_ENTER: u8 = 1 << 1;
+const OBS_PRESENTATION_FEEDBACK: u8 = 1 << 2;
+const OBS_CLOSED: u8 = 1 << 3;
+
 #[derive(Default)]
 struct State {
-    configure_received: bool,
+    /// Bitset of `OBS_*` flags — set as each protocol observation
+    /// fires.
+    observations: u8,
     latest_configure_serial: Option<u32>,
-    surface_enter_observed: bool,
-    closed: bool,
     live_resources: Vec<LiveResource>,
+}
+
+impl State {
+    const fn has(&self, bit: u8) -> bool {
+        self.observations & bit != 0
+    }
+    const fn set(&mut self, bit: u8) {
+        self.observations |= bit;
+    }
 }
 
 #[allow(dead_code)]
@@ -295,7 +345,7 @@ impl Dispatch<wl_surface::WlSurface, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         if matches!(event, wl_surface::Event::Enter { .. }) {
-            state.surface_enter_observed = true;
+            state.set(OBS_SURFACE_ENTER);
         }
     }
 }
@@ -338,7 +388,7 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
-            state.configure_received = true;
+            state.set(OBS_CONFIGURE_RECEIVED);
             state.latest_configure_serial = Some(serial);
         }
     }
@@ -354,7 +404,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         if matches!(event, xdg_toplevel::Event::Close) {
-            state.closed = true;
+            state.set(OBS_CLOSED);
         }
     }
 }
@@ -368,5 +418,36 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<wp_presentation::WpPresentation, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &wp_presentation::WpPresentation,
+        _: wp_presentation::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wp_presentation_feedback::WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if matches!(
+            event,
+            wp_presentation_feedback::Event::Presented { .. }
+                | wp_presentation_feedback::Event::Discarded
+        ) {
+            state.set(OBS_PRESENTATION_FEEDBACK);
+        }
     }
 }

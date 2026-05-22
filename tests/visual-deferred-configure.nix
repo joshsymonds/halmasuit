@@ -125,11 +125,10 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF scanout_active", timeout=30
     )
-    # The test client emits all markers very quickly (no network IO,
-    # single roundtrip each). Wait for SURFACE_ENTER — the last
-    # one emitted by the client's deterministic timeline.
+    # The test client emits markers in order; PRESENTATION_FEEDBACK_OBSERVED
+    # is the last one (R9 needs a VBlank to complete, so ~500ms sleep).
     machine.wait_until_succeeds(
-        "journalctl -u halmasuit | grep -qF SURFACE_ENTER_OBSERVED",
+        "journalctl -u halmasuit | grep -qF PRESENTATION_FEEDBACK_OBSERVED",
         timeout=30,
     )
 
@@ -209,6 +208,39 @@ pkgs.testers.runNixOSTest {
         f"zwp_linux_dmabuf_v1. Mesa-EGL clients (Qt 6 / GTK 4) "
         f"will fall back to wl_shm — degraded perf and a known "
         f"wedge vector. Observed line: {dmabuf_line!r}"
+    )
+
+    # PHASE 5 (R9): wp_presentation global advertised AND a
+    # `presented` / `discarded` event fires for surfaces that
+    # requested feedback. Two assertions:
+    presentation_bound_line = next(
+        (line for line in journal.splitlines()
+         if "PRESENTATION_GLOBAL_BOUND:" in line),
+        None,
+    )
+    assert presentation_bound_line is not None, (
+        "PRESENTATION_GLOBAL_BOUND not observed in halmasuit journal."
+    )
+    print(f"PHASE 5a: {presentation_bound_line.strip()}")
+    assert "PRESENTATION_GLOBAL_BOUND: true" in presentation_bound_line, (
+        f"R9 violated: halmasuit did NOT advertise wp_presentation. "
+        f"Observed line: {presentation_bound_line!r}"
+    )
+
+    feedback_line = next(
+        (line for line in journal.splitlines()
+         if "PRESENTATION_FEEDBACK_OBSERVED:" in line),
+        None,
+    )
+    assert feedback_line is not None, (
+        "PRESENTATION_FEEDBACK_OBSERVED not observed in halmasuit journal."
+    )
+    print(f"PHASE 5b: {feedback_line.strip()}")
+    assert "PRESENTATION_FEEDBACK_OBSERVED: true" in feedback_line, (
+        f"R9 violated: halmasuit advertised wp_presentation but never "
+        f"emitted `presented` (or `discarded`) for a surface that "
+        f"requested feedback. Spec requires one of those per request. "
+        f"Observed line: {feedback_line!r}"
     )
 
     # No black/uncovered/degenerate frame across the run — the

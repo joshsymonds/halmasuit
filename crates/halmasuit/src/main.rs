@@ -124,6 +124,15 @@ struct HalmasuitState {
     /// The dmabuf global handle. `None` on the SKIP path (no
     /// renderer → no formats to advertise).
     _dmabuf_global: Option<smithay::wayland::dmabuf::DmabufGlobal>,
+    /// `wp_presentation` global state. Created at startup with
+    /// `CLOCK_MONOTONIC`. Clients use this to receive
+    /// `wp_presentation_feedback.presented` for surfaces that asked
+    /// for it; halmasuit emits the events from the VBlank handler.
+    /// R9 (convergence).
+    _presentation_state: smithay::wayland::presentation::PresentationState,
+    /// Monotonic counter for the presentation `sequence` field —
+    /// increments once per VBlank. R9.
+    presentation_seq: u64,
     /// Layer roles for which `Event::ClientFirstFrame` has already
     /// been emitted (emit-once-per-role). The visual-backdrop
     /// continuity assertion keys off the first
@@ -995,6 +1004,7 @@ impl smithay::wayland::dmabuf::DmabufHandler for HalmasuitState {
     }
 }
 smithay::delegate_dmabuf!(HalmasuitState);
+smithay::delegate_presentation!(HalmasuitState);
 
 impl BufferHandler for HalmasuitState {
     fn buffer_destroyed(
@@ -2430,6 +2440,47 @@ fn main() -> io::Result<()> {
                             |_, _| Some(output.clone()),
                         );
                     }
+
+                    // R9 (convergence): emit wp_presentation_feedback.presented
+                    // for any surface that requested it on its last commit.
+                    // smithay's `take_presentation_feedback_surface_tree` walks
+                    // the cached feedback per surface; we drive it for the
+                    // foreground tree + each layer. The
+                    // primary-scanout-output closure unconditionally returns
+                    // the single output (halmasuit hosts one output and
+                    // every visible surface is on it).
+                    let kind = smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync;
+                    let mut feedback =
+                        smithay::desktop::utils::OutputPresentationFeedback::new(&output);
+                    if let Some(toplevel) = state.foreground_toplevel.as_ref() {
+                        smithay::desktop::utils::take_presentation_feedback_surface_tree(
+                            toplevel.wl_surface(),
+                            &mut feedback,
+                            |_, _| Some(output.clone()),
+                            |_, _| kind,
+                        );
+                    }
+                    for layer in &layers {
+                        smithay::desktop::utils::take_presentation_feedback_surface_tree(
+                            layer.wl_surface(),
+                            &mut feedback,
+                            |_, _| Some(output.clone()),
+                            |_, _| kind,
+                        );
+                    }
+                    let refresh_mhz = output.current_mode().map_or(60_000_i32, |m| m.refresh);
+                    #[allow(clippy::cast_sign_loss)]
+                    let refresh_period = std::time::Duration::from_nanos(
+                        1_000_000_000_000_u64 / (refresh_mhz.max(1) as u64),
+                    );
+                    let refresh = smithay::wayland::presentation::Refresh::fixed(refresh_period);
+                    state.presentation_seq = state.presentation_seq.wrapping_add(1);
+                    feedback.presented::<_, smithay::utils::Monotonic>(
+                        time,
+                        refresh,
+                        state.presentation_seq,
+                        smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync,
+                    );
                 }
                 smithay::backend::drm::DrmEvent::Error(e) => {
                     tracing::warn!(error = %e, "DRM device error");
@@ -2491,6 +2542,16 @@ fn main() -> io::Result<()> {
     // SKIP path (no renderer) we don't advertise the global at all
     // (advertising a global we can't serve is the
     // `linux-dmabuf-v1`-lie anti-pattern the epic codifies).
+    // R9 (convergence): wp_presentation global. CLOCK_MONOTONIC is
+    // what halmasuit's start_time / VBlank timestamps use, so the
+    // client's `presented` event timestamps are directly comparable
+    // to its other monotonic samples.
+    #[allow(clippy::cast_sign_loss)]
+    let presentation_state = smithay::wayland::presentation::PresentationState::new::<HalmasuitState>(
+        &display_handle,
+        libc::CLOCK_MONOTONIC as u32,
+    );
+
     let mut dmabuf_state = smithay::wayland::dmabuf::DmabufState::new();
     let dmabuf_global = drm_backend.as_ref().map(|b| {
         use smithay::backend::renderer::ImportDma;
@@ -2660,6 +2721,8 @@ fn main() -> io::Result<()> {
         layer_shell_state,
         dmabuf_state,
         _dmabuf_global: dmabuf_global,
+        _presentation_state: presentation_state,
+        presentation_seq: 0,
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
         popups: PopupManager::default(),
