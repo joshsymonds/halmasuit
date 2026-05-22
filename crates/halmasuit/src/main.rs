@@ -114,6 +114,16 @@ struct HalmasuitState {
     /// `layer_map_for_output`). Composited in z-order during
     /// `render_with_elements` from the commit-driven render path.
     layer_shell_state: WlrLayerShellState,
+    /// `zwp_linux_dmabuf_v1` state. The global is created at startup
+    /// from the renderer's supported dmabuf formats; the
+    /// `dmabuf_state` field stores the smithay-side bookkeeping and
+    /// is referenced via `delegate_dmabuf!`. On the SKIP (no-DRM)
+    /// path there is no renderer, so no global is advertised —
+    /// clients fall back to wl_shm cleanly. R10 (convergence).
+    dmabuf_state: smithay::wayland::dmabuf::DmabufState,
+    /// The dmabuf global handle. `None` on the SKIP path (no
+    /// renderer → no formats to advertise).
+    _dmabuf_global: Option<smithay::wayland::dmabuf::DmabufGlobal>,
     /// Layer roles for which `Event::ClientFirstFrame` has already
     /// been emitted (emit-once-per-role). The visual-backdrop
     /// continuity assertion keys off the first
@@ -956,6 +966,35 @@ impl ShmHandler for HalmasuitState {
         &self.shm_state
     }
 }
+
+impl smithay::wayland::dmabuf::DmabufHandler for HalmasuitState {
+    fn dmabuf_state(&mut self) -> &mut smithay::wayland::dmabuf::DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &smithay::wayland::dmabuf::DmabufGlobal,
+        dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+        notifier: smithay::wayland::dmabuf::ImportNotifier,
+    ) {
+        // Try importing the dmabuf into the GLES renderer. On
+        // success the client may now attach this dmabuf as a buffer
+        // to any wl_surface; on failure the client gets a buffer
+        // error and may fall back to wl_shm.
+        use smithay::backend::renderer::ImportDma;
+        let imported = self
+            .drm_backend
+            .as_mut()
+            .is_some_and(|b| b.renderer.import_dmabuf(&dmabuf, None).is_ok());
+        if imported {
+            let _ = notifier.successful::<Self>();
+        } else {
+            notifier.failed();
+        }
+    }
+}
+smithay::delegate_dmabuf!(HalmasuitState);
 
 impl BufferHandler for HalmasuitState {
     fn buffer_destroyed(
@@ -2444,6 +2483,25 @@ fn main() -> io::Result<()> {
         (None, None, synth, None)
     };
 
+    // R10 (convergence): zwp_linux_dmabuf_v1 global. Mesa-EGL
+    // clients prefer dmabuf over wl_shm — without this global they
+    // operate at significantly degraded performance and extra wedge
+    // surface area. Format list comes from the renderer's
+    // `dmabuf_formats()` when the DRM backend is present; on the
+    // SKIP path (no renderer) we don't advertise the global at all
+    // (advertising a global we can't serve is the
+    // `linux-dmabuf-v1`-lie anti-pattern the epic codifies).
+    let mut dmabuf_state = smithay::wayland::dmabuf::DmabufState::new();
+    let dmabuf_global = drm_backend.as_ref().map(|b| {
+        use smithay::backend::renderer::ImportDma;
+        let formats: Vec<_> = b.renderer.dmabuf_formats().into_iter().collect();
+        tracing::info!(
+            count = formats.len(),
+            "advertising zwp_linux_dmabuf_v1 with renderer-derived format tranche"
+        );
+        dmabuf_state.create_global::<HalmasuitState>(&display_handle, formats)
+    });
+
     // Bind the Wayland listening socket. smithay's ListeningSocketSource
     // places the socket at $XDG_RUNTIME_DIR/<name>; production halmasuit's
     // systemd unit sets XDG_RUNTIME_DIR=/run/halmasuit via the NixOS
@@ -2600,6 +2658,8 @@ fn main() -> io::Result<()> {
         output,
         shm_state,
         layer_shell_state,
+        dmabuf_state,
+        _dmabuf_global: dmabuf_global,
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
         popups: PopupManager::default(),

@@ -125,10 +125,9 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF scanout_active", timeout=30
     )
-    # The test client emits all three markers very quickly (no
-    # network IO, single roundtrip each). Wait for the SURFACE_ENTER
-    # marker — the last one — which signals the full observation is
-    # done.
+    # The test client emits all markers very quickly (no network IO,
+    # single roundtrip each). Wait for SURFACE_ENTER — the last
+    # one emitted by the client's deterministic timeline.
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF SURFACE_ENTER_OBSERVED",
         timeout=30,
@@ -189,6 +188,27 @@ pkgs.testers.runNixOSTest {
         f"send `enter` so the client can pick buffer scale / "
         f"transform / frame timing per-output. Observed line: "
         f"{enter_line!r}"
+    )
+
+    # PHASE 4 (R10): DMABUF_GLOBAL_BOUND MUST be true. The test
+    # client probed `zwp_linux_dmabuf_v1` from the registry; halmasuit
+    # must advertise that global (with renderer-derived format
+    # tranche) so Mesa-EGL clients can negotiate dmabuf buffers
+    # instead of falling back to wl_shm.
+    dmabuf_line = next(
+        (line for line in journal.splitlines()
+         if "DMABUF_GLOBAL_BOUND:" in line),
+        None,
+    )
+    assert dmabuf_line is not None, (
+        "DMABUF_GLOBAL_BOUND not observed in halmasuit journal."
+    )
+    print(f"PHASE 4: {dmabuf_line.strip()}")
+    assert "DMABUF_GLOBAL_BOUND: true" in dmabuf_line, (
+        f"R10 violated: halmasuit did NOT advertise "
+        f"zwp_linux_dmabuf_v1. Mesa-EGL clients (Qt 6 / GTK 4) "
+        f"will fall back to wl_shm — degraded perf and a known "
+        f"wedge vector. Observed line: {dmabuf_line!r}"
     )
 
     # No black/uncovered/degenerate frame across the run — the

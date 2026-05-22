@@ -46,6 +46,7 @@ use wayland_client::{
     globals::{GlobalListContents, registry_queue_init},
     protocol::{wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface},
 };
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1;
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 const SURFACE_W: u32 = 128;
@@ -66,6 +67,13 @@ fn main() -> anyhow::Result<()> {
     // client. Smithay's `Output::enter` walks `client_outputs_internal`
     // — a client that hasn't bound wl_output gets nothing.
     let _output: wl_output::WlOutput = globals.bind(&qh, 1..=4, ())?;
+    // R10: probe for the zwp_linux_dmabuf_v1 global. Bind succeeds
+    // only if halmasuit advertised it (which requires the renderer
+    // to have been created — production path with a real DRM device).
+    let dmabuf_bound = globals
+        .bind::<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _, _>(&qh, 3..=4, ())
+        .is_ok();
+    eprintln!("DMABUF_GLOBAL_BOUND: {dmabuf_bound}");
 
     let wl_surface = compositor.create_surface(&qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&wl_surface, &qh, ());
@@ -348,5 +356,17 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
         if matches!(event, xdg_toplevel::Event::Close) {
             state.closed = true;
         }
+    }
+}
+
+impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        _: zwp_linux_dmabuf_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
     }
 }
