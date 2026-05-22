@@ -20,4 +20,4 @@ anyhow             = "1"
 # configure/ack handshake internally and would hide protocol-level
 # timing of the initial configure event from the test.
 wayland-client     = "0.31"
-wayland-protocols  = { version = "0.32", features = ["client"] }
+wayland-protocols  = { version = "0.32", features = ["client", "staging", "unstable"] }

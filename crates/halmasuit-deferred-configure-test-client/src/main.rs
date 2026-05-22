@@ -46,8 +46,12 @@ use wayland_client::{
     globals::{GlobalListContents, registry_queue_init},
     protocol::{wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface},
 };
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1;
+use wayland_protocols::wp::pointer_gestures::zv1::client::zwp_pointer_gestures_v1;
 use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
+use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1;
+use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_manager_v2;
 use wayland_protocols::wp::viewporter::client::wp_viewporter;
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
@@ -83,12 +87,7 @@ fn main() -> anyhow::Result<()> {
         .bind::<wp_presentation::WpPresentation, _, _>(&qh, 1..=2, ())
         .ok();
     eprintln!("PRESENTATION_GLOBAL_BOUND: {}", presentation.is_some());
-    // Phase B: probe wp_viewporter. Bind succeeds if halmasuit
-    // advertised the global.
-    let viewporter_bound = globals
-        .bind::<wp_viewporter::WpViewporter, _, _>(&qh, 1..=1, ())
-        .is_ok();
-    eprintln!("VIEWPORTER_GLOBAL_BOUND: {viewporter_bound}");
+    probe_phase_b_globals(&globals, &qh);
 
     let wl_surface = compositor.create_surface(&qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&wl_surface, &qh, ());
@@ -229,6 +228,46 @@ fn attach_solid_buffer(
     state.live_resources.push(LiveResource::Pool(pool));
     state.live_resources.push(LiveResource::Buffer(buffer));
     Ok(())
+}
+
+/// Phase B advertise-and-delegate global probes — one journal
+/// marker per global so the VM test can grep for each. Extracted
+/// from `main` to keep it under the 100-line clippy ceiling.
+fn probe_phase_b_globals(globals: &wayland_client::globals::GlobalList, qh: &QueueHandle<State>) {
+    eprintln!(
+        "VIEWPORTER_GLOBAL_BOUND: {}",
+        globals
+            .bind::<wp_viewporter::WpViewporter, _, _>(qh, 1..=1, ())
+            .is_ok()
+    );
+    eprintln!(
+        "FRACTIONAL_SCALE_GLOBAL_BOUND: {}",
+        globals
+            .bind::<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, _, _>(qh, 1..=1, ())
+            .is_ok()
+    );
+    eprintln!(
+        "SINGLE_PIXEL_BUFFER_GLOBAL_BOUND: {}",
+        globals
+            .bind::<wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1, _, _>(
+                qh,
+                1..=1,
+                ()
+            )
+            .is_ok()
+    );
+    eprintln!(
+        "POINTER_GESTURES_GLOBAL_BOUND: {}",
+        globals
+            .bind::<zwp_pointer_gestures_v1::ZwpPointerGesturesV1, _, _>(qh, 1..=3, ())
+            .is_ok()
+    );
+    eprintln!(
+        "TABLET_MANAGER_GLOBAL_BOUND: {}",
+        globals
+            .bind::<zwp_tablet_manager_v2::ZwpTabletManagerV2, _, _>(qh, 1..=1, ())
+            .is_ok()
+    );
 }
 
 fn tempfile() -> anyhow::Result<std::fs::File> {
@@ -464,6 +503,54 @@ impl Dispatch<wp_viewporter::WpViewporter, ()> for State {
         _: &mut Self,
         _: &wp_viewporter::WpViewporter,
         _: wp_viewporter::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+        _: wp_fractional_scale_manager_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1,
+        _: wp_single_pixel_buffer_manager_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_pointer_gestures_v1::ZwpPointerGesturesV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &zwp_pointer_gestures_v1::ZwpPointerGesturesV1,
+        _: zwp_pointer_gestures_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_tablet_manager_v2::ZwpTabletManagerV2, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &zwp_tablet_manager_v2::ZwpTabletManagerV2,
+        _: zwp_tablet_manager_v2::Event,
         (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,

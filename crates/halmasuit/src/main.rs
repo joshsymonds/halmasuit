@@ -146,6 +146,21 @@ struct HalmasuitState {
     /// just owns the global. Both Qt 6 and GTK 4 bind viewporter
     /// for HiDPI fractional-scale composition / subsurface scaling.
     _viewporter_state: smithay::wayland::viewporter::ViewporterState,
+    /// `wp_fractional_scale_manager_v1` state (Phase B). HiDPI
+    /// fractional-scale negotiation; smithay manages the per-surface
+    /// scale advertisement.
+    _fractional_scale_state: smithay::wayland::fractional_scale::FractionalScaleManagerState,
+    /// `wp_single_pixel_buffer_manager_v1` state (Phase B). GTK 4
+    /// uses this for solid-color backgrounds without allocating a
+    /// shm/dmabuf.
+    _single_pixel_buffer_state: smithay::wayland::single_pixel_buffer::SinglePixelBufferState,
+    /// `zwp_pointer_gestures_v1` state (Phase B). GTK 4 touchpad
+    /// gesture protocol — swipe / pinch / hold passthrough.
+    _pointer_gestures_state: smithay::wayland::pointer_gestures::PointerGesturesState,
+    /// `zwp_tablet_manager_v2` state (Phase B). Tablet input
+    /// (stylus, eraser, tablet pad). Both toolkits expose tablet
+    /// API; protocol is the wire layer.
+    _tablet_manager_state: smithay::wayland::tablet_manager::TabletManagerState,
     /// Layer roles for which `Event::ClientFirstFrame` has already
     /// been emitted (emit-once-per-role). The visual-backdrop
     /// continuity assertion keys off the first
@@ -1033,6 +1048,15 @@ impl smithay::wayland::dmabuf::DmabufHandler for HalmasuitState {
 smithay::delegate_dmabuf!(HalmasuitState);
 smithay::delegate_presentation!(HalmasuitState);
 smithay::delegate_viewporter!(HalmasuitState);
+smithay::delegate_fractional_scale!(HalmasuitState);
+smithay::delegate_single_pixel_buffer!(HalmasuitState);
+smithay::delegate_pointer_gestures!(HalmasuitState);
+smithay::delegate_tablet_manager!(HalmasuitState);
+
+// Phase B handlers: smithay traits with sensible default impls.
+// Nothing protocol-visible to customize for v1.
+impl smithay::wayland::fractional_scale::FractionalScaleHandler for HalmasuitState {}
+impl smithay::wayland::tablet_manager::TabletSeatHandler for HalmasuitState {}
 
 impl BufferHandler for HalmasuitState {
     fn buffer_destroyed(
@@ -2575,6 +2599,29 @@ fn main() -> io::Result<()> {
     // GTK 4 bind this; smithay handles all the per-surface logic.
     let viewporter_state =
         smithay::wayland::viewporter::ViewporterState::new::<HalmasuitState>(&display_handle);
+    // Phase B: wp_fractional_scale_manager_v1 — HiDPI fractional
+    // scale negotiation. Smithay manages per-surface state.
+    let fractional_scale_state =
+        smithay::wayland::fractional_scale::FractionalScaleManagerState::new::<HalmasuitState>(
+            &display_handle,
+        );
+    // Phase B: wp_single_pixel_buffer_manager_v1 — solid-color
+    // buffers without an allocator. GTK 4 uses for backgrounds.
+    let single_pixel_buffer_state =
+        smithay::wayland::single_pixel_buffer::SinglePixelBufferState::new::<HalmasuitState>(
+            &display_handle,
+        );
+    // Phase B: zwp_pointer_gestures_v1 — GTK 4 touchpad gestures
+    // (swipe / pinch / hold). Smithay manages the per-gesture
+    // dispatch from libinput passthrough.
+    let pointer_gestures_state = smithay::wayland::pointer_gestures::PointerGesturesState::new::<
+        HalmasuitState,
+    >(&display_handle);
+    // Phase B: zwp_tablet_manager_v2 — stylus / eraser / tablet pad.
+    // Smithay manages the per-tool state on the seat.
+    let tablet_manager_state = smithay::wayland::tablet_manager::TabletManagerState::new::<
+        HalmasuitState,
+    >(&display_handle);
 
     // R9 (convergence): wp_presentation global. CLOCK_MONOTONIC is
     // what halmasuit's start_time / VBlank timestamps use, so the
@@ -2759,6 +2806,10 @@ fn main() -> io::Result<()> {
         presentation_seq: 0,
         cursor_status: CursorImageStatus::default_named(),
         _viewporter_state: viewporter_state,
+        _fractional_scale_state: fractional_scale_state,
+        _single_pixel_buffer_state: single_pixel_buffer_state,
+        _pointer_gestures_state: pointer_gestures_state,
+        _tablet_manager_state: tablet_manager_state,
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
         popups: PopupManager::default(),
