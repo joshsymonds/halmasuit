@@ -753,6 +753,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "xcursor",
  "zbus",
 ]
 

@@ -100,6 +100,11 @@ nix = { workspace = true, features = ["user", "signal", "process", "socket", "ui
 # solid phase. `default-features = false, features = ["png"]` at the
 # workspace level (no JPEG/GIF/… codecs pulled in).
 image = { workspace = true }
+# R8b-render: load Xcursor themes for the visible-cursor render path.
+# Reads $XCURSOR_THEME and $XCURSOR_SIZE at startup; the NixOS module
+# sets these in halmasuit.service's env and the broker propagates them
+# into the session leader's exec env (Amendment A9 allowlist).
+xcursor.workspace = true
 # frame_audit-only. `optional = true` keeps them out of the default
 # (production) dependency graph entirely; `frame_audit` turns them on.
 zbus = { workspace = true, optional = true }

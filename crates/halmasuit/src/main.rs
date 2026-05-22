@@ -31,6 +31,7 @@
 
 mod broker_relay;
 mod broker_session;
+mod cursor;
 #[cfg(feature = "frame_audit")]
 mod dbus;
 mod drm;
@@ -506,6 +507,10 @@ impl HalmasuitState {
             },
         );
         pointer.frame(self);
+        // R8b-render: feed the cursor render position.
+        if let Some(backend) = self.drm_backend.as_mut() {
+            backend.set_pointer_location(location);
+        }
     }
 
     fn on_pointer_absolute_motion<E: AbsolutePositionEvent<LibinputInputBackend>>(
@@ -528,6 +533,10 @@ impl HalmasuitState {
             },
         );
         pointer.frame(self);
+        // R8b-render: feed the cursor render position.
+        if let Some(backend) = self.drm_backend.as_mut() {
+            backend.set_pointer_location(location);
+        }
     }
 
     fn on_pointer_button<E: PointerButtonEvent<LibinputInputBackend>>(&mut self, evt: &E) {
@@ -1281,12 +1290,16 @@ impl SeatHandler for HalmasuitState {
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        // R8b (convergence epic): track the latest cursor surface.
-        // Visible-cursor rendering is the R8b-render follow-up; for
-        // now we accept and store the request so clients don't get
-        // protocol errors and so the future render path has the
-        // data it needs.
-        self.cursor_status = image;
+        // R8b state-tracking (kept) + R8b-render forward (new): mirror
+        // the latest CursorImageStatus into the DRM backend's cursor
+        // state. The renderer rebakes the named pixmap from the
+        // xcursor theme on the next scene_elements call when the icon
+        // name changes; Hidden / Surface variants short-circuit
+        // there.
+        self.cursor_status = image.clone();
+        if let Some(backend) = self.drm_backend.as_mut() {
+            backend.set_cursor_status(image);
+        }
     }
 }
 

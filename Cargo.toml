@@ -119,6 +119,10 @@ proptest           = "1"
 # its bottom-most internal background plane from frame 0 (epic G1
 # R3/R6). default-features off; only the `png` codec is enabled.
 image              = { version = "0.25", default-features = false, features = ["png"] }
+# Xcursor theme loader for R8b-render (visible cursor compositing).
+# Matches smithay anvil's pin (0.3.x). Reads $XCURSOR_THEME + $XCURSOR_SIZE
+# at compositor startup, returns animated frames for named cursors.
+xcursor            = "0.3"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
