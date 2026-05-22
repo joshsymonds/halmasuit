@@ -760,7 +760,7 @@ impl CompositorHandler for HalmasuitState {
         self.send_deferred_xdg_initial_configure(surface);
         self.handle_layer_shell_commit(surface);
         self.maybe_emit_session_first_frame(surface);
-        self.maybe_focus_session_toplevel(surface);
+        self.maybe_focus_foreground_toplevel(surface);
         self.repaint();
     }
 }
@@ -901,15 +901,16 @@ impl HalmasuitState {
         self.apply_swap_action(a);
     }
 
-    /// Focus-follows-foreground (req 17): the session's xdg_toplevel
-    /// gets keyboard focus on its first buffered commit, but only
-    /// once the greetd lifecycle has put the foreground in `Session`
-    /// (set by the A5 swap gate) — never on connection identity
-    /// alone.
-    fn maybe_focus_session_toplevel(&mut self, surface: &WlSurface) {
-        if self.foreground != halmasuit_introspect::Foreground::Session {
-            return;
-        }
+    /// Focus-follows-foreground (req 17 / R13b): the foreground
+    /// xdg_toplevel gets keyboard focus on its first buffered commit.
+    /// The function runs every commit but is bound to the
+    /// foreground_toplevel identity check + has-buffer guard, so it
+    /// becomes effective exactly once per toplevel mapping. Applies
+    /// to BOTH the greeter (greeter-niri's toplevel) and the session
+    /// (the broker-execed session leader's toplevel) — keystrokes
+    /// flow into whatever client owns the foreground surface, which
+    /// is the chain visual-dankgreeter exercises end-to-end.
+    fn maybe_focus_foreground_toplevel(&mut self, surface: &WlSurface) {
         let fg = self
             .foreground_toplevel
             .as_ref()
