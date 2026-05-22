@@ -227,6 +227,14 @@ struct HalmasuitState {
     /// `TextInputSeat::text_input().set_focus(...)`. Stored as a
     /// field (anvil discards) so the global's lifetime is explicit.
     _text_input_manager_state: smithay::wayland::text_input::TextInputManagerState,
+    /// `wp_cursor_shape_manager_v1` state (Phase B — staging tier).
+    /// Clients call `set_shape(serial, shape)` to request a named
+    /// cursor (Default, Pointer, Text, etc.). Smithay routes the
+    /// request directly through `SeatHandler::cursor_image` as
+    /// `CursorImageStatus::Named(CursorIcon)`, which halmasuit's
+    /// R8b-state implementation already stores. Visible cursor
+    /// compositing is the orthogonal R8b-render follow-up.
+    _cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
     /// Layer roles for which `Event::ClientFirstFrame` has already
     /// been emitted (emit-once-per-role). The visual-backdrop
     /// continuity assertion keys off the first
@@ -1271,6 +1279,14 @@ smithay::delegate_primary_selection!(HalmasuitState);
 // bind successfully and track focus via TextInputHandle in seat
 // user_data, but never receive preedit/commit events.
 smithay::delegate_text_input_manager!(HalmasuitState);
+
+// Phase B: wp_cursor_shape_manager_v1 — named-cursor protocol.
+// Smithay's delegate routes set_shape requests through
+// SeatHandler::cursor_image as CursorImageStatus::Named(...). The
+// existing R8b-state cursor_image impl stores the latest status,
+// so no additional handler is needed; visible cursor compositing
+// from that state is the orthogonal R8b-render follow-up.
+smithay::delegate_cursor_shape!(HalmasuitState);
 
 impl BufferHandler for HalmasuitState {
     fn buffer_destroyed(
@@ -2901,6 +2917,14 @@ fn main() -> io::Result<()> {
     // first GetTextInput request.
     let text_input_manager_state =
         smithay::wayland::text_input::TextInputManagerState::new::<HalmasuitState>(&display_handle);
+    // Phase B: wp_cursor_shape_manager_v1 — clients request named
+    // cursors instead of attaching their own buffers. Smithay routes
+    // set_shape through SeatHandler::cursor_image as
+    // CursorImageStatus::Named(CursorIcon); R8b-state already stores
+    // it, so this is a pure advertise-and-delegate.
+    let cursor_shape_state = smithay::wayland::cursor_shape::CursorShapeManagerState::new::<
+        HalmasuitState,
+    >(&display_handle);
 
     // R9 (convergence): wp_presentation global. CLOCK_MONOTONIC is
     // what halmasuit's start_time / VBlank timestamps use, so the
@@ -3099,6 +3123,7 @@ fn main() -> io::Result<()> {
         data_device_state,
         primary_selection_state,
         _text_input_manager_state: text_input_manager_state,
+        _cursor_shape_state: cursor_shape_state,
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
         popups: PopupManager::default(),

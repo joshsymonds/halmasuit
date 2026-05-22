@@ -49,6 +49,7 @@ use wayland_client::{
         wl_shm_pool, wl_surface,
     },
 };
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1;
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1;
 use wayland_protocols::wp::idle_inhibit::zv1::client::zwp_idle_inhibit_manager_v1;
 use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1;
@@ -312,6 +313,12 @@ fn probe_phase_b_input_globals(
                 _,
                 _,
             >(qh, 1..=1, ())
+            .is_ok()
+    );
+    eprintln!(
+        "CURSOR_SHAPE_GLOBAL_BOUND: {}",
+        globals
+            .bind::<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, _, _>(qh, 1..=1, ())
             .is_ok()
     );
 }
@@ -800,6 +807,18 @@ impl Dispatch<zwp_text_input_manager_v3::ZwpTextInputManagerV3, ()> for State {
         _: &mut Self,
         _: &zwp_text_input_manager_v3::ZwpTextInputManagerV3,
         _: zwp_text_input_manager_v3::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+        _: wp_cursor_shape_manager_v1::Event,
         (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
