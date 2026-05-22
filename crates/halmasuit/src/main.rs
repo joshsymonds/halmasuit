@@ -202,6 +202,14 @@ struct HalmasuitState {
     /// no titlebars or task list in v1 so the icon is unused; smithay
     /// caches the request, default no-op `set_icon` handler is fine.
     _xdg_toplevel_icon_manager: smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager,
+    /// `wl_data_device_manager` state (Phase B — first focus-bearing
+    /// semantic protocol). The `wayland.xml` core selection/DnD
+    /// global. halmasuit hosts one fullscreen toplevel per phase so
+    /// cross-client DnD is non-existent in v1; selection (clipboard)
+    /// routing between clients is handled internally by smithay. The
+    /// handler returns `&mut` from `data_device_state()`, so the
+    /// field is `pub`(crate)-visible without the leading underscore.
+    data_device_state: smithay::wayland::selection::data_device::DataDeviceState,
     /// Layer roles for which `Event::ClientFirstFrame` has already
     /// been emitted (emit-once-per-role). The visual-backdrop
     /// continuity assertion keys off the first
@@ -1030,15 +1038,22 @@ impl SeatHandler for HalmasuitState {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&Self::KeyboardFocus>) {
-        // R7 (convergence epic): full focus_changed expands this to
-        // update data-device / primary-selection / text-input focus
-        // atomically with keyboard focus. Those subsystems are not
-        // yet implemented (Phase B), so R7 is currently a no-op
-        // beyond the keyboard path. When Phase B brings those
-        // protocols online, replicate anvil's pattern: call
-        // `set_data_device_focus` / `set_primary_selection_focus` /
-        // text-input focus update here.
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&Self::KeyboardFocus>) {
+        // R7 (convergence epic): focus_changed updates EVERY focus
+        // subsystem atomically with keyboard focus. Currently wired:
+        //   - data-device (selection/clipboard owner) — this call.
+        // Pending (will join here as each lands):
+        //   - primary-selection-v1 focus
+        //   - text-input-v3 focus
+        // Pattern is anvil's: derive the kernel-validated Client from
+        // the focused WlSurface and pass it through to each focus
+        // setter.
+        let client = focused.and_then(|surface| self.display_handle.get_client(surface.id()).ok());
+        smithay::wayland::selection::data_device::set_data_device_focus(
+            &self.display_handle,
+            seat,
+            client,
+        );
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
@@ -1187,6 +1202,29 @@ smithay::delegate_xdg_dialog!(HalmasuitState);
 // smithay caches the request, default no-op `set_icon` is fine.
 impl smithay::wayland::xdg_toplevel_icon::XdgToplevelIconHandler for HalmasuitState {}
 smithay::delegate_xdg_toplevel_icon!(HalmasuitState);
+
+// Phase B: wl_data_device_manager — wayland.xml core selection/DnD.
+// Selection (clipboard) routing between clients is internal to
+// smithay; the handler is the dispatch entry. halmasuit's
+// SelectionUserData is `()` because there is no xwayland-to-Wayland
+// selection forwarding (the anvil pattern that uses non-unit user
+// data). DnD grab handlers use smithay defaults:
+// `WaylandDndGrabHandler::dnd_requested` cancels the source (correct
+// for the single-fullscreen-toplevel model), and the DndGrabHandler
+// reap path is a no-op.
+impl smithay::wayland::selection::data_device::DataDeviceHandler for HalmasuitState {
+    fn data_device_state(
+        &mut self,
+    ) -> &mut smithay::wayland::selection::data_device::DataDeviceState {
+        &mut self.data_device_state
+    }
+}
+impl smithay::wayland::selection::data_device::WaylandDndGrabHandler for HalmasuitState {}
+impl smithay::input::dnd::DndGrabHandler for HalmasuitState {}
+impl smithay::wayland::selection::SelectionHandler for HalmasuitState {
+    type SelectionUserData = ();
+}
+smithay::delegate_data_device!(HalmasuitState);
 
 impl BufferHandler for HalmasuitState {
     fn buffer_destroyed(
@@ -2794,6 +2832,15 @@ fn main() -> io::Result<()> {
         smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager::new::<HalmasuitState>(
             &display_handle,
         );
+    // Phase B: wl_data_device_manager — wayland.xml core selection/
+    // DnD global. Selection (clipboard) routing between clients is
+    // handled internally by smithay. Cross-client DnD is non-
+    // existent in halmasuit's single-fullscreen-toplevel-per-phase
+    // model; smithay's default `dnd_requested` gracefully cancels
+    // the source.
+    let data_device_state = smithay::wayland::selection::data_device::DataDeviceState::new::<
+        HalmasuitState,
+    >(&display_handle);
 
     // R9 (convergence): wp_presentation global. CLOCK_MONOTONIC is
     // what halmasuit's start_time / VBlank timestamps use, so the
@@ -2989,6 +3036,7 @@ fn main() -> io::Result<()> {
         xdg_foreign_state,
         _xdg_dialog_state: xdg_dialog_state,
         _xdg_toplevel_icon_manager: xdg_toplevel_icon_manager,
+        data_device_state,
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
         popups: PopupManager::default(),
