@@ -699,6 +699,17 @@
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
           ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # R12 (GTK4 half): real GTK4 wayland client as halmasuit's
+        # greeter. Qt6 is covered by visual-dankgreeter (Quickshell);
+        # this proves the parallel GTK4 path through the same
+        # halmasuit registry surface.
+        visual-gtk4-smoke = import ./tests/visual-gtk4-smoke.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+          ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # Convergence epic R2: wl_surface.frame callbacks fire so
         # Mesa-EGL clients don't wedge in dri2_wl_surface_throttle.
         visual-frame-callbacks = import ./tests/visual-frame-callbacks.nix {

@@ -116,6 +116,10 @@ test-vm:
     echo "── visual-dankgreeter ──"
     nix build .#checks.x86_64-linux.visual-dankgreeter -L --print-build-logs --no-link
     echo
+    # R12 (GTK4 half): minimal GTK4 wayland client end-to-end.
+    echo "── visual-gtk4-smoke ──"
+    nix build .#checks.x86_64-linux.visual-gtk4-smoke -L --print-build-logs --no-link
+    echo
     # Convergence epic R2: wl_surface.frame callbacks (no Mesa-EGL wedge).
     echo "── visual-frame-callbacks ──"
     nix build .#checks.x86_64-linux.visual-frame-callbacks -L --print-build-logs --no-link
