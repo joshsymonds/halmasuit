@@ -32,6 +32,10 @@ members = [
     # initial xdg_surface.configure event relative to the client's
     # first wl_surface.commit (xdg-shell deferred-configure contract).
     "crates/halmasuit-deferred-configure-test-client",
+    # Throwaway raw-protocol test client — observes the geometry the
+    # compositor forwards on xdg_popup.configure (xdg-shell positioner
+    # pipeline / PopupManager wiring contract).
+    "crates/halmasuit-popup-test-client",
     "xtask",
 ]
 

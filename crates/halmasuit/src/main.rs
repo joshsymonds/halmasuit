@@ -51,6 +51,7 @@ use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface}
 use smithay::backend::session::Session;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::desktop::layer_map_for_output;
+use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::keyboard::FilterResult;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
@@ -117,6 +118,13 @@ struct HalmasuitState {
     /// (greeter/session). v1 is one output, no window management — at
     /// most one toplevel is the foreground.
     foreground_toplevel: Option<ToplevelSurface>,
+    /// Smithay popup tracker. `track_popup` on `new_popup`,
+    /// `commit` per surface commit, `cleanup` once per VBlank.
+    /// Popup grabs (`grab` handler) still log-and-ignore until R8
+    /// wires `wl_seat` for pointer routing — at that point the grab
+    /// will go through `PopupManager::grab_popup` and a `PopupGrab`
+    /// installed on the seat's pointer.
+    popups: PopupManager,
     /// Which client is the foreground, driven by the greetd lifecycle
     /// (req 17): `Greeter` until `start_session` succeeds, then
     /// `Session`. Gates keyboard focus (greeter layer vs session
@@ -397,14 +405,24 @@ impl CompositorHandler for HalmasuitState {
 }
 
 impl HalmasuitState {
-    /// R4 (convergence epic): send the deferred initial xdg-shell
-    /// configure on the client's first commit, per xdg-shell.xml
-    /// `xdg_surface`: "The client must call wl_surface.commit ...
-    /// before it will receive the initial configure event." Smithay
-    /// canonical pattern (smallvil `handlers/xdg_shell.rs:152-189`):
-    /// inventory the xdg-shell surface, check
-    /// `is_initial_configure_sent()`, send once.
-    fn send_deferred_xdg_initial_configure(&self, surface: &WlSurface) {
+    /// R4 (convergence epic) + R5 (PopupManager): send the deferred
+    /// initial xdg-shell configure on the client's first commit, per
+    /// xdg-shell.xml `xdg_surface`: "The client must call
+    /// wl_surface.commit ... before it will receive the initial
+    /// configure event." Smithay canonical pattern (smallvil
+    /// `handlers/xdg_shell.rs:152-189`):
+    ///   1. Advance the PopupManager state machine for popup
+    ///      commits (positioner caching, unmapped→mapped move).
+    ///   2. For toplevels: check `is_initial_configure_sent()` on
+    ///      the `ToplevelSurface` inventory and send once.
+    ///   3. For popups: `find_popup(surface)` returns the
+    ///      `PopupKind`; check `is_initial_configure_sent()` and
+    ///      send once. Initial popup configure is always allowed
+    ///      (smithay returns `NotReactive` only on RE-configure of
+    ///      a non-reactive popup).
+    fn send_deferred_xdg_initial_configure(&mut self, surface: &WlSurface) {
+        self.popups.commit(surface);
+
         if let Some(toplevel) = self
             .xdg_shell_state
             .toplevel_surfaces()
@@ -415,18 +433,9 @@ impl HalmasuitState {
         {
             toplevel.send_configure();
         }
-        if let Some(popup) = self
-            .xdg_shell_state
-            .popup_surfaces()
-            .iter()
-            .find(|p| p.wl_surface() == surface)
-            .cloned()
+        if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface)
             && !popup.is_initial_configure_sent()
         {
-            // Initial popup configure is always allowed (smithay only
-            // returns `NotReactive` on RE-configure of a non-reactive
-            // popup). PopupManager + positioner-driven geometry lands
-            // in R5.
             let _ = popup.send_configure();
         }
     }
@@ -707,14 +716,26 @@ impl XdgShellHandler for HalmasuitState {
         }
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
-        // Per xdg-shell spec the initial `xdg_popup.configure` is
-        // sent in response to the client's first wl_surface.commit
-        // (see commit handler R4 block). PopupManager wiring + full
-        // positioner-driven geometry is R5; until then halmasuit
-        // doesn't host any popup-using clients (greeter + session
-        // tree under it use toplevels + layer surfaces).
-        tracing::debug!("new xdg_popup (initial configure deferred to commit handler)");
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        // R5 (convergence epic): stage the positioner-derived geometry
+        // and register the popup with `PopupManager`. The popup's
+        // initial `xdg_popup.configure` is sent from the commit
+        // handler on the client's first wl_surface.commit, gated on
+        // `is_initial_configure_sent()` (xdg-shell deferred-configure
+        // contract, R4). Unconstrain-against-the-output is intentionally
+        // omitted: halmasuit hosts one fullscreen toplevel whose
+        // geometry equals the output, so the positioner's own geometry
+        // is already screen-relative-correct; full unconstrain logic
+        // (smallvil `unconstrain_popup`) needs the
+        // window-geometry-on-output knowledge a `Space` would provide,
+        // which v1 doesn't have.
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        if let Err(e) = self.popups.track_popup(PopupKind::Xdg(surface)) {
+            tracing::warn!(error = %e, "PopupManager::track_popup failed");
+        }
     }
 
     fn grab(
@@ -730,10 +751,17 @@ impl XdgShellHandler for HalmasuitState {
     fn reposition_request(
         &mut self,
         surface: PopupSurface,
-        _positioner: PositionerState,
+        positioner: PositionerState,
         token: u32,
     ) {
-        // Acknowledge the reposition with the token; real placement comes later.
+        // Apply the new positioner state (geometry + positioner) and
+        // emit a `repositioned` event with the client's token, per
+        // xdg-shell. Smallvil pattern: `with_pending_state` + the
+        // matching `send_repositioned`.
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
         surface.send_repositioned(token);
     }
 }
@@ -2155,6 +2183,12 @@ fn main() -> io::Result<()> {
             &loop_handle,
             |event, _meta, state: &mut HalmasuitState| match event {
                 smithay::backend::drm::DrmEvent::VBlank(_crtc) => {
+                    // R5 (convergence epic): release dead popups
+                    // before any per-frame work — once per VBlank is
+                    // the smithay-recommended cadence and keeps the
+                    // popup tree from accumulating zombies between
+                    // commits.
+                    state.popups.cleanup();
                     if let Some(backend) = state.drm_backend.as_mut()
                         && let Err(e) = backend.frame_submitted()
                     {
@@ -2401,6 +2435,7 @@ fn main() -> io::Result<()> {
         layer_shell_state,
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
+        popups: PopupManager::default(),
         foreground: halmasuit_introspect::Foreground::Greeter,
         _libseat_session: libseat_session,
         loop_handle: loop_handle.clone(),

@@ -483,6 +483,30 @@
             };
           };
 
+          # halmasuit-popup-test-client — observes the geometry the
+          # compositor forwards on xdg_popup.configure (R5
+          # PopupManager-driven positioner pipeline). Raw protocol;
+          # creates xdg_toplevel + xdg_popup with a deliberate
+          # positioner and emits POPUP_CONFIGURE: x=..y=..w=..h=..
+          halmasuit-popup-test-client = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-popup-test-client";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [ "-p" "halmasuit-popup-test-client" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [ pkgs.wayland ];
+            doCheck = false;
+            meta = {
+              description = "xdg-shell popup positioner / geometry observer (R5)";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-popup-test-client";
+            };
+          };
+
           # ssimulacra2_rs — pure-Rust port of the SSIMULACRA2
           # perceptual image-diff metric. Used by visual VM tests as
           # the golden-comparison engine. Chosen over the C++
@@ -694,6 +718,16 @@
           halmasuit-session                         = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-deferred-configure-test-client  = self.packages.x86_64-linux.halmasuit-deferred-configure-test-client;
           ssimulacra2-cli                           = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Convergence epic R5: smithay PopupManager + positioner-driven
+        # xdg_popup geometry (no more zero-rect default configure).
+        visual-popup = import ./tests/visual-popup.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                  = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session          = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-popup-test-client = self.packages.x86_64-linux.halmasuit-popup-test-client;
+          ssimulacra2-cli            = self.packages.x86_64-linux.ssimulacra2-cli;
         };
         # Amendment A5.6: poll-only leader pidfd backstop — SCM_RIGHTS
         # worker→broker→compositor armed + fires on leader exit.

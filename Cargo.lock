@@ -805,6 +805,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "halmasuit-popup-test-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "wayland-client",
+ "wayland-protocols",
+]
+
+[[package]]
 name = "halmasuit-protocols"
 version = "0.1.0"
 
