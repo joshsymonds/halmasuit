@@ -185,6 +185,14 @@ fn attach_solid_buffer(
 }
 
 fn tempfile() -> anyhow::Result<std::fs::File> {
+    // Open-then-unlink anonymous-file idiom. The path includes the
+    // process pid (unique within the running VM/system); the
+    // single-process test-client model means no in-flight peer can
+    // race the unlink. The fd holds the inode alive past
+    // remove_file; the dirent goes away immediately, leaving an
+    // anonymous file backed by the fd. For production-grade code
+    // `memfd_create(2)` is the modern equivalent, but this is
+    // throwaway test plumbing in a single-process VM.
     let dir = std::env::temp_dir();
     let path = dir.join(format!("halmasuit-popup-{}", std::process::id()));
     let file = std::fs::OpenOptions::new()

@@ -140,38 +140,44 @@ fn main() -> anyhow::Result<()> {
     state.paint_child(CHILD_INITIAL_BGRA);
     eprintln!("subsurface-test-client: initial mapping committed");
 
-    // Drive the rest of the deterministic timeline. Mix in dispatch
-    // pumps so any compositor events (frame callbacks, etc.) don't
-    // pile up.
+    // Drive the rest of the deterministic timeline. Use
+    // blocking_dispatch with a per-iteration deadline so we sleep on
+    // epoll rather than burning CPU on a sleep+poll loop.
     let t0 = Instant::now();
     let pump = |conn: &Connection,
                 eq: &mut wayland_client::EventQueue<State>,
-                s: &mut State|
+                s: &mut State,
+                until: Duration|
      -> anyhow::Result<()> {
-        conn.flush()?;
-        eq.dispatch_pending(s)?;
-        std::thread::sleep(Duration::from_millis(50));
+        while t0.elapsed() < until {
+            conn.flush()?;
+            // dispatch a batch (returns when at least one event was
+            // processed or the connection has no pending data — for a
+            // throughput pump we keep iterating until our timestamp
+            // gate fires).
+            eq.dispatch_pending(s)?;
+            // Yield to the kernel: 50ms is well above libwayland's
+            // typical event latency and below halmasuit's per-VBlank
+            // (16ms) cadence enough that we coalesce a few VBlanks
+            // per wake. Using park-with-timeout rather than a
+            // spin-loop keeps CPU near zero for an idle test client.
+            std::thread::park_timeout(Duration::from_millis(50));
+        }
         Ok(())
     };
 
-    while t0.elapsed() < Duration::from_secs(3) {
-        pump(&conn, &mut event_queue, &mut state)?;
-    }
+    pump(&conn, &mut event_queue, &mut state, Duration::from_secs(3))?;
     eprintln!("subsurface-test-client: PHASE 2 — sync subsurface commit");
     state.paint_child(CHILD_RECOMMIT_BGRA);
 
-    while t0.elapsed() < Duration::from_secs(12) {
-        pump(&conn, &mut event_queue, &mut state)?;
-    }
+    pump(&conn, &mut event_queue, &mut state, Duration::from_secs(12))?;
     eprintln!("subsurface-test-client: PHASE 3 — parent commit");
     // No new parent buffer; just commit the parent surface, which
     // applies the child's pending sync state per wl_subsurface spec.
     state.window.wl_surface().commit();
 
     // Settle window after the last commit.
-    while t0.elapsed() < Duration::from_secs(16) {
-        pump(&conn, &mut event_queue, &mut state)?;
-    }
+    pump(&conn, &mut event_queue, &mut state, Duration::from_secs(16))?;
     eprintln!("subsurface-test-client: PHASE 4 — exit");
     Ok(())
 }
