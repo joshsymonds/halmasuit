@@ -161,6 +161,12 @@ struct HalmasuitState {
     /// (stylus, eraser, tablet pad). Both toolkits expose tablet
     /// API; protocol is the wire layer.
     _tablet_manager_state: smithay::wayland::tablet_manager::TabletManagerState,
+    /// `zxdg_decoration_manager_v1` state (Phase B). Qt 6 binds
+    /// this to ask whether to draw its own titlebar; halmasuit
+    /// hosts one fullscreen toplevel and draws no decorations, so
+    /// we always answer `ServerSide` (= "no decoration is the
+    /// server's contribution"; client also draws none).
+    _xdg_decoration_state: smithay::wayland::shell::xdg::decoration::XdgDecorationState,
     /// Layer roles for which `Event::ClientFirstFrame` has already
     /// been emitted (emit-once-per-role). The visual-backdrop
     /// continuity assertion keys off the first
@@ -1057,6 +1063,33 @@ smithay::delegate_tablet_manager!(HalmasuitState);
 // Nothing protocol-visible to customize for v1.
 impl smithay::wayland::fractional_scale::FractionalScaleHandler for HalmasuitState {}
 impl smithay::wayland::tablet_manager::TabletSeatHandler for HalmasuitState {}
+
+// Phase B: xdg-decoration handler. halmasuit always answers
+// `ServerSide` — its single fullscreen toplevel needs no decoration,
+// and `ServerSide` means "no client-side draws contribute either"
+// (which is what fullscreen-greeter / fullscreen-session want).
+impl smithay::wayland::shell::xdg::decoration::XdgDecorationHandler for HalmasuitState {
+    fn new_decoration(&mut self, toplevel: smithay::wayland::shell::xdg::ToplevelSurface) {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        toplevel.with_pending_state(|s| s.decoration_mode = Some(Mode::ServerSide));
+        toplevel.send_pending_configure();
+    }
+    fn request_mode(
+        &mut self,
+        toplevel: smithay::wayland::shell::xdg::ToplevelSurface,
+        _mode: smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode,
+    ) {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        toplevel.with_pending_state(|s| s.decoration_mode = Some(Mode::ServerSide));
+        toplevel.send_pending_configure();
+    }
+    fn unset_mode(&mut self, toplevel: smithay::wayland::shell::xdg::ToplevelSurface) {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        toplevel.with_pending_state(|s| s.decoration_mode = Some(Mode::ServerSide));
+        toplevel.send_pending_configure();
+    }
+}
+smithay::delegate_xdg_decoration!(HalmasuitState);
 
 impl BufferHandler for HalmasuitState {
     fn buffer_destroyed(
@@ -2622,6 +2655,12 @@ fn main() -> io::Result<()> {
     let tablet_manager_state = smithay::wayland::tablet_manager::TabletManagerState::new::<
         HalmasuitState,
     >(&display_handle);
+    // Phase B: zxdg_decoration_manager_v1 — always answer ServerSide
+    // (= "no decoration is server's contribution") for halmasuit's
+    // fullscreen toplevel model. Qt avoids double titlebars.
+    let xdg_decoration_state = smithay::wayland::shell::xdg::decoration::XdgDecorationState::new::<
+        HalmasuitState,
+    >(&display_handle);
 
     // R9 (convergence): wp_presentation global. CLOCK_MONOTONIC is
     // what halmasuit's start_time / VBlank timestamps use, so the
@@ -2810,6 +2849,7 @@ fn main() -> io::Result<()> {
         _single_pixel_buffer_state: single_pixel_buffer_state,
         _pointer_gestures_state: pointer_gestures_state,
         _tablet_manager_state: tablet_manager_state,
+        _xdg_decoration_state: xdg_decoration_state,
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
         popups: PopupManager::default(),

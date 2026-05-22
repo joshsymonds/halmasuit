@@ -53,6 +53,7 @@ use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_prese
 use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1;
 use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_manager_v2;
 use wayland_protocols::wp::viewporter::client::wp_viewporter;
+use wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1;
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 const SURFACE_W: u32 = 128;
@@ -266,6 +267,12 @@ fn probe_phase_b_globals(globals: &wayland_client::globals::GlobalList, qh: &Que
         "TABLET_MANAGER_GLOBAL_BOUND: {}",
         globals
             .bind::<zwp_tablet_manager_v2::ZwpTabletManagerV2, _, _>(qh, 1..=1, ())
+            .is_ok()
+    );
+    eprintln!(
+        "XDG_DECORATION_GLOBAL_BOUND: {}",
+        globals
+            .bind::<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _, _>(qh, 1..=1, ())
             .is_ok()
     );
 }
@@ -551,6 +558,18 @@ impl Dispatch<zwp_tablet_manager_v2::ZwpTabletManagerV2, ()> for State {
         _: &mut Self,
         _: &zwp_tablet_manager_v2::ZwpTabletManagerV2,
         _: zwp_tablet_manager_v2::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+        _: zxdg_decoration_manager_v1::Event,
         (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
