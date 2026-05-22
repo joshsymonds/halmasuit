@@ -710,6 +710,18 @@
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
           ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # R13(b) — currently NOT a gated check. visual-dankgreeter-auth
+        # exists in tests/ as a documented attempt at the G3 keystroke
+        # arc by running Quickshell directly against halmasuit (no
+        # greeter-niri in the chain). The test gets further than the
+        # niri-nested path — Quickshell launches, maps an Overlay
+        # wlr-layer-shell surface, renders the DMS UI — but injected
+        # keystrokes still do not visibly reach the DMS QML
+        # TextFields. The deeper investigation is tracked in Task #37
+        # and is outside this epic's halmasuit-code scope (the
+        # downstream chain is Qt's wl_keyboard handling /
+        # Quickshell's QML focus / DMS's input bindings, all
+        # upstream). Re-add this check once R13(b) is resolved.
         # Convergence epic R2: wl_surface.frame callbacks fire so
         # Mesa-EGL clients don't wedge in dri2_wl_surface_throttle.
         visual-frame-callbacks = import ./tests/visual-frame-callbacks.nix {
