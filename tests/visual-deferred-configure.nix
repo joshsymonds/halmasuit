@@ -254,6 +254,8 @@ pkgs.testers.runNixOSTest {
         "TABLET_MANAGER_GLOBAL_BOUND",
         "XDG_DECORATION_GLOBAL_BOUND",
         "XDG_ACTIVATION_GLOBAL_BOUND",
+        "IDLE_INHIBIT_GLOBAL_BOUND",
+        "KEYBOARD_SHORTCUTS_INHIBIT_GLOBAL_BOUND",
     ):
         line = next(
             (l for l in journal.splitlines() if f"{marker}:" in l),

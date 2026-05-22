@@ -47,6 +47,8 @@ use wayland_client::{
     protocol::{wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface},
 };
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1;
+use wayland_protocols::wp::idle_inhibit::zv1::client::zwp_idle_inhibit_manager_v1;
+use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1;
 use wayland_protocols::wp::pointer_gestures::zv1::client::zwp_pointer_gestures_v1;
 use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
@@ -280,6 +282,22 @@ fn probe_phase_b_globals(globals: &wayland_client::globals::GlobalList, qh: &Que
         "XDG_ACTIVATION_GLOBAL_BOUND: {}",
         globals
             .bind::<xdg_activation_v1::XdgActivationV1, _, _>(qh, 1..=1, ())
+            .is_ok()
+    );
+    eprintln!(
+        "IDLE_INHIBIT_GLOBAL_BOUND: {}",
+        globals
+            .bind::<zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1, _, _>(qh, 1..=1, ())
+            .is_ok()
+    );
+    eprintln!(
+        "KEYBOARD_SHORTCUTS_INHIBIT_GLOBAL_BOUND: {}",
+        globals
+            .bind::<
+                zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
+                _,
+                _,
+            >(qh, 1..=1, ())
             .is_ok()
     );
 }
@@ -589,6 +607,32 @@ impl Dispatch<xdg_activation_v1::XdgActivationV1, ()> for State {
         _: &mut Self,
         _: &xdg_activation_v1::XdgActivationV1,
         _: xdg_activation_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
+        _: zwp_idle_inhibit_manager_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1, ()>
+    for State
+{
+    fn event(
+        _: &mut Self,
+        _: &zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
+        _: zwp_keyboard_shortcuts_inhibit_manager_v1::Event,
         (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,

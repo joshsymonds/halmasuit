@@ -174,6 +174,17 @@ struct HalmasuitState {
     /// log+ignore the activation requests themselves. Field is
     /// `pub`(crate) because the handler returns a `&mut` to it.
     xdg_activation_state: smithay::wayland::xdg_activation::XdgActivationState,
+    /// `zwp_idle_inhibit_manager_v1` state (Phase B). GTK 4 binds.
+    /// halmasuit has no idle behavior in v1; inhibit/uninhibit are
+    /// no-ops protocol-side, smithay tracks the inhibitor set.
+    _idle_inhibit_state: smithay::wayland::idle_inhibit::IdleInhibitManagerState,
+    /// `zwp_keyboard_shortcuts_inhibit_manager_v1` state (Phase B).
+    /// halmasuit has no global keyboard shortcuts to intercept (all
+    /// keyboard input goes straight to the focused client), so the
+    /// protocol records inhibitor requests but they're effectively
+    /// no-ops. `pub`(crate) because the handler returns a `&mut`.
+    keyboard_shortcuts_inhibit_state:
+        smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState,
     /// Layer roles for which `Event::ClientFirstFrame` has already
     /// been emitted (emit-once-per-role). The visual-backdrop
     /// continuity assertion keys off the first
@@ -1115,6 +1126,28 @@ impl smithay::wayland::xdg_activation::XdgActivationHandler for HalmasuitState {
     }
 }
 smithay::delegate_xdg_activation!(HalmasuitState);
+
+// Phase B: zwp_idle_inhibit — no idle behavior in v1; inhibit/
+// uninhibit are no-ops.
+impl smithay::wayland::idle_inhibit::IdleInhibitHandler for HalmasuitState {
+    fn inhibit(&mut self, _surface: WlSurface) {}
+    fn uninhibit(&mut self, _surface: WlSurface) {}
+}
+smithay::delegate_idle_inhibit!(HalmasuitState);
+
+// Phase B: zwp_keyboard_shortcuts_inhibit — no global shortcuts in
+// v1; smithay tracks inhibitor objects, default trait methods are
+// fine (new_inhibitor / inhibitor_destroyed are no-ops).
+impl smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitHandler
+    for HalmasuitState
+{
+    fn keyboard_shortcuts_inhibit_state(
+        &mut self,
+    ) -> &mut smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState {
+        &mut self.keyboard_shortcuts_inhibit_state
+    }
+}
+smithay::delegate_keyboard_shortcuts_inhibit!(HalmasuitState);
 
 impl BufferHandler for HalmasuitState {
     fn buffer_destroyed(
@@ -2693,6 +2726,18 @@ fn main() -> io::Result<()> {
     let xdg_activation_state = smithay::wayland::xdg_activation::XdgActivationState::new::<
         HalmasuitState,
     >(&display_handle);
+    // Phase B: zwp_idle_inhibit_manager_v1 — GTK 4 binds. No idle
+    // behavior in v1; inhibit/uninhibit handlers are no-ops.
+    let idle_inhibit_state = smithay::wayland::idle_inhibit::IdleInhibitManagerState::new::<
+        HalmasuitState,
+    >(&display_handle);
+    // Phase B: zwp_keyboard_shortcuts_inhibit_manager_v1 — halmasuit
+    // has no global keyboard shortcuts; inhibitor requests are
+    // tracked but inert.
+    let keyboard_shortcuts_inhibit_state =
+        smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState::new::<
+            HalmasuitState,
+        >(&display_handle);
 
     // R9 (convergence): wp_presentation global. CLOCK_MONOTONIC is
     // what halmasuit's start_time / VBlank timestamps use, so the
@@ -2883,6 +2928,8 @@ fn main() -> io::Result<()> {
         _tablet_manager_state: tablet_manager_state,
         _xdg_decoration_state: xdg_decoration_state,
         xdg_activation_state,
+        _idle_inhibit_state: idle_inhibit_state,
+        keyboard_shortcuts_inhibit_state,
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
         popups: PopupManager::default(),
