@@ -406,8 +406,13 @@ impl HalmasuitState {
             }
             InputEvent::PointerButton { event } => self.on_pointer_button(&event),
             InputEvent::PointerAxis { event } => self.on_pointer_axis(&event),
+            InputEvent::TouchDown { event } => self.on_touch_down(&event),
+            InputEvent::TouchUp { event } => self.on_touch_up(&event),
+            InputEvent::TouchMotion { event } => self.on_touch_motion(&event),
+            InputEvent::TouchFrame { event: _ } => self.on_touch_frame(),
+            InputEvent::TouchCancel { event: _ } => self.on_touch_cancel(),
             _ => {
-                // Tablet, touch, switch — not in v1 scope. Future epics.
+                // Tablet, switch — not in v1 scope. Future epics.
             }
         }
     }
@@ -547,6 +552,90 @@ impl HalmasuitState {
         let _ = AxisRelativeDirection::Identical;
         pointer.axis(self, frame);
         pointer.frame(self);
+    }
+
+    // Touch handlers. halmasuit hosts one fullscreen toplevel/layer
+    // surface per phase, so the touch target trivially equals the
+    // keyboard focus (same as the pointer model). Touch absolute
+    // coords come from the libinput event transformed against the
+    // current output extents.
+
+    fn on_touch_down<E: smithay::backend::input::TouchDownEvent<LibinputInputBackend>>(
+        &mut self,
+        evt: &E,
+    ) {
+        let Some(touch) = self.seat.get_touch() else {
+            return;
+        };
+        let (w, h) = self
+            .output
+            .current_mode()
+            .map_or((1280_i32, 800_i32), |m| (m.size.w, m.size.h));
+        let location = evt.position_transformed((w, h).into());
+        let focus = self.pointer_focus();
+        touch.down(
+            self,
+            focus,
+            &smithay::input::touch::DownEvent {
+                slot: evt.slot(),
+                location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time: evt.time_msec(),
+            },
+        );
+    }
+
+    fn on_touch_up<E: smithay::backend::input::TouchUpEvent<LibinputInputBackend>>(
+        &mut self,
+        evt: &E,
+    ) {
+        let Some(touch) = self.seat.get_touch() else {
+            return;
+        };
+        touch.up(
+            self,
+            &smithay::input::touch::UpEvent {
+                slot: evt.slot(),
+                serial: SERIAL_COUNTER.next_serial(),
+                time: evt.time_msec(),
+            },
+        );
+    }
+
+    fn on_touch_motion<E: smithay::backend::input::TouchMotionEvent<LibinputInputBackend>>(
+        &mut self,
+        evt: &E,
+    ) {
+        let Some(touch) = self.seat.get_touch() else {
+            return;
+        };
+        let (w, h) = self
+            .output
+            .current_mode()
+            .map_or((1280_i32, 800_i32), |m| (m.size.w, m.size.h));
+        let location = evt.position_transformed((w, h).into());
+        let focus = self.pointer_focus();
+        touch.motion(
+            self,
+            focus,
+            &smithay::input::touch::MotionEvent {
+                slot: evt.slot(),
+                location,
+                time: evt.time_msec(),
+            },
+        );
+    }
+
+    fn on_touch_frame(&mut self) {
+        if let Some(touch) = self.seat.get_touch() {
+            touch.frame(self);
+        }
+    }
+
+    fn on_touch_cancel(&mut self) {
+        if let Some(touch) = self.seat.get_touch() {
+            touch.cancel(self);
+        }
     }
 
     /// Point keyboard focus at `surface` (or clear it). No-op if it is
@@ -2636,6 +2725,11 @@ fn main() -> io::Result<()> {
     seat.add_keyboard(smithay::input::keyboard::XkbConfig::default(), 200, 25)
         .map_err(|e| io::Error::other(format!("seat.add_keyboard: {e}")))?;
     seat.add_pointer();
+    // wl_touch capability — locked in the 25-protocol scope. libinput
+    // touch events route through this handle in `dispatch_libinput`;
+    // even on systems without a touch device the capability is
+    // advertised, matching wl_seat's contract.
+    seat.add_touch();
 
     let output_manager_state =
         OutputManagerState::new_with_xdg_output::<HalmasuitState>(&display_handle);
