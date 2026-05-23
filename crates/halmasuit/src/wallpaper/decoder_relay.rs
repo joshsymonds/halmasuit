@@ -42,14 +42,6 @@
 //!   MAX_FRAME_BYTES` AND `width * height * 4 == bytes_len` AND
 //!   non-zero dims, enforced via `validate_frame_header`.
 
-// reason: VideoBackend is the consumer (T20 wires it). This module
-// ships ahead so the relay primitives are review-able as their own
-// commit; the dead_code allow lifts once T20 calls into it.
-#![allow(
-    dead_code,
-    reason = "consumed by VideoBackend in T20; module ships ahead of the consumer"
-)]
-
 use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -97,10 +89,6 @@ pub enum RelayError {
     PidfdOpen(nix::Error),
     #[error("IPC error: {0}")]
     Ipc(IpcError),
-    #[error("decoder exited before Ready handshake")]
-    DecoderExitedBeforeReady,
-    #[error("decoder protocol violation: {0}")]
-    Protocol(String),
 }
 
 /// Errors from the IPC encode/decode path. Distinct from `RelayError`
@@ -294,7 +282,6 @@ pub struct DecoderRelay {
     pidfd: OwnedFd,
     decoder_pid: nix::unistd::Pid,
     latest_frame: RefCell<Option<LatestFrame>>,
-    wallpaper_path: std::path::PathBuf,
     /// Sliding-window restart bookkeeping.
     restart_history: RefCell<Vec<Instant>>,
     /// True once the restart budget is exhausted; VideoBackend
@@ -322,10 +309,9 @@ impl DecoderRelay {
         // bump via the kernel mirroring it on a socketpair.
         set_socket_buffers(parent_end.as_raw_fd())?;
 
-        let wallpaper_path = wallpaper_path.to_path_buf();
         let wallpaper_file =
-            File::open(&wallpaper_path).map_err(|err| RelayError::OpenWallpaper {
-                path: wallpaper_path.clone(),
+            File::open(wallpaper_path).map_err(|err| RelayError::OpenWallpaper {
+                path: wallpaper_path.to_path_buf(),
                 err,
             })?;
 
@@ -354,7 +340,6 @@ impl DecoderRelay {
             pidfd,
             decoder_pid: child_pid,
             latest_frame: RefCell::new(None),
-            wallpaper_path,
             restart_history: RefCell::new(Vec::new()),
             dead: RefCell::new(false),
             ready: RefCell::new(false),
@@ -435,14 +420,19 @@ impl DecoderRelay {
     }
 
     /// True if the restart budget is exhausted and the wallpaper
-    /// engine should fall back.
+    /// engine should fall back. Consumed by `VideoBackend` after each
+    /// poll to short-circuit the "keep rendering forever" path.
     pub fn is_dead(&self) -> bool {
         *self.dead.borrow()
     }
 
     /// Borrowed pidfd for poll-based decoder-exit detection. Not yet
     /// wired into calloop (Phase A polls via `poll_frames` in
-    /// render_element); calloop integration is a follow-on.
+    /// render_element); calloop integration is a follow-on epic.
+    #[allow(
+        dead_code,
+        reason = "available for calloop integration; not consumed in Phase A"
+    )]
     pub fn pidfd(&self) -> BorrowedFd<'_> {
         self.pidfd.as_fd()
     }

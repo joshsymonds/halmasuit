@@ -374,7 +374,7 @@ where
                 WallpaperConfig::Video {
                     source,
                     loop_playback,
-                } => Box::new(VideoBackend::new(&mut renderer, source, loop_playback)?),
+                } => Box::new(VideoBackend::new(&mut renderer, &source, loop_playback)?),
             };
             WallpaperEngine::with_backend(backend)
         }
