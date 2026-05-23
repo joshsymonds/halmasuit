@@ -38,9 +38,18 @@ tracing-subscriber.workspace = true
 #   bounded, CORE=0).
 # - sched: unshare(CLONE_NEW{USER,NET,NS}) for namespace isolation.
 # - fs: open /proc/self/fd for the fd-close iteration.
-nix       = { workspace = true, features = ["socket", "signal", "process", "resource", "sched", "fs", "user"] }
+nix       = { workspace = true, features = ["socket", "signal", "process", "resource", "sched", "fs", "user", "uio"] }
 # libc: PR_SET_NO_NEW_PRIVS via prctl (nix doesn't expose it), plus
 # STDERR_FILENO / STDIN_FILENO etc. constants for the fd-close
 # allowlist.
 libc.workspace      = true
 thiserror.workspace = true
+# Video decoder — MIT-licensed wrapper around FFmpeg's libav*
+# (LGPL-2.1+ dynamic-link). Probes pkg-config for libavformat /
+# libavcodec / libavutil / libswscale at build time; production
+# closure has them via pkgs.ffmpeg-headless. NOT --enable-gpl,
+# so x264/x265 are NOT in scope — h264 via stock libavcodec,
+# AV1 via libdav1d. Spike (Epic #12 task 2) confirmed this dep
+# does not re-trigger clang-sys#128 against halmasuit-session's
+# dev-deps pam-sys.
+rsmpeg = { workspace = true }

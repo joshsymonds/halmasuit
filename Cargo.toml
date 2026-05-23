@@ -138,6 +138,25 @@ image              = { version = "0.25", default-features = false, features = ["
 # defaults don't collide with pam-sys's bindgen 0.69).
 rsmpeg             = { version = "0.18.0", default-features = false, features = ["link_system_ffmpeg", "ffmpeg8"] }
 
+# Vendored `[patch.crates-io]` override (Epic #12): the dev-deps-only
+# pam-sys audit lever (halmasuit-session/tests/pam_ffi_parity.rs)
+# coexists with rsmpeg's transitive bindgen 0.71. Without this patch,
+# pam-sys's bindgen 0.69 (`default-features = false`) and rsmpeg's
+# bindgen 0.71 (runtime ON) collide at the unified clang-sys feature
+# set — `cargo nextest run --all-features` panics in clang-sys 1.8.1
+# at "a `libclang` shared library is not loaded on this thread"
+# (clang-sys#128, open since 2021). The vendored copy is byte-identical
+# to upstream 1.0.0-alpha5 except for a single Cargo.toml line:
+# bindgen's `default-features = false` → `default-features = true`,
+# which enables bindgen's runtime feature so its build.rs calls
+# clang_sys::load() itself. The patch affects ONLY the dev-deps audit
+# lever; production halmasuit-session uses the hand-rolled FFI in
+# `crates/halmasuit-session/src/pam_sys.rs` (Epic #5) and never touches
+# pam-sys. Re-evaluate when pam-sys upstream ships 1.0 final or when
+# clang-sys#128 lands a fix.
+[patch.crates-io]
+pam-sys = { path = "vendor/pam-sys-1.0.0-alpha5-runtime-feature" }
+
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery  = { level = "warn", priority = -1 }

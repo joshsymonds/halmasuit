@@ -24,18 +24,22 @@
 //! - The IPC loop in `main.rs` uses only nix's safe `send`/`recv`
 //!   wrappers and has no `unsafe` blocks of its own.
 
+mod decode;
 mod sandbox;
 
-use std::os::fd::RawFd;
+use std::io::IoSliceMut;
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::process::ExitCode;
 
 use halmasuit_decoder_ipc::{
-    CompositorToDecoder, DecoderToCompositor, MAX_CONTROL_MSG_BYTES, WIRE_VERSION, encode_control,
-    try_decode_control,
+    CompositorToDecoder, DecoderToCompositor, FrameFormat, MAX_CONTROL_MSG_BYTES, WIRE_VERSION,
+    encode_control, try_decode_control,
 };
-use nix::sys::socket::{MsgFlags, recv, send};
+use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg, send};
 use thiserror::Error;
 use tracing::{Level, error, info, warn};
+
+use crate::decode::{DecodeError, RgbaFrame};
 
 /// fd the parent (`halmasuit`) dup2's our IPC socketpair end to before
 /// exec. Convention; not negotiable per-process.
@@ -60,6 +64,14 @@ enum DecoderError {
     /// without sending `Shutdown`. Equivalent to a hangup mid-stream.
     #[error("ipc peer hung up unexpectedly")]
     PeerHangup,
+    /// `LoadFile` arrived without an accompanying `SCM_RIGHTS` fd.
+    /// The protocol guarantees the fd; if absent, the compositor is
+    /// misbehaving.
+    #[error("LoadFile arrived without an SCM_RIGHTS fd")]
+    LoadFileMissingFd,
+    /// rsmpeg / libavcodec error during decode.
+    #[error("decode error: {0}")]
+    Decode(DecodeError),
 }
 
 fn main() -> ExitCode {
@@ -107,22 +119,101 @@ fn init_tracing() {
 /// Drive the IPC loop on `fd`.
 ///
 /// 1. Send `Ready { wire_version }`.
-/// 2. Loop: receive a control message; act on it.
+/// 2. Loop on `recvmsg` (carries SCM_RIGHTS for the wallpaper fd):
 ///    - `Shutdown` → return Ok(()).
-///    - Anything else → log "skeleton: ignoring {msg:?}" and continue.
+///    - `LoadFile { loop_playback }` (T17 MVP: ignores `loop_playback`,
+///      decodes ONE frame): extract the fd from the ancillary
+///      data, open via [`decode::open_video_input`], decode the
+///      first frame via [`decode::decode_first_frame`], send
+///      `FrameHeader` + raw RGBA bytes. Then continue the loop
+///      (waiting for Shutdown). The full multi-frame decode loop
+///      with Pause/Resume/Seek/EOF-loop lands in T18.
+///    - Other control variants → log and continue (until T18).
 ///
 /// Extracted from `main()` for unit-testing against a `socketpair`.
 fn run(fd: RawFd) -> Result<(), DecoderError> {
     send_ready(fd)?;
 
     loop {
-        match recv_one(fd)? {
+        let (msg, fds) = recv_one(fd)?;
+        match msg {
             CompositorToDecoder::Shutdown => return Ok(()),
+            CompositorToDecoder::LoadFile { loop_playback } => {
+                let _ = loop_playback; // T17 MVP: ignore; T18 will use it.
+                let wallpaper_fd = fds
+                    .into_iter()
+                    .next()
+                    .ok_or(DecoderError::LoadFileMissingFd)?;
+                handle_load_file_once(fd, wallpaper_fd)?;
+            }
             other => {
-                warn!(message = ?other, "skeleton: ignoring control message (not yet implemented)");
+                warn!(message = ?other, "T17 MVP: ignoring control message (Pause/Resume/Seek arrive in T18)");
             }
         }
     }
+}
+
+/// MVP `LoadFile` handler (T17): decode exactly ONE frame, emit it
+/// on the wire, then return to the recv loop.
+fn handle_load_file_once(ipc_fd: RawFd, wallpaper_fd: OwnedFd) -> Result<(), DecoderError> {
+    // `into_raw_fd` transfers ownership to libavformat (which calls
+    // open() / close() on /dev/fd/N internally). Without this the
+    // OwnedFd would close at scope exit before libavformat is done
+    // with it.
+    let raw_wallpaper = wallpaper_fd.into_raw_fd();
+    let mut state = decode::open_video_input(raw_wallpaper).map_err(|err| {
+        // Send a DecoderError on the wire before propagating up so
+        // halmasuit's relay sees the categorized failure code.
+        let _ = send_decoder_error(ipc_fd, &err);
+        DecoderError::Decode(err)
+    })?;
+    let frame = decode::decode_first_frame(&mut state).map_err(|err| {
+        let _ = send_decoder_error(ipc_fd, &err);
+        DecoderError::Decode(err)
+    })?;
+    send_frame(ipc_fd, &frame, 0)?;
+    Ok(())
+}
+
+/// Send a `DecoderError` wire message to halmasuit. Best-effort —
+/// errors here are logged but not propagated (the calling site is
+/// already in an error path).
+fn send_decoder_error(ipc_fd: RawFd, err: &DecodeError) -> Result<(), DecoderError> {
+    let wire = DecoderToCompositor::DecoderError {
+        code: err.to_wire_code(),
+        message: err.to_string(),
+    };
+    let bytes = encode_control(&wire).map_err(DecoderError::Codec)?;
+    send_all(ipc_fd, &bytes)
+}
+
+/// Send one frame: header datagram, then raw RGBA bytes datagram.
+fn send_frame(ipc_fd: RawFd, frame: &RgbaFrame, frame_idx: u64) -> Result<(), DecoderError> {
+    let bytes_len = u32::try_from(frame.bytes.len()).map_err(|_| {
+        DecoderError::Codec(halmasuit_decoder_ipc::CodecError::OversizedFrame(
+            u32::MAX,
+            halmasuit_decoder_ipc::MAX_FRAME_BYTES,
+        ))
+    })?;
+    let header = DecoderToCompositor::FrameHeader {
+        frame_idx,
+        pts_us: frame.pts_us,
+        width: frame.width,
+        height: frame.height,
+        format: FrameFormat::Rgba8,
+        bytes_len,
+    };
+    let header_bytes = encode_control(&header).map_err(DecoderError::Codec)?;
+    send_all(ipc_fd, &header_bytes)?;
+    send_all(ipc_fd, &frame.bytes)?;
+    info!(
+        width = frame.width,
+        height = frame.height,
+        bytes = frame.bytes.len(),
+        pts_us = frame.pts_us,
+        "decoder: sent frame",
+    );
+    Ok(())
 }
 
 fn send_ready(fd: RawFd) -> Result<(), DecoderError> {
@@ -147,14 +238,38 @@ fn send_all(fd: RawFd, bytes: &[u8]) -> Result<(), DecoderError> {
     }
 }
 
-/// Receive ONE control-plane message. SOCK_SEQPACKET delivers one
-/// datagram per `recv`; we size the buffer for [`MAX_CONTROL_MSG_BYTES`]
-/// plus the 4-byte length prefix so the codec sees a complete frame.
-fn recv_one(fd: RawFd) -> Result<CompositorToDecoder, DecoderError> {
+/// Receive ONE control-plane message + any SCM_RIGHTS fds the peer
+/// attached. SOCK_SEQPACKET delivers one datagram per `recvmsg`;
+/// we size the iovec for [`MAX_CONTROL_MSG_BYTES`] + 4 (length
+/// prefix) and the cmsg buffer for ~16 fds' worth of `SCM_RIGHTS`
+/// (only one fd should ever arrive — the wallpaper fd alongside
+/// `LoadFile` — but we accept up to 16 in case the kernel batches).
+fn recv_one(fd: RawFd) -> Result<(CompositorToDecoder, Vec<OwnedFd>), DecoderError> {
     let mut buf = vec![0u8; MAX_CONTROL_MSG_BYTES as usize + 4];
-    let n = loop {
-        match recv(fd, &mut buf, MsgFlags::empty()) {
-            Ok(n) => break n,
+    let mut cmsg_space: Vec<u8> = vec![0; nix::sys::socket::cmsg_space::<[RawFd; 16]>()];
+
+    let (n, fds) = loop {
+        let mut iov = [IoSliceMut::new(&mut buf)];
+        match recvmsg::<()>(fd, &mut iov, Some(&mut cmsg_space), MsgFlags::empty()) {
+            Ok(msg) => {
+                let mut received_fds: Vec<OwnedFd> = Vec::new();
+                for cmsg in msg.cmsgs().map_err(DecoderError::Recv)? {
+                    if let ControlMessageOwned::ScmRights(raw_fds) = cmsg {
+                        for raw in raw_fds {
+                            // SAFETY: each fd is freshly received from
+                            // the kernel via SCM_RIGHTS; we take
+                            // ownership exactly once.
+                            #[expect(
+                                unsafe_code,
+                                reason = "SCM_RIGHTS fds are freshly received; OwnedFd::from_raw_fd takes ownership"
+                            )]
+                            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+                            received_fds.push(owned);
+                        }
+                    }
+                }
+                break (msg.bytes, received_fds);
+            }
             // EINTR: fall through; loop iterates naturally.
             Err(nix::errno::Errno::EINTR) => {}
             Err(err) => return Err(DecoderError::Recv(err)),
@@ -173,7 +288,7 @@ fn recv_one(fd: RawFd) -> Result<CompositorToDecoder, DecoderError> {
     let (msg, _consumed): (CompositorToDecoder, usize) = try_decode_control(&buf)
         .map_err(DecoderError::Codec)?
         .ok_or(partial_frame_err)?;
-    Ok(msg)
+    Ok((msg, fds))
 }
 
 #[cfg(test)]
