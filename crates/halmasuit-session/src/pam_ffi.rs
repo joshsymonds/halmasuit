@@ -28,7 +28,7 @@ use std::marker::PhantomData;
 use std::{panic, ptr};
 
 use halmasuit_session_ipc::{BrokerToCompositor, Secret};
-use pam_sys::{
+use crate::pam_sys::{
     PAM_BUF_ERR, PAM_CONV_ERR, PAM_DELETE_CRED, PAM_ESTABLISH_CRED, PAM_RUSER, PAM_SUCCESS,
     PAM_TTY, PAM_USER, pam_acct_mgmt, pam_authenticate, pam_close_session, pam_conv, pam_end,
     pam_get_item, pam_getenvlist, pam_handle_t, pam_message, pam_open_session, pam_putenv,
@@ -663,29 +663,29 @@ mod tests {
         specs: &[(i32, &str)],
     ) -> (
         Vec<CString>,
-        Vec<*const pam_sys::pam_message>,
-        Vec<pam_sys::pam_message>,
+        Vec<*const crate::pam_sys::pam_message>,
+        Vec<crate::pam_sys::pam_message>,
     ) {
         let cstrings: Vec<CString> = specs
             .iter()
             .map(|(_, t)| CString::new(*t).unwrap())
             .collect();
-        let messages: Vec<pam_sys::pam_message> = specs
+        let messages: Vec<crate::pam_sys::pam_message> = specs
             .iter()
             .zip(&cstrings)
-            .map(|((style, _), cs)| pam_sys::pam_message {
+            .map(|((style, _), cs)| crate::pam_sys::pam_message {
                 msg_style: *style,
                 msg: cs.as_ptr(),
             })
             .collect();
-        let ptrs: Vec<*const pam_sys::pam_message> =
+        let ptrs: Vec<*const crate::pam_sys::pam_message> =
             messages.iter().map(std::ptr::from_ref).collect();
         (cstrings, ptrs, messages)
     }
 
     /// Free a libpam-style response array the way libpam would, so the
     /// test does not leak what the trampoline allocated.
-    fn free_like_pam(resp: *mut pam_sys::pam_response, n: usize) {
+    fn free_like_pam(resp: *mut crate::pam_sys::pam_response, n: usize) {
         if resp.is_null() {
             return;
         }
@@ -707,10 +707,10 @@ mod tests {
     fn run(
         specs: &[(i32, &str)],
         responder: &mut dyn ConvResponder,
-    ) -> (i32, *mut pam_sys::pam_response) {
+    ) -> (i32, *mut crate::pam_sys::pam_response) {
         let (_keep, ptrs, _msgs) = msgs(specs);
         let mut ctx = ConvCtx { responder };
-        let mut resp: *mut pam_sys::pam_response = std::ptr::null_mut();
+        let mut resp: *mut crate::pam_sys::pam_response = std::ptr::null_mut();
         let n = i32::try_from(specs.len()).unwrap();
         #[expect(
             unsafe_code,
@@ -720,7 +720,7 @@ mod tests {
             conv_trampoline(
                 n,
                 ptrs.as_ptr()
-                    .cast::<*const pam_sys::pam_message>()
+                    .cast::<*const crate::pam_sys::pam_message>()
                     .cast_mut(),
                 &raw mut resp,
                 (&raw mut ctx).cast::<c_void>(),
@@ -734,22 +734,22 @@ mod tests {
         // Pins task #4's hardcoded libpam codes against pam_sys.
         assert_eq!(
             conv::pam_style_of(PromptStyle::Secret),
-            pam_sys::PAM_PROMPT_ECHO_OFF
+            crate::pam_sys::PAM_PROMPT_ECHO_OFF
         );
         assert_eq!(
             conv::pam_style_of(PromptStyle::Visible),
-            pam_sys::PAM_PROMPT_ECHO_ON
+            crate::pam_sys::PAM_PROMPT_ECHO_ON
         );
         assert_eq!(
             conv::pam_style_of(PromptStyle::Error),
-            pam_sys::PAM_ERROR_MSG
+            crate::pam_sys::PAM_ERROR_MSG
         );
         assert_eq!(
             conv::pam_style_of(PromptStyle::Info),
-            pam_sys::PAM_TEXT_INFO
+            crate::pam_sys::PAM_TEXT_INFO
         );
         assert_eq!(
-            conv::prompt_style_from_pam(pam_sys::PAM_TEXT_INFO).unwrap(),
+            conv::prompt_style_from_pam(crate::pam_sys::PAM_TEXT_INFO).unwrap(),
             PromptStyle::Info
         );
     }
@@ -764,12 +764,12 @@ mod tests {
         };
         let (rc, resp) = run(
             &[
-                (pam_sys::PAM_PROMPT_ECHO_OFF, "Password: "),
-                (pam_sys::PAM_PROMPT_ECHO_ON, "Login: "),
+                (crate::pam_sys::PAM_PROMPT_ECHO_OFF, "Password: "),
+                (crate::pam_sys::PAM_PROMPT_ECHO_ON, "Login: "),
             ],
             &mut r,
         );
-        assert_eq!(rc, pam_sys::PAM_SUCCESS);
+        assert_eq!(rc, crate::pam_sys::PAM_SUCCESS);
         assert!(!resp.is_null());
         #[expect(
             unsafe_code,
@@ -795,12 +795,12 @@ mod tests {
         };
         let (rc, resp) = run(
             &[
-                (pam_sys::PAM_TEXT_INFO, "one moment"),
-                (pam_sys::PAM_ERROR_MSG, "bad thing"),
+                (crate::pam_sys::PAM_TEXT_INFO, "one moment"),
+                (crate::pam_sys::PAM_ERROR_MSG, "bad thing"),
             ],
             &mut r,
         );
-        assert_eq!(rc, pam_sys::PAM_SUCCESS);
+        assert_eq!(rc, crate::pam_sys::PAM_SUCCESS);
         assert!(!resp.is_null());
         #[expect(
             unsafe_code,
@@ -826,7 +826,7 @@ mod tests {
             fail: false,
         };
         let (rc, resp) = run(&[(99, "weird")], &mut r);
-        assert_eq!(rc, pam_sys::PAM_CONV_ERR);
+        assert_eq!(rc, crate::pam_sys::PAM_CONV_ERR);
         assert!(resp.is_null(), "no array published on the error path");
         assert!(r.seen.is_empty());
     }
@@ -839,8 +839,8 @@ mod tests {
             seen: vec![],
             fail: true,
         };
-        let (rc, resp) = run(&[(pam_sys::PAM_PROMPT_ECHO_OFF, "Password: ")], &mut r);
-        assert_eq!(rc, pam_sys::PAM_CONV_ERR);
+        let (rc, resp) = run(&[(crate::pam_sys::PAM_PROMPT_ECHO_OFF, "Password: ")], &mut r);
+        assert_eq!(rc, crate::pam_sys::PAM_CONV_ERR);
         assert!(resp.is_null());
     }
 
@@ -853,7 +853,7 @@ mod tests {
             fail: false,
         };
         let mut ctx = ConvCtx { responder: &mut r };
-        let mut resp: *mut pam_sys::pam_response = std::ptr::null_mut();
+        let mut resp: *mut crate::pam_sys::pam_response = std::ptr::null_mut();
         #[expect(
             unsafe_code,
             reason = "exercising the trampoline's defensive null/<=0 guards."
@@ -866,7 +866,7 @@ mod tests {
                     &raw mut resp,
                     (&raw mut ctx).cast::<c_void>()
                 ),
-                pam_sys::PAM_CONV_ERR
+                crate::pam_sys::PAM_CONV_ERR
             );
             assert_eq!(
                 conv_trampoline(
@@ -875,7 +875,7 @@ mod tests {
                     &raw mut resp,
                     (&raw mut ctx).cast::<c_void>()
                 ),
-                pam_sys::PAM_CONV_ERR
+                crate::pam_sys::PAM_CONV_ERR
             );
             assert_eq!(
                 conv_trampoline(
@@ -884,7 +884,7 @@ mod tests {
                     std::ptr::null_mut(),
                     (&raw mut ctx).cast::<c_void>()
                 ),
-                pam_sys::PAM_CONV_ERR
+                crate::pam_sys::PAM_CONV_ERR
             );
         }
     }
@@ -929,12 +929,12 @@ mod tests {
             responder: &mut responder,
         };
         let text = CString::new("PW: ").unwrap();
-        let message = pam_sys::pam_message {
-            msg_style: pam_sys::PAM_PROMPT_ECHO_OFF,
+        let message = crate::pam_sys::pam_message {
+            msg_style: crate::pam_sys::PAM_PROMPT_ECHO_OFF,
             msg: text.as_ptr(),
         };
-        let mut mptr: *const pam_sys::pam_message = std::ptr::from_ref(&message);
-        let mut resp: *mut pam_sys::pam_response = std::ptr::null_mut();
+        let mut mptr: *const crate::pam_sys::pam_message = std::ptr::from_ref(&message);
+        let mut resp: *mut crate::pam_sys::pam_response = std::ptr::null_mut();
         #[expect(
             unsafe_code,
             reason = "end-to-end: our own trampoline with one synthetic \
@@ -949,7 +949,7 @@ mod tests {
                 (&raw mut ctx).cast::<c_void>(),
             )
         };
-        assert_eq!(rc, pam_sys::PAM_SUCCESS);
+        assert_eq!(rc, crate::pam_sys::PAM_SUCCESS);
         #[expect(
             unsafe_code,
             reason = "read back then free the trampoline's response array, as libpam would."
