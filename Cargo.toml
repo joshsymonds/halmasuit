@@ -103,10 +103,11 @@ caps               = "0.5"
 # halmasuit-session privilege-drop primitives lean on it for
 # boundary-condition coverage.
 proptest           = "1"
-# Witness-PNG decoder used by the `halmasuit` compositor: it decodes
-# the configured `HALMASUIT_WITNESS_IMAGE` PNG and composites it as
-# its bottom-most internal background plane from frame 0 (epic G1
-# R3/R6). default-features off; only the `png` codec is enabled.
+# Wallpaper-image decoder used by the `halmasuit` compositor: the
+# wallpaper engine's ImageBackend decodes the configured
+# `HALMASUIT_WALLPAPER_PATH` file and composites it as the
+# bottom-most wallpaper plane from frame 0 (epic G1/R3/R6).
+# default-features off; only the `png` codec is enabled.
 image              = { version = "0.25", default-features = false, features = ["png"] }
 
 [workspace.lints.clippy]

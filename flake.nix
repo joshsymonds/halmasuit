@@ -521,7 +521,8 @@
         };
         # Epic #1 FLAGSHIP gate (headline): ONE pam_handle_t spans
         # auth→session — real pam_unix, pam_mount-equivalent authtok
-        # witness, getgrouplist-MERGE, Amendment-A1.3 env survival.
+        # continuity across phases, getgrouplist-MERGE, Amendment-A1.3
+        # env survival.
         session-onehandle = import ./tests/session-onehandle.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
@@ -582,7 +583,7 @@
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
         # Epic layer F1: real xdg_toplevel composited fullscreen
-        # over halmasuit's internal witness plane.
+        # over halmasuit's internal wallpaper plane.
         visual-halmasuit-toplevel = import ./tests/visual-halmasuit-toplevel.nix {
           system = "x86_64-linux";
           inherit nixpkgs;

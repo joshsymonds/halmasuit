@@ -2,7 +2,7 @@
 # pidfd backstop gate.
 #
 # Proves the privilege-crossing fd path end to end on the REAL
-# mechanism (halmasuit's internal witness plane + layer-shell greeter
+# mechanism (halmasuit's internal wallpaper plane + layer-shell greeter
 # + real greetd full-auth → compositor relays to the privileged
 # halmasuit-session broker → the
 # broker forks-then-drops the session as an xdg_toplevel client):
@@ -69,7 +69,7 @@ pkgs.testers.runNixOSTest {
         greeterUid      = 999;
         greeterGroup    = "halmasuit-greeter";
         compositorUid   = 998;
-        witnessImage    = fixture;
+        wallpaper = { type = "image"; source = fixture; };
         greeterCommand  = "${pkgs.writeShellScript "halmasuit-fg-greeter" ''
           export HALMASUIT_TESTCLIENT_KEYBOARD=1
           export HALMASUIT_TESTCLIENT_LAYER=top
@@ -134,7 +134,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF scanout_active", timeout=30
     )
-    # The witness plane is composited internally from frame 0.
+    # The wallpaper plane is composited internally from frame 0.
     machine.wait_until_succeeds(
         "journalctl -u halmasuit -o cat | grep -qF client_first_frame", timeout=30
     )

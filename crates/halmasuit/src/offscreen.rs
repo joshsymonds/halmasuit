@@ -106,7 +106,7 @@ where
 /// scene, used by the in-crate exact-image unit tests (`frame_audit`
 /// and this module). The VM gate's exact-image comparison is the
 /// Python ssimulacra2 path (≥ 95.0) against the checked-in PNG
-/// witness; this Rust helper is the unit-test embodiment of the same
+/// golden; this Rust helper is the unit-test embodiment of the same
 /// model that replaces the old `mean_luminance < 0.02` /
 /// `backdrop_coverage` proxy heuristics. `#[cfg(test)]`: it has no
 /// non-test consumer, so it never bloats `halmasuit-debug` either.

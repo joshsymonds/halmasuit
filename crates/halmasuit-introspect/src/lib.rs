@@ -134,15 +134,15 @@ pub enum Event {
     /// of these events (`visual.assert_no_flash_stream`), as EXACT
     /// integer/boolean facts — never fuzzy aggregate float thresholds.
     /// Anchored at FRAME 0 (epic amendment G1/R3): halmasuit
-    /// composites the witness plane internally from the first frame,
-    /// so the single `client_first_frame{role:background}` precedes
-    /// every `FrameRendered` and EVERY frame (frame 0 onward, not a
-    /// suffix) must have `clear_pixel_count == 0` (no sentinel-clear
-    /// pixel leaked through — there is no pre-client solid phase) and
-    /// `degenerate == false` (no all-clear, all-black, or
-    /// empty/dropped frame). `pixel_count` stays constant across the
-    /// whole stream (the composited target is never resized/recreated
-    /// under the live output mode).
+    /// composites the wallpaper plane internally from the first
+    /// frame, so the single `client_first_frame{role:wallpaper}`
+    /// precedes every `FrameRendered` and EVERY frame (frame 0
+    /// onward, not a suffix) must have `clear_pixel_count == 0` (no
+    /// sentinel-clear pixel leaked through — there is no pre-client
+    /// solid phase) and `degenerate == false` (no all-clear,
+    /// all-black, or empty/dropped frame). `pixel_count` stays
+    /// constant across the whole stream (the composited target is
+    /// never resized/recreated under the live output mode).
     FrameRendered {
         /// Monotonic per-process frame counter, starting at 0 on the
         /// first composited frame.
@@ -172,18 +172,18 @@ pub enum Event {
         /// gross content shifts without pixel-exact comparison.
         phash: u64,
     },
-    /// First composite of a given layer role. For `Background` this
-    /// is halmasuit's INTERNAL witness plane (epic amendment G1/R3) —
-    /// emitted once, before the first composited frame, since the
-    /// witness is composited from frame 0 (there is no external
-    /// background client). `Bottom`/`Top`/`Overlay` are the first
-    /// buffer a real wlr-layer-shell client of that role committed.
-    /// Emitted once per role per process lifetime. Unconditional (NOT
-    /// `frame_audit`-gated): a cheap state-transition marker, like
-    /// `GreeterSpawned`. The exact no-flash stream gate
-    /// (`visual.assert_no_flash_stream`) requires the single
-    /// `ClientFirstFrame { role: Background }` to precede every
-    /// `FrameRendered`, each of which must then have
+    /// First composite of a given layer role. For `Wallpaper` this
+    /// is halmasuit's INTERNAL wallpaper plane (epic amendment
+    /// G1/R3) — emitted once, before the first composited frame,
+    /// since the wallpaper is composited from frame 0 (there is no
+    /// external background client). `Bottom`/`Top`/`Overlay` are the
+    /// first buffer a real wlr-layer-shell client of that role
+    /// committed. Emitted once per role per process lifetime.
+    /// Unconditional (NOT `frame_audit`-gated): a cheap
+    /// state-transition marker, like `GreeterSpawned`. The exact
+    /// no-flash stream gate (`visual.assert_no_flash_stream`)
+    /// requires the single `ClientFirstFrame { role: Wallpaper }` to
+    /// precede every `FrameRendered`, each of which must then have
     /// `clear_pixel_count == 0` (Epic #1 req 11 / R3).
     ClientFirstFrame {
         /// Which layer-shell role first painted.
@@ -278,21 +278,38 @@ pub enum Foreground {
     Session,
 }
 
-/// wlr-layer-shell layer (mirrors `wlr_layer::Layer`).
+/// Layer role used by the `ClientFirstFrame` event.
 ///
-/// Duplicated here so `halmasuit-introspect` needs no smithay
-/// dependency for one enum; halmasuit maps the smithay value onto
-/// this at the emission site.
+/// Four of the variants (`Background`/`Bottom`/`Top`/`Overlay`)
+/// mirror the `wlr-layer-shell` protocol layer of the same name and
+/// mark the first frame any external wlr-layer-shell client of that
+/// role committed. `Wallpaper` is halmasuit's INTERNAL wallpaper
+/// plane — no external client; the wallpaper engine composites it
+/// from frame 0 (epic amendment G1/R3) and emits the
+/// `ClientFirstFrame { role: Wallpaper }` anchor before the first
+/// composited frame. `Background` therefore represents an external
+/// wlr-layer-shell `background` client (composited above the
+/// wallpaper plane, below normal windows). Duplicated here so
+/// `halmasuit-introspect` needs no smithay dependency; halmasuit
+/// maps the smithay layer value onto this at the emission site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayerRole {
-    /// Wallpaper plane — the persistent system background (splash).
+    /// The wallpaper plane — halmasuit's internal bottom-most
+    /// composited content surface, hosting image / shader / video
+    /// backends via the wallpaper engine. NO external client; the
+    /// engine emits this exactly once per process lifetime, before
+    /// the first composited frame.
+    Wallpaper,
+    /// An external wlr-layer-shell `background` layer client
+    /// (composited above the wallpaper plane, below normal windows).
     Background,
-    /// Below normal windows.
+    /// Below normal windows (wlr-layer-shell `bottom` layer).
     Bottom,
-    /// Above normal windows.
+    /// Above normal windows (wlr-layer-shell `top` layer).
     Top,
-    /// Topmost — lockscreens, OSKs, notifications.
+    /// Topmost — lockscreens, OSKs, notifications (wlr-layer-shell
+    /// `overlay` layer).
     Overlay,
 }
 
@@ -557,11 +574,12 @@ mod tests {
     #[test]
     fn event_client_first_frame_carries_role() {
         let v = round_trip(&Event::ClientFirstFrame {
-            role: LayerRole::Background,
+            role: LayerRole::Wallpaper,
         });
         assert_eq!(v["event"], "client_first_frame");
-        assert_eq!(v["role"], "background");
+        assert_eq!(v["role"], "wallpaper");
         for (role, name) in [
+            (LayerRole::Background, "background"),
             (LayerRole::Bottom, "bottom"),
             (LayerRole::Top, "top"),
             (LayerRole::Overlay, "overlay"),

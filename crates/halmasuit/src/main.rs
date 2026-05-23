@@ -24,6 +24,7 @@ mod frame_audit;
 #[cfg(feature = "frame_audit")]
 mod offscreen;
 mod swap_gate;
+mod wallpaper;
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -1387,11 +1388,11 @@ fn broker_socket_path_from_env() -> PathBuf {
 
 /// The transient GL clear color in XRGB8888 little-endian, derived
 /// from [`drm::CLEAR_RGB`]. Under epic amendment G1/R6 it is never
-/// visible: the witness plane covers the entire output on every frame
-/// including frame 0, so there is no observable pre-client solid
-/// phase. It remains the uncovered sentinel the no-flash audit keys
-/// on — a pixel byte-equal to it means the witness is NOT covering
-/// (a flash / broken renderer).
+/// visible: the wallpaper plane covers the entire output on every
+/// frame including frame 0, so there is no observable pre-client
+/// solid phase. It remains the uncovered sentinel the no-flash
+/// audit keys on — a pixel byte-equal to it means the wallpaper is
+/// NOT covering (a flash / broken renderer).
 ///
 /// Built via [`drm::xrgb_le`] from [`drm::CLEAR_RGB`] — the single
 /// source of truth — so the byte ordering is unit-tested at build
@@ -1462,14 +1463,18 @@ fn greeter_command_from_env() -> Option<PathBuf> {
     std::env::var_os("HALMASUIT_GREETER_COMMAND").map(PathBuf::from)
 }
 
-/// Path of the witness PNG halmasuit composites as its internal
-/// bottom-most background plane from frame 0 (epic G1/R3/R6). Returns
-/// `None` when `HALMASUIT_WITNESS_IMAGE` is unset — non-visual
-/// integration tests run without one (the legacy clear-only scene);
+/// Resolve the wallpaper config from environment. Returns `None`
+/// when `HALMASUIT_WALLPAPER_PATH` is unset — non-visual integration
+/// tests run without a wallpaper (the legacy clear-only scene);
 /// production and visual deployments always set it via
-/// `services.halmasuit.witnessImage`.
-fn witness_image_from_env() -> Option<PathBuf> {
-    std::env::var_os("HALMASUIT_WITNESS_IMAGE").map(PathBuf::from)
+/// `services.halmasuit.wallpaper`. Phase-A: the env var carries a
+/// single file path and the backend variant is inferred from the
+/// extension (see `wallpaper::config::infer_from_path`); the
+/// shader-uniforms task will add a `HALMASUIT_WALLPAPER_CONFIG`
+/// TOML companion when richer config (named uniforms, per-monitor)
+/// is needed.
+fn wallpaper_config_from_env() -> Option<wallpaper::WallpaperConfig> {
+    wallpaper::config::from_env()
 }
 
 /// Spawn the greeter binary as a child process running under the
@@ -2002,10 +2007,11 @@ fn main() -> io::Result<()> {
     // built — `setup_drm_backend` needs `loop_handle` to wire the
     // page-flip event source.
     let drm_device_path = drm_device_path_from_env()?;
-    // The internal witness plane (epic G1/R3/R6). Decoded once inside
+    // The wallpaper plane (epic G1/R3/R6). Constructed once inside
     // `setup_drm_backend`; `is_some()` here also gates the frame-0
-    // background anchor emitted below.
-    let witness_path = witness_image_from_env();
+    // wallpaper anchor emitted below.
+    let wallpaper_config = wallpaper_config_from_env();
+    let wallpaper_configured = wallpaper_config.is_some();
 
     // Initialize the Wayland display + protocol state.
     let display: Display<HalmasuitState> = Display::new().map_err(io::Error::other)?;
@@ -2078,7 +2084,7 @@ fn main() -> io::Result<()> {
                     tracing::warn!(error = %e, "DRM device error");
                 }
             },
-            witness_path.as_deref(),
+            wallpaper_config,
         )?;
 
         // libinput, fed device fds through the SAME seatd session
@@ -2301,22 +2307,22 @@ fn main() -> io::Result<()> {
         session_first_frame_emitted: false,
     };
 
-    // The witness plane is composited from frame 0 (epic G1/R3/R6):
-    // emit the `Background` first-frame anchor BEFORE the initial
+    // The wallpaper plane is composited from frame 0 (epic G1/R3/R6):
+    // emit the `Wallpaper` first-frame anchor BEFORE the initial
     // render so `assert_no_flash_stream` counts frame 0's audit as
-    // post-background (it must already be witness-covered — there is
+    // post-wallpaper (it must already be wallpaper-covered — there is
     // no pre-client solid phase). The `seen_layer_roles` guard makes
-    // this the single `ClientFirstFrame{Background}` for the episode;
-    // a later real Background layer client cannot emit a second one
+    // this the single `ClientFirstFrame{Wallpaper}` for the episode;
+    // a later real wallpaper-layer client cannot emit a second one
     // (the no-flash invariant requires exactly one). Skipped when no
-    // witness is configured (non-visual integration tests).
-    if witness_path.is_some()
+    // wallpaper is configured (non-visual integration tests).
+    if wallpaper_configured
         && state
             .seen_layer_roles
-            .insert(halmasuit_introspect::LayerRole::Background)
+            .insert(halmasuit_introspect::LayerRole::Wallpaper)
     {
         emit(&Event::ClientFirstFrame {
-            role: halmasuit_introspect::LayerRole::Background,
+            role: halmasuit_introspect::LayerRole::Wallpaper,
         });
     }
 
@@ -2324,7 +2330,7 @@ fn main() -> io::Result<()> {
     // for this frame triggers the next vblank, which our DRM event
     // handler observes (`frame_submitted`) — that's the keepalive for
     // the render loop. Subsequent damage events (wl_client commits)
-    // queue additional frames over the witness plane.
+    // queue additional frames over the wallpaper plane.
     //
     // `Phase::ScanoutActive` fires here, on the first successful
     // `queue_frame` — "first pixel via GLES" per the epic's IMMUTABLE

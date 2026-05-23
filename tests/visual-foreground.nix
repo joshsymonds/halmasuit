@@ -1,7 +1,7 @@
 # tests/visual-foreground.nix — epic layer F2 gate.
 #
 # Proves the greetd-lifecycle-driven foreground swap on the REAL
-# mechanism: halmasuit's internal witness plane (composited from
+# mechanism: halmasuit's internal wallpaper plane (composited from
 # frame 0, persistent) + a layer-shell greeter (halmasuit's tracked
 # greeterCommand child) → halmasuit-vm-client
 # drives a real greetd full-auth → the compositor relays it to the
@@ -87,9 +87,9 @@ pkgs.testers.runNixOSTest {
         greeterUid     = 999;
         greeterGroup   = "halmasuit-greeter";
         compositorUid  = 998;
-        witnessImage   = fixture;
+        wallpaper = { type = "image"; source = fixture; };
         # The greeter: a fullscreen keyboard-interactive layer client
-        # over halmasuit's internal witness plane. halmasuit's tracked
+        # over halmasuit's internal wallpaper plane. halmasuit's tracked
         # child — killed on start_session.
         greeterCommand = "${pkgs.writeShellScript "halmasuit-fg-greeter" ''
           export HALMASUIT_TESTCLIENT_KEYBOARD=1
@@ -171,7 +171,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF scanout_active", timeout=30
     )
-    # The witness plane is composited internally from frame 0.
+    # The wallpaper plane is composited internally from frame 0.
     machine.wait_until_succeeds(
         "journalctl -u halmasuit -o cat | grep -qF client_first_frame", timeout=30
     )

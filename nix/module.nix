@@ -30,6 +30,28 @@ let
   brokerPeerUid = if cfg.enable then cfg.compositorUid else cfg.greeterUid;
 in
 {
+  imports = [
+    # Hard-cut, no alias: the prior `witnessImage` option is removed
+    # by the wallpaper-engine epic. Configs setting it now fail with
+    # this message rather than silently mapping to the new option
+    # shape (user preference; see CLAUDE.md "delete replaced code
+    # completely; no backwards-compatibility shims").
+    (lib.mkRemovedOptionModule [ "services" "halmasuit" "witnessImage" ] ''
+      This option was renamed to `services.halmasuit.wallpaper` and
+      reshaped into a discriminated union. Replace the old
+      single-path form with:
+
+        services.halmasuit.wallpaper = {
+          type   = "image";
+          source = ./branding/wallpaper.png;
+        };
+
+      `type = "shader"` and `type = "video"` are Phase-A typed
+      scaffolding; the wallpaper-engine epic's follow-up tasks wire
+      the backends. See ARCHITECTURE.md for the design.
+    '')
+  ];
+
   options.services.halmasuit = {
     enable = lib.mkEnableOption "halmasuit — Linux system compositor";
 
@@ -116,17 +138,62 @@ in
       '';
     };
 
-    witnessImage = lib.mkOption {
-      type        = lib.types.nullOr lib.types.path;
+    wallpaper = lib.mkOption {
+      type = lib.types.nullOr (lib.types.submodule {
+        options = {
+          type = lib.mkOption {
+            type        = lib.types.enum [ "image" "shader" "video" ];
+            default     = "image";
+            description = ''
+              Which wallpaper backend to use. Phase-A wires only
+              `image' (PNG/JPG/WebP); `shader' (GLSL fragment) and
+              `video' (h264/AV1) are typed config entries the
+              wallpaper-engine epic's follow-up tasks fill in. Picking
+              an unwired backend fails the compositor closed at
+              startup with a clear error.
+            '';
+          };
+          source = lib.mkOption {
+            type        = lib.types.path;
+            description = ''
+              Absolute path to the wallpaper file (image / shader
+              source / video). String-interpolated into the unit
+              environment so a path literal is realized into the
+              store; an absolute runtime path interpolates to itself.
+            '';
+          };
+          uniforms = lib.mkOption {
+            type        = lib.types.attrsOf lib.types.anything;
+            default     = {};
+            description = ''
+              Named GLSL uniforms for `type = "shader"'. Phase-A: not
+              yet wired (the shader-uniforms task lands the parser).
+              The schema admits four uniform kinds — auto-*
+              (engine-driven time/resolution/frame/delta/mouse),
+              static-typed (float/vec2/vec3/vec4/int/bool),
+              event-time and event-value (bus-driven, Phase-B).
+            '';
+          };
+          loop = lib.mkOption {
+            type        = lib.types.bool;
+            default     = true;
+            description = ''
+              Whether `type = "video"' wallpapers loop. Defaults to
+              true for wallpaper use.
+            '';
+          };
+        };
+      });
       default     = null;
-      example     = lib.literalExpression ''./branding/witness.png'';
+      example     = lib.literalExpression ''{ type = "image"; source = ./branding/wallpaper.png; }'';
       description = ''
-        Absolute path to a PNG halmasuit composites as its bottom-most
-        internal background plane from frame 0 (epic G1/R3/R6). When
-        set, exported to halmasuit's unit environment as
-        `HALMASUIT_WITNESS_IMAGE` and decoded by halmasuit itself at
-        startup — there is no separate client. `null` runs halmasuit
-        with no witness (legacy clear-only — non-visual tests).
+        Wallpaper config. The wallpaper engine composites this as the
+        bottom-most plane of every frame from frame 0 (epic G1/R3/R6).
+        When set, the source path is exported to halmasuit's unit
+        environment as `HALMASUIT_WALLPAPER_PATH' and decoded by
+        halmasuit itself at startup — there is no separate client.
+        `null' runs halmasuit with no wallpaper (legacy clear-only —
+        non-visual tests).
       '';
     };
 
@@ -400,15 +467,17 @@ in
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.
         HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
-      } // lib.optionalAttrs (cfg.witnessImage != null) {
-        # Decoded by halmasuit at startup as the internal witness
-        # plane. See `services.halmasuit.witnessImage`. String
-        # interpolation (NOT `toString`) so a path literal is realized
-        # into the store and is guaranteed present at this path in
-        # halmasuit's closure — `witnessImage` is self-sufficient, not
-        # reliant on some other unit pulling the file in. An absolute
+      } // lib.optionalAttrs (cfg.wallpaper != null) {
+        # Path of the wallpaper file (image / shader / video). The
+        # wallpaper engine reads this at startup, infers the backend
+        # from the file extension (Phase-A simple shape), and
+        # constructs the configured backend. See
+        # `services.halmasuit.wallpaper`. String interpolation (NOT
+        # `toString`) so a path literal is realized into the store
+        # and is guaranteed present at this path in halmasuit's
+        # closure — the option is self-sufficient. An absolute
         # runtime-path string interpolates to itself unchanged.
-        HALMASUIT_WITNESS_IMAGE = "${cfg.witnessImage}";
+        HALMASUIT_WALLPAPER_PATH = "${cfg.wallpaper.source}";
       };
     };
    })

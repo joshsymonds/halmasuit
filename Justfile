@@ -32,7 +32,7 @@ r14-gate:
 # (`assert_no_flash_stream`, epic R3/R9). Runs the contract test in
 # tests/lib/visual.py with NO VM/GPU: a clean frame-0-anchored stream
 # must pass and every flaw class (incl. the frame-0-anchor
-# strengthening — a frame_rendered preceding the witness cff) must be
+# strengthening — a frame_rendered preceding the wallpaper cff) must be
 # rejected. A hard gate so the load-bearing assertion can never
 # silently weaken.
 vis-selftest:

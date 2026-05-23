@@ -1,13 +1,13 @@
 # tests/visual-halmasuit-toplevel.nix — epic layer F1 gate.
 #
-# halmasuit-debug with its internal witness plane (composited from
+# halmasuit-debug with its internal wallpaper plane (composited from
 # frame 0, the 4-quadrant fixture), plus a separate xdg_toplevel
 # client (fullscreen solid magenta #FF22AA) as a systemd-launched
 # wl_client. Proves halmasuit maps + composites a REAL xdg_toplevel
-# fullscreen ABOVE the witness background (z-order: toplevel over
+# fullscreen ABOVE the wallpaper (z-order: toplevel over
 # Background). Capture is the in-process Snapshot() D-Bus method.
 #
-# Golden = uniform #FF22AA (witness fully occluded by the toplevel) —
+# Golden = uniform #FF22AA (wallpaper fully occluded by the toplevel) —
 # distinct from every prior golden, so it unambiguously proves
 # xdg-shell compositing (not layer-shell, not clear).
 
@@ -51,7 +51,7 @@ pkgs.testers.runNixOSTest {
         greeterUid     = 999;
         greeterGroup   = "halmasuit-greeter";
         compositorUid  = 998;
-        witnessImage   = fixture;
+        wallpaper = { type = "image"; source = fixture; };
       };
 
       # The xdg_toplevel client connects as the greeter uid after
@@ -121,7 +121,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF scanout_active", timeout=30
     )
-    # Socket is up + the witness plane is composited — now launch the
+    # Socket is up + the wallpaper plane is composited — now launch the
     # xdg_toplevel client (boot-race-free).
     machine.succeed("systemctl start test-toplevel.service")
     # halmasuit accepted + configured the xdg_toplevel fullscreen …
