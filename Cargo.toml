@@ -14,6 +14,10 @@ members = [
     # Pure wire contract for the compositor↔halmasuit-decoder video-decode
     # relay (Epic #12: sandboxed-decoder VideoBackend). Types + codec only.
     "crates/halmasuit-decoder-ipc",
+    # Sandboxed video-decoder subprocess (Epic #12). Forked + dup2'd to
+    # fd 3 by halmasuit; decodes via rsmpeg behind a seccomp/namespace
+    # boundary; emits RGBA frames back to the compositor.
+    "crates/halmasuit-decoder",
     # Test-only: real-PAM VM gate driver for halmasuit-session (R12).
     "crates/halmasuit-session-pam-testdriver",
     "crates/halmasuit-cli",

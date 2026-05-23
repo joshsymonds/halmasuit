@@ -335,8 +335,9 @@ mod tests {
         // Skip the 4-byte length prefix to inspect the body shape.
         let body = std::str::from_utf8(&encoded[LENGTH_PREFIX_SIZE..]).expect("utf-8");
         assert_eq!(body, expected_json, "wire format drift");
-        let (decoded, consumed) =
-            try_decode_control::<T>(&encoded).expect("decode").expect("complete");
+        let (decoded, consumed) = try_decode_control::<T>(&encoded)
+            .expect("decode")
+            .expect("complete");
         assert_eq!(&decoded, value);
         assert_eq!(consumed, encoded.len());
     }
@@ -399,10 +400,7 @@ mod tests {
 
     #[test]
     fn wire_format_end_of_file() {
-        roundtrip(
-            &DecoderToCompositor::EndOfFile,
-            r#"{"type":"end_of_file"}"#,
-        );
+        roundtrip(&DecoderToCompositor::EndOfFile, r#"{"type":"end_of_file"}"#);
     }
 
     #[test]
@@ -489,8 +487,7 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&100u32.to_ne_bytes());
         buf.extend_from_slice(b"{partial");
-        let result =
-            try_decode_control::<CompositorToDecoder>(&buf).expect("ok with partial body");
+        let result = try_decode_control::<CompositorToDecoder>(&buf).expect("ok with partial body");
         assert!(result.is_none());
     }
 
@@ -503,13 +500,8 @@ mod tests {
 
     #[test]
     fn validate_frame_header_rejects_oversized() {
-        let err = validate_frame_header(
-            8192,
-            8192,
-            FrameFormat::Rgba8,
-            MAX_FRAME_BYTES + 1,
-        )
-        .expect_err("oversized");
+        let err = validate_frame_header(8192, 8192, FrameFormat::Rgba8, MAX_FRAME_BYTES + 1)
+            .expect_err("oversized");
         matches!(err, CodecError::OversizedFrame(_, _));
     }
 
@@ -523,25 +515,18 @@ mod tests {
 
     #[test]
     fn validate_frame_header_rejects_zero_dimension() {
-        let err =
-            validate_frame_header(0, 1080, FrameFormat::Rgba8, 0).expect_err("zero width");
+        let err = validate_frame_header(0, 1080, FrameFormat::Rgba8, 0).expect_err("zero width");
         matches!(err, CodecError::OversizedFrame(_, _));
 
-        let err =
-            validate_frame_header(1920, 0, FrameFormat::Rgba8, 0).expect_err("zero height");
+        let err = validate_frame_header(1920, 0, FrameFormat::Rgba8, 0).expect_err("zero height");
         matches!(err, CodecError::OversizedFrame(_, _));
     }
 
     #[test]
     fn validate_frame_header_rejects_overflow_dimensions() {
         // u32::MAX * u32::MAX * 4 would overflow; checked_mul saturates.
-        let err = validate_frame_header(
-            u32::MAX,
-            u32::MAX,
-            FrameFormat::Rgba8,
-            MAX_FRAME_BYTES,
-        )
-        .expect_err("overflow");
+        let err = validate_frame_header(u32::MAX, u32::MAX, FrameFormat::Rgba8, MAX_FRAME_BYTES)
+            .expect_err("overflow");
         matches!(err, CodecError::OversizedFrame(_, _));
     }
 }

@@ -1,0 +1,34 @@
+[package]
+name        = "halmasuit-decoder"
+description = "Sandboxed video-decoder subprocess for halmasuit's wallpaper engine (Epic #12). Decodes h264 + AV1 via rsmpeg; emits RGBA frames to the compositor over a SOCK_SEQPACKET back-channel. NEVER runs as root; fd 3 is the IPC socketpair end the parent dup2'd before exec."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+# Single binary entry point. No library surface; the IPC contract is
+# imported from halmasuit-decoder-ipc.
+[[bin]]
+name = "halmasuit-decoder"
+path = "src/main.rs"
+
+[dependencies]
+# The frozen wire contract with the compositor (Epic #12 task #1).
+halmasuit-decoder-ipc = { path = "../halmasuit-decoder-ipc", version = "0.1" }
+# Tracing for structured stderr logging. JSON formatter so halmasuit
+# can forward decoder logs into its own journald target if needed.
+tracing.workspace            = true
+tracing-subscriber.workspace = true
+# nix: SOCK_SEQPACKET send/recv on the raw fd inherited from the
+# parent, plus signal handling. We use the raw-fd APIs (rather than
+# wrapping in OwnedFd) to keep this skeleton hard-`#![forbid(unsafe_code)]`;
+# later tasks (sandbox primitives, rsmpeg integration) will introduce
+# per-block `#[expect(unsafe_code, reason = "...")]` annotations on
+# the specific FFI sites.
+nix       = { workspace = true, features = ["socket", "signal", "process"] }
+thiserror.workspace = true
