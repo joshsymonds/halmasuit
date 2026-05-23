@@ -221,7 +221,20 @@ pkgs.testers.runNixOSTest {
     ).strip()
 
     # DMS uses ONE TextField that toggles between username and
-    # password mode on Enter.
+    # password mode on Enter. The username→password transition is
+    # client-side state inside Quickshell's QML scene — neither
+    # halmasuit nor the broker emit a journal-visible marker for
+    # it (the broker's auth_message is logged only at Quickshell
+    # debug-log level, which requires fragile env-var setup that
+    # depends on Qt's category-resolver internals). 1-second sleep
+    # is the best-available proxy; in practice the transition is
+    # sub-100ms once DMS sees Enter.
+    #
+    # Pre-existing wart on this family of tests (visual-dankgreeter
+    # has a similar settle sleep). Replace with a state-based gate
+    # if/when DMS or halmasuit emits a structured log line at
+    # password-mode entry — would need an upstream change to DMS or
+    # a new halmasuit-greetd log emission.
     machine.send_chars("alice")
     machine.send_key("ret")
     time.sleep(1)

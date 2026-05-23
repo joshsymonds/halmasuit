@@ -63,6 +63,14 @@ use crate::broker_relay::{BrokerRelay, RelayError, RelayEvent};
 /// The PATH is HARDCODED, not read from `$PATH` — the greeter never
 /// controls it. This is the same posture used by the OpenSSH server,
 /// systemd-pam, and other privilege-boundary daemons.
+///
+/// **Ordering is security-significant: first hit wins.** Earlier
+/// directories shadow later ones, so `/run/wrappers/bin` (NixOS
+/// setuid wrappers) takes precedence over `/run/current-system/sw/bin`
+/// (the activation-package profile), which takes precedence over the
+/// FHS dirs. This matches how `execvp(3)` walks a PATH, and matches
+/// what a NixOS user expects (wrappers are the system-blessed
+/// versions).
 const SYSTEM_PATH: &[&str] = &[
     "/run/wrappers/bin",
     "/run/current-system/sw/bin",
@@ -72,15 +80,38 @@ const SYSTEM_PATH: &[&str] = &[
 ];
 
 /// Resolve `cmd[0]` against [`SYSTEM_PATH`] if it does not start
-/// with `/`. Returns the resolved command vector with cmd[0]
-/// substituted, or `None` if no executable named `cmd[0]` is found
-/// on the fixed system path. Absolute commands and empty vectors
-/// pass through unchanged (the broker enforces non-empty + absolute
-/// — the relay-side resolution is a convenience, not a security
-/// gate).
+/// with `/`. Returns the resolved command vector with `cmd[0]`
+/// substituted, or `None` for any input the broker would not accept:
+///
+/// - empty vector (broker rejects with `SpecError::EmptyCommand`),
+/// - `cmd[0]` containing an interior `\0` (broker would reject at
+///   `CString::new` in the worker; we fail closed earlier),
+/// - `cmd[0]` containing `/` but not absolute (path-traversal-shaped
+///   strings — greeter has no business sending these),
+/// - `cmd[0]` plain name but not found on any [`SYSTEM_PATH`] entry.
+///
+/// Absolute commands pass through unchanged.
+///
+/// **Thread:** runs on the compositor's calloop thread inside the
+/// `Demand::Spawn` handler, performing up to `SYSTEM_PATH.len()`
+/// synchronous `stat(2)` syscalls (`Path::is_file`). This is
+/// intentional — the alternative (suspend `Demand::Spawn` for an
+/// async resolve) would add greetd-state-machine surface to spare a
+/// handful of local-FS stats that fire **once per login transition**,
+/// not per frame or input event. The A7 rule ("the compositor never
+/// blocks the render/calloop thread on broker IPC") is specifically
+/// about broker IPC; bounded local-FS stats are explicitly fine.
 #[must_use]
 pub fn resolve_command_path(cmd: Vec<String>) -> Option<Vec<String>> {
     let first = cmd.first()?;
+    // Reject interior NUL bytes explicitly. The broker would reject
+    // these too (worker's `CString::new` returns NulError) but
+    // catching them here means a future refactor that swaps the
+    // `is_file` lookup for an in-memory cache can't silently regress
+    // NUL-rejection.
+    if first.contains('\0') {
+        return None;
+    }
     if first.starts_with('/') {
         return Some(cmd);
     }
@@ -598,6 +629,30 @@ mod tests {
         assert_eq!(resolve_command_path(vec![]), None);
     }
 
+    /// Empty-string first element returns `None`. `Path::join("")`
+    /// yields the directory itself, which `is_file()` returns false
+    /// on — so today this is "safe by accident." Lock that property
+    /// in here.
+    #[test]
+    fn resolve_command_path_rejects_empty_first_arg() {
+        assert_eq!(resolve_command_path(vec![String::new()]), None);
+    }
+
+    /// Interior NUL in `cmd[0]` returns `None`. The broker would
+    /// catch this at `CString::new`, but rejecting here keeps the
+    /// invariant explicit and survives a future refactor that
+    /// replaces `is_file()` with an in-memory directory cache (in
+    /// which case `is_file` would no longer accidentally reject NUL
+    /// names).
+    #[test]
+    fn resolve_command_path_rejects_interior_nul() {
+        assert_eq!(resolve_command_path(vec!["niri\0bad".into()]), None);
+        assert_eq!(
+            resolve_command_path(vec!["a\0b".into(), "--session".into()]),
+            None
+        );
+    }
+
     /// (compositor channel, broker end) connected SEQPACKET pair. The
     /// tests act as the broker SYNCHRONOUSLY on the broker end —
     /// single-threaded, deterministic (socketpair buffers; the episode
@@ -853,6 +908,65 @@ mod tests {
             broker_recv(&broker),
             CompositorToBroker::StartSession { .. }
         ));
+    }
+
+    /// Integration coverage for the `Demand::Spawn` ↔
+    /// `resolve_command_path` boundary: a greeter that sends a
+    /// command which fails resolution drives the episode through
+    /// fail_closed, NOT through to the broker. Exercises the failure
+    /// branch without filesystem state — we use a name that cannot
+    /// exist on SYSTEM_PATH (interior NUL, rejected before any stat).
+    #[test]
+    fn unresolvable_session_command_fails_closed_before_broker() {
+        let (mut ep, broker) = episode();
+        ep.on_greeter_bytes(&create("bob"));
+        assert!(matches!(
+            broker_recv(&broker),
+            CompositorToBroker::BeginAuth { .. }
+        ));
+        broker_send(
+            &broker,
+            &BrokerToCompositor::Success {
+                username: "bob".into(),
+                uid: 1000,
+                gid: 1000,
+            },
+        );
+        let _ = ep.on_broker_readable();
+
+        // NUL in cmd[0] is rejected by resolve_command_path before any
+        // filesystem stat — the broker never sees a StartSession frame.
+        let ss = greetd_encode(&Request::StartSession {
+            cmd: vec!["niri\0bad".into()],
+            env: vec![],
+        })
+        .unwrap();
+        let o = ep.on_greeter_bytes(&ss);
+
+        // `spawned` is None — the resolver fail_closed'd before
+        // surfacing the spawn identity. The broker never received a
+        // StartSession frame (the resolver short-circuited).
+        assert!(
+            o.spawned.is_none(),
+            "fail_closed must NOT surface a spawn identity"
+        );
+        // Episode terminates — greetd's broker_closed path drives
+        // the connection down.
+        assert!(o.terminate, "fail_closed sets terminate");
+        // The greeter-reply contains greetd's pre-Demand::Spawn
+        // Response::Success (appended by the state machine before
+        // the relay-side resolver runs). This is the same shape as
+        // the pre-existing `relay.is_none()` fail_closed branch:
+        // the greeter sees Success then channel close. Documenting
+        // it here as the current contract so a future change to
+        // either greetd's response ordering OR resolve_command_path
+        // would trip this assertion.
+        assert_eq!(
+            greeter_responses(&o.greeter_reply),
+            vec![Response::Success],
+            "fail_closed contract: greetd's Success was already \
+             appended; episode terminates without retracting it"
+        );
     }
 
     #[test]
