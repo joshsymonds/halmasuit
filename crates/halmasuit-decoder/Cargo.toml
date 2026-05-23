@@ -30,5 +30,17 @@ tracing-subscriber.workspace = true
 # later tasks (sandbox primitives, rsmpeg integration) will introduce
 # per-block `#[expect(unsafe_code, reason = "...")]` annotations on
 # the specific FFI sites.
-nix       = { workspace = true, features = ["socket", "signal", "process"] }
+# nix features:
+# - socket: SOCK_SEQPACKET send/recv on the IPC fd.
+# - signal: signal-mask reset in pre-exec contexts (later subtasks).
+# - process: fork (sandbox tests) + waitpid.
+# - resource: setrlimit for the sandbox (NPROC=0, AS bounded, NOFILE
+#   bounded, CORE=0).
+# - sched: unshare(CLONE_NEW{USER,NET,NS}) for namespace isolation.
+# - fs: open /proc/self/fd for the fd-close iteration.
+nix       = { workspace = true, features = ["socket", "signal", "process", "resource", "sched", "fs", "user"] }
+# libc: PR_SET_NO_NEW_PRIVS via prctl (nix doesn't expose it), plus
+# STDERR_FILENO / STDIN_FILENO etc. constants for the fd-close
+# allowlist.
+libc.workspace      = true
 thiserror.workspace = true

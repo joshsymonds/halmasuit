@@ -17,11 +17,14 @@
 //! - `Pause` / `Resume` / `Seek` — task #5.
 //! - `FrameHeader` emission with RGBA bytes appended — task #5.
 //!
-//! The crate is hard-`#![forbid(unsafe_code)]` at the skeleton stage
-//! (we operate on a raw fd via nix's safe wrappers; rsmpeg FFI lands
-//! later under per-block `#[expect(unsafe_code, …)]` annotations).
+//! Module map / unsafe boundary:
+//! - `sandbox` — unsafe surface #1: process-level sandbox primitives
+//!   (prctl/unshare/fd-close). Every unsafe block carries
+//!   `#[expect(unsafe_code, reason = "…")]`.
+//! - The IPC loop in `main.rs` uses only nix's safe `send`/`recv`
+//!   wrappers and has no `unsafe` blocks of its own.
 
-#![forbid(unsafe_code)]
+mod sandbox;
 
 use std::os::fd::RawFd;
 use std::process::ExitCode;
@@ -65,6 +68,14 @@ fn main() -> ExitCode {
         pid = nix::unistd::getpid().as_raw(),
         "halmasuit-decoder starting"
     );
+
+    // Sandbox before any other I/O — including the Ready handshake.
+    // The IPC fd and stderr are the only fds the sandbox keeps open
+    // (the wallpaper fd arrives later via SCM_RIGHTS on LoadFile).
+    if let Err(err) = sandbox::enter_sandbox(&[IPC_FD, libc::STDERR_FILENO]) {
+        error!(error = %err, "halmasuit-decoder: sandbox setup failed");
+        return ExitCode::from(1);
+    }
 
     match run(IPC_FD) {
         Ok(()) => {
