@@ -188,6 +188,10 @@ impl DecoderChannel {
     /// Non-blocking recv of one decoder→compositor message. Returns
     /// `Ok(None)` on EAGAIN. The buffer is reused; the returned slice
     /// is valid only until the next recv.
+    ///
+    /// Wire v2 (Epic #12 task 10): a FRAME datagram packs
+    /// `[length_prefix:4][header_json:N][payload:M]` into one atomic
+    /// `recvmsg` — no second recv, no half-frame deadlock.
     fn recv_one(&self) -> Result<Option<RecvOutcome>, IpcError> {
         let mut buf = self.recv_buf.borrow_mut();
         let mut iov = [std::io::IoSliceMut::new(&mut buf)];
@@ -200,10 +204,11 @@ impl DecoderChannel {
             return Err(IpcError::Closed);
         }
         let n = r.bytes;
-        // First try to decode as a control-shape message (length-
-        // prefixed JSON). If that succeeds AND it's a FrameHeader,
-        // we read the payload bytes from the buffer past the header.
-        let (msg, _consumed): (DecoderToCompositor, usize) = try_decode_control(&buf[..n])
+        // Decode the header JSON from the front of the datagram.
+        // `try_decode_control` returns `(msg, consumed)` where
+        // `consumed = 4 + json_len`. For FrameHeader, payload bytes
+        // are at `&buf[consumed..]`.
+        let (msg, consumed): (DecoderToCompositor, usize) = try_decode_control(&buf[..n])
             .map_err(IpcError::Codec)?
             .ok_or(IpcError::PartialFrame)?;
         match msg {
@@ -216,24 +221,16 @@ impl DecoderChannel {
                 bytes_len,
             } => {
                 validate_frame_header(width, height, format, bytes_len).map_err(IpcError::Codec)?;
-                // The frame payload is the next datagram on the wire.
-                // Read it now in a SECOND recvmsg.
-                drop(buf); // release RefCell borrow before re-entrant recv
-                let mut payload = vec![0u8; bytes_len as usize];
-                let mut piov = [std::io::IoSliceMut::new(&mut payload)];
-                let pr = match recvmsg::<()>(
-                    self.fd.as_raw_fd(),
-                    &mut piov,
-                    None,
-                    MsgFlags::empty(), // block here; the header already arrived
-                ) {
-                    Ok(r) => r,
-                    Err(e) => return Err(IpcError::Io(e)),
-                };
-                if pr.bytes != bytes_len as usize {
+                let payload_start = consumed;
+                let payload_end = payload_start + bytes_len as usize;
+                if payload_end != n {
+                    // The datagram's trailing payload doesn't match
+                    // the header's declared length — protocol
+                    // violation (oversized or truncated).
                     return Err(IpcError::PartialFrame);
                 }
-                let _ = (frame_idx, pts_us); // consumed by Outcome
+                let payload = buf[payload_start..payload_end].to_vec();
+                let _ = pts_us; // not yet consumed downstream
                 Ok(Some(RecvOutcome::Frame(LatestFrame {
                     width,
                     height,
@@ -512,11 +509,16 @@ fn spawn_decoder_session(
     )
     .map_err(RelayError::Socketpair)?;
 
-    // Bump SO_SNDBUF/SO_RCVBUF on the parent end so a single 1080p
-    // RGBA frame (8.3 MiB) fits in one datagram without ENOBUFS.
-    // The decoder side gets the same effective bump via the kernel
-    // mirroring it on a socketpair.
+    // Bump SO_SNDBUF/SO_RCVBUF on BOTH ends. Each side of an AF_UNIX
+    // socketpair has its own send/receive queues — setsockopt on the
+    // parent doesn't propagate to the child. We're transient owners
+    // of both fds here (between socketpair and fork-exec); set both
+    // now so the child inherits a SNDBUF wide enough to send a
+    // full-frame datagram without EMSGSIZE. Capped by the kernel's
+    // wmem_max / rmem_max sysctls — nix/module.nix raises those to
+    // MAX_FRAME_BYTES when wallpaper.type = "video".
     set_socket_buffers(parent_end.as_raw_fd())?;
+    set_socket_buffers(child_end.as_raw_fd())?;
 
     let wallpaper_file = File::open(wallpaper_path).map_err(|err| RelayError::OpenWallpaper {
         path: wallpaper_path.to_path_buf(),

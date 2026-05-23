@@ -28,11 +28,21 @@
 //! with a `u32` length prefix, capped at [`MAX_CONTROL_MSG_BYTES`]
 //! (4 KiB).
 //!
-//! A frame is a [`DecoderToCompositor::FrameHeader`] message
-//! immediately followed by raw RGBA bytes on the same socket. Phase A
-//! sizes each frame to fit in one `SOCK_SEQPACKET` datagram (which
-//! requires `setsockopt(SO_SNDBUF, …)` to grow the kernel buffer on
-//! the decoder side; see [`MAX_FRAME_BYTES`]). Phase B (later epic):
+//! A frame is one ATOMIC `SOCK_SEQPACKET` datagram laid out as
+//! `[length_prefix:4][header_json:N][payload_bytes:M]` — the length
+//! prefix covers only the JSON header (matching the control framing),
+//! then `header.bytes_len` raw RGBA bytes follow IN THE SAME
+//! datagram. Atomic-or-not on the wire eliminates the dropped-header
+//! / orphan-payload class of bug entirely: the receiver either gets
+//! the whole frame in one `recvmsg` or none of it. Atomicity also
+//! lets the decoder treat `EAGAIN` on a frame send as "drop this
+//! frame, continue" without corrupting the wire (the relay's Phase A
+//! pacing model: decoder runs at max speed, compositor consume-and-
+//! discard).
+//!
+//! Phase A sizes each frame to fit in one datagram (which requires
+//! `setsockopt(SO_SNDBUF, …)` plus `net.core.wmem_max` sysctl to
+//! match — see [`MAX_FRAME_BYTES`]). Phase B (later epic):
 //! shared-memory pool for >1080p frames.
 
 #![forbid(unsafe_code)]
@@ -43,7 +53,14 @@ use thiserror::Error;
 /// Protocol wire-format version. Sent in [`DecoderToCompositor::Ready`]
 /// at decoder startup; the compositor verifies the value matches and
 /// tears down the connection on mismatch.
-pub const WIRE_VERSION: u8 = 1;
+///
+/// - v1: separate header + payload datagrams (deprecated; never
+///   shipped past Epic #12 task 10 — the model deadlocked the
+///   compositor on mid-frame decoder death and forced atomic
+///   header+payload handling).
+/// - v2: header + payload bundled into a single atomic datagram
+///   (`[length_prefix:4][header_json:N][payload_bytes:M]`).
+pub const WIRE_VERSION: u8 = 2;
 
 /// Hard ceiling on a single control-plane JSON message.
 ///
@@ -133,10 +150,11 @@ pub enum CompositorToDecoder {
 /// Sent on the same `SOCK_SEQPACKET` socket as control. The compositor
 /// distinguishes by serde tag.
 ///
-/// A [`Self::FrameHeader`] is immediately followed on the wire by
-/// `bytes_len` bytes of raw frame data (NOT JSON-encoded). The relay
-/// reads the header datagram, validates `bytes_len <= MAX_FRAME_BYTES`,
-/// then reads the payload bytes from subsequent datagram(s).
+/// A [`Self::FrameHeader`] is immediately followed by `bytes_len`
+/// bytes of raw RGBA in the SAME datagram (single atomic recvmsg) —
+/// see the crate-level "Frame plane vs. control plane" doc. The relay
+/// reads one datagram, decodes the JSON header from the front, then
+/// reads `bytes_len` payload bytes from the same buffer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DecoderToCompositor {
@@ -282,6 +300,43 @@ pub fn try_decode_control<T: serde::de::DeserializeOwned>(
     Ok(Some((msg, needed)))
 }
 
+/// Encode a frame datagram as one atomic `SOCK_SEQPACKET` payload.
+///
+/// Wire shape: `[length_prefix:4][header_json:N][payload:M]`. The
+/// length prefix covers only the header JSON (matching
+/// [`encode_control`]'s prefix semantics, so the receiver's
+/// prefix-parsing path is shared); the payload's length is
+/// encoded in the JSON header's `bytes_len` field.
+///
+/// # Errors
+///
+/// [`CodecError::OversizedFrame`] if `payload.len() > MAX_FRAME_BYTES`;
+/// [`CodecError::Json`] if serialization fails;
+/// [`CodecError::OversizedControl`] if the header JSON exceeds
+/// [`MAX_CONTROL_MSG_BYTES`] (the FrameHeader variant fits easily,
+/// but the bound is enforced).
+pub fn encode_frame_datagram(
+    header: &DecoderToCompositor,
+    payload: &[u8],
+) -> Result<Vec<u8>, CodecError> {
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| CodecError::OversizedFrame(u32::MAX, MAX_FRAME_BYTES))?;
+    if payload_len > MAX_FRAME_BYTES {
+        return Err(CodecError::OversizedFrame(payload_len, MAX_FRAME_BYTES));
+    }
+    let body = serde_json::to_vec(header)?;
+    let len = u32::try_from(body.len())
+        .map_err(|_| CodecError::OversizedControl(u32::MAX, MAX_CONTROL_MSG_BYTES))?;
+    if len > MAX_CONTROL_MSG_BYTES {
+        return Err(CodecError::OversizedControl(len, MAX_CONTROL_MSG_BYTES));
+    }
+    let mut out = Vec::with_capacity(LENGTH_PREFIX_SIZE + body.len() + payload.len());
+    out.extend_from_slice(&len.to_ne_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
 /// Defensive validation a relay applies to a freshly-decoded
 /// [`DecoderToCompositor::FrameHeader`] before reading the payload
 /// bytes.
@@ -378,9 +433,57 @@ mod tests {
     #[test]
     fn wire_format_ready() {
         roundtrip(
-            &DecoderToCompositor::Ready { wire_version: 1 },
-            r#"{"type":"ready","wire_version":1}"#,
+            &DecoderToCompositor::Ready { wire_version: 2 },
+            r#"{"type":"ready","wire_version":2}"#,
         );
+    }
+
+    #[test]
+    fn wire_version_is_current_v2() {
+        // Drift gate: keep this constant in sync with the crate-
+        // level "Wire topology" doc and the `WIRE_VERSION`
+        // constant's doc comment.
+        assert_eq!(WIRE_VERSION, 2);
+    }
+
+    #[test]
+    fn encode_frame_datagram_packs_header_then_payload() {
+        let header = DecoderToCompositor::FrameHeader {
+            frame_idx: 0,
+            pts_us: 0,
+            width: 2,
+            height: 2,
+            format: FrameFormat::Rgba8,
+            bytes_len: 16,
+        };
+        // 2x2 RGBA = 16 bytes; payload distinguishable from JSON.
+        let payload: Vec<u8> = (0u8..16u8).collect();
+        let datagram = encode_frame_datagram(&header, &payload).expect("encode");
+        // Parse the header from the front via the standard control
+        // codec; consumed should equal LENGTH_PREFIX + json_len.
+        let (decoded, consumed) = try_decode_control::<DecoderToCompositor>(&datagram)
+            .expect("decode")
+            .expect("complete");
+        assert_eq!(decoded, header);
+        // The payload bytes are at &datagram[consumed..].
+        assert_eq!(&datagram[consumed..], &payload[..]);
+    }
+
+    #[test]
+    fn encode_frame_datagram_rejects_oversized_payload() {
+        let header = DecoderToCompositor::FrameHeader {
+            frame_idx: 0,
+            pts_us: 0,
+            width: 1,
+            height: 1,
+            format: FrameFormat::Rgba8,
+            bytes_len: MAX_FRAME_BYTES + 1,
+        };
+        let payload = vec![0u8; MAX_FRAME_BYTES as usize + 1];
+        match encode_frame_datagram(&header, &payload) {
+            Err(CodecError::OversizedFrame(_, _)) => {}
+            other => panic!("expected OversizedFrame, got {other:?}"),
+        }
     }
 
     #[test]

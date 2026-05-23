@@ -110,6 +110,11 @@ test-vm:
     # Real broker-launched niri, software-rendered headless (llvmpipe).
     echo "── visual-niri-session ──"
     nix build .#checks.x86_64-linux.visual-niri-session -L --print-build-logs --no-link
+    echo
+    # Epic #12: real halmasuit-decoder sandbox + crash-recovery +
+    # budget-exhaustion + login-flash continuity under video wallpaper.
+    echo "── visual-wallpaper-video ──"
+    nix build .#checks.x86_64-linux.visual-wallpaper-video -L --print-build-logs --no-link
 
 # Regenerate one or all visual-test goldens. Runs the named test
 # interactively (driverInteractive), with HALMASUIT_GOLDEN_REGEN=1 and

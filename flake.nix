@@ -545,6 +545,17 @@
           halmasuit            = self.packages.x86_64-linux.halmasuit;
           halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
         };
+        # Epic #12 task 10: end-to-end video wallpaper gate. Real
+        # h264, real rsmpeg, real sandbox; asserts decoder spawn,
+        # crash-recovery respawn within budget, budget-exhaustion
+        # fallback, AND login-flash continuity under video wallpaper.
+        visual-wallpaper-video = import ./tests/visual-wallpaper-video.nix {
+          system            = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-decoder = self.packages.x86_64-linux.halmasuit-decoder;
+        };
         halmasuit-vm = import ./tests/halmasuit-vm.nix {
           system    = "x86_64-linux";
           inherit nixpkgs;

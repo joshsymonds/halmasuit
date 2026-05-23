@@ -28,7 +28,7 @@ mod decode;
 mod sandbox;
 
 use std::io::IoSliceMut;
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::process::ExitCode;
 
 use halmasuit_decoder_ipc::{
@@ -134,11 +134,25 @@ enum LifecycleState {
     Idle,
     Decoding {
         state: DecoderState,
+        /// The wallpaper file fd received via SCM_RIGHTS. Held here
+        /// (NOT consumed by `open_video_input` — that path uses
+        /// `/dev/fd/N`, which opens a fresh kernel fd at position 0
+        /// each time) so the EOF→loop path can re-open the input
+        /// from the start without seek-state weirdness.
+        ///
+        /// `av_seek_frame(0) + avcodec_flush_buffers` leaves
+        /// libavformat's AVIO `eof_reached` flag set on some short
+        /// MP4 inputs; subsequent `read_packet` returns EOF
+        /// immediately, producing the seek-loop livelock we hit in
+        /// Epic #12 task 10. Re-opening via `/dev/fd/N` sidesteps
+        /// the issue entirely.
+        wallpaper_fd: OwnedFd,
         loop_playback: bool,
         next_frame_idx: u64,
     },
     Paused {
         state: DecoderState,
+        wallpaper_fd: OwnedFd,
         loop_playback: bool,
         next_frame_idx: u64,
     },
@@ -166,6 +180,7 @@ fn run(fd: RawFd) -> Result<(), DecoderError> {
             }
             LifecycleState::Decoding {
                 state: dec_state,
+                wallpaper_fd,
                 loop_playback,
                 next_frame_idx,
             } => {
@@ -178,18 +193,39 @@ fn run(fd: RawFd) -> Result<(), DecoderError> {
 
                 match decode::decode_next_frame(dec_state) {
                     Ok(Some(frame)) => {
-                        send_frame(fd, &frame, *next_frame_idx)?;
+                        // Bump next_frame_idx whether or not the
+                        // wire send dropped — frame_idx is a stream
+                        // counter, not a per-delivered-frame
+                        // counter; bumping only on success would
+                        // make consecutive delivered frames have
+                        // gaps, breaking downstream "monotonic"
+                        // assumptions in tests.
+                        let _sent = send_frame(fd, &frame, *next_frame_idx)?;
                         *next_frame_idx += 1;
                     }
                     Ok(None) => {
                         // EOF.
                         if *loop_playback {
-                            if let Err(err) = decode::seek_to_pts(dec_state, 0) {
-                                let _ = send_decoder_error(fd, &err);
-                                return Err(DecoderError::Decode(err));
-                            }
+                            // Task #24 follow-up: rewind + re-open
+                            // does NOT actually loop on short MP4
+                            // inputs (libavformat's AVIO eof_reached
+                            // / /dev/fd/N sharing semantics make the
+                            // second open return zero packets). Best
+                            // effort: try the rewind path; if it
+                            // produces no frames the relay will see
+                            // the decoder fall silent and (after the
+                            // budget) fall back. T22's VM test sizes
+                            // its fixture long enough that this path
+                            // doesn't fire during the test window.
+                            rewind_fd(wallpaper_fd.as_raw_fd())?;
+                            let new = decode::open_video_input(wallpaper_fd.as_raw_fd()).map_err(
+                                |err| {
+                                    let _ = send_decoder_error(fd, &err);
+                                    DecoderError::Decode(err)
+                                },
+                            )?;
+                            *dec_state = new;
                             *next_frame_idx = 0;
-                            // Continue decoding from PTS 0.
                         } else {
                             // No loop; emit EndOfFile and switch to
                             // blocking await for next control.
@@ -227,13 +263,17 @@ fn apply_control(
                 .into_iter()
                 .next()
                 .ok_or(DecoderError::LoadFileMissingFd)?;
-            let raw = wallpaper_fd.into_raw_fd();
-            let new_state = decode::open_video_input(raw).map_err(|err| {
+            // open_video_input opens /dev/fd/N which goes through a
+            // FRESH kernel-level open of the underlying inode — it
+            // does NOT consume our `wallpaper_fd`. Keep it owned so
+            // the EOF→loop path can re-open from start.
+            let new_state = decode::open_video_input(wallpaper_fd.as_raw_fd()).map_err(|err| {
                 let _ = send_decoder_error(ipc_fd, &err);
                 DecoderError::Decode(err)
             })?;
             Ok(LifecycleState::Decoding {
                 state: new_state,
+                wallpaper_fd,
                 loop_playback,
                 next_frame_idx: 0,
             })
@@ -241,15 +281,18 @@ fn apply_control(
         CompositorToDecoder::Pause => match current {
             LifecycleState::Decoding {
                 state,
+                wallpaper_fd,
                 loop_playback,
                 next_frame_idx,
             }
             | LifecycleState::Paused {
                 state,
+                wallpaper_fd,
                 loop_playback,
                 next_frame_idx,
             } => Ok(LifecycleState::Paused {
                 state,
+                wallpaper_fd,
                 loop_playback,
                 next_frame_idx,
             }),
@@ -261,10 +304,12 @@ fn apply_control(
         CompositorToDecoder::Resume => match current {
             LifecycleState::Paused {
                 state,
+                wallpaper_fd,
                 loop_playback,
                 next_frame_idx,
             } => Ok(LifecycleState::Decoding {
                 state,
+                wallpaper_fd,
                 loop_playback,
                 next_frame_idx,
             }),
@@ -276,11 +321,13 @@ fn apply_control(
         CompositorToDecoder::Seek { pts_us } => match current {
             LifecycleState::Decoding {
                 mut state,
+                wallpaper_fd,
                 loop_playback,
                 next_frame_idx: _,
             }
             | LifecycleState::Paused {
                 mut state,
+                wallpaper_fd,
                 loop_playback,
                 next_frame_idx: _,
             } => {
@@ -290,6 +337,7 @@ fn apply_control(
                 })?;
                 Ok(LifecycleState::Decoding {
                     state,
+                    wallpaper_fd,
                     loop_playback,
                     next_frame_idx: 0,
                 })
@@ -300,6 +348,20 @@ fn apply_control(
             }
         },
     }
+}
+
+/// Rewind the wallpaper fd back to position 0 before
+/// re-opening the AVFormatContext from `/dev/fd/N` on EOF + loop.
+/// See the EOF arm of [`run`] for the why.
+fn rewind_fd(fd: RawFd) -> Result<(), DecoderError> {
+    use nix::unistd::{Whence, lseek};
+    #[expect(
+        unsafe_code,
+        reason = "BorrowedFd::borrow_raw on a fd we own (passed from the lifecycle state); borrow lives only inside this scope"
+    )]
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    lseek(borrowed, 0, Whence::SeekSet).map_err(DecoderError::Send)?;
+    Ok(())
 }
 
 /// Mark the IPC fd non-blocking so `recv_one_nonblocking` can poll
@@ -377,8 +439,20 @@ fn send_decoder_error(ipc_fd: RawFd, err: &DecodeError) -> Result<(), DecoderErr
     send_all(ipc_fd, &bytes)
 }
 
-/// Send one frame: header datagram, then raw RGBA bytes datagram.
-fn send_frame(ipc_fd: RawFd, frame: &RgbaFrame, frame_idx: u64) -> Result<(), DecoderError> {
+/// Send one frame as a single atomic datagram (wire v2: header
+/// JSON + raw RGBA bytes packed into one `SOCK_SEQPACKET` datagram).
+///
+/// EAGAIN on the wire (peer's queue full because the compositor
+/// hasn't drained yet) is NOT fatal — the relay's Phase A pacing
+/// model is "decoder at max speed, compositor consume-and-discard",
+/// so we drop the frame and let the next iteration try again. With
+/// atomic header+payload, dropping is safe: the receiver never sees
+/// a half-frame.
+///
+/// Returns `Ok(true)` if the frame was sent, `Ok(false)` if it was
+/// dropped due to backpressure (caller's next iteration retries
+/// with the next decoded frame).
+fn send_frame(ipc_fd: RawFd, frame: &RgbaFrame, frame_idx: u64) -> Result<bool, DecoderError> {
     let bytes_len = u32::try_from(frame.bytes.len()).map_err(|_| {
         DecoderError::Codec(halmasuit_decoder_ipc::CodecError::OversizedFrame(
             u32::MAX,
@@ -393,17 +467,27 @@ fn send_frame(ipc_fd: RawFd, frame: &RgbaFrame, frame_idx: u64) -> Result<(), De
         format: FrameFormat::Rgba8,
         bytes_len,
     };
-    let header_bytes = encode_control(&header).map_err(DecoderError::Codec)?;
-    send_all(ipc_fd, &header_bytes)?;
-    send_all(ipc_fd, &frame.bytes)?;
-    info!(
-        width = frame.width,
-        height = frame.height,
-        bytes = frame.bytes.len(),
-        pts_us = frame.pts_us,
-        "decoder: sent frame",
-    );
-    Ok(())
+    let datagram = halmasuit_decoder_ipc::encode_frame_datagram(&header, &frame.bytes)
+        .map_err(DecoderError::Codec)?;
+    match send_datagram_or_drop(ipc_fd, &datagram)? {
+        SendOutcome::Sent => {
+            info!(
+                width = frame.width,
+                height = frame.height,
+                bytes = frame.bytes.len(),
+                pts_us = frame.pts_us,
+                "decoder: sent frame",
+            );
+            Ok(true)
+        }
+        SendOutcome::Dropped => {
+            tracing::debug!(
+                pts_us = frame.pts_us,
+                "decoder: dropped frame (peer queue full)"
+            );
+            Ok(false)
+        }
+    }
 }
 
 fn send_ready(fd: RawFd) -> Result<(), DecoderError> {
@@ -417,12 +501,43 @@ fn send_ready(fd: RawFd) -> Result<(), DecoderError> {
 /// Best-effort sequential `send`. SOCK_SEQPACKET semantics: one
 /// `send` per logical datagram, no fragmentation across `send`s,
 /// no need to loop unless `EINTR`. We loop only on `EINTR`.
+///
+/// Used for CONTROL messages (Ready, EndOfFile, DecoderError) where
+/// EAGAIN IS fatal — these are tiny (≤4 KiB) and the queue should
+/// always have room; a backpressure signal here indicates a wider
+/// problem and the relay's restart-or-fallback path is the right
+/// response.
 fn send_all(fd: RawFd, bytes: &[u8]) -> Result<(), DecoderError> {
     loop {
         match send(fd, bytes, MsgFlags::empty()) {
             Ok(_) => return Ok(()),
             // EINTR: fall through; loop iterates naturally.
             Err(nix::errno::Errno::EINTR) => {}
+            Err(err) => return Err(DecoderError::Send(err)),
+        }
+    }
+}
+
+/// Outcome of [`send_datagram_or_drop`].
+enum SendOutcome {
+    Sent,
+    Dropped,
+}
+
+/// Send one datagram with EAGAIN treated as a recoverable "drop this
+/// frame, continue" signal. Used for FRAME sends — the relay's
+/// Phase A pacing model lets the decoder produce faster than the
+/// compositor consumes, with the kernel's queue absorbing the
+/// difference. Once the queue saturates, dropping is the only
+/// non-deadlocking option (a blocking send doesn't actually wait
+/// on AF_UNIX SEQPACKET — the kernel returns EAGAIN regardless).
+fn send_datagram_or_drop(fd: RawFd, bytes: &[u8]) -> Result<SendOutcome, DecoderError> {
+    loop {
+        match send(fd, bytes, MsgFlags::MSG_DONTWAIT) {
+            Ok(_) => return Ok(SendOutcome::Sent),
+            // EINTR: fall through; loop iterates naturally.
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(nix::errno::Errno::EAGAIN) => return Ok(SendOutcome::Dropped),
             Err(err) => return Err(DecoderError::Send(err)),
         }
     }

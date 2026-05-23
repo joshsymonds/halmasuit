@@ -528,6 +528,20 @@ in
     };
    })
 
+   # Epic #12: kernel socket-buffer ceiling. The decoder→compositor
+   # IPC sends one RGBA frame per SOCK_SEQPACKET datagram (up to
+   # `MAX_FRAME_BYTES` = 16 MiB; 1080p RGBA is 8.3 MiB). Linux's
+   # default `net.core.wmem_max` / `rmem_max` is ~208 KiB; setsockopt
+   # SO_SNDBUF/SO_RCVBUF silently caps at those, so without raising
+   # the sysctls the relay's setsockopt has no effect and the
+   # decoder's first send fails with EMSGSIZE. Raise the ceiling
+   # only when video wallpaper is configured (no regression for
+   # image/shader/no-wallpaper deployments).
+   (lib.mkIf (cfg.enable && cfg.wallpaper != null && cfg.wallpaper.type == "video") {
+     boot.kernel.sysctl."net.core.wmem_max" = lib.mkDefault 16777216;
+     boot.kernel.sysctl."net.core.rmem_max" = lib.mkDefault 16777216;
+   })
+
    # Epic #1 R6 / Amendment A2: the socket-activated privileged broker.
    # A SEPARATE unit from the compositor (above) — it is the host-ns
    # root PAM-lifecycle owner. PID 1 owns the listening socket and
