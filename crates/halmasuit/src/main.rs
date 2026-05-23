@@ -1464,16 +1464,21 @@ fn greeter_command_from_env() -> Option<PathBuf> {
 }
 
 /// Resolve the wallpaper config from environment. Returns `None`
-/// when `HALMASUIT_WALLPAPER_PATH` is unset — non-visual integration
-/// tests run without a wallpaper (the legacy clear-only scene);
-/// production and visual deployments always set it via
-/// `services.halmasuit.wallpaper`. Phase-A: the env var carries a
-/// single file path and the backend variant is inferred from the
-/// extension (see `wallpaper::config::infer_from_path`); the
-/// shader-uniforms task will add a `HALMASUIT_WALLPAPER_CONFIG`
-/// TOML companion when richer config (named uniforms, per-monitor)
-/// is needed.
-fn wallpaper_config_from_env() -> Option<wallpaper::WallpaperConfig> {
+/// when neither `HALMASUIT_WALLPAPER_CONFIG` nor `HALMASUIT_WALLPAPER_PATH`
+/// is set — non-visual integration tests run without a wallpaper
+/// (the legacy clear-only scene); production and visual deployments
+/// always set one via `services.halmasuit.wallpaper`.
+///
+/// Resolution order: `HALMASUIT_WALLPAPER_CONFIG` (JSON file with
+/// the full config — needed when a shader declares named uniforms)
+/// then `HALMASUIT_WALLPAPER_PATH` (single path with extension
+/// inference; shader sources get the default Shadertoy bindings).
+///
+/// # Errors
+///
+/// Returns an error when `HALMASUIT_WALLPAPER_CONFIG` is set but
+/// the file can't be read or parsed as JSON.
+fn wallpaper_config_from_env() -> io::Result<Option<wallpaper::WallpaperConfig>> {
     wallpaper::config::from_env()
 }
 
@@ -2010,7 +2015,7 @@ fn main() -> io::Result<()> {
     // The wallpaper plane (epic G1/R3/R6). Constructed once inside
     // `setup_drm_backend`; `is_some()` here also gates the frame-0
     // wallpaper anchor emitted below.
-    let wallpaper_config = wallpaper_config_from_env();
+    let wallpaper_config = wallpaper_config_from_env()?;
     let wallpaper_configured = wallpaper_config.is_some();
 
     // Initialize the Wayland display + protocol state.

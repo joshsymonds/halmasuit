@@ -3,33 +3,44 @@
 // One discriminated union ([`WallpaperConfig`]) over the three
 // backend shapes (image / shader / video), plus the
 // declared-uniforms pipeline types ([`UniformBinding`],
-// [`StaticValue`]) the shader backend will consume. Phase-A:
-// `WallpaperConfig::Image` is fully wired; the other variants and
-// the four `UniformBinding` kinds are typed scaffolding the
-// follow-up tasks fill in.
+// [`StaticValue`]) the shader backend consumes. Phase-A wires
+// image + shader live; video is still a Phase-A stub (the
+// follow-up task fills it in). The four `UniformBinding` kinds are
+// all parseable from JSON; only `Auto*` and `Static` fire today —
+// `Event*` kinds wait for the bus-event epic.
 //
-// Loaded from env in [`from_env`]: today's shape is a single
-// `HALMASUIT_WALLPAPER_PATH` path with file-extension type
-// inference. The richer TOML schema (named uniforms, per-monitor
-// settings, etc.) lands with the shader-uniforms task that actually
-// needs it — defining the Rust types now lets that task ship a
-// config file shape without re-plumbing the parser.
+// Loaded from env in [`from_env`]. Two paths:
+//
+//   1. `HALMASUIT_WALLPAPER_CONFIG` — a JSON file matching
+//      [`WallpaperConfig`]. The Nix module writes this whenever
+//      `services.halmasuit.wallpaper` is set. Required for shader
+//      wallpapers with declared (non-Shadertoy) uniform names.
+//   2. `HALMASUIT_WALLPAPER_PATH` — a single path. The backend
+//      variant is inferred from the file extension; shaders get
+//      the default Shadertoy uniform bindings. Useful for quick
+//      dev/test setups.
 
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
+
 /// Top-level wallpaper config. Discriminated union over the three
-/// backend shapes.
-#[derive(Debug, Clone)]
+/// backend shapes. Deserialized from JSON the Nix module writes to
+/// `$HALMASUIT_WALLPAPER_CONFIG`; the simpler `$HALMASUIT_WALLPAPER_PATH`
+/// env-var-only path infers the variant from the file extension and
+/// uses default uniform bindings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum WallpaperConfig {
     /// Static image (PNG/JPEG/WebP, via the `image` crate).
     Image {
         /// Absolute path to the image file.
         source: PathBuf,
     },
-    /// GLSL ES 100 fragment shader with a declared-uniforms pipeline.
-    /// Phase-A: the variant is recognised but the backend is a stub —
-    /// constructing this from a config will fail closed.
+    /// GLSL ES 100 fragment shader with a declared-uniforms
+    /// pipeline.
     Shader {
         /// Absolute path to the `.frag` / `.glsl` file.
         source: PathBuf,
@@ -37,6 +48,7 @@ pub enum WallpaperConfig {
         /// Phase-A: only `auto-*` and static-typed kinds fire; the
         /// `event-*` kinds parse cleanly and warn that no bus is
         /// connected (the bus-event epic wires them).
+        #[serde(default)]
         uniforms: HashMap<String, UniformBinding>,
     },
     /// Video file (h264 or AV1; software decode via libavcodec
@@ -47,8 +59,15 @@ pub enum WallpaperConfig {
         source: PathBuf,
         /// Whether to loop the video. Defaults to `true` for
         /// wallpaper use.
+        #[serde(default = "default_loop", rename = "loop")]
         loop_playback: bool,
     },
+}
+
+/// Default `loop_playback` for video wallpapers — `true`, matching
+/// the simple env-var path's inference.
+const fn default_loop() -> bool {
+    true
 }
 
 /// What feeds a named uniform in a shader wallpaper.
@@ -58,11 +77,8 @@ pub enum WallpaperConfig {
 /// "wallpaper bus not yet connected" warning. The bus-event epic
 /// connects them without changing this enum (that is the point of
 /// typing all four kinds today).
-#[derive(Debug, Clone)]
-#[allow(
-    dead_code,
-    reason = "Phase-A scaffold: variants typed now so shader/bus epics ship without re-shaping the config enum"
-)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UniformBinding {
     /// Seconds since the wallpaper started, as `float`. Shadertoy's
     /// `iTime`.
@@ -80,7 +96,10 @@ pub enum UniformBinding {
     /// Shadertoy's `iMouse`.
     AutoMouse,
     /// A typed constant from the config.
-    Static(StaticValue),
+    Static {
+        /// The constant value.
+        value: StaticValue,
+    },
     /// Phase-B: write `current_time` into this uniform when the
     /// named bus event fires. Phase-A: parses, warns "no bus
     /// connected", never writes.
@@ -97,11 +116,8 @@ pub enum UniformBinding {
 }
 
 /// A typed static value for a `Static` uniform binding.
-#[derive(Debug, Clone)]
-#[allow(
-    dead_code,
-    reason = "Phase-A scaffold: variants typed now so shader epic ships without re-shaping the value enum"
-)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum StaticValue {
     /// `float`.
     Float(f32),
@@ -113,33 +129,58 @@ pub enum StaticValue {
     Vec4([f32; 4]),
     /// `int`.
     Int(i32),
-    /// `bool`.
+    /// `bool` (encoded as `_1i` in GLSL ES 100).
     Bool(bool),
+}
+
+/// Read the wallpaper config from a JSON file at `path`. The
+/// schema mirrors [`WallpaperConfig`] with serde-tagged variants:
+///
+/// ```json
+/// { "type": "image", "source": "/path/to/wallpaper.png" }
+/// { "type": "shader", "source": "/path/to/wallpaper.frag",
+///   "uniforms": { "iTime": {"kind": "auto_time"} } }
+/// { "type": "video", "source": "/path/to/wallpaper.mp4", "loop": true }
+/// ```
+///
+/// # Errors
+///
+/// Returns an error on file-read or JSON-parse failure.
+pub fn from_json_file(path: &Path) -> io::Result<WallpaperConfig> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| io::Error::other(format!("read wallpaper config {}: {e}", path.display())))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| io::Error::other(format!("parse wallpaper config {}: {e}", path.display())))
 }
 
 /// Read the wallpaper config from environment variables.
 ///
-/// Phase-A: only `HALMASUIT_WALLPAPER_PATH` is read. Extension
-/// inference picks the backend type:
+/// Resolution order:
 ///
-/// | extension                  | backend           |
-/// |----------------------------|-------------------|
-/// | `.png` / `.jpg` / `.jpeg` / `.webp` | image     |
-/// | `.frag` / `.glsl`          | shader (Phase-A stub) |
-/// | `.mp4` / `.webm` / `.mkv`  | video (Phase-A stub)  |
+/// 1. `HALMASUIT_WALLPAPER_CONFIG` — path to a JSON file matching
+///    [`WallpaperConfig`]. Used when richer config (named shader
+///    uniforms, explicit video loop flag, etc.) is needed. The Nix
+///    module writes this when `services.halmasuit.wallpaper` has
+///    `uniforms` set or any non-default field.
+/// 2. `HALMASUIT_WALLPAPER_PATH` — path-only fallback. Extension
+///    inference picks the backend variant; uniforms default to the
+///    canonical Shadertoy set for shader sources.
 ///
-/// Returns `None` when the env var is unset — the legacy
-/// clear-only scene used by non-visual integration tests.
+/// Returns `Ok(None)` when neither is set (the legacy clear-only
+/// scene used by non-visual integration tests).
 ///
-/// Future: when the shader-uniforms task lands, a
-/// `HALMASUIT_WALLPAPER_CONFIG` env var pointing to a TOML file
-/// will carry the richer shape (named uniforms, per-monitor, etc.)
-/// and supersede the extension-inference path for shader/video.
-#[must_use]
-pub fn from_env() -> Option<WallpaperConfig> {
-    let raw = std::env::var_os("HALMASUIT_WALLPAPER_PATH")?;
-    let path = PathBuf::from(raw);
-    Some(infer_from_path(path))
+/// # Errors
+///
+/// Returns an error when `HALMASUIT_WALLPAPER_CONFIG` is set but
+/// the file cannot be read or parsed as JSON.
+pub fn from_env() -> io::Result<Option<WallpaperConfig>> {
+    if let Some(raw) = std::env::var_os("HALMASUIT_WALLPAPER_CONFIG") {
+        return Ok(Some(from_json_file(Path::new(&raw))?));
+    }
+    if let Some(raw) = std::env::var_os("HALMASUIT_WALLPAPER_PATH") {
+        return Ok(Some(infer_from_path(PathBuf::from(raw))));
+    }
+    Ok(None)
 }
 
 /// Pick the backend variant from the file extension. Public for
@@ -153,7 +194,7 @@ pub fn infer_from_path(path: PathBuf) -> WallpaperConfig {
     match ext.as_deref() {
         Some("frag" | "glsl") => WallpaperConfig::Shader {
             source: path,
-            uniforms: HashMap::new(),
+            uniforms: default_shadertoy_bindings(),
         },
         Some("mp4" | "webm" | "mkv") => WallpaperConfig::Video {
             source: path,
@@ -164,6 +205,21 @@ pub fn infer_from_path(path: PathBuf) -> WallpaperConfig {
         // the source of truth for "is this an image."
         _ => WallpaperConfig::Image { source: path },
     }
+}
+
+/// The canonical Shadertoy uniform-binding set, auto-bound by name
+/// to engine values. The shader backend ships these as the default
+/// when no `HALMASUIT_WALLPAPER_CONFIG` TOML is supplied — Shadertoy
+/// demos drop in unchanged. A future TOML config can override or
+/// extend the set with named declared uniforms.
+fn default_shadertoy_bindings() -> HashMap<String, UniformBinding> {
+    let mut m = HashMap::new();
+    m.insert("iResolution".to_owned(), UniformBinding::AutoResolution);
+    m.insert("iTime".to_owned(), UniformBinding::AutoTime);
+    m.insert("iTimeDelta".to_owned(), UniformBinding::AutoDelta);
+    m.insert("iFrame".to_owned(), UniformBinding::AutoFrame);
+    m.insert("iMouse".to_owned(), UniformBinding::AutoMouse);
+    m
 }
 
 #[cfg(test)]
@@ -236,6 +292,91 @@ mod tests {
         match infer_from_path(PathBuf::from("/x.mp4")) {
             WallpaperConfig::Video { loop_playback, .. } => {
                 assert!(loop_playback, "video wallpaper defaults to looping");
+            }
+            other => panic!("expected Video, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_image_config_deserializes() {
+        let json = r#"{"type":"image","source":"/path/to/wallpaper.png"}"#;
+        let cfg: WallpaperConfig = serde_json::from_str(json).expect("image config parses");
+        match cfg {
+            WallpaperConfig::Image { source } => {
+                assert_eq!(source, PathBuf::from("/path/to/wallpaper.png"));
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_shader_config_with_declared_uniforms_deserializes() {
+        let json = r#"{
+            "type": "shader",
+            "source": "/path/to/wallpaper.frag",
+            "uniforms": {
+                "iTime": { "kind": "auto_time" },
+                "iResolution": { "kind": "auto_resolution" },
+                "theme_color": {
+                    "kind": "static",
+                    "value": { "type": "vec3", "value": [0.04, 0.0, 0.08] }
+                },
+                "login_event_time": {
+                    "kind": "event_time",
+                    "event": "halmasuit.session.opened"
+                }
+            }
+        }"#;
+        let cfg: WallpaperConfig = serde_json::from_str(json).expect("shader config parses");
+        match cfg {
+            WallpaperConfig::Shader { source, uniforms } => {
+                assert_eq!(source, PathBuf::from("/path/to/wallpaper.frag"));
+                assert!(matches!(
+                    uniforms.get("iTime"),
+                    Some(UniformBinding::AutoTime)
+                ));
+                assert!(matches!(
+                    uniforms.get("iResolution"),
+                    Some(UniformBinding::AutoResolution)
+                ));
+                assert!(matches!(
+                    uniforms.get("theme_color"),
+                    Some(UniformBinding::Static {
+                        value: StaticValue::Vec3([_, _, _])
+                    })
+                ));
+                assert!(matches!(
+                    uniforms.get("login_event_time"),
+                    Some(UniformBinding::EventTime { .. })
+                ));
+            }
+            other => panic!("expected Shader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_video_config_with_loop_deserializes() {
+        let json = r#"{"type":"video","source":"/x.mp4","loop":false}"#;
+        let cfg: WallpaperConfig = serde_json::from_str(json).expect("video config parses");
+        match cfg {
+            WallpaperConfig::Video {
+                source,
+                loop_playback,
+            } => {
+                assert_eq!(source, PathBuf::from("/x.mp4"));
+                assert!(!loop_playback);
+            }
+            other => panic!("expected Video, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_video_config_loop_defaults_to_true_when_omitted() {
+        let json = r#"{"type":"video","source":"/x.mp4"}"#;
+        let cfg: WallpaperConfig = serde_json::from_str(json).expect("video config parses");
+        match cfg {
+            WallpaperConfig::Video { loop_playback, .. } => {
+                assert!(loop_playback, "loop defaults to true");
             }
             other => panic!("expected Video, got {other:?}"),
         }

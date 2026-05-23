@@ -467,18 +467,42 @@ in
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.
         HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
-      } // lib.optionalAttrs (cfg.wallpaper != null) {
-        # Path of the wallpaper file (image / shader / video). The
-        # wallpaper engine reads this at startup, infers the backend
-        # from the file extension (Phase-A simple shape), and
-        # constructs the configured backend. See
-        # `services.halmasuit.wallpaper`. String interpolation (NOT
-        # `toString`) so a path literal is realized into the store
-        # and is guaranteed present at this path in halmasuit's
-        # closure — the option is self-sufficient. An absolute
-        # runtime-path string interpolates to itself unchanged.
-        HALMASUIT_WALLPAPER_PATH = "${cfg.wallpaper.source}";
-      };
+      } // lib.optionalAttrs (cfg.wallpaper != null) (
+        let
+          # Project the Nix option shape onto the JSON schema the
+          # wallpaper engine's serde deserializer expects (see
+          # `wallpaper::config::WallpaperConfig` — discriminator
+          # `type`, snake-case variants, `loop` rather than
+          # `loop_playback`).
+          wp = cfg.wallpaper;
+          jsonContent =
+            if wp.type == "image" then {
+              type   = "image";
+              source = "${wp.source}";
+            } else if wp.type == "shader" then {
+              type     = "shader";
+              source   = "${wp.source}";
+              uniforms = wp.uniforms;
+            } else {
+              type     = "video";
+              source   = "${wp.source}";
+              "loop"   = wp.loop;
+            };
+          configFile = pkgs.writeText "halmasuit-wallpaper.json"
+            (builtins.toJSON jsonContent);
+        in {
+          # The wallpaper engine prefers HALMASUIT_WALLPAPER_CONFIG
+          # (JSON) over HALMASUIT_WALLPAPER_PATH; the JSON carries
+          # the full discriminated-union shape including shader
+          # uniform bindings. String interpolation (NOT `toString`)
+          # so the Nix path is realized into the store.
+          HALMASUIT_WALLPAPER_CONFIG = "${configFile}";
+          # Also export PATH as a fallback for early diagnostics
+          # (anything that wants "where's the asset" without parsing
+          # the JSON). The engine never reads this when CONFIG is
+          # set; setting both is defense-in-depth, not redundancy.
+          HALMASUIT_WALLPAPER_PATH = "${wp.source}";
+        });
     };
    })
 

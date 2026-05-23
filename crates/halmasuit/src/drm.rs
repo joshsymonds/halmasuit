@@ -109,12 +109,17 @@ pub fn xrgb_le_to_color32f(bytes: [u8; 4]) -> Color32F {
 render_elements! {
     /// One frame's render elements. smithay element lists are
     /// front-to-back (index 0 = topmost, drawn last). `Surface` wraps
-    /// a committed wl_client subtree; `Wallpaper` is halmasuit's
-    /// internal full-output background plane, always the LAST element
-    /// so every surface composites over it (epic G1/R3/R6).
+    /// a committed wl_client subtree; `Wallpaper` /
+    /// `WallpaperShader` are halmasuit's internal full-output
+    /// background plane (image-backed and shader-backed
+    /// respectively), always the LAST element so every surface
+    /// composites over it (epic G1/R3/R6). Exactly one wallpaper
+    /// variant is produced per frame — the engine's active backend
+    /// picks which.
     pub SceneElement<=GlesRenderer>;
     Surface = WaylandSurfaceRenderElement<GlesRenderer>,
     Wallpaper = TextureRenderElement<GlesTexture>,
+    WallpaperShader = smithay::backend::renderer::gles::element::PixelShaderElement,
 }
 
 /// The full GLES + GBM + DrmCompositor stack wrapped around a single
@@ -364,7 +369,7 @@ where
                     Box::new(ImageBackend::new(&mut renderer, &source)?)
                 }
                 WallpaperConfig::Shader { source, uniforms } => {
-                    Box::new(ShaderBackend::new(&mut renderer, source, uniforms)?)
+                    Box::new(ShaderBackend::new(&mut renderer, &source, uniforms)?)
                 }
                 WallpaperConfig::Video {
                     source,
