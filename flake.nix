@@ -100,8 +100,10 @@
             # via libloading; not a build-time link dep. libdrm comes
             # transitively via drm-rs / gbm-sys.
             # libpam is for the halmasuit-session broker's FFI — the
-            # SOLE libpam surface in the workspace (Epic #1 R14;
-            # pam-sys links libpam.so.0 via `links = "pam"`).
+            # SOLE libpam surface in the workspace (Epic #1 R14; Epic #5
+            # replaced the pam-sys dep with a hand-rolled `unsafe extern
+            # "C"` block in `halmasuit_session::pam_sys` that links
+            # libpam.so.0 directly via `#[link(name = "pam")]`).
             buildInputs = with pkgs; [
               libxkbcommon
               wayland
@@ -192,8 +194,6 @@
             # Runtime + link deps:
             # - libxkbcommon: smithay needs it for keymap handling.
             # - wayland: smithay's protocol scanner.
-            # - pam: pam-sys links against libpam.so.0 at runtime via
-            #   `links = "pam"` in its Cargo.toml.
             # - libgbm: smithay's `backend_gbm` + `renderer_gl` link
             #   against libgbm.so via gbm-sys at build time.
             # - libGL (libglvnd): provides `libEGL.so.1` which smithay
@@ -209,10 +209,16 @@
             #   (smithay backend_libinput/backend_udev; input-sys
             #   hardcodes -lxkbcommon). udev: libudev for seat-scoped
             #   device discovery.
+            #
+            # NOT included: libpam. The compositor has no PAM in its
+            # address space (CLAUDE.md hard rule); the privileged
+            # broker (`halmasuit-session`) is the sole libpam consumer
+            # and has its own derivation below with `pkgs.pam` in its
+            # buildInputs. `cargo tree -p halmasuit | grep -i pam` is
+            # empty.
             buildInputs       = [
               pkgs.libxkbcommon
               pkgs.wayland
-              pkgs.pam
               pkgs.libgbm
               pkgs.libGL
               pkgs.seatd
