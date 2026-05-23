@@ -40,6 +40,67 @@ use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg, send};
 
 use crate::broker_relay::{BrokerRelay, RelayError, RelayEvent};
 
+/// System-controlled PATH used for resolving relative session
+/// commands sent by the greeter (R8 PATH-resolution hardening).
+///
+/// Greeters like DMS DankGreeter read `.desktop` files whose `Exec=`
+/// lines are often plain command names (`niri-session`) — the XDG
+/// Desktop Entry spec allows both relative and absolute Exec entries
+/// and the greeter forwards what it found verbatim. The broker's
+/// `halmasuit-session::session_leader::SessionSpec::validate` REFUSES
+/// relative commands (CVE-2019-style argv-injection / PATH-attack
+/// hardening — the privileged process must never PATH-resolve from a
+/// peer-controlled string).
+///
+/// halmasuit-greetd's relay runs in the UNPRIVILEGED compositor's
+/// address space, so PATH resolution here is not a privilege boundary
+/// — we resolve against this fixed system path (NixOS + FHS
+/// conventions), substitute the absolute path into the SpawnRequest,
+/// then hand the broker the absolute-path form it requires. If the
+/// command is already absolute, it passes through untouched. If
+/// resolution fails, the episode fails closed.
+///
+/// The PATH is HARDCODED, not read from `$PATH` — the greeter never
+/// controls it. This is the same posture used by the OpenSSH server,
+/// systemd-pam, and other privilege-boundary daemons.
+const SYSTEM_PATH: &[&str] = &[
+    "/run/wrappers/bin",
+    "/run/current-system/sw/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+];
+
+/// Resolve `cmd[0]` against [`SYSTEM_PATH`] if it does not start
+/// with `/`. Returns the resolved command vector with cmd[0]
+/// substituted, or `None` if no executable named `cmd[0]` is found
+/// on the fixed system path. Absolute commands and empty vectors
+/// pass through unchanged (the broker enforces non-empty + absolute
+/// — the relay-side resolution is a convenience, not a security
+/// gate).
+#[must_use]
+pub fn resolve_command_path(cmd: Vec<String>) -> Option<Vec<String>> {
+    let first = cmd.first()?;
+    if first.starts_with('/') {
+        return Some(cmd);
+    }
+    // Reject `cmd[0]` containing path separators that aren't an
+    // absolute path (e.g. `../niri`): these are explicit relative
+    // path traversals the greeter has no business sending.
+    if first.contains('/') {
+        return None;
+    }
+    for dir in SYSTEM_PATH {
+        let candidate = std::path::PathBuf::from(dir).join(first);
+        if candidate.is_file() {
+            let mut resolved = cmd;
+            resolved[0] = candidate.to_string_lossy().into_owned();
+            return Some(resolved);
+        }
+    }
+    None
+}
+
 /// SEQPACKET framing error. Internal — every variant is turned into a
 /// fail-closed greeter auth failure by the episode; it is never
 /// surfaced to the greeter as anything but an auth error.
@@ -431,9 +492,26 @@ impl BrokerEpisode {
                     Err(RelayError::OutOfPhase) => self.fail_closed(out),
                 }
             }
-            Demand::Spawn(spawn) => {
+            Demand::Spawn(mut spawn) => {
                 // greetd already appended Response::Success to `reply`.
                 if self.relay.is_none() {
+                    self.fail_closed(out);
+                    return;
+                }
+                // Greeters typically forward `Exec=` from a
+                // .desktop file verbatim (e.g. DMS sends
+                // ["niri-session"]). The broker requires absolute
+                // paths. Resolve here, in the unprivileged
+                // compositor's address space, against a fixed
+                // system PATH. See `resolve_command_path` for the
+                // security posture.
+                if let Some(resolved) = resolve_command_path(spawn.cmd) {
+                    spawn.cmd = resolved;
+                } else {
+                    tracing::warn!(
+                        "session command not absolute and not found on system PATH; \
+                         failing closed"
+                    );
                     self.fail_closed(out);
                     return;
                 }
@@ -482,6 +560,43 @@ mod tests {
     };
     use halmasuit_session_ipc::{PromptStyle, SessionOutcome};
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, recv, socketpair};
+
+    /// Absolute commands pass through `resolve_command_path` unchanged.
+    /// This is the production-recommended posture for greeter wire
+    /// content; the resolver exists to be lenient about XDG `.desktop`
+    /// Exec lines, not because anyone in the live path should rely on
+    /// PATH lookups.
+    #[test]
+    fn resolve_command_path_passes_absolute_through() {
+        let r = resolve_command_path(vec!["/usr/bin/niri".into(), "--session".into()]);
+        assert_eq!(r, Some(vec!["/usr/bin/niri".into(), "--session".into()]));
+    }
+
+    /// A relative command not present on any directory in
+    /// `SYSTEM_PATH` returns `None` — the episode then fails closed
+    /// rather than handing the broker an unresolvable name.
+    #[test]
+    fn resolve_command_path_rejects_unknown_relative() {
+        let r = resolve_command_path(vec!["definitely-not-a-real-binary".into()]);
+        assert_eq!(r, None);
+    }
+
+    /// Relative paths containing `/` (e.g. `../niri`) are rejected
+    /// outright — these are path traversals the greeter has no
+    /// business sending and the fixed system PATH would not search
+    /// them anyway.
+    #[test]
+    fn resolve_command_path_rejects_path_traversal() {
+        assert_eq!(resolve_command_path(vec!["../niri".into()]), None);
+        assert_eq!(resolve_command_path(vec!["bin/niri".into()]), None);
+    }
+
+    /// Empty command vector returns `None` (matches the broker's
+    /// `SpecError::EmptyCommand` behavior on the other side).
+    #[test]
+    fn resolve_command_path_rejects_empty() {
+        assert_eq!(resolve_command_path(vec![]), None);
+    }
 
     /// (compositor channel, broker end) connected SEQPACKET pair. The
     /// tests act as the broker SYNCHRONOUSLY on the broker end —
@@ -612,7 +727,11 @@ mod tests {
         // Greeter → StartSession. Episode forwards StartSession and
         // surfaces the broker-resolved identity (NOT "alice").
         let ss = greetd_encode(&Request::StartSession {
-            cmd: vec!["niri".into()],
+            // Absolute path — the broker requires absolute commands,
+            // and `resolve_command_path` passes them through
+            // unchanged. (A relative `"niri"` would trigger PATH
+            // resolution which can fail on the test runner.)
+            cmd: vec!["/usr/bin/niri".into()],
             env: vec!["XDG_SESSION_TYPE=wayland".into()],
         })
         .unwrap();
@@ -624,7 +743,7 @@ mod tests {
         assert_eq!(spawned.gid, 1001);
         match broker_recv(&broker) {
             CompositorToBroker::StartSession { cmd, env } => {
-                assert_eq!(cmd, vec!["niri".to_string()]);
+                assert_eq!(cmd, vec!["/usr/bin/niri".to_string()]);
                 assert_eq!(env, vec![("XDG_SESSION_TYPE".into(), "wayland".into())]);
             }
             other => panic!("expected StartSession, got {other:?}"),
@@ -723,7 +842,7 @@ mod tests {
         assert_eq!(greeter_responses(&o.greeter_reply), vec![Response::Success]);
 
         let ss = greetd_encode(&Request::StartSession {
-            cmd: vec!["sway".into()],
+            cmd: vec!["/usr/bin/sway".into()],
             env: vec![],
         })
         .unwrap();

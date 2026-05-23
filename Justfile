@@ -120,10 +120,10 @@ test-vm:
     echo "── visual-gtk4-smoke ──"
     nix build .#checks.x86_64-linux.visual-gtk4-smoke -L --print-build-logs --no-link
     echo
-    # R13(b): G3 keystroke auth arc end-to-end through a Qt6 toolkit
-    # greeter (xdg-toplevel) → broker → real pam_unix → real niri session.
-    echo "── visual-qt6-greeter-auth ──"
-    nix build .#checks.x86_64-linux.visual-qt6-greeter-auth -L --print-build-logs --no-link
+    # R13(b): G3 keystroke auth arc end-to-end through real DMS
+    # DankGreeter → broker → real pam_unix → session_opened.
+    echo "── visual-dankgreeter-auth ──"
+    nix build .#checks.x86_64-linux.visual-dankgreeter-auth -L --print-build-logs --no-link
     echo
     # Convergence epic R2: wl_surface.frame callbacks (no Mesa-EGL wedge).
     echo "── visual-frame-callbacks ──"

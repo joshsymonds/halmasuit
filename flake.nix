@@ -699,6 +699,17 @@
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
           ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # R13(b) GATE: real DMS DankGreeter as halmasuit's greeter,
+        # real keystrokes → broker → real pam_unix → session_opened.
+        # The end-to-end chain through the upstream client we
+        # actually deploy with on gnomon.
+        visual-dankgreeter-auth = import ./tests/visual-dankgreeter-auth.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+          ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # R12 (GTK4 half): real GTK4 wayland client as halmasuit's
         # greeter. Qt6 is covered by visual-dankgreeter (Quickshell);
         # this proves the parallel GTK4 path through the same
@@ -709,20 +720,6 @@
           halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
           ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
-        };
-        # R13(b) keystroke auth arc via a minimal Qt6 Widgets greeter
-        # that uses xdg-toplevel (NOT wlr-layer-shell). Same load-bearing
-        # assertion as visual-dankgreeter-auth (Qt6 keystrokes → broker
-        # → real pam_unix → real niri session) but routes around the
-        # Round-4b Qt+wlr-layer-shell blockage by using a Qt protocol
-        # surface (xdg-toplevel) that QtWayland fully supports.
-        visual-qt6-greeter-auth = import ./tests/visual-qt6-greeter-auth.nix {
-          system = "x86_64-linux";
-          inherit nixpkgs nix-config;
-          halmasuit          = self.packages.x86_64-linux.halmasuit-debug;
-          halmasuit-session  = self.packages.x86_64-linux.halmasuit-session;
-          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
-          ssimulacra2-cli    = self.packages.x86_64-linux.ssimulacra2-cli;
         };
         # Convergence epic R2: wl_surface.frame callbacks fire so
         # Mesa-EGL clients don't wedge in dri2_wl_surface_throttle.
