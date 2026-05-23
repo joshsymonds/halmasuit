@@ -831,6 +831,7 @@ version = "0.1.0"
 dependencies = [
  "calloop",
  "caps",
+ "halmasuit-decoder-ipc",
  "halmasuit-greetd",
  "halmasuit-introspect",
  "halmasuit-session-ipc",
@@ -842,6 +843,7 @@ dependencies = [
  "serde_json",
  "smithay",
  "tempfile",
+ "thiserror",
  "tracing",
  "tracing-subscriber",
  "zbus",

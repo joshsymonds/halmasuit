@@ -42,6 +42,12 @@ halmasuit-greetd     = { path = "../halmasuit-greetd",     version = "0.1" }
 # path (halmasuit-pam, the in-compositor C1 model, is deleted with
 # setuid halmasuit-spawn in the atomic R10/R14/R15 commit).
 halmasuit-session-ipc = { path = "../halmasuit-session-ipc", version = "0.1" }
+# Frozen compositor↔halmasuit-decoder wire contract (Epic #12). The
+# DecoderRelay (wallpaper/decoder_relay.rs) translates VideoBackend
+# control into these frames and validates incoming FrameHeaders before
+# uploading raw RGBA bytes as a GLES texture.
+halmasuit-decoder-ipc = { path = "../halmasuit-decoder-ipc", version = "0.1" }
+thiserror.workspace = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
 # smithay features:

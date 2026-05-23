@@ -18,6 +18,7 @@
 
 pub mod backend;
 pub mod config;
+pub mod decoder_relay;
 pub mod image;
 pub mod shader;
 pub mod video;
