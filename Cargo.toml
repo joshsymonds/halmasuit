@@ -11,6 +11,9 @@ members = [
     "crates/halmasuit-session-ipc",
     # Privileged PAM-lifecycle broker (Epic: unified session/pamd).
     "crates/halmasuit-session",
+    # Pure wire contract for the compositor↔halmasuit-decoder video-decode
+    # relay (Epic #12: sandboxed-decoder VideoBackend). Types + codec only.
+    "crates/halmasuit-decoder-ipc",
     # Test-only: real-PAM VM gate driver for halmasuit-session (R12).
     "crates/halmasuit-session-pam-testdriver",
     "crates/halmasuit-cli",

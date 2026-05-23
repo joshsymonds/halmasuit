@@ -762,6 +762,15 @@ name = "halmasuit-cli"
 version = "0.1.0"
 
 [[package]]
+name = "halmasuit-decoder-ipc"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "halmasuit-greetd"
 version = "0.1.0"
 dependencies = [
