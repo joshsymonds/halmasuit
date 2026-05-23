@@ -7,13 +7,35 @@
 //! validated (`bytes_len <= MAX_FRAME_BYTES` AND `width * height *
 //! 4 == bytes_len`) before becoming a GLES texture.
 //!
+//! ## Lazy decoder spawn (Epic anti-pattern: "NO running the
+//! decoder as root or with elevated capabilities")
+//!
+//! VideoBackend is constructed during `setup_drm_backend`, which
+//! runs BEFORE halmasuit's in-process privilege drop
+//! (`phase_entered:deprivileged`). Spawning the decoder eagerly
+//! from `new()` would inherit the compositor's pre-drop uid (0 in
+//! production deploys), making the sandbox's uid_map a 0→0
+//! identity instead of `compositor_uid → compositor_uid`. The
+//! sandbox primitives confine root-in-sandbox, but the explicit
+//! epic anti-pattern requires the decoder NOT to run as root.
+//!
+//! Fix: `new()` only stages the source path + the placeholder
+//! texture. The first call to [`Self::poll_pending`] performs the
+//! spawn. The compositor's wallpaper-tick calloop timer (in
+//! `main.rs`) is registered just before the privilege-drop block,
+//! so its first dispatch — and therefore the lazy spawn — fires
+//! from the post-`setresuid` main loop, at uid 998
+//! (`halmasuit-compositor`). The decoder inherits that uid and
+//! its user-namespace uid_map writes `998 998 1`, satisfying
+//! the anti-pattern.
+//!
 //! ## Frame-0 readiness
 //!
 //! Wallpaper rendering is invariant: every frame must paint
 //! SOMETHING (no black flash, ever — that's the project's purpose).
-//! Until the decoder hands us its first frame, this backend paints
-//! a 1×1 black placeholder texture stretched to the output. The
-//! first valid frame replaces it; subsequent frames replace
+//! From [`Self::new`] through the first decoded frame, this backend
+//! paints a 1×1 black placeholder texture stretched to the output.
+//! The first valid frame replaces it; subsequent frames replace
 //! whatever's current.
 //!
 //! ## Restart + fallback
@@ -26,24 +48,41 @@
 //! (image / shader) requires the operator to configure one; not
 //! Phase A.
 
+use std::cell::RefCell;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::texture::{TextureBuffer, TextureRenderElement};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
-use tracing::{debug, error};
+use tracing::{debug, error, info, warn};
 
 use super::backend::WallpaperBackend;
 use super::decoder_relay::DecoderRelay;
 use crate::drm::SceneElement;
 
-/// Video wallpaper backend. Owns the relay + the currently-uploaded
+/// Video wallpaper backend. Owns the relay (lazily spawned post-
+/// privilege-drop; see module doc) and the currently-uploaded
 /// frame's GLES texture.
 pub struct VideoBackend {
-    relay: DecoderRelay,
+    /// Wallpaper source path, retained for the lazy
+    /// [`DecoderRelay::spawn`] call.
+    source: PathBuf,
+    /// Relay slot, populated on the first [`Self::poll_pending`]
+    /// after halmasuit's privilege drop. `RefCell<Option<...>>`
+    /// because lazy-spawn happens through a `&self` method and the
+    /// slot starts empty. Once spawned (or once spawn fails fatally
+    /// — see `spawn_attempted` below), the slot stays as-is.
+    relay: RefCell<Option<DecoderRelay>>,
+    /// True once [`Self::poll_pending`] has attempted to spawn. On
+    /// spawn failure, we DO NOT retry — the wallpaper degrades to
+    /// the placeholder/last-good-frame, but we don't burn CPU
+    /// re-spawning every 100 ms (the relay's own restart-budget
+    /// handles transient decoder crashes; failure to even fork-exec
+    /// is treated as terminal).
+    spawn_attempted: std::cell::Cell<bool>,
     /// Currently-uploaded GLES texture. Initially a 1×1 black
     /// placeholder so frame-0 has something to paint; replaced with
     /// each new decoded frame.
@@ -59,15 +98,17 @@ pub struct VideoBackend {
 }
 
 impl VideoBackend {
-    /// Construct the backend: spawn the decoder, allocate a 1×1
-    /// black placeholder texture, send LoadFile with the wallpaper
-    /// fd via SCM_RIGHTS.
+    /// Stage the backend: store the source path + allocate the
+    /// placeholder texture. Does NOT spawn the decoder — that
+    /// happens lazily on the first [`Self::poll_pending`], which
+    /// fires from a calloop timer registered AFTER the compositor's
+    /// `setresuid` (see module doc).
     ///
     /// # Errors
     ///
-    /// Propagates decoder-spawn or wallpaper-open failures from
-    /// `DecoderRelay::spawn`. Texture-import failures are also
-    /// propagated.
+    /// Texture-import failures (placeholder allocation) are
+    /// propagated. Decoder spawn failures are deferred and surface
+    /// as a warning during the first `poll_pending`.
     pub fn new(
         renderer: &mut GlesRenderer,
         source: &Path,
@@ -77,8 +118,6 @@ impl VideoBackend {
         // = true sent unconditionally by DecoderRelay::spawn). The
         // _loop_playback parameter is reserved for the future
         // dynamic-config epic; for now we ignore it.
-        let relay = DecoderRelay::spawn(source)
-            .map_err(|e| io::Error::other(format!("decoder relay spawn: {e}")))?;
 
         // 1×1 black placeholder texture (RGBA). Stretched to the
         // output by `render_element`, this paints a black wallpaper
@@ -97,18 +136,55 @@ impl VideoBackend {
         .map_err(|e| io::Error::other(format!("video placeholder texture: {e}")))?;
 
         Ok(Self {
-            relay,
+            source: source.to_path_buf(),
+            relay: RefCell::new(None),
+            spawn_attempted: std::cell::Cell::new(false),
             current_buffer: buffer,
             current_size: Size::from((1, 1)),
             last_uploaded_idx: None,
         })
     }
+
+    /// Lazy decoder spawn. Called on the first [`Self::poll_pending`]
+    /// (timer-driven, post-`setresuid`). On failure we log and mark
+    /// `spawn_attempted` so we don't retry forever.
+    fn ensure_relay_spawned(&self) {
+        if self.spawn_attempted.get() {
+            return;
+        }
+        self.spawn_attempted.set(true);
+        match DecoderRelay::spawn(&self.source) {
+            Ok(relay) => {
+                info!(
+                    source = %self.source.display(),
+                    "video wallpaper: decoder spawn deferred until post-deprivilege"
+                );
+                *self.relay.borrow_mut() = Some(relay);
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    source = %self.source.display(),
+                    "video wallpaper: decoder spawn failed; keeping placeholder"
+                );
+            }
+        }
+    }
 }
 
 impl WallpaperBackend for VideoBackend {
     fn poll_pending(&self) {
-        if !self.relay.is_dead() {
-            self.relay.poll_frames();
+        // Lazy-spawn on the first call. The wallpaper-tick calloop
+        // timer in main.rs is registered before the privilege-drop
+        // block but only DISPATCHES from the main loop, which runs
+        // AFTER setresuid — so this call site executes at the
+        // configured compositor uid, not at the inherited root uid
+        // of WallpaperBackend::new's call site.
+        self.ensure_relay_spawned();
+        if let Some(r) = self.relay.borrow().as_ref()
+            && !r.is_dead()
+        {
+            r.poll_frames();
         }
     }
 
@@ -118,11 +194,12 @@ impl WallpaperBackend for VideoBackend {
         output_size: Size<i32, Logical>,
     ) -> io::Result<SceneElement> {
         // 1. Drain any frames the decoder produced since last render.
-        //    Once the relay's restart budget is exhausted, `is_dead`
-        //    returns true and we stop polling — keeps rendering the
-        //    last good frame (or placeholder).
-        if !self.relay.is_dead() {
-            self.relay.poll_frames();
+        //    The relay may not exist yet (pre-first-poll) or may have
+        //    died — both are handled by paintable-placeholder state.
+        if let Some(r) = self.relay.borrow().as_ref()
+            && !r.is_dead()
+        {
+            r.poll_frames();
         }
 
         // 2. If a new frame is available, re-upload as the current
@@ -131,17 +208,19 @@ impl WallpaperBackend for VideoBackend {
         //    raw-texel-update API, and the GPU driver makes the
         //    rebuild cheap for stable sizes.
         let new_frame_data: Option<(u64, u32, u32, Vec<u8>)> = {
-            self.relay.latest_frame().and_then(|frame| {
-                if Some(frame.frame_idx) == self.last_uploaded_idx {
-                    None
-                } else {
-                    Some((
-                        frame.frame_idx,
-                        frame.width,
-                        frame.height,
-                        frame.bytes.clone(),
-                    ))
-                }
+            self.relay.borrow().as_ref().and_then(|r| {
+                r.latest_frame().and_then(|frame| {
+                    if Some(frame.frame_idx) == self.last_uploaded_idx {
+                        None
+                    } else {
+                        Some((
+                            frame.frame_idx,
+                            frame.width,
+                            frame.height,
+                            frame.bytes.clone(),
+                        ))
+                    }
+                })
             })
         };
         if let Some((idx, w, h, bytes)) = new_frame_data {

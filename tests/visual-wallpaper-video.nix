@@ -255,20 +255,13 @@ pkgs.testers.runNixOSTest {
     )
     print(f"GREETER PHASE: halmasuit pid={halmasuit_pid_before}")
 
-    # ── Gate 1: initial decoder spawn ──
+    # ── Gate 1: initial decoder spawn + uid posture ──
     # arg0 is the literal string "halmasuit-decoder" (set via
     # Command::arg0 in DecoderRelay's fork-exec path); pgrep -f
     # matches the full cmdline because the 17-char name overflows
-    # /proc/PID/comm's 15-char limit. We deliberately do NOT filter
-    # by user — the decoder currently inherits the compositor's
-    # pre-deprivilege uid (root) because WallpaperEngine constructs
-    # before halmasuit's in-process privilege drop (task #25
-    # follow-up tracks fixing the spawn-order). The sandbox
-    # primitives (NEWUSER + NEWNET + NEWNS + rlimits) still confine
-    # what root-in-sandbox can do; this gate's contract is
-    # "halmasuit-decoder spawned", not "ran under a specific uid".
-    # The `grep -v` suffix filters out the pgrep invocation itself
-    # (whose cmdline contains "halmasuit-decoder").
+    # /proc/PID/comm's 15-char limit. The `grep -v` suffix filters
+    # out the pgrep invocation itself (whose cmdline contains
+    # "halmasuit-decoder").
     machine.wait_until_succeeds(
         "pgrep -af halmasuit-decoder | grep -v 'pgrep -af'",
         timeout=30,
@@ -280,7 +273,45 @@ pkgs.testers.runNixOSTest {
     assert initial_decoder_pid.isdigit(), (
         f"initial decoder pid must be digit, got {initial_decoder_pid!r}"
     )
-    print(f"GATE 1 PASS: halmasuit-decoder spawned pid={initial_decoder_pid}")
+
+    # Epic anti-pattern: "NO running the decoder as root or with
+    # elevated capabilities. Forked from halmasuit (uid 998), no
+    # cap retention." VideoBackend's lazy-spawn defers the
+    # DecoderRelay::spawn call to its first poll_pending — which
+    # fires from the wallpaper-tick calloop timer, post-`setresuid`
+    # in main.rs. The decoder inherits the configured compositor
+    # uid (998 here, mapped to halmasuit-compositor) and its user-
+    # namespace uid_map writes `998 998 1`, NOT `0 0 1`. This
+    # assertion pins the invariant against regression.
+    decoder_uid_line = machine.succeed(
+        f"grep '^Uid:' /proc/{initial_decoder_pid}/status"
+    ).strip()
+    decoder_uid = decoder_uid_line.split()[1]
+    if decoder_uid != "998":
+        raise AssertionError(
+            f"GATE 1 FAIL: decoder runs as uid {decoder_uid}, "
+            "expected 998 (halmasuit-compositor).\n"
+            "Epic anti-pattern violation: the decoder must not "
+            "run as root or any elevated uid.\n"
+            f"Full /proc/{initial_decoder_pid}/status Uid line: "
+            f"{decoder_uid_line}"
+        )
+    decoder_uid_map = machine.succeed(
+        f"cat /proc/{initial_decoder_pid}/uid_map"
+    ).strip()
+    if not decoder_uid_map.split()[0] == "998":
+        raise AssertionError(
+            "GATE 1 FAIL: decoder's user-namespace uid_map does "
+            "not start with 998 (inner=outer=998).\n"
+            f"  got: {decoder_uid_map!r}\n"
+            "A uid_map starting with 0 indicates the decoder was "
+            "spawned before the compositor's privilege drop "
+            "(regression of task #25's lazy-spawn fix)."
+        )
+    print(
+        f"GATE 1 PASS: halmasuit-decoder spawned pid={initial_decoder_pid} "
+        f"uid={decoder_uid} (uid_map: {decoder_uid_map})"
+    )
 
     # ── Gate 4 (early — captures pre-kill PID continuity) ──
     # Wait for the broker to fork the session leader (test user
