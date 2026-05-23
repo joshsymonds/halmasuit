@@ -27,13 +27,13 @@ use std::ffi::{CStr, CString, NulError, c_int, c_void};
 use std::marker::PhantomData;
 use std::{panic, ptr};
 
-use halmasuit_session_ipc::{BrokerToCompositor, Secret};
 use crate::pam_sys::{
     PAM_BUF_ERR, PAM_CONV_ERR, PAM_DELETE_CRED, PAM_ESTABLISH_CRED, PAM_RUSER, PAM_SUCCESS,
     PAM_TTY, PAM_USER, pam_acct_mgmt, pam_authenticate, pam_close_session, pam_conv, pam_end,
     pam_get_item, pam_getenvlist, pam_handle_t, pam_message, pam_open_session, pam_putenv,
     pam_response, pam_set_item, pam_setcred, pam_start,
 };
+use halmasuit_session_ipc::{BrokerToCompositor, Secret};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -839,7 +839,10 @@ mod tests {
             seen: vec![],
             fail: true,
         };
-        let (rc, resp) = run(&[(crate::pam_sys::PAM_PROMPT_ECHO_OFF, "Password: ")], &mut r);
+        let (rc, resp) = run(
+            &[(crate::pam_sys::PAM_PROMPT_ECHO_OFF, "Password: ")],
+            &mut r,
+        );
         assert_eq!(rc, crate::pam_sys::PAM_CONV_ERR);
         assert!(resp.is_null());
     }

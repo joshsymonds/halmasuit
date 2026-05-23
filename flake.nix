@@ -118,10 +118,15 @@
               libinput
             ];
 
-            # bindgen (used transitively by pam-sys at build time) needs
-            # libclang.so available; LIBCLANG_PATH points it at the right
-            # one. Without this, `cargo build` panics inside clang-sys's
-            # build script when it can't find libclang.
+            # libclang is required ONLY by the dev-deps-only pam-sys
+            # parity audit lever (`crates/halmasuit-session/tests/pam_ffi_parity.rs`,
+            # Epic #5): pam-sys lives in [dev-dependencies] of
+            # halmasuit-session and runs bindgen at build time when
+            # compiled by `cargo test`. Production builds use the
+            # hand-rolled `halmasuit_session::pam_sys` FFI module — they
+            # link `-lpam` directly with zero bindgen / clang-sys /
+            # libclang involvement (and the production Nix packages
+            # below DO NOT include libclang in their nativeBuildInputs).
             #
             # pkg-config is needed by smithay-client-toolkit (and
             # transitively xkbcommon-sys) at build time to find
@@ -135,10 +140,12 @@
               export CARGO_HOME="$PWD/.cargo-home"
               export RUSTUP_HOME="$PWD/.rustup-home"
               export PATH="$CARGO_HOME/bin:$PATH"
+              # libclang + bindgen wiring for the pam-sys parity test
+              # (dev-deps-only). bindgen invokes clang directly,
+              # bypassing NIX_CFLAGS_COMPILE; point it at PAM + glibc
+              # headers so pam-sys's build.rs finds
+              # <security/pam_appl.h> and its transitive <unistd.h>.
               export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
-              # bindgen invokes clang directly, bypassing NIX_CFLAGS_COMPILE.
-              # Point it at PAM + glibc headers so pam-sys's build.rs
-              # finds <security/pam_appl.h> and its transitive <unistd.h>.
               export BINDGEN_EXTRA_CLANG_ARGS="-I${pkgs.pam}/include -I${pkgs.glibc.dev}/include"
               mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
             '';
@@ -173,11 +180,15 @@
             cargoBuildFlags    = [ "-p" "halmasuit" ];
             # Native deps:
             # - pkg-config: smithay's build script probes for libwayland.
-            # - llvmPackages.libclang: bindgen (transitively via pam-sys)
-            #   runs clang at build time. The dev shell exports this via
-            #   shellHook; rustPlatform.buildRustPackage has its own
-            #   sandboxed env, so we duplicate the wiring here.
-            nativeBuildInputs = [ pkgs.pkg-config pkgs.llvmPackages.libclang ];
+            #
+            # libclang is NOT in this list: the compositor binary has
+            # no bindgen consumer in its dep graph (verified via
+            # `cargo tree -p halmasuit --edges normal,build`). The
+            # privileged broker's libpam FFI is hand-rolled in
+            # `halmasuit_session::pam_sys` and the compositor never
+            # links libpam at all (CLAUDE.md: "No PAM in the
+            # compositor's address space").
+            nativeBuildInputs = [ pkgs.pkg-config ];
             # Runtime + link deps:
             # - libxkbcommon: smithay needs it for keymap handling.
             # - wayland: smithay's protocol scanner.
@@ -208,14 +219,6 @@
               pkgs.libinput
               pkgs.udev
             ];
-            # bindgen invokes clang directly (bypassing NIX_CFLAGS_COMPILE).
-            # Mirror the shellHook so pam-sys's build.rs finds
-            # <security/pam_appl.h> and its transitive <unistd.h>.
-            env = {
-              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-              BINDGEN_EXTRA_CLANG_ARGS =
-                "-I${pkgs.pam}/include -I${pkgs.glibc.dev}/include";
-            };
             # Integration tests spawn the binary and send POSIX signals; the
             # Nix sandbox doesn't permit that cleanly. `just check` is the
             # canonical gate; the NixOS VM test (next task) is the deployment-side gate.
@@ -273,10 +276,13 @@
           };
 
           # halmasuit-session — the socket-activated privileged
-          # PAM-lifecycle broker (Epic #1 R6). Links pam-sys (the SOLE
-          # libpam surface, R14) so it needs the same bindgen + libpam
-          # wiring as the testdriver, but none of smithay's
-          # wayland/GL/seatd stack.
+          # PAM-lifecycle broker (Epic #1 R6). The sole libpam-linking
+          # crate in the workspace (R14), now via the hand-rolled
+          # `halmasuit_session::pam_sys` FFI module (Epic #5). Production
+          # links `-lpam` directly — no bindgen, no clang-sys, no
+          # libclang at build time. pam-sys is a [dev-dependencies]
+          # audit lever for the parity test only (`doCheck = false`
+          # below means this derivation never sees dev-deps).
           halmasuit-session = rustPlatform.buildRustPackage {
             pname   = "halmasuit-session";
             version = "0.1.0";
@@ -286,13 +292,8 @@
               allowBuiltinFetchGit = true;
             };
             cargoBuildFlags   = [ "-p" "halmasuit-session" "--bin" "halmasuit-session" ];
-            nativeBuildInputs = [ pkgs.pkg-config pkgs.llvmPackages.libclang ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs       = [ pkgs.pam ];
-            env = {
-              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-              BINDGEN_EXTRA_CLANG_ARGS =
-                "-I${pkgs.pam}/include -I${pkgs.glibc.dev}/include";
-            };
             doCheck = false;
             meta = {
               description = "halmasuit socket-activated privileged PAM-lifecycle broker";
@@ -302,11 +303,9 @@
           };
 
           # halmasuit-session-pam-testdriver — test-only driver for the
-          # real-PAM gate (Epic #1 R12). Links pam-sys (via
-          # halmasuit-session) so it needs the same bindgen + libpam
-          # build wiring as `halmasuit` (clang for pam-sys's build.rs,
-          # pam headers, libpam.so.0 to link) — but NOT smithay's
-          # wayland/GL/seatd stack (halmasuit-session has none of it).
+          # real-PAM gate (Epic #1 R12). Reaches libpam via
+          # halmasuit-session's hand-rolled FFI (Epic #5); no bindgen
+          # at build time, no libclang.
           halmasuit-session-pam-testdriver = rustPlatform.buildRustPackage {
             pname   = "halmasuit-session-pam-testdriver";
             version = "0.1.0";
@@ -316,13 +315,8 @@
               allowBuiltinFetchGit = true;
             };
             cargoBuildFlags   = [ "-p" "halmasuit-session-pam-testdriver" ];
-            nativeBuildInputs = [ pkgs.pkg-config pkgs.llvmPackages.libclang ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs       = [ pkgs.pam ];
-            env = {
-              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-              BINDGEN_EXTRA_CLANG_ARGS =
-                "-I${pkgs.pam}/include -I${pkgs.glibc.dev}/include";
-            };
             doCheck = false;
             meta = {
               description = "halmasuit-session real-PAM VM-gate driver (test-only)";

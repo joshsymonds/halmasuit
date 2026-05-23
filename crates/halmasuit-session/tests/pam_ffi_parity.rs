@@ -17,7 +17,7 @@
 //!    pam-sys's same-named symbol. Since both crates use `#[link(name
 //!    = "pam")]` with no name-mangling, the linker MUST resolve them
 //!    to the same `pam_*@PLT` entry — and if it doesn't (someone
-//!    introduces name-mangling, mis-spells a symbol, or libpam's
+//!    introduces name-mangling, misspells a symbol, or libpam's
 //!    SONAME ever forks), this test fails before the broker hits the
 //!    drift in production.
 //!
@@ -174,7 +174,7 @@ fn message_style_constants_match_pam_sys() {
 // with the canonical C symbol names (no mangling). The linker resolves
 // each declaration to the matching `pam_*@PLT` entry in `libpam.so`.
 // If our declaration and pam-sys's declaration ever stop resolving to
-// the same address (mis-spell, mangling option, SONAME fork, etc.),
+// the same address (misspell, mangling option, SONAME fork, etc.),
 // this test catches it.
 
 #[test]
@@ -188,10 +188,7 @@ fn pam_start_symbol_matches() {
 
 #[test]
 fn pam_end_symbol_matches() {
-    assert_eq!(
-        ours::pam_end as *const (),
-        pam_sys::pam_end as *const (),
-    );
+    assert_eq!(ours::pam_end as *const (), pam_sys::pam_end as *const (),);
 }
 
 #[test]

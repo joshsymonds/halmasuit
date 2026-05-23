@@ -45,18 +45,26 @@ authors       = ["Josh Symonds <veraticus@gmail.com>"]
 # `thiserror` for error enums that benefit from Display derives. Used
 # by halmasuit-greetd's StateMachineError.
 thiserror          = "2"
-# PAM FFI for the privileged halmasuit-session broker (the sole
-# libpam-linking crate, Epic #1 R2/R14). Direct thin FFI (no wrapper
-# crate) per ARCHITECTURE.md "Open decisions" row 1 — wrappers flatten
-# PAM's message-style enum that our AuthMessageType already mirrors.
+# pam-sys: dev-dependencies-only audit lever (Epic #5).
 #
-# NOTE: 1.0.0-alpha5 is a pre-release (last released 2023-11) at a
-# privilege-critical FFI boundary. The crate has shipped alphas for
-# years and downstream consumers (the `pam` and `pam-client` wrapper
-# crates) pin to this exact version, so it is de-facto stable. Track
-# upstream (https://github.com/1wilkens/pam-sys) and RustSec for
-# advisories before each release tag; if a stable 1.0 ships, update
-# the pin and re-audit any signature changes (esp. pam_conv).
+# Production libpam FFI for the halmasuit-session broker is hand-rolled
+# in `crates/halmasuit-session/src/pam_sys.rs`, following sudo-rs's
+# pattern. Production builds link `-lpam` directly: NO bindgen,
+# NO clang-sys, NO libclang at build time.
+#
+# This dependency is consumed ONLY by
+# `crates/halmasuit-session/tests/pam_ffi_parity.rs` (an integration
+# test, listed under halmasuit-session's `[dev-dependencies]`, not its
+# `[dependencies]`). The parity test asserts struct layouts, constant
+# values, and `extern "C"` symbol resolution between our hand-rolled
+# FFI and pam-sys's bindgen output. Any libpam ABI drift fails CI
+# before the broker hits it in production.
+#
+# pam-sys upstream (https://github.com/1wilkens/pam-sys) has been
+# dormant since 2023-11. That is acceptable risk for a dev-deps-only
+# audit lever — the worst-case "pam-sys breaks on a new bindgen" only
+# affects the parity test, never the production binary. The hand-roll
+# is what removes the bus-factor exposure.
 pam-sys            = "1.0.0-alpha5"
 # C types and constants for the halmasuit-session libpam FFI surface.
 libc               = "0.2"

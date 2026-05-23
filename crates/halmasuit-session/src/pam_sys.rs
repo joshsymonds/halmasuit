@@ -270,11 +270,7 @@ unsafe extern "C" {
     /// `PAM_CONV`). libpam copies strings; for `PAM_CONV`, libpam
     /// stores the [`pam_conv`] pointer and the application keeps the
     /// allocation alive.
-    pub fn pam_set_item(
-        pamh: *mut pam_handle_t,
-        item_type: c_int,
-        item: *const c_void,
-    ) -> c_int;
+    pub fn pam_set_item(pamh: *mut pam_handle_t, item_type: c_int, item: *const c_void) -> c_int;
 
     /// Read back a PAM item. Writes a libpam-owned pointer into
     /// `*item`; do not free.
