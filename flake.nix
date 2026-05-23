@@ -118,6 +118,15 @@
               # libinput.pc for smithay's backend_libinput (input-sys)
               # under the same feature.
               libinput
+              # FFmpeg headers + libs for the halmasuit-decoder
+              # subsystem (Epic #12). rsmpeg's link_system_ffmpeg
+              # feature probes pkg-config for libavformat /
+              # libavcodec / libavutil / libswscale at build time.
+              # Without ffmpeg-headless here, devShell `cargo check`
+              # of anything depending on rsmpeg fails at the
+              # pkg-config probe. Production halmasuit-decoder has
+              # its own derivation below with this in buildInputs.
+              ffmpeg-headless
             ];
 
             # libclang is required ONLY by the dev-deps-only pam-sys

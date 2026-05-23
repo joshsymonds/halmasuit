@@ -120,6 +120,19 @@ proptest           = "1"
 # bottom-most wallpaper plane from frame 0 (epic G1/R3/R6).
 # default-features off; only the `png` codec is enabled.
 image              = { version = "0.25", default-features = false, features = ["png"] }
+# Video decoder for the wallpaper engine's VideoBackend, consumed
+# by the sandboxed `halmasuit-decoder` subprocess (Epic #12). MIT-
+# licensed wrapper around FFmpeg's libav* (LGPL-2.1+ dynamic-link;
+# NOT --enable-gpl, so x264/x265 are NOT in the closure — h264 via
+# stock libavcodec, AV1 via libdav1d). `link_system_ffmpeg` probes
+# pkg-config for libavformat etc. at build time; ffmpeg-headless
+# is the production buildInput. `ffmpeg8` matches our nix
+# ffmpeg-headless version. The bindgen-conflict spike (Epic #12
+# task #14) confirmed rsmpeg 0.18 coexists with halmasuit-session's
+# dev-deps pam-sys without re-triggering clang-sys#128 (rsmpeg
+# pins rusty_ffmpeg 0.16.7 with bindgen 0.71, whose feature
+# defaults don't collide with pam-sys's bindgen 0.69).
+rsmpeg             = { version = "0.18.0", default-features = false, features = ["link_system_ffmpeg", "ffmpeg8"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
