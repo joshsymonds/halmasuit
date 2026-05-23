@@ -21,10 +21,15 @@
 //!    and-discards).
 //! 3. `latest_frame()` — accessor for the last validated RGBA8
 //!    frame.
-//! 4. Restart on decoder exit / fatal error: bounded retries
-//!    (`MAX_RESTARTS_PER_WINDOW = 3` in `RESTART_WINDOW = 10s`).
-//!    Exhausted → relay marks itself dead; VideoBackend falls back
-//!    to its configured fallback image (or solid color).
+//! 4. Restart on decoder exit / fatal error: in-place respawn — the
+//!    relay re-runs the fork-exec dance, swaps the new IPC socket
+//!    and pidfd in over interior-mutability slots, and resets the
+//!    Ready handshake. Bounded by
+//!    `MAX_RESTARTS_PER_WINDOW = 3` in `RESTART_WINDOW = 10s` (the
+//!    4th failure within the window marks the relay dead instead of
+//!    respawning). Exhausted → relay is dead; VideoBackend keeps
+//!    rendering the last good frame (or the 1×1 black placeholder)
+//!    and stops polling.
 //! 5. `Drop` — send `Shutdown`, brief wait, `pidfd_send_signal
 //!    SIGKILL` if the child hasn't exited.
 //!
@@ -42,12 +47,12 @@
 //!   MAX_FRAME_BYTES` AND `width * height * 4 == bytes_len` AND
 //!   non-zero dims, enforced via `validate_frame_header`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
@@ -277,11 +282,28 @@ enum RecvOutcome {
 /// Per-video-wallpaper relay. Owns the IPC socket, the decoder
 /// pidfd, the restart-budget bookkeeping, and the last validated
 /// frame.
+///
+/// `chan`, `pidfd`, and `decoder_pid` sit behind interior mutability
+/// so [`Self::respawn`] can swap them in place on a failure under
+/// budget; the relay's outer identity (and its borrow by
+/// `VideoBackend`) stays stable across respawns.
 pub struct DecoderRelay {
-    chan: DecoderChannel,
-    pidfd: OwnedFd,
-    decoder_pid: nix::unistd::Pid,
+    chan: RefCell<DecoderChannel>,
+    pidfd: RefCell<OwnedFd>,
+    decoder_pid: Cell<nix::unistd::Pid>,
+    /// Wallpaper source path, kept so [`Self::respawn`] can re-open
+    /// the file and re-send `LoadFile` after a decoder failure.
+    source: PathBuf,
     latest_frame: RefCell<Option<LatestFrame>>,
+    /// Monotonic frame counter assigned by the relay across the
+    /// relay's entire lifetime (NOT per decoder session). The wire-
+    /// protocol `FrameHeader::frame_idx` resets to 0 on every
+    /// LoadFile (= every respawn), so VideoBackend's
+    /// `last_uploaded_idx` cache would falsely match the new
+    /// decoder's frame 0 against the old decoder's frame 0 and skip
+    /// the re-upload. Relabeling at the relay boundary makes the
+    /// idx strictly monotonic for the consumer.
+    next_frame_idx: Cell<u64>,
     /// Sliding-window restart bookkeeping.
     restart_history: RefCell<Vec<Instant>>,
     /// True once the restart budget is exhausted; VideoBackend
@@ -295,69 +317,41 @@ pub struct DecoderRelay {
 impl DecoderRelay {
     /// Spawn the decoder, send LoadFile + wallpaper fd, return relay.
     pub fn spawn(wallpaper_path: &Path) -> Result<Self, RelayError> {
-        let (parent_end, child_end) = socketpair(
-            AddressFamily::Unix,
-            SockType::SeqPacket,
-            None,
-            SockFlag::SOCK_CLOEXEC,
-        )
-        .map_err(RelayError::Socketpair)?;
+        let (chan, pidfd, decoder_pid) = spawn_decoder_session(wallpaper_path)?;
 
-        // Bump the kernel SO_SNDBUF/SO_RCVBUF on the parent end so a
-        // single 1080p RGBA frame (8.3 MiB) fits in one datagram
-        // without ENOBUFS. The decoder side gets the same effective
-        // bump via the kernel mirroring it on a socketpair.
-        set_socket_buffers(parent_end.as_raw_fd())?;
-
-        let wallpaper_file =
-            File::open(wallpaper_path).map_err(|err| RelayError::OpenWallpaper {
-                path: wallpaper_path.to_path_buf(),
-                err,
-            })?;
-
-        // Fork-exec halmasuit-decoder with child_end dup2'd to fd 3.
-        let child_raw = child_end.into_raw_fd();
-        let child_pid = fork_exec_decoder(child_raw)?;
-
-        // We hold the parent end; the child sees fd 3 = its IPC.
-        // SAFETY: the child has its own copy of child_raw; we close
-        // our reference to it now since we don't need it.
-        #[expect(
-            unsafe_code,
-            reason = "child_raw was duplicated by the kernel into the child's fd table; we close our parent-side reference"
-        )]
-        unsafe {
-            libc::close(child_raw);
-        }
-
-        let chan = DecoderChannel::new(parent_end);
-
-        // Open a pidfd to the decoder child for signaling.
-        let pidfd = pidfd_open(child_pid)?;
-
-        let relay = Self {
-            chan,
-            pidfd,
-            decoder_pid: child_pid,
+        Ok(Self {
+            chan: RefCell::new(chan),
+            pidfd: RefCell::new(pidfd),
+            decoder_pid: Cell::new(decoder_pid),
+            source: wallpaper_path.to_path_buf(),
             latest_frame: RefCell::new(None),
+            next_frame_idx: Cell::new(0),
             restart_history: RefCell::new(Vec::new()),
             dead: RefCell::new(false),
             ready: RefCell::new(false),
-        };
+        })
+    }
 
-        // Send LoadFile with the wallpaper fd via SCM_RIGHTS.
-        relay
-            .chan
-            .send_load_file(true, wallpaper_file.as_fd())
-            .map_err(RelayError::Ipc)?;
-        // `wallpaper_file` drops here; the kernel-dup'd copy in the
-        // decoder process keeps the underlying inode open.
-
+    /// In-place respawn: re-run the fork-exec dance, swap the new
+    /// chan/pidfd/decoder_pid in over the RefCells, and reset the
+    /// Ready handshake so the next poll re-syncs with the new
+    /// decoder. The old chan + pidfd drop here, which closes the
+    /// old IPC socket (the old decoder, if still alive, sees EOF
+    /// and exits) and the old pidfd (the kernel still has the
+    /// process — auto-reap when it exits since SIGCHLD is default).
+    fn respawn(&self) -> Result<(), RelayError> {
+        let (new_chan, new_pidfd, new_pid) = spawn_decoder_session(&self.source)?;
+        *self.chan.borrow_mut() = new_chan;
+        *self.pidfd.borrow_mut() = new_pidfd;
+        self.decoder_pid.set(new_pid);
+        *self.ready.borrow_mut() = false;
+        // Keep `latest_frame` so VideoBackend keeps painting the last
+        // good content while the new decoder warms up.
         info!(
-            decoder_pid = child_pid.as_raw(),
-            "wallpaper: spawned halmasuit-decoder"
+            decoder_pid = new_pid.as_raw(),
+            "wallpaper: decoder respawned in-place"
         );
-        Ok(relay)
+        Ok(())
     }
 
     /// Drain pending decoder messages non-blockingly. Updates
@@ -369,18 +363,31 @@ impl DecoderRelay {
         }
         let mut got_frame = false;
         loop {
-            match self.chan.recv_one() {
+            // Pull the result into a local so the RefCell borrow on
+            // `chan` is released before any [`Self::note_failure`]
+            // call below — note_failure's respawn path needs
+            // `borrow_mut` on the same cell.
+            let recv = self.chan.borrow().recv_one();
+            match recv {
                 Ok(None) => break, // EAGAIN: drained
                 Ok(Some(RecvOutcome::Ready)) => {
                     *self.ready.borrow_mut() = true;
                     debug!("wallpaper: decoder Ready");
                 }
-                Ok(Some(RecvOutcome::Frame(frame))) => {
+                Ok(Some(RecvOutcome::Frame(mut frame))) => {
                     if !*self.ready.borrow() {
                         warn!("wallpaper: frame before Ready; protocol violation");
                         self.note_failure();
                         break;
                     }
+                    // Relabel with the relay-local monotonic counter
+                    // so VideoBackend's `last_uploaded_idx` is
+                    // strictly increasing across respawns. Wire-
+                    // protocol resets frame_idx to 0 on each
+                    // LoadFile; relay-local is unique forever.
+                    let idx = self.next_frame_idx.get();
+                    self.next_frame_idx.set(idx.wrapping_add(1));
+                    frame.frame_idx = idx;
                     *self.latest_frame.borrow_mut() = Some(frame);
                     got_frame = true;
                 }
@@ -426,41 +433,42 @@ impl DecoderRelay {
         *self.dead.borrow()
     }
 
-    /// Borrowed pidfd for poll-based decoder-exit detection. Not yet
-    /// wired into calloop (Phase A polls via `poll_frames` in
-    /// render_element); calloop integration is a follow-on epic.
-    #[allow(
-        dead_code,
-        reason = "available for calloop integration; not consumed in Phase A"
-    )]
-    pub fn pidfd(&self) -> BorrowedFd<'_> {
-        self.pidfd.as_fd()
-    }
-
     fn note_failure(&self) {
         let now = Instant::now();
-        let mut hist = self.restart_history.borrow_mut();
-        hist.retain(|t| now.duration_since(*t).as_secs() < RESTART_WINDOW_SECS);
-        hist.push(now);
-        if u32::try_from(hist.len()).unwrap_or(u32::MAX) > MAX_RESTARTS_PER_WINDOW {
+        let count_after = {
+            let mut hist = self.restart_history.borrow_mut();
+            hist.retain(|t| now.duration_since(*t).as_secs() < RESTART_WINDOW_SECS);
+            hist.push(now);
+            u32::try_from(hist.len()).unwrap_or(u32::MAX)
+        };
+        if count_after > MAX_RESTARTS_PER_WINDOW {
             warn!(
-                count = hist.len(),
+                count = count_after,
                 "wallpaper: decoder restart budget exhausted; relay dead"
             );
             *self.dead.borrow_mut() = true;
+            return;
         }
-        // Phase A: we don't actually respawn here. The relay is
-        // dropped+recreated by the wallpaper engine at the next
-        // render tick (or VideoBackend falls back to ImageBackend
-        // if `is_dead()`). Respawning in-place is a future
-        // optimization.
+        match self.respawn() {
+            Ok(()) => {}
+            Err(err) => {
+                error!(
+                    error = %err,
+                    "wallpaper: decoder respawn failed; relay dead"
+                );
+                *self.dead.borrow_mut() = true;
+            }
+        }
     }
 }
 
 impl Drop for DecoderRelay {
     fn drop(&mut self) {
         // Best-effort clean shutdown.
-        let _ = self.chan.send_control(&CompositorToDecoder::Shutdown);
+        let _ = self
+            .chan
+            .borrow()
+            .send_control(&CompositorToDecoder::Shutdown);
         // SIGKILL via pidfd as a backstop. We don't wait — the
         // broker isn't reaping our child here; the kernel will
         // wait4-style auto-reap if we ever set SIGCHLD to ignore,
@@ -474,17 +482,72 @@ impl Drop for DecoderRelay {
         unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
-                self.pidfd.as_raw_fd(),
+                self.pidfd.borrow().as_raw_fd(),
                 libc::SIGKILL,
                 std::ptr::null::<libc::c_void>(),
                 0_u32,
             );
         }
         debug!(
-            decoder_pid = self.decoder_pid.as_raw(),
+            decoder_pid = self.decoder_pid.get().as_raw(),
             "wallpaper: relay dropped, decoder signaled"
         );
     }
+}
+
+/// Fork-exec one halmasuit-decoder session: build a socketpair,
+/// open the wallpaper file, fork-exec the decoder with the child
+/// socket on fd 3, open a pidfd to the child, and send LoadFile.
+/// Returns the parent-side channel + pidfd + child pid. Used by
+/// both [`DecoderRelay::spawn`] (initial) and
+/// [`DecoderRelay::respawn`] (recovery within budget).
+fn spawn_decoder_session(
+    wallpaper_path: &Path,
+) -> Result<(DecoderChannel, OwnedFd, nix::unistd::Pid), RelayError> {
+    let (parent_end, child_end) = socketpair(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        None,
+        SockFlag::SOCK_CLOEXEC,
+    )
+    .map_err(RelayError::Socketpair)?;
+
+    // Bump SO_SNDBUF/SO_RCVBUF on the parent end so a single 1080p
+    // RGBA frame (8.3 MiB) fits in one datagram without ENOBUFS.
+    // The decoder side gets the same effective bump via the kernel
+    // mirroring it on a socketpair.
+    set_socket_buffers(parent_end.as_raw_fd())?;
+
+    let wallpaper_file = File::open(wallpaper_path).map_err(|err| RelayError::OpenWallpaper {
+        path: wallpaper_path.to_path_buf(),
+        err,
+    })?;
+
+    let child_raw = child_end.into_raw_fd();
+    let child_pid = fork_exec_decoder(child_raw)?;
+
+    // The child has its own copy of child_raw; close our reference.
+    #[expect(
+        unsafe_code,
+        reason = "child_raw was duplicated by the kernel into the child's fd table; we close our parent-side reference"
+    )]
+    unsafe {
+        libc::close(child_raw);
+    }
+
+    let chan = DecoderChannel::new(parent_end);
+    let pidfd = pidfd_open(child_pid)?;
+
+    chan.send_load_file(true, wallpaper_file.as_fd())
+        .map_err(RelayError::Ipc)?;
+    // `wallpaper_file` drops here; the kernel-dup'd copy in the
+    // decoder process keeps the underlying inode open.
+
+    info!(
+        decoder_pid = child_pid.as_raw(),
+        "wallpaper: spawned halmasuit-decoder"
+    );
+    Ok((chan, pidfd, child_pid))
 }
 
 /// Increase the socket buffers so a 1080p RGBA frame fits in one
