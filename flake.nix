@@ -317,6 +317,47 @@
             };
           };
 
+          # halmasuit-decoder — sandboxed video-decoder subprocess
+          # (Epic #12). Forked by halmasuit at runtime via
+          # DecoderRelay; lives in a private user/net/mount namespace
+          # under PR_SET_NO_NEW_PRIVS + rlimits. Links FFmpeg (LGPL,
+          # dynamic) via rsmpeg's link_system_ffmpeg feature. NOT
+          # --enable-gpl; h264 via stock libavcodec, AV1 via libdav1d.
+          # libclang IS needed in nativeBuildInputs because rsmpeg's
+          # build.rs runs bindgen against the ffmpeg-headless headers
+          # at build time (the Epic #5 hand-roll only removed bindgen
+          # from halmasuit-session's production path; rsmpeg is its
+          # own bindgen consumer and that's fine — it's NOT the
+          # privileged broker, and the clang-sys feature-unification
+          # bug is mitigated workspace-wide by the vendored pam-sys
+          # patch).
+          halmasuit-decoder = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-decoder";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags   = [ "-p" "halmasuit-decoder" ];
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.llvmPackages.libclang ];
+            buildInputs       = [ pkgs.ffmpeg-headless ];
+            # bindgen invokes clang directly (bypasses NIX_CFLAGS_COMPILE);
+            # point it at ffmpeg + glibc headers so rsmpeg's build.rs
+            # finds <libavformat/avformat.h> etc.
+            env = {
+              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+              BINDGEN_EXTRA_CLANG_ARGS =
+                "-I${pkgs.ffmpeg-headless.dev}/include -I${pkgs.glibc.dev}/include";
+            };
+            doCheck = false;
+            meta = {
+              description = "halmasuit sandboxed video-decoder subprocess";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-decoder";
+            };
+          };
+
           # halmasuit-session-pam-testdriver — test-only driver for the
           # real-PAM gate (Epic #1 R12). Reaches libpam via
           # halmasuit-session's hand-rolled FFI (Epic #5); no bindgen

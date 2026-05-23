@@ -266,6 +266,21 @@ in
         '';
       };
     };
+
+    decoder = {
+      package = lib.mkOption {
+        type        = lib.types.package;
+        default     = pkgs.halmasuit-decoder;
+        defaultText = lib.literalExpression "pkgs.halmasuit-decoder";
+        description = ''
+          The `halmasuit-decoder` sandboxed video-decoder subprocess
+          package (Epic #12). Forked at runtime by halmasuit's
+          DecoderRelay when `services.halmasuit.wallpaper.type = "video"`.
+          Override with a flake-built derivation for iteration.
+          Unused when the wallpaper type is `image` or `shader`.
+        '';
+      };
+    };
   };
 
   config = lib.mkMerge [
@@ -502,6 +517,13 @@ in
           # the JSON). The engine never reads this when CONFIG is
           # set; setting both is defense-in-depth, not redundancy.
           HALMASUIT_WALLPAPER_PATH = "${wp.source}";
+        } // lib.optionalAttrs (wp.type == "video") {
+          # Video wallpapers spawn `halmasuit-decoder` as a sandboxed
+          # subprocess (Epic #12). DecoderRelay reads this env var to
+          # locate the binary at fork-exec time; otherwise it falls
+          # back to `halmasuit-decoder` on PATH, which won't work in
+          # systemd's restricted PATH context.
+          HALMASUIT_DECODER_PATH = lib.getExe cfg.decoder.package;
         });
     };
    })
