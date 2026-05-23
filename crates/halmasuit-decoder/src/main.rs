@@ -39,7 +39,7 @@ use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg, send};
 use thiserror::Error;
 use tracing::{Level, error, info, warn};
 
-use crate::decode::{DecodeError, RgbaFrame};
+use crate::decode::{DecodeError, DecoderState, RgbaFrame};
 
 /// fd the parent (`halmasuit`) dup2's our IPC socketpair end to before
 /// exec. Convention; not negotiable per-process.
@@ -72,6 +72,11 @@ enum DecoderError {
     /// rsmpeg / libavcodec error during decode.
     #[error("decode error: {0}")]
     Decode(DecodeError),
+    /// Internal sentinel used by `apply_control` to signal a clean
+    /// `Shutdown` from inside a nested call. The top-level `run`
+    /// loop converts this back to `Ok(())`.
+    #[error("shutdown requested")]
+    ShutdownRequested,
 }
 
 fn main() -> ExitCode {
@@ -90,7 +95,7 @@ fn main() -> ExitCode {
     }
 
     match run(IPC_FD) {
-        Ok(()) => {
+        Ok(()) | Err(DecoderError::ShutdownRequested) => {
             info!("halmasuit-decoder clean shutdown");
             ExitCode::from(0)
         }
@@ -116,63 +121,248 @@ fn init_tracing() {
         .try_init();
 }
 
-/// Drive the IPC loop on `fd`.
+/// Decoder lifecycle state machine.
 ///
-/// 1. Send `Ready { wire_version }`.
-/// 2. Loop on `recvmsg` (carries SCM_RIGHTS for the wallpaper fd):
-///    - `Shutdown` → return Ok(()).
-///    - `LoadFile { loop_playback }` (T17 MVP: ignores `loop_playback`,
-///      decodes ONE frame): extract the fd from the ancillary
-///      data, open via [`decode::open_video_input`], decode the
-///      first frame via [`decode::decode_first_frame`], send
-///      `FrameHeader` + raw RGBA bytes. Then continue the loop
-///      (waiting for Shutdown). The full multi-frame decode loop
-///      with Pause/Resume/Seek/EOF-loop lands in T18.
-///    - Other control variants → log and continue (until T18).
+/// - `Idle`: no LoadFile yet (or last EOF-no-loop completed). Block
+///   on the next control message.
+/// - `Decoding`: actively decoding; poll control non-blockingly
+///   between frames.
+/// - `Paused`: hold position; block on next control message.
+/// - `EofWaiting`: stream EOF reached with `loop_playback = false`.
+///   Block awaiting next LoadFile or Shutdown.
+enum LifecycleState {
+    Idle,
+    Decoding {
+        state: DecoderState,
+        loop_playback: bool,
+        next_frame_idx: u64,
+    },
+    Paused {
+        state: DecoderState,
+        loop_playback: bool,
+        next_frame_idx: u64,
+    },
+    EofWaiting,
+}
+
+/// Drive the lifecycle state machine on `fd`. Sends `Ready` on
+/// startup, then loops responding to control messages and decoding
+/// frames as appropriate.
 ///
-/// Extracted from `main()` for unit-testing against a `socketpair`.
+/// Extracted from `main()` for testability.
 fn run(fd: RawFd) -> Result<(), DecoderError> {
     send_ready(fd)?;
+    set_nonblocking(fd)?;
 
+    let mut state = LifecycleState::Idle;
     loop {
-        let (msg, fds) = recv_one(fd)?;
-        match msg {
-            CompositorToDecoder::Shutdown => return Ok(()),
-            CompositorToDecoder::LoadFile { loop_playback } => {
-                let _ = loop_playback; // T17 MVP: ignore; T18 will use it.
-                let wallpaper_fd = fds
-                    .into_iter()
-                    .next()
-                    .ok_or(DecoderError::LoadFileMissingFd)?;
-                handle_load_file_once(fd, wallpaper_fd)?;
+        match &mut state {
+            LifecycleState::Idle | LifecycleState::EofWaiting | LifecycleState::Paused { .. } => {
+                // Block awaiting the next control message.
+                let (msg, fds) = recv_one_blocking(fd)?;
+                state = apply_control(fd, state, msg, fds)?;
+                // Fall through; next iteration drives whatever state
+                // apply_control transitioned us into.
             }
-            other => {
-                warn!(message = ?other, "T17 MVP: ignoring control message (Pause/Resume/Seek arrive in T18)");
+            LifecycleState::Decoding {
+                state: dec_state,
+                loop_playback,
+                next_frame_idx,
+            } => {
+                // Poll for control non-blockingly first.
+                if let Some((msg, fds)) = recv_one_nonblocking(fd)? {
+                    state = apply_control(fd, state, msg, fds)?;
+                    continue;
+                }
+                // No message pending; decode a frame.
+
+                match decode::decode_next_frame(dec_state) {
+                    Ok(Some(frame)) => {
+                        send_frame(fd, &frame, *next_frame_idx)?;
+                        *next_frame_idx += 1;
+                    }
+                    Ok(None) => {
+                        // EOF.
+                        if *loop_playback {
+                            if let Err(err) = decode::seek_to_pts(dec_state, 0) {
+                                let _ = send_decoder_error(fd, &err);
+                                return Err(DecoderError::Decode(err));
+                            }
+                            *next_frame_idx = 0;
+                            // Continue decoding from PTS 0.
+                        } else {
+                            // No loop; emit EndOfFile and switch to
+                            // blocking await for next control.
+                            send_end_of_file(fd)?;
+                            state = LifecycleState::EofWaiting;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = send_decoder_error(fd, &err);
+                        return Err(DecoderError::Decode(err));
+                    }
+                }
             }
         }
     }
 }
 
-/// MVP `LoadFile` handler (T17): decode exactly ONE frame, emit it
-/// on the wire, then return to the recv loop.
-fn handle_load_file_once(ipc_fd: RawFd, wallpaper_fd: OwnedFd) -> Result<(), DecoderError> {
-    // `into_raw_fd` transfers ownership to libavformat (which calls
-    // open() / close() on /dev/fd/N internally). Without this the
-    // OwnedFd would close at scope exit before libavformat is done
-    // with it.
-    let raw_wallpaper = wallpaper_fd.into_raw_fd();
-    let mut state = decode::open_video_input(raw_wallpaper).map_err(|err| {
-        // Send a DecoderError on the wire before propagating up so
-        // halmasuit's relay sees the categorized failure code.
-        let _ = send_decoder_error(ipc_fd, &err);
-        DecoderError::Decode(err)
-    })?;
-    let frame = decode::decode_first_frame(&mut state).map_err(|err| {
-        let _ = send_decoder_error(ipc_fd, &err);
-        DecoderError::Decode(err)
-    })?;
-    send_frame(ipc_fd, &frame, 0)?;
+/// Apply a control message to the current state. Returns the next
+/// state. Shutdown propagates as `Err(DecoderError::ShutdownRequested)` —
+/// `main()` converts that sentinel back to a clean exit.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "msg ownership is moved into the function for the match destructure; passing by reference would force ref patterns at each arm"
+)]
+fn apply_control(
+    ipc_fd: RawFd,
+    current: LifecycleState,
+    msg: CompositorToDecoder,
+    fds: Vec<OwnedFd>,
+) -> Result<LifecycleState, DecoderError> {
+    match msg {
+        CompositorToDecoder::Shutdown => Err(DecoderError::ShutdownRequested),
+        CompositorToDecoder::LoadFile { loop_playback } => {
+            let wallpaper_fd = fds
+                .into_iter()
+                .next()
+                .ok_or(DecoderError::LoadFileMissingFd)?;
+            let raw = wallpaper_fd.into_raw_fd();
+            let new_state = decode::open_video_input(raw).map_err(|err| {
+                let _ = send_decoder_error(ipc_fd, &err);
+                DecoderError::Decode(err)
+            })?;
+            Ok(LifecycleState::Decoding {
+                state: new_state,
+                loop_playback,
+                next_frame_idx: 0,
+            })
+        }
+        CompositorToDecoder::Pause => match current {
+            LifecycleState::Decoding {
+                state,
+                loop_playback,
+                next_frame_idx,
+            }
+            | LifecycleState::Paused {
+                state,
+                loop_playback,
+                next_frame_idx,
+            } => Ok(LifecycleState::Paused {
+                state,
+                loop_playback,
+                next_frame_idx,
+            }),
+            other => {
+                warn!("decoder: Pause ignored in non-decoding state");
+                Ok(other)
+            }
+        },
+        CompositorToDecoder::Resume => match current {
+            LifecycleState::Paused {
+                state,
+                loop_playback,
+                next_frame_idx,
+            } => Ok(LifecycleState::Decoding {
+                state,
+                loop_playback,
+                next_frame_idx,
+            }),
+            other => {
+                warn!("decoder: Resume ignored in non-paused state");
+                Ok(other)
+            }
+        },
+        CompositorToDecoder::Seek { pts_us } => match current {
+            LifecycleState::Decoding {
+                mut state,
+                loop_playback,
+                next_frame_idx: _,
+            }
+            | LifecycleState::Paused {
+                mut state,
+                loop_playback,
+                next_frame_idx: _,
+            } => {
+                decode::seek_to_pts(&mut state, pts_us).map_err(|err| {
+                    let _ = send_decoder_error(ipc_fd, &err);
+                    DecoderError::Decode(err)
+                })?;
+                Ok(LifecycleState::Decoding {
+                    state,
+                    loop_playback,
+                    next_frame_idx: 0,
+                })
+            }
+            other => {
+                warn!("decoder: Seek ignored in non-decoding state");
+                Ok(other)
+            }
+        },
+    }
+}
+
+/// Mark the IPC fd non-blocking so `recv_one_nonblocking` can poll
+/// without stalling the decode loop.
+fn set_nonblocking(fd: RawFd) -> Result<(), DecoderError> {
+    use nix::fcntl::{F_GETFL, F_SETFL, OFlag, fcntl};
+    #[expect(
+        unsafe_code,
+        reason = "fd is the inherited IPC socket; BorrowedFd::borrow_raw is the safe pattern for using a raw fd we don't own"
+    )]
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let flags = fcntl(borrowed, F_GETFL).map_err(DecoderError::Recv)?;
+    let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+    #[expect(
+        unsafe_code,
+        reason = "second BorrowedFd::borrow_raw of the same long-lived fd"
+    )]
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    fcntl(borrowed, F_SETFL(flags)).map_err(DecoderError::Recv)?;
     Ok(())
+}
+
+/// Like `recv_one` but returns `Ok(None)` on EAGAIN/EWOULDBLOCK.
+///
+/// On Linux, EAGAIN and EWOULDBLOCK are the same value (Errno::EAGAIN);
+/// matching once covers both spellings of the same condition.
+fn recv_one_nonblocking(
+    fd: RawFd,
+) -> Result<Option<(CompositorToDecoder, Vec<OwnedFd>)>, DecoderError> {
+    match recv_one(fd) {
+        Ok(pair) => Ok(Some(pair)),
+        Err(DecoderError::Recv(nix::errno::Errno::EAGAIN)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Block until the next control message arrives. Re-uses
+/// `recv_one_nonblocking` + `poll` to avoid changing socket flags.
+fn recv_one_blocking(fd: RawFd) -> Result<(CompositorToDecoder, Vec<OwnedFd>), DecoderError> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    loop {
+        #[expect(
+            unsafe_code,
+            reason = "fd is the long-lived IPC socket; BorrowedFd::borrow_raw is the safe wrapper pattern"
+        )]
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(err) => return Err(DecoderError::Recv(err)),
+        }
+        if let Some(pair) = recv_one_nonblocking(fd)? {
+            return Ok(pair);
+        }
+        // Spurious wakeup; outer loop iterates and re-polls.
+    }
+}
+
+/// Send `EndOfFile` to the compositor.
+fn send_end_of_file(ipc_fd: RawFd) -> Result<(), DecoderError> {
+    let bytes = encode_control(&DecoderToCompositor::EndOfFile).map_err(DecoderError::Codec)?;
+    send_all(ipc_fd, &bytes)
 }
 
 /// Send a `DecoderError` wire message to halmasuit. Best-effort —
@@ -356,8 +546,13 @@ mod tests {
             send_control(parent, &CompositorToDecoder::Pause);
             // Decoder is still alive; send Shutdown.
             send_control(parent, &CompositorToDecoder::Shutdown);
-            // Run completes Ok(()).
-            join.join().expect("thread").expect("run ok");
+            // Run completes — Ok(()) or Err(ShutdownRequested) (the
+            // sentinel main() converts to clean exit) both count.
+            let result = join.join().expect("thread");
+            assert!(
+                matches!(result, Ok(()) | Err(DecoderError::ShutdownRequested)),
+                "expected clean shutdown, got {result:?}"
+            );
         });
     }
 

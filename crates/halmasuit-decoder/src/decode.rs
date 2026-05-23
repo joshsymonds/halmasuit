@@ -145,15 +145,16 @@ pub fn open_video_input(fd: RawFd) -> Result<DecoderState, DecodeError> {
     })
 }
 
-/// Read packets and decode until the first video frame emerges;
-/// convert to RGBA8 via `SwsContext`.
-pub fn decode_first_frame(state: &mut DecoderState) -> Result<RgbaFrame, DecodeError> {
+/// Read packets and decode until the next video frame emerges;
+/// convert to RGBA8 via `SwsContext`. Returns `Ok(None)` when the
+/// stream is at EOF (after the decoder has been fully drained).
+pub fn decode_next_frame(state: &mut DecoderState) -> Result<Option<RgbaFrame>, DecodeError> {
     loop {
         let packet = state.ictx.read_packet().map_err(DecodeError::Codec)?;
         let Some(packet) = packet else {
-            // EOF before first frame: flush the decoder.
+            // EOF: flush the decoder and drain any pending frames.
             state.dec.send_packet(None).map_err(DecodeError::Codec)?;
-            return drain_first_frame(state);
+            return drain_one_frame(state);
         };
         if (packet.stream_index as usize) != state.stream_idx {
             continue;
@@ -163,7 +164,7 @@ pub fn decode_first_frame(state: &mut DecoderState) -> Result<RgbaFrame, DecodeE
             .send_packet(Some(&packet))
             .map_err(DecodeError::Codec)?;
         match state.dec.receive_frame() {
-            Ok(frame) => return convert_frame_to_rgba(&frame, state.time_base),
+            Ok(frame) => return convert_frame_to_rgba(&frame, state.time_base).map(Some),
             // Need more packets; loop iterates naturally.
             Err(RsmpegError::DecoderDrainError) => {}
             Err(err) => return Err(DecodeError::Codec(err)),
@@ -171,11 +172,34 @@ pub fn decode_first_frame(state: &mut DecoderState) -> Result<RgbaFrame, DecodeE
     }
 }
 
-fn drain_first_frame(state: &mut DecoderState) -> Result<RgbaFrame, DecodeError> {
+/// Drain ONE frame from the codec after EOF flush. Returns
+/// `Ok(None)` if the codec is fully drained (we've delivered every
+/// frame and `read_packet` is now hitting EOF).
+fn drain_one_frame(state: &mut DecoderState) -> Result<Option<RgbaFrame>, DecodeError> {
     match state.dec.receive_frame() {
-        Ok(frame) => convert_frame_to_rgba(&frame, state.time_base),
+        Ok(frame) => convert_frame_to_rgba(&frame, state.time_base).map(Some),
+        Err(RsmpegError::DecoderFlushedError) => Ok(None),
         Err(err) => Err(DecodeError::Codec(err)),
     }
+}
+
+/// Seek the format context to `pts_us` (microseconds). Flushes the
+/// codec so the next `decode_next_frame` returns a freshly-decoded
+/// frame at the new position.
+pub fn seek_to_pts(state: &mut DecoderState, pts_us: i64) -> Result<(), DecodeError> {
+    // Convert microseconds → stream's time_base units.
+    // ts_units = pts_us * time_base.den / (time_base.num * 1_000_000)
+    let num = i128::from(state.time_base.num).max(1);
+    let den = i128::from(state.time_base.den).max(1);
+    let pts_units = i64::try_from(i128::from(pts_us) * den / (num * 1_000_000)).unwrap_or(0);
+    let stream_idx_i32 = i32::try_from(state.stream_idx).unwrap_or(-1);
+    state
+        .ictx
+        .seek(stream_idx_i32, pts_units, ffi::AVSEEK_FLAG_BACKWARD as i32)
+        .map_err(DecodeError::Codec)?;
+    state.dec.flush_buffers();
+    info!(pts_us, "decoder: sought to pts");
+    Ok(())
 }
 
 fn convert_frame_to_rgba(
