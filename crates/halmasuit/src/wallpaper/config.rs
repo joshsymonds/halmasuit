@@ -52,8 +52,10 @@ pub enum WallpaperConfig {
         uniforms: HashMap<String, UniformBinding>,
     },
     /// Video file (h264 or AV1; software decode via libavcodec
-    /// configured minimal). Phase-A: stub; the live implementation
-    /// is the video-backend task.
+    /// configured minimal). Wired through
+    /// [`crate::wallpaper::VideoBackend`] which forks
+    /// [`halmasuit-decoder`](../../halmasuit-decoder) as a sandboxed
+    /// subprocess.
     Video {
         /// Absolute path to the video file.
         source: PathBuf,

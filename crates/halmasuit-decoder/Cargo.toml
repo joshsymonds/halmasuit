@@ -38,7 +38,7 @@ tracing-subscriber.workspace = true
 #   bounded, CORE=0).
 # - sched: unshare(CLONE_NEW{USER,NET,NS}) for namespace isolation.
 # - fs: open /proc/self/fd for the fd-close iteration.
-nix       = { workspace = true, features = ["socket", "signal", "process", "resource", "sched", "fs", "user", "uio", "poll"] }
+nix       = { workspace = true, features = ["socket", "signal", "process", "resource", "sched", "fs", "user", "uio", "poll", "dir"] }
 # libc: PR_SET_NO_NEW_PRIVS via prctl (nix doesn't expose it), plus
 # STDERR_FILENO / STDIN_FILENO etc. constants for the fd-close
 # allowlist.

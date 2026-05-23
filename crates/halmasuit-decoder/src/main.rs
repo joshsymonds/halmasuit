@@ -518,6 +518,17 @@ fn recv_one(fd: RawFd) -> Result<(CompositorToDecoder, Vec<OwnedFd>), DecoderErr
         let mut iov = [IoSliceMut::new(&mut buf)];
         match recvmsg::<()>(fd, &mut iov, Some(&mut cmsg_space), MsgFlags::empty()) {
             Ok(msg) => {
+                // MSG_CTRUNC means the kernel had more cmsg data than
+                // our cmsg_space buffer could hold. For SCM_RIGHTS
+                // this leaks fds: the kernel installed them into our
+                // fd table, but truncated their representation in the
+                // cmsg stream so msg.cmsgs() can't iterate them. The
+                // leaked fds would linger until exec/exit. Treat as a
+                // protocol violation; the decoder exits and the
+                // compositor's restart budget handles the consequences.
+                if msg.flags.contains(MsgFlags::MSG_CTRUNC) {
+                    return Err(DecoderError::Recv(nix::errno::Errno::EMSGSIZE));
+                }
                 let mut received_fds: Vec<OwnedFd> = Vec::new();
                 for cmsg in msg.cmsgs().map_err(DecoderError::Recv)? {
                     if let ControlMessageOwned::ScmRights(raw_fds) = cmsg {
@@ -549,11 +560,20 @@ fn recv_one(fd: RawFd) -> Result<(CompositorToDecoder, Vec<OwnedFd>), DecoderErr
     // SOCK_SEQPACKET delivers a whole datagram in one recv; if the
     // codec returns Ok(None) we've received a truncated frame, which
     // means the peer is misbehaving.
-    let partial_frame_err =
-        DecoderError::Codec(halmasuit_decoder_ipc::CodecError::OversizedControl(0, 0));
+    let declared = if buf.len() >= 4 {
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&buf[..4]);
+        u32::from_ne_bytes(bytes)
+    } else {
+        0
+    };
+    let truncated_err = DecoderError::Codec(halmasuit_decoder_ipc::CodecError::TruncatedControl {
+        declared,
+        got: u32::try_from(buf.len()).unwrap_or(u32::MAX),
+    });
     let (msg, _consumed): (CompositorToDecoder, usize) = try_decode_control(&buf)
         .map_err(DecoderError::Codec)?
-        .ok_or(partial_frame_err)?;
+        .ok_or(truncated_err)?;
     Ok((msg, fds))
 }
 

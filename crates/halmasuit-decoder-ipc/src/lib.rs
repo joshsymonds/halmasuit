@@ -54,12 +54,8 @@ use thiserror::Error;
 /// at decoder startup; the compositor verifies the value matches and
 /// tears down the connection on mismatch.
 ///
-/// - v1: separate header + payload datagrams (deprecated; never
-///   shipped past Epic #12 task 10 — the model deadlocked the
-///   compositor on mid-frame decoder death and forced atomic
-///   header+payload handling).
-/// - v2: header + payload bundled into a single atomic datagram
-///   (`[length_prefix:4][header_json:N][payload_bytes:M]`).
+/// A frame is one atomic `SOCK_SEQPACKET` datagram laid out as
+/// `[length_prefix:4][header_json:N][payload_bytes:M]`.
 pub const WIRE_VERSION: u8 = 2;
 
 /// Hard ceiling on a single control-plane JSON message.
@@ -240,6 +236,26 @@ pub enum CodecError {
     #[error("frame bytes_len {0} exceeds MAX_FRAME_BYTES ({1})")]
     OversizedFrame(u32, u32),
 
+    /// A [`DecoderToCompositor::FrameHeader`] is internally
+    /// inconsistent — either a zero dimension, or `bytes_len`
+    /// doesn't match `width * height * bytes_per_pixel`.
+    #[error("malformed frame header: {width}x{height} declares {declared_bytes} bytes")]
+    MalformedFrame {
+        width: u32,
+        height: u32,
+        declared_bytes: u32,
+    },
+
+    /// A SOCK_SEQPACKET datagram was shorter than its length prefix
+    /// claims (truncated mid-message). Caller should tear down.
+    #[error("truncated control message: prefix declared {declared} bytes, got {got}")]
+    TruncatedControl { declared: u32, got: u32 },
+
+    /// The decoder's `Ready` reported a wire version different from
+    /// [`WIRE_VERSION`]. Caller MUST tear the connection down.
+    #[error("wire-version mismatch: got {got}, expected {expected}")]
+    WireVersionMismatch { got: u8, expected: u8 },
+
     /// The body wasn't valid JSON or didn't deserialize to the expected
     /// type, or the encode side couldn't serialize the message.
     #[error("JSON error: {0}")]
@@ -342,15 +358,16 @@ pub fn encode_frame_datagram(
 /// bytes.
 ///
 /// Checks:
-/// - `bytes_len <= MAX_FRAME_BYTES`
-/// - `bytes_len == width * height * bytes_per_pixel(format)` (no
-///   trailing padding, no over-allocation)
-/// - `width > 0` and `height > 0`
+/// - `bytes_len <= MAX_FRAME_BYTES` — over-cap → [`CodecError::OversizedFrame`]
+/// - `width > 0` and `height > 0`, and
+///   `bytes_len == width * height * bytes_per_pixel(format)` (no
+///   trailing padding, no over-allocation) — malformed →
+///   [`CodecError::MalformedFrame`]
 ///
 /// # Errors
 ///
-/// [`CodecError::OversizedFrame`] on the first failure; the caller
-/// (compositor relay) should tear the connection down.
+/// As above. The caller (compositor relay) should tear the
+/// connection down on either.
 pub fn validate_frame_header(
     width: u32,
     height: u32,
@@ -367,8 +384,12 @@ pub fn validate_frame_header(
         .checked_mul(u64::from(height))
         .and_then(|wh| wh.checked_mul(bpp))
         .unwrap_or(u64::MAX);
-    if expected != u64::from(bytes_len) || width == 0 || height == 0 {
-        return Err(CodecError::OversizedFrame(bytes_len, MAX_FRAME_BYTES));
+    if width == 0 || height == 0 || expected != u64::from(bytes_len) {
+        return Err(CodecError::MalformedFrame {
+            width,
+            height,
+            declared_bytes: bytes_len,
+        });
     }
     Ok(())
 }
@@ -605,7 +626,10 @@ mod tests {
     fn validate_frame_header_rejects_oversized() {
         let err = validate_frame_header(8192, 8192, FrameFormat::Rgba8, MAX_FRAME_BYTES + 1)
             .expect_err("oversized");
-        matches!(err, CodecError::OversizedFrame(_, _));
+        assert!(
+            matches!(err, CodecError::OversizedFrame(_, _)),
+            "expected OversizedFrame, got {err:?}"
+        );
     }
 
     #[test]
@@ -613,23 +637,36 @@ mod tests {
         // width * height * 4 != bytes_len
         let err =
             validate_frame_header(1920, 1080, FrameFormat::Rgba8, 1000).expect_err("mismatch");
-        matches!(err, CodecError::OversizedFrame(_, _));
+        assert!(
+            matches!(err, CodecError::MalformedFrame { .. }),
+            "expected MalformedFrame, got {err:?}"
+        );
     }
 
     #[test]
     fn validate_frame_header_rejects_zero_dimension() {
         let err = validate_frame_header(0, 1080, FrameFormat::Rgba8, 0).expect_err("zero width");
-        matches!(err, CodecError::OversizedFrame(_, _));
+        assert!(
+            matches!(err, CodecError::MalformedFrame { .. }),
+            "expected MalformedFrame, got {err:?}"
+        );
 
         let err = validate_frame_header(1920, 0, FrameFormat::Rgba8, 0).expect_err("zero height");
-        matches!(err, CodecError::OversizedFrame(_, _));
+        assert!(
+            matches!(err, CodecError::MalformedFrame { .. }),
+            "expected MalformedFrame, got {err:?}"
+        );
     }
 
     #[test]
     fn validate_frame_header_rejects_overflow_dimensions() {
-        // u32::MAX * u32::MAX * 4 would overflow; checked_mul saturates.
+        // u32::MAX * u32::MAX * 4 would overflow; checked_mul saturates
+        // to u64::MAX, which mismatches bytes_len → MalformedFrame.
         let err = validate_frame_header(u32::MAX, u32::MAX, FrameFormat::Rgba8, MAX_FRAME_BYTES)
             .expect_err("overflow");
-        matches!(err, CodecError::OversizedFrame(_, _));
+        assert!(
+            matches!(err, CodecError::MalformedFrame { .. }),
+            "expected MalformedFrame, got {err:?}"
+        );
     }
 }

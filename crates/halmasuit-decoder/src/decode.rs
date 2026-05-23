@@ -7,25 +7,14 @@
 //! a cursor over the mmap'd slice, finds the best video stream,
 //! opens the codec, and decodes RGBA8 frames via `SwsContext`.
 //!
-//! ## Why a custom AVIO, not `/dev/fd/N` path open
+//! ## mmap + custom AVIO
 //!
-//! Earlier versions opened the wallpaper via the `/dev/fd/N` pseudo-
-//! path. That path's open semantics on Linux give the new file
-//! struct the EXISTING fd's position (effectively a dup-like share),
-//! so after one full decode pass the shared position sat at EOF and
-//! every re-open immediately reported zero packets to libavformat —
-//! the loop-on-EOF path livelocked at "open succeeded, read returned
-//! EOF, repeat" forever (Epic #12 task #24). `seek_to_pts(0) +
-//! avcodec_flush_buffers` also failed to clear AVIO's stuck
-//! `eof_reached` flag on short MP4 inputs.
-//!
-//! The mmap + custom-AVIO design sidesteps both problems:
-//! - The mmap is in the decoder's address space; no kernel fd-
-//!   position state is shared with anything.
-//! - On EOF + loop the decoder calls [`rewind`], which drops the
-//!   AVFormatContext + AVIO and rebuilds them from the SAME mmap
-//!   with a fresh cursor at offset 0. libavformat sees a brand-
-//!   new input every loop iteration.
+//! The mmap lives in the decoder's address space; no kernel fd-
+//! position state is shared with anything outside the decoder
+//! process. On EOF + loop the decoder calls [`rewind`], which drops
+//! the AVFormatContext + AVIO and rebuilds them from the SAME mmap
+//! with cursor at offset 0 — libavformat sees a brand-new input
+//! every loop iteration.
 //!
 //! ## Phase A scope
 //!
@@ -76,11 +65,6 @@ use tracing::info;
 /// [`DecodeError::WallpaperTooLarge`].
 const MAX_WALLPAPER_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Internal AVSEEK_SIZE flag — when libavformat passes this in
-/// `whence`, the seek callback must return the total stream size
-/// (not perform a seek). Mirrors the C `#define AVSEEK_SIZE 0x10000`.
-const AVSEEK_SIZE: i32 = 0x10000;
-
 /// AVIO read-buffer size handed to `avio_alloc_context`. libavformat
 /// reads ahead into this buffer; 4 KiB is the standard FFmpeg default
 /// and plenty for our streaming-from-memory case.
@@ -110,6 +94,32 @@ pub struct DecoderState {
     /// without re-reading the underlying file. `Arc` because both
     /// the read and seek AVIO callbacks need a borrow.
     wallpaper: Arc<Mmap>,
+    /// Cached sws_scale context for the steady-state input → RGBA
+    /// conversion. Built lazily on first `convert_frame_to_rgba`,
+    /// rebuilt if the input dimensions or pixel format change. Saves
+    /// ~50–200 µs per frame vs. constructing fresh each call.
+    sws: Option<SwsContextCacheEntry>,
+    /// Cached destination AVFrame (RGBA buffer). Reused across
+    /// frames at fixed dimensions to avoid an 8 MiB libavutil alloc
+    /// per 1080p frame.
+    dst: Option<DstFrameCacheEntry>,
+}
+
+/// Cache key + value for the sws_scale context. Recreated when any
+/// input parameter changes.
+struct SwsContextCacheEntry {
+    width: i32,
+    height: i32,
+    src_fmt: i32,
+    ctx: SwsContext,
+}
+
+/// Cached destination frame for sws_scale. Recreated when dimensions
+/// change.
+struct DstFrameCacheEntry {
+    width: i32,
+    height: i32,
+    frame: rsmpeg::avutil::AVFrame,
 }
 
 /// Errors from the rsmpeg-driven decode path. Mapped to
@@ -192,10 +202,14 @@ fn build_avio(wallpaper: &Arc<Mmap>) -> AVIOContextCustom {
             let total = wallpaper_s.len() as i64;
             // libavformat's AVSEEK_SIZE asks for the total stream
             // size; do NOT move the cursor on this whence value.
-            if whence == AVSEEK_SIZE {
+            // AVSEEK_FORCE may be OR'd into whence by some protocol
+            // paths; strip it before matching the base.
+            let avseek_size = ffi::AVSEEK_SIZE as i32;
+            let avseek_force = ffi::AVSEEK_FORCE as i32;
+            if whence == avseek_size {
                 return total;
             }
-            let base = match whence {
+            let base = match whence & !avseek_force {
                 libc::SEEK_SET => 0,
                 libc::SEEK_CUR => *c as i64,
                 libc::SEEK_END => total,
@@ -259,6 +273,8 @@ fn build_state(wallpaper: Arc<Mmap>) -> Result<DecoderState, DecodeError> {
         stream_idx,
         time_base,
         wallpaper,
+        sws: None,
+        dst: None,
     })
 }
 
@@ -363,7 +379,7 @@ pub fn decode_next_frame(state: &mut DecoderState) -> Result<Option<RgbaFrame>, 
             .send_packet(Some(&packet))
             .map_err(DecodeError::Codec)?;
         match state.dec.receive_frame() {
-            Ok(frame) => return convert_frame_to_rgba(&frame, state.time_base).map(Some),
+            Ok(frame) => return convert_frame_to_rgba(state, &frame).map(Some),
             // Need more packets; loop iterates naturally.
             Err(RsmpegError::DecoderDrainError) => {}
             Err(err) => return Err(DecodeError::Codec(err)),
@@ -376,7 +392,7 @@ pub fn decode_next_frame(state: &mut DecoderState) -> Result<Option<RgbaFrame>, 
 /// frame and `read_packet` is now hitting EOF).
 fn drain_one_frame(state: &mut DecoderState) -> Result<Option<RgbaFrame>, DecodeError> {
     match state.dec.receive_frame() {
-        Ok(frame) => convert_frame_to_rgba(&frame, state.time_base).map(Some),
+        Ok(frame) => convert_frame_to_rgba(state, &frame).map(Some),
         Err(RsmpegError::DecoderFlushedError) => Ok(None),
         Err(err) => Err(DecodeError::Codec(err)),
     }
@@ -401,10 +417,15 @@ pub fn seek_to_pts(state: &mut DecoderState, pts_us: i64) -> Result<(), DecodeEr
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear convert pipeline: validate size → sws cache check → dst cache check → scale → copy out → pts conversion. Splitting would scatter the AVFrame lifetime across helpers."
+)]
 fn convert_frame_to_rgba(
+    state: &mut DecoderState,
     frame: &rsmpeg::avutil::AVFrame,
-    time_base: ffi::AVRational,
 ) -> Result<RgbaFrame, DecodeError> {
+    let time_base = state.time_base;
     let width = u32::try_from(frame.width).unwrap_or(0);
     let height = u32::try_from(frame.height).unwrap_or(0);
     let src_fmt = frame.format;
@@ -425,43 +446,74 @@ fn convert_frame_to_rgba(
         });
     }
 
-    // Set up sws_scale: src format → RGBA8. SWS_BILINEAR is a fine
-    // default for the wallpaper use case (sharper algorithms cost
-    // CPU we don't need for a decorative surface).
-    let mut sws = SwsContext::get_context(
-        frame.width,
-        frame.height,
-        src_fmt,
-        frame.width,
-        frame.height,
-        ffi::AV_PIX_FMT_RGBA,
-        ffi::SWS_BILINEAR,
-        None,
-        None,
-        None,
-    )
-    .ok_or(DecodeError::SwsAllocFailed)?;
+    // sws_scale context (reused across calls for fixed dimensions —
+    // rebuilt only on a dimension or pixel-format change).
+    // SWS_BILINEAR is a fine default for the wallpaper use case
+    // (sharper algorithms cost CPU we don't need for a decorative
+    // surface).
+    let needs_new_sws = state
+        .sws
+        .as_ref()
+        .is_none_or(|e| e.width != frame.width || e.height != frame.height || e.src_fmt != src_fmt);
+    if needs_new_sws {
+        let ctx = SwsContext::get_context(
+            frame.width,
+            frame.height,
+            src_fmt,
+            frame.width,
+            frame.height,
+            ffi::AV_PIX_FMT_RGBA,
+            ffi::SWS_BILINEAR,
+            None,
+            None,
+            None,
+        )
+        .ok_or(DecodeError::SwsAllocFailed)?;
+        state.sws = Some(SwsContextCacheEntry {
+            width: frame.width,
+            height: frame.height,
+            src_fmt,
+            ctx,
+        });
+    }
 
-    let mut dst = rsmpeg::avutil::AVFrame::new();
-    dst.set_width(frame.width);
-    dst.set_height(frame.height);
-    dst.set_format(ffi::AV_PIX_FMT_RGBA);
-    dst.alloc_buffer().map_err(DecodeError::Codec)?;
-    sws.scale_frame(frame, 0, frame.height, &mut dst)
+    // Destination AVFrame (reused across calls for fixed dimensions).
+    let needs_new_dst = state
+        .dst
+        .as_ref()
+        .is_none_or(|d| d.width != frame.width || d.height != frame.height);
+    if needs_new_dst {
+        let mut new_dst = rsmpeg::avutil::AVFrame::new();
+        new_dst.set_width(frame.width);
+        new_dst.set_height(frame.height);
+        new_dst.set_format(ffi::AV_PIX_FMT_RGBA);
+        new_dst.alloc_buffer().map_err(DecodeError::Codec)?;
+        state.dst = Some(DstFrameCacheEntry {
+            width: frame.width,
+            height: frame.height,
+            frame: new_dst,
+        });
+    }
+
+    let dst_entry = state.dst.as_mut().expect("dst cache populated above");
+    let sws_entry = state.sws.as_mut().expect("sws cache populated above");
+    sws_entry
+        .ctx
+        .scale_frame(frame, 0, frame.height, &mut dst_entry.frame)
         .map_err(DecodeError::SwsScale)?;
 
     // Extract RGBA bytes. AV_PIX_FMT_RGBA is interleaved RGBA8888,
     // tightly packed (linesize == width * 4) when alloc_buffer
-    // produces it. Validate the linesize matches.
+    // produces it. If padded, copy row-by-row.
     let expected_linesize = (width * 4) as i32;
-    let actual_linesize = dst.linesize[0];
+    let actual_linesize = dst_entry.frame.linesize[0];
     let row_stride = if actual_linesize == expected_linesize {
         expected_linesize as usize
     } else {
-        // Padded; copy row-by-row.
         actual_linesize as usize
     };
-    let mut bytes = Vec::with_capacity(expected_bytes as usize);
+    let expected_usize = expected_bytes as usize;
+    let mut bytes = Vec::with_capacity(expected_usize);
     // SAFETY: dst.data[0] points to a buffer of linesize[0] * height
     // bytes (libavutil's documented contract); we read it as a slice
     // of that length and copy out the tightly-packed RGBA.
@@ -470,7 +522,7 @@ fn convert_frame_to_rgba(
         reason = "dst.data[0] is a libavutil-owned buffer of linesize[0] * height bytes; we slice it for one read-only copy."
     )]
     unsafe {
-        let src_ptr = dst.data[0];
+        let src_ptr = dst_entry.frame.data[0];
         let height_usize = frame.height as usize;
         let tight_row = (width * 4) as usize;
         for row in 0..height_usize {

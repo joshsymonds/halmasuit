@@ -57,8 +57,8 @@ use std::process::Command;
 use std::time::Instant;
 
 use halmasuit_decoder_ipc::{
-    CompositorToDecoder, DecoderToCompositor, MAX_FRAME_BYTES, WIRE_VERSION, encode_control,
-    try_decode_control, validate_frame_header,
+    CompositorToDecoder, DecoderToCompositor, MAX_CONTROL_MSG_BYTES, MAX_FRAME_BYTES, WIRE_VERSION,
+    encode_control, try_decode_control, validate_frame_header,
 };
 use nix::sys::socket::{
     AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, recvmsg, sendmsg, socketpair,
@@ -139,13 +139,18 @@ pub struct DecoderChannel {
 
 impl DecoderChannel {
     fn new(fd: OwnedFd) -> Self {
-        // Buffer sized for the largest expected single-datagram read:
-        // either a control message (4 KiB) or a frame payload (up to
-        // MAX_FRAME_BYTES = 16 MiB). We allocate once at the larger
-        // size and reuse forever.
+        // Buffer sized for the largest possible atomic frame datagram:
+        // [length_prefix:4][header_json:N][payload:M] where M ≤
+        // MAX_FRAME_BYTES and N ≤ MAX_CONTROL_MSG_BYTES. Sizing at
+        // exactly MAX_FRAME_BYTES would truncate a max-bound frame
+        // by the header bytes — kernel would set MSG_TRUNC and the
+        // downstream `payload_end != n` check would respawn-loop.
+        // Allocate once at startup and reuse forever.
+        const BUF_SIZE: usize =
+            MAX_FRAME_BYTES as usize + MAX_CONTROL_MSG_BYTES as usize + std::mem::size_of::<u32>();
         Self {
             fd,
-            recv_buf: RefCell::new(vec![0u8; MAX_FRAME_BYTES as usize]),
+            recv_buf: RefCell::new(vec![0u8; BUF_SIZE]),
         }
     }
 
@@ -200,6 +205,15 @@ impl DecoderChannel {
             Err(nix::errno::Errno::EAGAIN) => return Ok(None),
             Err(e) => return Err(IpcError::Io(e)),
         };
+        // MSG_TRUNC: the kernel had a larger datagram than our recv_buf
+        // and the trailing bytes are gone. With recv_buf sized to
+        // MAX_FRAME_BYTES + MAX_CONTROL_MSG_BYTES + 4 this should
+        // never trip in normal operation; if it does, the peer is
+        // sending oversized garbage and we treat it as a protocol
+        // violation.
+        if r.flags.contains(MsgFlags::MSG_TRUNC) {
+            return Err(IpcError::Io(nix::errno::Errno::EMSGSIZE));
+        }
         if r.bytes == 0 {
             return Err(IpcError::Closed);
         }
@@ -241,10 +255,10 @@ impl DecoderChannel {
             DecoderToCompositor::Ready { wire_version } => {
                 if wire_version != WIRE_VERSION {
                     return Err(IpcError::Codec(
-                        halmasuit_decoder_ipc::CodecError::OversizedControl(
-                            u32::from(wire_version),
-                            u32::from(WIRE_VERSION),
-                        ),
+                        halmasuit_decoder_ipc::CodecError::WireVersionMismatch {
+                            got: wire_version,
+                            expected: WIRE_VERSION,
+                        },
                     ));
                 }
                 Ok(Some(RecvOutcome::Ready))

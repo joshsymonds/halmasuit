@@ -2017,6 +2017,10 @@ fn main() -> io::Result<()> {
     // wallpaper anchor emitted below.
     let wallpaper_config = wallpaper_config_from_env()?;
     let wallpaper_configured = wallpaper_config.is_some();
+    let wallpaper_is_video = matches!(
+        wallpaper_config,
+        Some(crate::wallpaper::WallpaperConfig::Video { .. })
+    );
 
     // Initialize the Wayland display + protocol state.
     let display: Display<HalmasuitState> = Display::new().map_err(io::Error::other)?;
@@ -2370,32 +2374,36 @@ fn main() -> io::Result<()> {
     // Wallpaper-engine background tick: a calloop timer at 100 ms
     // drives [`DrmBackend::tick_wallpaper`], which delegates to the
     // active wallpaper backend's [`WallpaperBackend::poll_pending`].
-    // Today this only does useful work for `VideoBackend`, where it
-    // drains the decoder's IPC socket independently of the render
-    // path. The render path (DRM vblank chain) stops firing once
-    // wallpaper content stabilizes, so without this keepalive the
-    // relay's poll_frames never observes decoder death and the
-    // restart-budget machinery never gets to run.
+    // Only `VideoBackend` does useful work in the tick (drains the
+    // decoder's IPC socket independently of the render path). For
+    // image/shader/no-wallpaper configurations, registering the
+    // timer would wake the compositor 10× per second forever for a
+    // no-op — preventing deep-idle CPU states on battery-backed
+    // hardware. Gate the registration on the wallpaper type.
     //
     // 100 ms is a deliberate compromise: low enough to bound
     // crash-recovery latency below human-perceptible levels, high
     // enough that an idle compositor stays mostly asleep. Frame-
     // delivery latency for active playback is unaffected because
-    // render_element also polls (the path is duplicated).
+    // render_element ALSO polls when the render path fires; the
+    // timer is the keepalive for periods when the render loop has
+    // stopped (wallpaper content stabilized → no new vblanks).
     //
     // Wraps around forever via `TimeoutAction::ToDuration(period)`.
-    let wallpaper_tick = calloop::timer::Timer::immediate();
-    loop_handle
-        .insert_source(
-            wallpaper_tick,
-            |_deadline, &mut (), state: &mut HalmasuitState| {
-                if let Some(backend) = state.drm_backend.as_ref() {
-                    backend.tick_wallpaper();
-                }
-                calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(100))
-            },
-        )
-        .map_err(|e| io::Error::other(format!("insert wallpaper tick timer: {e}")))?;
+    if wallpaper_is_video {
+        let wallpaper_tick = calloop::timer::Timer::immediate();
+        loop_handle
+            .insert_source(
+                wallpaper_tick,
+                |_deadline, &mut (), state: &mut HalmasuitState| {
+                    if let Some(backend) = state.drm_backend.as_ref() {
+                        backend.tick_wallpaper();
+                    }
+                    calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(100))
+                },
+            )
+            .map_err(|e| io::Error::other(format!("insert wallpaper tick timer: {e}")))?;
+    }
 
     // Privilege drop. The DRM master FD and both Unix sockets are
     // acquired above while we still have euid==0; everything from

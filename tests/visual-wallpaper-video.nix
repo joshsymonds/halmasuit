@@ -427,19 +427,51 @@ pkgs.testers.runNixOSTest {
     # math, and count_after stays ≤3, so the relay respawns instead
     # of going dead. Solution: do the rapid kills in ONE bash loop
     # on the VM side, no test-driver round-trips between iterations.
-    machine.succeed(
-        # Five kills (one extra past the 4 needed to exhaust) to
-        # be robust against pgrep racing with the respawn cycle.
-        # 0.3s between kills gives the relay's 100 ms tick timer
-        # time to detect the IPC close and respawn before we hit
-        # the next pid; pgrep -n gets the newest matching pid.
-        "for i in 1 2 3 4 5; do "
-        "  pid=$(pgrep -af halmasuit-decoder | grep -v 'pgrep -af' | "
-        "        awk '{print $1}' | head -1); "
-        "  if [ -n \"$pid\" ]; then kill -9 \"$pid\" 2>/dev/null; fi; "
-        "  sleep 0.3; "
-        "done"
-    )
+    # Drive 5 rapid kills, each gated on the relay observing the
+    # previous decoder's death (one new "wallpaper: decoder closed
+    # connection" log entry per kill). State-based polling per
+    # CLAUDE.md memory `state-based-polling`: no fixed sleeps.
+    # Five kills (one extra past the 4 needed to exhaust) is
+    # robust against pgrep racing with the relay's respawn cycle.
+    pre_close_count = machine.succeed(
+        "journalctl -u halmasuit | "
+        "grep -c 'wallpaper: decoder closed connection' || true"
+    ).strip()
+    pre_close_count_int = int(pre_close_count) if pre_close_count else 0
+    closes_observed = pre_close_count_int
+    for k in range(5):
+        # `|| true` on each piped step so an empty pgrep result
+        # doesn't trip nixos-test's `set -euo pipefail` shell.
+        kill_result = machine.succeed(
+            "set +e; "
+            "pid=$(pgrep -af halmasuit-decoder | "
+            "       grep -v 'pgrep -af' | awk '{print $1}' | "
+            "       head -1); "
+            "if [ -n \"$pid\" ]; then "
+            "  kill -9 \"$pid\" 2>/dev/null && echo \"killed=$pid\"; "
+            "else echo \"no-decoder\"; fi"
+        ).strip()
+        if kill_result == "no-decoder":
+            # Relay marked dead before this iteration; budget already
+            # exhausted. Break out and let the post-loop assertions
+            # verify the dead state.
+            print(
+                f"  iter {k+1}: no decoder running ({kill_result}); "
+                "budget already exhausted"
+            )
+            break
+        target = closes_observed + 1
+        # Wait for the relay to observe the close — guarantees the
+        # next pgrep+kill iteration targets a different decoder than
+        # this one, and that this kill registered against the
+        # restart-budget window. Bounded under 10 s so the budget
+        # window won't slide between kills.
+        machine.wait_until_succeeds(
+            "test \"$(journalctl -u halmasuit | "
+            f"grep -c 'wallpaper: decoder closed connection')\" -ge {target}",
+            timeout=10,
+        )
+        closes_observed = target
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF "
         "'decoder restart budget exhausted'",

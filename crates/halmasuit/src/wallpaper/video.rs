@@ -193,20 +193,24 @@ impl WallpaperBackend for VideoBackend {
         renderer: &mut GlesRenderer,
         output_size: Size<i32, Logical>,
     ) -> io::Result<SceneElement> {
-        // 1. Drain any frames the decoder produced since last render.
-        //    The relay may not exist yet (pre-first-poll) or may have
-        //    died — both are handled by paintable-placeholder state.
+        // Drain any frames produced since the last render. The 100 ms
+        // wallpaper-tick calloop timer in main.rs ALSO polls (and is
+        // the source of polling when the render path has idled); the
+        // double-call here is intentional — under active rendering it
+        // cuts the frame-arrival latency from up to 100 ms (timer
+        // cadence) down to one render tick. `poll_frames()` is a
+        // cheap no-op when nothing is pending.
         if let Some(r) = self.relay.borrow().as_ref()
             && !r.is_dead()
         {
             r.poll_frames();
         }
 
-        // 2. If a new frame is available, re-upload as the current
-        //    texture. We rebuild TextureBuffer (rather than mutating
-        //    in-place) — smithay's TextureBuffer doesn't expose a
-        //    raw-texel-update API, and the GPU driver makes the
-        //    rebuild cheap for stable sizes.
+        // If a new frame is available, re-upload as the current
+        // texture. We rebuild TextureBuffer (rather than mutating
+        // in-place) — smithay's TextureBuffer doesn't expose a
+        // raw-texel-update API, and the GPU driver makes the
+        // rebuild cheap for stable sizes.
         let new_frame_data: Option<(u64, u32, u32, Vec<u8>)> = {
             self.relay.borrow().as_ref().and_then(|r| {
                 r.latest_frame().and_then(|frame| {

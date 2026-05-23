@@ -182,6 +182,21 @@ in
               true for wallpaper use.
             '';
           };
+          raiseSocketBuffers = lib.mkOption {
+            type        = lib.types.bool;
+            default     = true;
+            description = ''
+              When `type = "video"`, raise `net.core.wmem_max` /
+              `net.core.rmem_max` to 16 MiB so a single RGBA frame
+              (up to 8.3 MiB at 1080p) fits in one SOCK_SEQPACKET
+              datagram. This is a SYSTEM-WIDE sysctl; on hosts with
+              hostile local users it widens unprivileged kernel-
+              memory pinning surface. Set false to keep the
+              kernel defaults; the decoder will then EMSGSIZE on its
+              first frame send and the wallpaper will degrade to the
+              placeholder.
+            '';
+          };
         };
       });
       default     = null;
@@ -534,10 +549,26 @@ in
    # default `net.core.wmem_max` / `rmem_max` is ~208 KiB; setsockopt
    # SO_SNDBUF/SO_RCVBUF silently caps at those, so without raising
    # the sysctls the relay's setsockopt has no effect and the
-   # decoder's first send fails with EMSGSIZE. Raise the ceiling
-   # only when video wallpaper is configured (no regression for
-   # image/shader/no-wallpaper deployments).
-   (lib.mkIf (cfg.enable && cfg.wallpaper != null && cfg.wallpaper.type == "video") {
+   # decoder's first send fails with EMSGSIZE.
+   #
+   # Security trade-off (Epic #12 review finding): these sysctls are
+   # SYSTEM-WIDE. Raising wmem_max/rmem_max from 208 KiB to 16 MiB
+   # (~80×) lets any local process on the host `setsockopt SO_SNDBUF`
+   # up to 16 MiB; a malicious user holding N sockets can pin
+   # N × 16 MiB of unswappable kernel memory. Phase B replaces the
+   # single-datagram model with a shm-pool, eliminating the sysctl
+   # raise entirely; until then the trade-off is "video wallpapers
+   # work" vs. "tighter per-user kernel-memory ceiling". We default
+   # to raising the ceiling because video wallpaper is opt-in (only
+   # raised when `wallpaper.type = "video"`); operators with hostile
+   # local users on the same machine can opt out:
+   #
+   #   services.halmasuit.wallpaper.raiseSocketBuffers = false;
+   #
+   # but the decoder will then EMSGSIZE on first send and the
+   # wallpaper will fall back to the placeholder.
+   (lib.mkIf (cfg.enable && cfg.wallpaper != null && cfg.wallpaper.type == "video"
+              && cfg.wallpaper.raiseSocketBuffers) {
      boot.kernel.sysctl."net.core.wmem_max" = lib.mkDefault 16777216;
      boot.kernel.sysctl."net.core.rmem_max" = lib.mkDefault 16777216;
    })

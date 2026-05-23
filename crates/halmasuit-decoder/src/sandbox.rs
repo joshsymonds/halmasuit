@@ -141,24 +141,46 @@ fn set_no_new_privs() -> Result<(), SandboxError> {
 /// later mount-ns unshare doesn't affect it — but the iteration is
 /// cheaper before the kernel sets up the new ns regardless.)
 fn close_fds_except(keep_fds: &[RawFd]) -> Result<(), SandboxError> {
-    let entries = fs::read_dir("/proc/self/fd").map_err(SandboxError::OpenProcFd)?;
-    // Collect first so we don't close the dirfd mid-iteration.
+    use nix::dir::Dir;
+    use nix::fcntl::OFlag;
+    use nix::sys::stat::Mode;
+    use std::os::fd::AsRawFd;
+
+    // Open /proc/self/fd with nix::dir::Dir so we can read the
+    // dirfd's raw value via AsRawFd — std::fs::ReadDir doesn't
+    // expose it.
+    let mut dir = Dir::open(
+        "/proc/self/fd",
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|err| SandboxError::OpenProcFd(std::io::Error::from_raw_os_error(err as i32)))?;
+    // The dirfd backing the iterator appears in its own listing. We
+    // explicitly skip it from `to_close` because the close loop below
+    // runs AFTER `dir` is dropped — at which point the dirfd's
+    // number can be recycled by the kernel for an unrelated fd, and
+    // a stale `libc::close(old_dirfd)` would close the wrong file
+    // descriptor. Race window is tiny in single-threaded sandbox
+    // setup but the explicit skip is correct.
+    let dirfd_raw = dir.as_raw_fd();
     let mut to_close: Vec<RawFd> = Vec::new();
-    for entry in entries.flatten() {
-        let Ok(name) = entry.file_name().into_string() else {
+    for entry in dir.iter().flatten() {
+        let bytes = entry.file_name().to_bytes();
+        let Ok(name) = std::str::from_utf8(bytes) else {
             continue;
         };
         let Ok(fd) = name.parse::<RawFd>() else {
             continue;
         };
-        if keep_fds.contains(&fd) {
+        if keep_fds.contains(&fd) || fd == dirfd_raw {
             continue;
         }
-        // The procfs dirfd itself appears in the listing; we don't
-        // want to close it while iterating. Skip; it closes when the
-        // `entries` iterator drops.
         to_close.push(fd);
     }
+    // Drop the Dir BEFORE the close loop so the dirfd is released
+    // (the kernel may then recycle its number, but we've already
+    // excluded it from to_close above).
+    drop(dir);
     for fd in to_close {
         // SAFETY: each fd came from /proc/self/fd; we own it
         // implicitly (inherited at fork or opened during process
