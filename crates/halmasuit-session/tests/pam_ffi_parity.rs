@@ -115,23 +115,13 @@ fn pam_conv_layout_matches_pam_sys() {
     );
 }
 
-#[test]
-fn pam_handle_t_pointer_size_matches_pam_sys() {
-    // Our `pam_handle_t` is an uninhabited enum (canonical opaque type);
-    // pam-sys's is a `u8` stub. Both are used only by pointer. The
-    // pointer sizes must match (always true on a given target, but the
-    // assertion documents intent).
-    assert_eq!(
-        size_of::<*const ours::pam_handle_t>(),
-        size_of::<*const pam_sys::pam_handle_t>(),
-        "*const pam_handle_t size divergence"
-    );
-    assert_eq!(
-        size_of::<*mut ours::pam_handle_t>(),
-        size_of::<*mut pam_sys::pam_handle_t>(),
-        "*mut pam_handle_t size divergence"
-    );
-}
+// Note: there is no `pam_handle_t` layout test. Our `pam_handle_t` is
+// an uninhabited enum (canonical opaque type); pam-sys's is a `u8`
+// stub. Both are only ever held by pointer. `size_of::<*const T>()`
+// is `size_of::<usize>()` regardless of the pointee type, so any such
+// runtime assertion would be tautological. The opaque-handle property
+// is documented at the `pub enum pam_handle_t {}` declaration in
+// `src/pam_sys.rs`.
 
 // ============================================================================
 // Constant value parity — every PAM_* we declare

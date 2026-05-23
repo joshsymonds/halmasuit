@@ -303,10 +303,21 @@ unsafe extern "C" {
 
 // ============================================================================
 // Layout assertions — pin our `#[repr(C)]` struct shapes against the C
-// compiler's view of `<security/_pam_types.h>` on this build host. The
-// cross-implementation `pam-sys` bindgen comparison lives in the
-// dev-deps-only `tests/pam_ffi_parity.rs`; these are the in-module
-// sanity checks.
+// ABI rules directly, with hardcoded LP64 expectations.
+//
+// These checks are *complementary* to `tests/pam_ffi_parity.rs`, which
+// compares our types against bindgen's output. The parity test catches
+// divergence between us and bindgen; this in-module check additionally
+// catches the (admittedly remote) case where us AND bindgen drift in
+// the same direction — bindgen's reference is the build host's libpam
+// headers, so a host whose headers are wrong would mask the drift in
+// the parity test but not here. They also run when pam-sys is
+// excluded (e.g. a future downstream consumer of halmasuit-session
+// that builds with `--no-default-features` and skips dev-deps).
+//
+// Assertions are LP64-correct (x86_64, aarch64, riscv64, etc.) —
+// halmasuit's supported targets are all LP64 Linux. No cfg gate is
+// needed.
 // ============================================================================
 
 #[cfg(test)]
@@ -316,8 +327,8 @@ mod layout {
     use super::{pam_conv, pam_message, pam_response};
 
     #[test]
-    fn pam_message_layout_x86_64() {
-        // sizeof(struct pam_message) on x86_64:
+    fn pam_message_layout() {
+        // sizeof(struct pam_message) on LP64:
         //   int msg_style (4) + pad (4) + const char *msg (8) = 16
         assert_eq!(size_of::<pam_message>(), 16);
         assert_eq!(align_of::<pam_message>(), 8);
@@ -326,8 +337,8 @@ mod layout {
     }
 
     #[test]
-    fn pam_response_layout_x86_64() {
-        // sizeof(struct pam_response) on x86_64:
+    fn pam_response_layout() {
+        // sizeof(struct pam_response) on LP64:
         //   char *resp (8) + int resp_retcode (4) + pad (4) = 16
         assert_eq!(size_of::<pam_response>(), 16);
         assert_eq!(align_of::<pam_response>(), 8);
@@ -336,8 +347,8 @@ mod layout {
     }
 
     #[test]
-    fn pam_conv_layout_x86_64() {
-        // sizeof(struct pam_conv) on x86_64:
+    fn pam_conv_layout() {
+        // sizeof(struct pam_conv) on LP64:
         //   fn pointer (8, via Option<fn>'s null-pointer optimization)
         //   + void *appdata_ptr (8) = 16
         assert_eq!(size_of::<pam_conv>(), 16);
