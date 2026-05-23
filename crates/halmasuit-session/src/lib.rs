@@ -28,6 +28,7 @@ pub mod auth;
 pub mod broker;
 pub mod conv;
 pub mod pam_ffi;
+pub mod pam_sys;
 pub mod responder;
 pub mod session;
 pub mod session_leader;
