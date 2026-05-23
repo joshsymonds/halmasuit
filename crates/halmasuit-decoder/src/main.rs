@@ -133,26 +133,17 @@ fn init_tracing() {
 enum LifecycleState {
     Idle,
     Decoding {
+        /// Owns the AVFormatContext + AVIO + the wallpaper mmap
+        /// (see [`decode::DecoderState`]). The SCM_RIGHTS-received
+        /// wallpaper fd is consumed and dup'd into the mmap by
+        /// [`decode::open_video_input`]; nothing in the lifecycle
+        /// state holds the original fd any longer.
         state: DecoderState,
-        /// The wallpaper file fd received via SCM_RIGHTS. Held here
-        /// (NOT consumed by `open_video_input` — that path uses
-        /// `/dev/fd/N`, which opens a fresh kernel fd at position 0
-        /// each time) so the EOF→loop path can re-open the input
-        /// from the start without seek-state weirdness.
-        ///
-        /// `av_seek_frame(0) + avcodec_flush_buffers` leaves
-        /// libavformat's AVIO `eof_reached` flag set on some short
-        /// MP4 inputs; subsequent `read_packet` returns EOF
-        /// immediately, producing the seek-loop livelock we hit in
-        /// Epic #12 task 10. Re-opening via `/dev/fd/N` sidesteps
-        /// the issue entirely.
-        wallpaper_fd: OwnedFd,
         loop_playback: bool,
         next_frame_idx: u64,
     },
     Paused {
         state: DecoderState,
-        wallpaper_fd: OwnedFd,
         loop_playback: bool,
         next_frame_idx: u64,
     },
@@ -180,7 +171,6 @@ fn run(fd: RawFd) -> Result<(), DecoderError> {
             }
             LifecycleState::Decoding {
                 state: dec_state,
-                wallpaper_fd,
                 loop_playback,
                 next_frame_idx,
             } => {
@@ -206,25 +196,18 @@ fn run(fd: RawFd) -> Result<(), DecoderError> {
                     Ok(None) => {
                         // EOF.
                         if *loop_playback {
-                            // Task #24 follow-up: rewind + re-open
-                            // does NOT actually loop on short MP4
-                            // inputs (libavformat's AVIO eof_reached
-                            // / /dev/fd/N sharing semantics make the
-                            // second open return zero packets). Best
-                            // effort: try the rewind path; if it
-                            // produces no frames the relay will see
-                            // the decoder fall silent and (after the
-                            // budget) fall back. T22's VM test sizes
-                            // its fixture long enough that this path
-                            // doesn't fire during the test window.
-                            rewind_fd(wallpaper_fd.as_raw_fd())?;
-                            let new = decode::open_video_input(wallpaper_fd.as_raw_fd()).map_err(
-                                |err| {
-                                    let _ = send_decoder_error(fd, &err);
-                                    DecoderError::Decode(err)
-                                },
-                            )?;
-                            *dec_state = new;
+                            // Rewind via the mmap-backed AVIO
+                            // (Epic #12 task #24). decode::rewind
+                            // drops the current AVFormatContext +
+                            // AVIO and rebuilds them over the SAME
+                            // wallpaper mmap with cursor at offset
+                            // 0 — libavformat sees a brand-new
+                            // input, no stuck EOF flag, no shared
+                            // fd-position state with the parent.
+                            decode::rewind(dec_state).map_err(|err| {
+                                let _ = send_decoder_error(fd, &err);
+                                DecoderError::Decode(err)
+                            })?;
                             *next_frame_idx = 0;
                         } else {
                             // No loop; emit EndOfFile and switch to
@@ -263,17 +246,17 @@ fn apply_control(
                 .into_iter()
                 .next()
                 .ok_or(DecoderError::LoadFileMissingFd)?;
-            // open_video_input opens /dev/fd/N which goes through a
-            // FRESH kernel-level open of the underlying inode — it
-            // does NOT consume our `wallpaper_fd`. Keep it owned so
-            // the EOF→loop path can re-open from start.
+            // open_video_input dup'd its own fd and mmap'd the
+            // underlying file; the original SCM_RIGHTS fd drops
+            // here and the kernel closes it. The mmap's dup keeps
+            // the inode pinned for the decoder's lifetime.
             let new_state = decode::open_video_input(wallpaper_fd.as_raw_fd()).map_err(|err| {
                 let _ = send_decoder_error(ipc_fd, &err);
                 DecoderError::Decode(err)
             })?;
+            drop(wallpaper_fd);
             Ok(LifecycleState::Decoding {
                 state: new_state,
-                wallpaper_fd,
                 loop_playback,
                 next_frame_idx: 0,
             })
@@ -281,18 +264,15 @@ fn apply_control(
         CompositorToDecoder::Pause => match current {
             LifecycleState::Decoding {
                 state,
-                wallpaper_fd,
                 loop_playback,
                 next_frame_idx,
             }
             | LifecycleState::Paused {
                 state,
-                wallpaper_fd,
                 loop_playback,
                 next_frame_idx,
             } => Ok(LifecycleState::Paused {
                 state,
-                wallpaper_fd,
                 loop_playback,
                 next_frame_idx,
             }),
@@ -304,12 +284,10 @@ fn apply_control(
         CompositorToDecoder::Resume => match current {
             LifecycleState::Paused {
                 state,
-                wallpaper_fd,
                 loop_playback,
                 next_frame_idx,
             } => Ok(LifecycleState::Decoding {
                 state,
-                wallpaper_fd,
                 loop_playback,
                 next_frame_idx,
             }),
@@ -321,13 +299,11 @@ fn apply_control(
         CompositorToDecoder::Seek { pts_us } => match current {
             LifecycleState::Decoding {
                 mut state,
-                wallpaper_fd,
                 loop_playback,
                 next_frame_idx: _,
             }
             | LifecycleState::Paused {
                 mut state,
-                wallpaper_fd,
                 loop_playback,
                 next_frame_idx: _,
             } => {
@@ -337,7 +313,6 @@ fn apply_control(
                 })?;
                 Ok(LifecycleState::Decoding {
                     state,
-                    wallpaper_fd,
                     loop_playback,
                     next_frame_idx: 0,
                 })
@@ -348,20 +323,6 @@ fn apply_control(
             }
         },
     }
-}
-
-/// Rewind the wallpaper fd back to position 0 before
-/// re-opening the AVFormatContext from `/dev/fd/N` on EOF + loop.
-/// See the EOF arm of [`run`] for the why.
-fn rewind_fd(fd: RawFd) -> Result<(), DecoderError> {
-    use nix::unistd::{Whence, lseek};
-    #[expect(
-        unsafe_code,
-        reason = "BorrowedFd::borrow_raw on a fd we own (passed from the lifecycle state); borrow lives only inside this scope"
-    )]
-    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-    lseek(borrowed, 0, Whence::SeekSet).map_err(DecoderError::Send)?;
-    Ok(())
 }
 
 /// Mark the IPC fd non-blocking so `recv_one_nonblocking` can poll

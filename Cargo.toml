@@ -138,6 +138,19 @@ image              = { version = "0.25", default-features = false, features = ["
 # defaults don't collide with pam-sys's bindgen 0.69).
 rsmpeg             = { version = "0.18.0", default-features = false, features = ["link_system_ffmpeg", "ffmpeg8"] }
 
+# Memory-map the wallpaper file in halmasuit-decoder once at startup
+# so the decoder's loop-on-EOF path can rewind via fresh AVIO+AVFormat
+# context creation against the SAME memory region (Epic #12 task #24).
+# Previously the decoder opened /dev/fd/N path-based for each loop
+# iteration, but Linux's /dev/fd/N semantics give the new file struct
+# the EXISTING fd's position, so after one full decode pass the shared
+# position was at EOF and every re-open immediately saw zero packets
+# (livelock). mmap removes the fd-position concern entirely — the
+# AVIO custom-callback layer reads from a cursor over the mmap'd
+# slice. No fd, no positional state shared with anything outside the
+# decoder process.
+memmap2            = "0.9"
+
 # Vendored `[patch.crates-io]` override (Epic #12): the dev-deps-only
 # pam-sys audit lever (halmasuit-session/tests/pam_ffi_parity.rs)
 # coexists with rsmpeg's transitive bindgen 0.71. Without this patch,

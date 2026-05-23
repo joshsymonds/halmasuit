@@ -1,19 +1,41 @@
 //! rsmpeg-driven video-decode helpers for `halmasuit-decoder`
-//! (Epic #12 task #5).
+//! (Epic #12).
 //!
 //! Receives a wallpaper file fd from the compositor via SCM_RIGHTS,
-//! opens it via libavformat by formatting `/dev/fd/N` (kernel-level
-//! fd-to-path), finds the best video stream, opens the codec, and
-//! decodes the first frame into RGBA8 via `SwsContext`.
+//! mmaps it into the decoder's address space, drives libavformat
+//! through a custom-callback AVIO context whose read/seek read from
+//! a cursor over the mmap'd slice, finds the best video stream,
+//! opens the codec, and decodes RGBA8 frames via `SwsContext`.
+//!
+//! ## Why a custom AVIO, not `/dev/fd/N` path open
+//!
+//! Earlier versions opened the wallpaper via the `/dev/fd/N` pseudo-
+//! path. That path's open semantics on Linux give the new file
+//! struct the EXISTING fd's position (effectively a dup-like share),
+//! so after one full decode pass the shared position sat at EOF and
+//! every re-open immediately reported zero packets to libavformat —
+//! the loop-on-EOF path livelocked at "open succeeded, read returned
+//! EOF, repeat" forever (Epic #12 task #24). `seek_to_pts(0) +
+//! avcodec_flush_buffers` also failed to clear AVIO's stuck
+//! `eof_reached` flag on short MP4 inputs.
+//!
+//! The mmap + custom-AVIO design sidesteps both problems:
+//! - The mmap is in the decoder's address space; no kernel fd-
+//!   position state is shared with anything.
+//! - On EOF + loop the decoder calls [`rewind`], which drops the
+//!   AVFormatContext + AVIO and rebuilds them from the SAME mmap
+//!   with a fresh cursor at offset 0. libavformat sees a brand-
+//!   new input every loop iteration.
 //!
 //! ## Phase A scope
 //!
-//! - One frame per `LoadFile` (the multi-frame loop, Pause/Resume/
-//!   Seek/EndOfFile lands in the next subtask, T18).
 //! - h264 + AV1 codecs (FFmpeg's stock libavcodec; AV1 via libdav1d
 //!   when the system FFmpeg was built with `--enable-libdav1d`,
 //!   which `pkgs.ffmpeg-headless` is).
 //! - Up to 1080p RGBA8 output (`MAX_FRAME_BYTES = 16 MiB`).
+//! - Wallpaper file size bounded by [`MAX_WALLPAPER_BYTES`] — we
+//!   mmap the entire file, so very large inputs would balloon the
+//!   decoder's VSZ past `RLIMIT_AS` (512 MiB).
 //!
 //! ## Phase B (deferred)
 //!
@@ -34,16 +56,35 @@
     clippy::cast_possible_wrap
 )]
 
-use std::ffi::CString;
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, RawFd};
+use std::sync::{Arc, Mutex};
 
+use memmap2::Mmap;
 use rsmpeg::avcodec::AVCodecContext;
-use rsmpeg::avformat::AVFormatContextInput;
+use rsmpeg::avformat::{AVFormatContextInput, AVIOContextContainer, AVIOContextCustom};
+use rsmpeg::avutil::AVMem;
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 use rsmpeg::swscale::SwsContext;
 use thiserror::Error;
 use tracing::info;
+
+/// Hard ceiling on the wallpaper file size we'll mmap. The decoder's
+/// RLIMIT_AS is 512 MiB; we leave room for the codec's working set
+/// (typically <100 MiB for 1080p h264/AV1) + the libav* libraries.
+/// Files larger than this fail [`open_video_input`] with
+/// [`DecodeError::WallpaperTooLarge`].
+const MAX_WALLPAPER_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Internal AVSEEK_SIZE flag — when libavformat passes this in
+/// `whence`, the seek callback must return the total stream size
+/// (not perform a seek). Mirrors the C `#define AVSEEK_SIZE 0x10000`.
+const AVSEEK_SIZE: i32 = 0x10000;
+
+/// AVIO read-buffer size handed to `avio_alloc_context`. libavformat
+/// reads ahead into this buffer; 4 KiB is the standard FFmpeg default
+/// and plenty for our streaming-from-memory case.
+const AVIO_READ_BUFFER_BYTES: usize = 4 * 1024;
 
 /// One RGBA8 frame extracted from the decoder. Caller (the IPC
 /// driver in main.rs) owns the bytes and writes them to the wire.
@@ -54,8 +95,8 @@ pub struct RgbaFrame {
     pub bytes: Vec<u8>,
 }
 
-/// State held between `open_video_input` and `decode_first_frame`
-/// (and, in T18, the multi-frame decode loop).
+/// State held between [`open_video_input`] / [`rewind`] and the
+/// per-frame decode calls in main.rs.
 pub struct DecoderState {
     ictx: AVFormatContextInput,
     dec: AVCodecContext,
@@ -64,6 +105,11 @@ pub struct DecoderState {
     /// AV time base of the video stream; used to convert
     /// `frame.pts` → microseconds.
     time_base: ffi::AVRational,
+    /// The mmap'd wallpaper file, retained so [`rewind`] can rebuild
+    /// the AVFormatContext + AVIO over the same memory region
+    /// without re-reading the underlying file. `Arc` because both
+    /// the read and seek AVIO callbacks need a borrow.
+    wallpaper: Arc<Mmap>,
 }
 
 /// Errors from the rsmpeg-driven decode path. Mapped to
@@ -87,6 +133,10 @@ pub enum DecodeError {
     SwsScale(RsmpegError),
     #[error("decoded frame too large: {width}x{height} ({bytes} bytes) > MAX_FRAME_BYTES")]
     FrameTooLarge { width: u32, height: u32, bytes: u64 },
+    #[error("wallpaper file too large: {bytes} bytes > MAX_WALLPAPER_BYTES ({max} bytes)")]
+    WallpaperTooLarge { bytes: u64, max: u64 },
+    #[error("wallpaper file mmap failed: {0}")]
+    MmapFailed(std::io::Error),
 }
 
 impl DecodeError {
@@ -98,19 +148,92 @@ impl DecodeError {
             Self::OpenFailed(_) | Self::NoVideoStream => W::OpenFailed,
             Self::UnsupportedCodec(_) => W::UnsupportedCodec,
             Self::Codec(_) | Self::SwsScale(_) => W::ParseError,
-            Self::SwsAllocFailed | Self::FrameTooLarge { .. } => W::AllocationFailed,
+            Self::SwsAllocFailed
+            | Self::FrameTooLarge { .. }
+            | Self::WallpaperTooLarge { .. }
+            | Self::MmapFailed(_) => W::AllocationFailed,
         }
     }
 }
 
-/// Open the wallpaper file at `fd` (received via SCM_RIGHTS from
-/// the compositor) and prepare the decoder.
-pub fn open_video_input(fd: RawFd) -> Result<DecoderState, DecodeError> {
-    // /dev/fd/N is a kernel-provided pseudo-path that resolves to
-    // the underlying file behind fd N. libavformat treats it as any
-    // other path.
-    let path = CString::new(format!("/dev/fd/{fd}")).map_err(|_| DecodeError::InvalidFd(fd))?;
-    let ictx = AVFormatContextInput::open(&path).map_err(DecodeError::OpenFailed)?;
+/// Build a custom AVIO context that reads + seeks over the
+/// `wallpaper` mmap. The cursor is held in a `Mutex<usize>` shared
+/// between the read and seek closures (rsmpeg's `Send + 'static`
+/// bound on the callback types rules out `Cell` / `Rc`); the lock
+/// is uncontested in practice — libavformat invokes the callbacks
+/// sequentially on the decoder's single thread.
+fn build_avio(wallpaper: &Arc<Mmap>) -> AVIOContextCustom {
+    let cursor = Arc::new(Mutex::new(0usize));
+
+    let wallpaper_r = Arc::clone(wallpaper);
+    let cursor_r = Arc::clone(&cursor);
+    let read_cb: rsmpeg::avformat::ReadPacketCallback =
+        Box::new(move |_opaque: &mut Vec<u8>, buf: &mut [u8]| -> i32 {
+            let Ok(mut c) = cursor_r.lock() else {
+                return ffi::AVERROR_EXTERNAL;
+            };
+            let avail = wallpaper_r.len().saturating_sub(*c);
+            if avail == 0 {
+                return ffi::AVERROR_EOF;
+            }
+            let n = avail.min(buf.len());
+            buf[..n].copy_from_slice(&wallpaper_r[*c..*c + n]);
+            *c += n;
+            i32::try_from(n).unwrap_or(i32::MAX)
+        });
+
+    let wallpaper_s = Arc::clone(wallpaper);
+    let cursor_s = Arc::clone(&cursor);
+    let seek_cb: rsmpeg::avformat::SeekCallback = Box::new(
+        move |_opaque: &mut Vec<u8>, offset: i64, whence: i32| -> i64 {
+            let Ok(mut c) = cursor_s.lock() else {
+                return -1;
+            };
+            let total = wallpaper_s.len() as i64;
+            // libavformat's AVSEEK_SIZE asks for the total stream
+            // size; do NOT move the cursor on this whence value.
+            if whence == AVSEEK_SIZE {
+                return total;
+            }
+            let base = match whence {
+                libc::SEEK_SET => 0,
+                libc::SEEK_CUR => *c as i64,
+                libc::SEEK_END => total,
+                _ => return -1,
+            };
+            let Some(new_pos) = base.checked_add(offset) else {
+                return -1;
+            };
+            if new_pos < 0 || new_pos > total {
+                return -1;
+            }
+            *c = new_pos as usize;
+            new_pos
+        },
+    );
+
+    let buffer = AVMem::new(AVIO_READ_BUFFER_BYTES);
+    AVIOContextCustom::alloc_context(
+        buffer,
+        false, // read mode
+        Vec::new(),
+        Some(read_cb),
+        None,
+        Some(seek_cb),
+    )
+}
+
+/// Build a fresh `AVFormatContextInput` over a given wallpaper mmap.
+/// Called by [`open_video_input`] (initial open) and [`rewind`]
+/// (loop-on-EOF restart). Each call produces a brand-new
+/// AVFormatContext + AVIO with cursor at offset 0; libavformat
+/// never sees any state from a previous iteration.
+fn build_state(wallpaper: Arc<Mmap>) -> Result<DecoderState, DecodeError> {
+    let avio = build_avio(&wallpaper);
+    let ictx = AVFormatContextInput::builder()
+        .io_context(AVIOContextContainer::Custom(avio))
+        .open()
+        .map_err(DecodeError::OpenFailed)?;
 
     let (stream_idx, decoder) = ictx
         .find_best_stream(ffi::AVMEDIA_TYPE_VIDEO)
@@ -130,19 +253,95 @@ pub fn open_video_input(fd: RawFd) -> Result<DecoderState, DecodeError> {
 
     let time_base = ictx.streams()[stream_idx].time_base;
 
-    info!(
-        codec = ?codec_id,
-        width = dec.width,
-        height = dec.height,
-        "decoder: opened video input",
-    );
-
     Ok(DecoderState {
         ictx,
         dec,
         stream_idx,
         time_base,
+        wallpaper,
     })
+}
+
+/// Open the wallpaper file at `fd` (received via SCM_RIGHTS from
+/// the compositor): dup the fd, mmap the underlying file once, and
+/// drive libavformat through a custom-callback AVIO context over
+/// the mmap'd slice.
+///
+/// The dup ensures we own a private fd whose drop closes correctly
+/// without disturbing the caller's fd table. The mmap pins the file
+/// for the decoder's lifetime; subsequent [`rewind`] calls reuse
+/// the SAME mmap without touching the fd again.
+///
+/// # Errors
+///
+/// - [`DecodeError::InvalidFd`] if `dup` fails (EMFILE / EBADF).
+/// - [`DecodeError::WallpaperTooLarge`] if the file exceeds
+///   [`MAX_WALLPAPER_BYTES`].
+/// - [`DecodeError::MmapFailed`] if `mmap(2)` rejects the file
+///   (non-regular, sealed, etc.).
+/// - Plus the usual rsmpeg errors from `build_state`.
+pub fn open_video_input(fd: RawFd) -> Result<DecoderState, DecodeError> {
+    // Dup the fd so the Mmap owns its own File handle independent
+    // of the caller's fd table.
+    #[expect(
+        unsafe_code,
+        reason = "dup gives us a fresh fd we own; from_raw_fd takes ownership of it"
+    )]
+    let file = {
+        let raw = unsafe { libc::dup(fd) };
+        if raw < 0 {
+            return Err(DecodeError::InvalidFd(fd));
+        }
+        unsafe { std::fs::File::from_raw_fd(raw) }
+    };
+
+    let metadata = file.metadata().map_err(DecodeError::MmapFailed)?;
+    let size = metadata.len();
+    if size > MAX_WALLPAPER_BYTES {
+        return Err(DecodeError::WallpaperTooLarge {
+            bytes: size,
+            max: MAX_WALLPAPER_BYTES,
+        });
+    }
+
+    // SAFETY: the file is a private dup of the wallpaper fd; nothing
+    // else holds a handle to it. memmap2's Mmap::map(&file) requires
+    // unsafe because the OS file could be modified externally — for
+    // wallpaper files that's a non-issue (the operator wouldn't
+    // mutate a wallpaper mid-playback; even if they did, the worst
+    // case is libavformat seeing corrupted bytes and the relay's
+    // restart-budget machinery kicks in).
+    #[expect(
+        unsafe_code,
+        reason = "Mmap::map's unsafety is about the file being externally mutated; \
+                  wallpaper files aren't mutated mid-playback, and corruption is \
+                  handled by the relay's restart budget"
+    )]
+    let mmap = unsafe { Mmap::map(&file) }.map_err(DecodeError::MmapFailed)?;
+    drop(file);
+    let wallpaper = Arc::new(mmap);
+
+    let state = build_state(Arc::clone(&wallpaper))?;
+    info!(
+        bytes = wallpaper.len(),
+        codec = ?state.dec.codec_id,
+        width = state.dec.width,
+        height = state.dec.height,
+        "decoder: opened video input (mmap'd)",
+    );
+    Ok(state)
+}
+
+/// Rewind for loop-on-EOF: drop the current AVFormatContext + AVIO
+/// and build a fresh pair over the SAME wallpaper mmap with cursor
+/// at offset 0. Cheaper than re-reading the file (no syscalls), and
+/// sidesteps both the `/dev/fd/N`-position bug and the stuck-AVIO-
+/// EOF bug — libavformat sees a brand-new input.
+pub fn rewind(state: &mut DecoderState) -> Result<(), DecodeError> {
+    let wallpaper = Arc::clone(&state.wallpaper);
+    *state = build_state(wallpaper)?;
+    info!("decoder: rewound for loop");
+    Ok(())
 }
 
 /// Read packets and decode until the next video frame emerges;

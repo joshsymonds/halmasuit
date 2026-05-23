@@ -53,3 +53,10 @@ thiserror.workspace = true
 # does not re-trigger clang-sys#128 against halmasuit-session's
 # dev-deps pam-sys.
 rsmpeg = { workspace = true }
+# Memory-map the wallpaper file once at decoder startup. The custom
+# AVIO callbacks read from a cursor over the mmap'd slice; loop-on-
+# EOF rewinds by recreating the AVIO + AVFormatContext over the
+# same mmap (Epic #12 task #24). No fd/position sharing with anything
+# outside the decoder process; no re-read of the underlying file
+# per loop.
+memmap2 = { workspace = true }

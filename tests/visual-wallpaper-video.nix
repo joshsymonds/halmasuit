@@ -35,18 +35,21 @@
 #      invariant. This is the canonical Epic R3 gate, asserted
 #      under the new configuration.
 #
-# Test fixture: a 60-second 320x240 30fps h264 mp4 (libx264 YUV420p),
+# Test fixture: a 2-second 320x240 30fps h264 mp4 (libx264 YUV420p),
 # generated at build time via pkgs.ffmpeg (GPL build — fixture is a
 # build artifact only; halmasuit-decoder runtime-links ffmpeg-
 # headless which is LGPL).
 #
-# The 60s duration is intentional: the decoder's loop-on-EOF path
-# has a known re-open livelock on short MP4 inputs (Epic #12 task
-# 11 / task #24 follow-up). Sizing the fixture longer than the test
-# wall-clock keeps the first EOF from triggering during the test
-# window — the decoder runs through the file forward only, which
-# is the production-relevant happy path AND all the failure modes
-# this test asserts on.
+# The 2s duration is deliberately SHORT: short enough that the
+# decoder hits EOF (and therefore the loop path) within the test
+# window. Looping is a hard epic requirement (#2 "Loop playback").
+# The mmap + custom-AVIO design (task #24) means the decoder
+# rebuilds its AVFormatContext + AVIO over the SAME mmap on EOF —
+# no fd-position state, no stuck AVIO EOF flag. The loop gate
+# below counts wire-protocol frames sent and asserts the count
+# grows past one decode pass (~60 frames at 30fps × 2s) by a
+# margin that proves at least one full loop iteration delivered
+# frames.
 #
 # Note on headless rendering (CLAUDE.md "Test-VM rendering gotcha"):
 # this test does NOT screenshot — virtio-gpu-pci in CI paints solid
@@ -65,14 +68,14 @@
 let
   pkgs = import nixpkgs { inherit system; };
 
-  # 60s, 320x240, 30fps, baseline-profile h264 in mp4 — small per-
-  # frame (~300 KiB RGBA), long enough that the test's wall-clock
-  # window can't hit EOF (see fixture-duration rationale above).
+  # 2s, 320x240, 30fps, baseline-profile h264 in mp4 — short enough
+  # that the loop-on-EOF path fires during the test window (see
+  # fixture-duration rationale above).
   videoFixture = pkgs.runCommand "halmasuit-test-wallpaper.mp4" {
     nativeBuildInputs = [ pkgs.ffmpeg ];
   } ''
     ffmpeg -y -hide_banner -loglevel error \
-      -f lavfi -i 'testsrc=duration=60:size=320x240:rate=30' \
+      -f lavfi -i 'testsrc=duration=2:size=320x240:rate=30' \
       -c:v libx264 -pix_fmt yuv420p -profile:v baseline -tune zerolatency \
       -movflags +faststart \
       $out
@@ -344,6 +347,48 @@ pkgs.testers.runNixOSTest {
         "across greeter→session with video wallpaper — no flash"
     )
 
+    # ── Gate 5: loop-on-EOF ──
+    # The 2-second fixture has ~60 frames at 30 fps. After the
+    # decoder reaches EOF the lifecycle's loop_playback branch calls
+    # decode::rewind, which drops the AVFormatContext + AVIO and
+    # rebuilds them over the SAME wallpaper mmap with cursor at 0.
+    # libavformat sees a brand-new input and starts producing
+    # frames again. We count the decoder's "decoder: sent frame"
+    # log lines and assert the total exceeds one full file's
+    # worth of frames (giving a margin to prove at least one
+    # complete loop iteration happened).
+    #
+    # Pre-T24 the loop livelocked at "open returned EOF" forever,
+    # producing exactly one decode pass before going silent.
+    machine.wait_until_succeeds(
+        # >= 90 frames = 60 first-pass + at least 30 from a second
+        # loop iteration. Conservative margin against frame-drop
+        # noise from the relay's queue-full backpressure.
+        "test \"$(journalctl -u halmasuit | "
+        "grep -c 'decoder: sent frame')\" -ge 90",
+        timeout=30,
+    )
+    sent_frames = machine.succeed(
+        "journalctl -u halmasuit | "
+        "grep -c 'decoder: sent frame'"
+    ).strip()
+    rewind_count = machine.succeed(
+        "journalctl -u halmasuit | "
+        "grep -c 'decoder: rewound for loop' || true"
+    ).strip()
+    if int(rewind_count) < 1:
+        raise AssertionError(
+            "GATE 5 FAIL: decoder did not log any 'rewound for "
+            f"loop' messages. sent_frames={sent_frames}, "
+            f"rewind_count={rewind_count}.\n"
+            "The mmap + custom-AVIO loop path (task #24) "
+            "regressed."
+        )
+    print(
+        f"GATE 5 PASS: decoder produced {sent_frames} frames "
+        f"across {rewind_count}+ loop iterations"
+    )
+
     # ── Gate 2: crash recovery within budget ──
     # SIGKILL the current decoder. The compositor's wallpaper-tick
     # calloop timer (registered in main.rs at 100 ms cadence) calls
@@ -373,46 +418,39 @@ pkgs.testers.runNixOSTest {
           f"(was {initial_decoder_pid})")
 
     # ── Gate 3: budget exhaustion ──
-    # MAX_RESTARTS_PER_WINDOW = 3 in 10s. We've consumed 1 failure
-    # so far. Three more kills push the history past 3 (count = 4),
-    # at which point note_failure marks the relay dead and stops
-    # respawning. The journal log is the canonical signal.
-    last_pid = respawn_pid
-    for i in range(3):
-        machine.succeed(f"kill -9 {last_pid}")
-        machine.wait_until_succeeds(
-            f"! kill -0 {last_pid} 2>/dev/null",
-            timeout=10,
-        )
-        if i < 2:
-            # Still under budget — expect another respawn.
-            machine.wait_until_succeeds(
-                "pgrep -af halmasuit-decoder | grep -v 'pgrep -af'",
-                timeout=15,
-            )
-            new_pid = machine.succeed(
-                "pgrep -af halmasuit-decoder | grep -v 'pgrep -af' | awk '{print $1}' | head -1"
-            ).strip()
-            assert new_pid != last_pid, (
-                f"iter {i+1}: pgrep returned same pid {new_pid} after kill"
-            )
-            print(f"  under-budget respawn #{i+2}: pid={new_pid}")
-            last_pid = new_pid
-        else:
-            # 4th kill — budget exhausted. Wait for the log marker;
-            # this is the canonical state-based signal that the
-            # relay's note_failure decided "dead" instead of "respawn".
-            machine.wait_until_succeeds(
-                "journalctl -u halmasuit | grep -qF "
-                "'decoder restart budget exhausted'",
-                timeout=30,
-            )
-            # After dead, no respawn happens — pgrep stays empty.
-            machine.wait_until_succeeds(
-                "! pgrep -af halmasuit-decoder | grep -qv 'pgrep -af'",
-                timeout=10,
-            )
-            print("GATE 3 PASS: budget exhausted, relay dead, no respawn")
+    # MAX_RESTARTS_PER_WINDOW = 3 in 10s. Gate 2 has already used
+    # 1 failure. We need at least 3 MORE failures inside the 10s
+    # rolling window. Per-kill setup in nixos-test (`succeed` + the
+    # default 1s poll cadence of wait_until_succeeds) is slow enough
+    # that four kills spread across the gate's iterations can
+    # span >10s — older entries get pruned by note_failure's window
+    # math, and count_after stays ≤3, so the relay respawns instead
+    # of going dead. Solution: do the rapid kills in ONE bash loop
+    # on the VM side, no test-driver round-trips between iterations.
+    machine.succeed(
+        # Five kills (one extra past the 4 needed to exhaust) to
+        # be robust against pgrep racing with the respawn cycle.
+        # 0.3s between kills gives the relay's 100 ms tick timer
+        # time to detect the IPC close and respawn before we hit
+        # the next pid; pgrep -n gets the newest matching pid.
+        "for i in 1 2 3 4 5; do "
+        "  pid=$(pgrep -af halmasuit-decoder | grep -v 'pgrep -af' | "
+        "        awk '{print $1}' | head -1); "
+        "  if [ -n \"$pid\" ]; then kill -9 \"$pid\" 2>/dev/null; fi; "
+        "  sleep 0.3; "
+        "done"
+    )
+    machine.wait_until_succeeds(
+        "journalctl -u halmasuit | grep -qF "
+        "'decoder restart budget exhausted'",
+        timeout=30,
+    )
+    # After dead, no respawn happens — pgrep stays empty.
+    machine.wait_until_succeeds(
+        "! pgrep -af halmasuit-decoder | grep -qv 'pgrep -af'",
+        timeout=10,
+    )
+    print("GATE 3 PASS: budget exhausted, relay dead, no respawn")
 
     # ── Gate 3 continuation: halmasuit MUST survive ──
     # The whole reason halmasuit-decoder is a sandboxed subprocess is
