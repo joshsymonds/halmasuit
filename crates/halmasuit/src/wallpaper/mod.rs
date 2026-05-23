@@ -94,6 +94,18 @@ impl WallpaperEngine {
         )
     }
 
+    /// Periodic background tick — dispatched by a calloop timer
+    /// independent of the render path. Delegates to the active
+    /// backend's [`WallpaperBackend::poll_pending`]. Today only
+    /// [`VideoBackend`] makes meaningful use of this hook (it
+    /// drives `DecoderRelay::poll_frames`); the default no-op
+    /// keeps the call free for image/shader/empty configurations.
+    pub fn poll_pending(&self) {
+        if let Some(b) = self.backend.as_ref() {
+            b.poll_pending();
+        }
+    }
+
     /// Private swap entry point — exists so future epics (bus-event
     /// driven swap, runtime config reload) can plug in without
     /// reshaping the engine. Phase-A: never called; intentionally

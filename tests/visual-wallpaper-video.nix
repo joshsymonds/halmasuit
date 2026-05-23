@@ -313,46 +313,106 @@ pkgs.testers.runNixOSTest {
         "across greeter→session with video wallpaper — no flash"
     )
 
-    # ── Gates 2 + 3: crash recovery + budget exhaustion ──
-    # DEFERRED to task #26: the relay's restart-budget mechanism is
-    # implemented and exercised by unit tests, but the calloop event
-    # source that would let the relay DETECT a decoder death without
-    # an active render path is a follow-up. In Phase A the relay's
-    # poll_frames runs only via render_element, which fires from the
-    # DRM vblank chain — when the wallpaper content stabilizes the
-    # render loop stops firing. SIGKILL-ing the decoder in this
-    # environment leaves the relay unaware (it's never polled).
-    #
-    # Reactivating these gates after task #26 lands is one block of
-    # commented test code below the "ALL GATES PASSED" print.
-    #
-    # What we CAN assert here, today, without the calloop wiring:
-    # that halmasuit's MainPID is unchanged from before any kill
-    # activity — the compositor must survive any sandboxed-decoder
-    # failure mode. That is asserted by Gate 4 above; the broader
-    # "crash-recovery loop" is the deferred piece.
-    #
-    # Sanity: the decoder is still the same pid we captured, and
-    # halmasuit's pid is unchanged — together these confirm the
-    # Phase-A subsystem reached steady state cleanly.
+    # ── Gate 2: crash recovery within budget ──
+    # SIGKILL the current decoder. The compositor's wallpaper-tick
+    # calloop timer (registered in main.rs at 100 ms cadence) calls
+    # tick_wallpaper, which delegates through DrmBackend →
+    # WallpaperEngine → VideoBackend::poll_pending → relay.poll_frames.
+    # poll_frames sees IPC EOF from the dead decoder, calls
+    # respawn() under budget, swapping in a new chan/pidfd. We wait
+    # until a NEW pid (distinct from initial) appears.
+    machine.succeed(f"kill -9 {initial_decoder_pid}")
+    machine.wait_until_succeeds(
+        f"! kill -0 {initial_decoder_pid} 2>/dev/null",
+        timeout=10,
+    )
+    machine.wait_until_succeeds(
+        "pgrep -af halmasuit-decoder | grep -v 'pgrep -af'",
+        timeout=30,
+    )
+    respawn_pid = machine.succeed(
+        "pgrep -af halmasuit-decoder | grep -v 'pgrep -af' | awk '{print $1}' | head -1"
+    ).strip()
+    if respawn_pid == initial_decoder_pid:
+        raise AssertionError(
+            f"GATE 2 FAIL: pgrep returned the killed pid {initial_decoder_pid} "
+            "after kill -9 — relay did not respawn"
+        )
+    print(f"GATE 2 PASS: relay respawned decoder pid={respawn_pid} "
+          f"(was {initial_decoder_pid})")
+
+    # ── Gate 3: budget exhaustion ──
+    # MAX_RESTARTS_PER_WINDOW = 3 in 10s. We've consumed 1 failure
+    # so far. Three more kills push the history past 3 (count = 4),
+    # at which point note_failure marks the relay dead and stops
+    # respawning. The journal log is the canonical signal.
+    last_pid = respawn_pid
+    for i in range(3):
+        machine.succeed(f"kill -9 {last_pid}")
+        machine.wait_until_succeeds(
+            f"! kill -0 {last_pid} 2>/dev/null",
+            timeout=10,
+        )
+        if i < 2:
+            # Still under budget — expect another respawn.
+            machine.wait_until_succeeds(
+                "pgrep -af halmasuit-decoder | grep -v 'pgrep -af'",
+                timeout=15,
+            )
+            new_pid = machine.succeed(
+                "pgrep -af halmasuit-decoder | grep -v 'pgrep -af' | awk '{print $1}' | head -1"
+            ).strip()
+            assert new_pid != last_pid, (
+                f"iter {i+1}: pgrep returned same pid {new_pid} after kill"
+            )
+            print(f"  under-budget respawn #{i+2}: pid={new_pid}")
+            last_pid = new_pid
+        else:
+            # 4th kill — budget exhausted. Wait for the log marker;
+            # this is the canonical state-based signal that the
+            # relay's note_failure decided "dead" instead of "respawn".
+            machine.wait_until_succeeds(
+                "journalctl -u halmasuit | grep -qF "
+                "'decoder restart budget exhausted'",
+                timeout=30,
+            )
+            # After dead, no respawn happens — pgrep stays empty.
+            machine.wait_until_succeeds(
+                "! pgrep -af halmasuit-decoder | grep -qv 'pgrep -af'",
+                timeout=10,
+            )
+            print("GATE 3 PASS: budget exhausted, relay dead, no respawn")
+
+    # ── Gate 3 continuation: halmasuit MUST survive ──
+    # The whole reason halmasuit-decoder is a sandboxed subprocess is
+    # that a buggy/exploitable video file cannot kill the compositor.
+    # After 4 forced decoder crashes, halmasuit.service stays
+    # ActiveState=active AND its MainPID is identical to what we
+    # captured before any kills.
     halmasuit_status = machine.succeed(
         "systemctl show -p ActiveState --value halmasuit.service"
     ).strip()
-    assert halmasuit_status == "active", (
-        f"halmasuit unexpectedly inactive: {halmasuit_status}"
-    )
+    if halmasuit_status != "active":
+        raise AssertionError(
+            f"GATE 3 FAIL: halmasuit died after decoder budget exhaustion: "
+            f"ActiveState={halmasuit_status}\n"
+            "A crashing decoder MUST NOT take down the compositor — "
+            "that is the entire reason for the sandbox subsystem."
+        )
     halmasuit_pid_final = machine.succeed(
         "systemctl show -p MainPID --value halmasuit.service"
     ).strip()
-    assert halmasuit_pid_final == halmasuit_pid_before, (
-        f"halmasuit pid drifted in Phase-A run: "
-        f"before={halmasuit_pid_before} final={halmasuit_pid_final}"
+    if halmasuit_pid_final != halmasuit_pid_before:
+        raise AssertionError(
+            f"GATE 3 FAIL: halmasuit restarted after decoder kills:\n"
+            f"  before={halmasuit_pid_before} final={halmasuit_pid_final}\n"
+            "halmasuit must be PID-stable across decoder failures."
+        )
+    print(
+        f"GATE 3 PASS (continuation): halmasuit pid={halmasuit_pid_final} "
+        "still active, identical to before decoder kills"
     )
 
-    print(
-        "visual-wallpaper-video: GATES 1+4 PASSED "
-        "(decoder spawn + login-flash continuity under video wallpaper). "
-        "Gates 2+3 (crash-recovery loop) deferred to task #26."
-    )
+    print("visual-wallpaper-video: ALL GATES PASSED")
   '';
 }

@@ -2367,6 +2367,36 @@ fn main() -> io::Result<()> {
         dbus::serve(backend.snapshot_handle());
     }
 
+    // Wallpaper-engine background tick: a calloop timer at 100 ms
+    // drives [`DrmBackend::tick_wallpaper`], which delegates to the
+    // active wallpaper backend's [`WallpaperBackend::poll_pending`].
+    // Today this only does useful work for `VideoBackend`, where it
+    // drains the decoder's IPC socket independently of the render
+    // path. The render path (DRM vblank chain) stops firing once
+    // wallpaper content stabilizes, so without this keepalive the
+    // relay's poll_frames never observes decoder death and the
+    // restart-budget machinery never gets to run.
+    //
+    // 100 ms is a deliberate compromise: low enough to bound
+    // crash-recovery latency below human-perceptible levels, high
+    // enough that an idle compositor stays mostly asleep. Frame-
+    // delivery latency for active playback is unaffected because
+    // render_element also polls (the path is duplicated).
+    //
+    // Wraps around forever via `TimeoutAction::ToDuration(period)`.
+    let wallpaper_tick = calloop::timer::Timer::immediate();
+    loop_handle
+        .insert_source(
+            wallpaper_tick,
+            |_deadline, &mut (), state: &mut HalmasuitState| {
+                if let Some(backend) = state.drm_backend.as_ref() {
+                    backend.tick_wallpaper();
+                }
+                calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(100))
+            },
+        )
+        .map_err(|e| io::Error::other(format!("insert wallpaper tick timer: {e}")))?;
+
     // Privilege drop. The DRM master FD and both Unix sockets are
     // acquired above while we still have euid==0; everything from
     // here onwards runs as the configured compositor system user with

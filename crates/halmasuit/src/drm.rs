@@ -167,6 +167,14 @@ impl DrmBackend {
     pub fn snapshot_handle(&self) -> crate::dbus::SnapshotBuffer {
         self.snapshot_buf.clone()
     }
+
+    /// Periodic tick that drives the wallpaper backend's
+    /// render-loop-independent polling. Called from a calloop timer
+    /// registered in [`setup_drm_backend`] for `WallpaperConfig::Video`
+    /// configurations. For non-video backends this is a no-op.
+    pub fn tick_wallpaper(&self) {
+        self.wallpaper.poll_pending();
+    }
 }
 
 /// Set up the full DRM/GBM/EGL/GLES/DrmCompositor stack on the device

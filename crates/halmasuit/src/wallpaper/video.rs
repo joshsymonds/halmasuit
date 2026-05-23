@@ -106,6 +106,12 @@ impl VideoBackend {
 }
 
 impl WallpaperBackend for VideoBackend {
+    fn poll_pending(&self) {
+        if !self.relay.is_dead() {
+            self.relay.poll_frames();
+        }
+    }
+
     fn render_element(
         &mut self,
         renderer: &mut GlesRenderer,

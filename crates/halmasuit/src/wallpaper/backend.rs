@@ -43,4 +43,16 @@ pub trait WallpaperBackend: Send {
         renderer: &mut GlesRenderer,
         output_size: Size<i32, Logical>,
     ) -> io::Result<SceneElement>;
+
+    /// Optional background tick — called by a periodic calloop timer
+    /// independent of the render path. Default no-op; only
+    /// [`super::VideoBackend`] overrides this to drive
+    /// `DecoderRelay::poll_frames`, which guarantees the relay
+    /// observes decoder death (IPC EOF) and runs its respawn-budget
+    /// machinery even when the render loop has stopped firing
+    /// (e.g. wallpaper has reached a static visual state with no
+    /// surface commits forcing new vblanks). The render path's
+    /// `render_element` ALSO calls `poll_frames` when it runs; this
+    /// hook is the keepalive that doesn't rely on the render loop.
+    fn poll_pending(&self) {}
 }
