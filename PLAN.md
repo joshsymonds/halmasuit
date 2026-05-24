@@ -6,36 +6,61 @@ empirically validated).
 
 ## Where we are
 
-**Phase A's in-repo contract is complete, and the privilege model has
-been rebuilt.** The original Phase A shipped in-compositor PAM
-(`halmasuit-pam`) plus a setuid `halmasuit-spawn` helper. The **unified
-session/pamd privilege-separation epic** then replaced that model
-wholesale with the OpenSSH/GDM shape: a single privileged
-`halmasuit-session` broker that owns one `pam_handle_t` for the entire
-auth→session lifecycle, runs `pam_authenticate` in an ephemeral
-SIGKILL-able fork, and launches the session by forking once and dropping
-privileges in a non-setuid child. `halmasuit-pam` and the setuid
-`halmasuit-spawn` are **deleted** — one libpam surface, no setuid inode.
-The compositor is now an unprivileged sans-IO relay to the broker. See
-[`HANDOFF.md`](HANDOFF.md) §0 (the decision record + Amendments A1–A9)
-and [`ARCHITECTURE.md`](ARCHITECTURE.md) "Authentication and session
-lifecycle".
+**The in-repo compositor is complete.** Six epics have shipped on
+`main` (canonical @ `74dfd25`):
 
-`tests/login-flash.nix` is GREEN **through the broker-launched session**
-(PID + frame continuity across the real greeter→session transition).
-`just check` is 244/244 + `r14-gate`; `just test-vm` is the 14-gate
-sweep incl. the three real-PAM broker gates (`run-pam-auth`,
-`session-r5r6`, `session-onehandle`).
+1. **Phase A** — rootfs compositor, greetd I/O, DRM master, privilege
+   drop, greeter spawn/kill.
+2. **Privilege-separation** (HANDOFF §0) — the unified session/pamd
+   epic. The OpenSSH/GDM shape: a single privileged
+   `halmasuit-session` broker owns one `pam_handle_t` for the entire
+   auth→session lifecycle, runs `pam_authenticate` in an ephemeral
+   SIGKILL-able fork, and launches the session by forking once and
+   dropping privileges in a non-setuid child. `halmasuit-pam` and the
+   setuid `halmasuit-spawn` are **deleted** — one libpam surface, no
+   setuid inode. The compositor is an unprivileged sans-IO relay to
+   the broker. See HANDOFF §0 (decision record + Amendments A1–A9)
+   and ARCHITECTURE.md "Authentication and session lifecycle".
+3. **Epic #2 Visual G-layer** — wallpaper plane composited from frame
+   0, `assert_no_flash_stream` live, real niri as broker-launched
+   session, frame-audit instrument with ssimulacra2 goldens.
+4. **Epic #5 Hand-rolled libpam FFI** — production halmasuit-session
+   links `-lpam` directly; `pam-sys` reduced to dev-deps-only audit
+   lever via `tests/pam_ffi_parity.rs`. Zero bindgen/clang-sys/
+   libclang at production build time.
+5. **Epic #12 VideoBackend** — sandboxed `halmasuit-decoder`
+   subprocess (rsmpeg + seccomp-bpf), restart-or-fallback policy,
+   frame-0 invariant preserved through video wallpaper.
+6. **Wayland-server convergence epic** — the R2-DankGreeter-pixel
+   tail Epic #2 explicitly deferred. Delivers `wl_surface.frame`
+   callbacks post-vblank, commit aggregation, deferred xdg-shell
+   configure, PopupManager, surface enter/leave, full focus
+   integration (data-device, primary-selection, text-input),
+   libinput pointer + Xcursor render, presentation-feedback,
+   linux-dmabuf, and the Phase-B-1..15 protocol surface (viewporter,
+   decoration, activation, inhibit pair, foreign-v2, wm-dialog,
+   toplevel-icon, data-device, primary-selection-v1, text-input-v3,
+   cursor-shape, touch). Real DMS DankGreeter (Quickshell+Qt6) is the
+   greeter; the full Qt6 keystroke auth arc reaches `SessionOpened`
+   end-to-end.
 
-**What's left to put halmasuit on real hardware is cross-repo work in
-nix-config / DMS / gnomon:** the DankGreeter launcher patch, the
-dms-niri integration switchover, and a real-hardware shakedown. The
-in-repo next milestone is the **visual G-layer** (real DankGreeter +
-real niri on the broker-launched path — HANDOFF §6).
+`tests/login-flash.nix` is GREEN **through the broker-launched
+session** (PID + frame continuity across the real greeter→session
+transition). `just check` is 336/336 + `r14-gate` + `vis-selftest`;
+`just test-vm` is the 24-gate sweep.
 
-**Phase B (initramfs survival) hasn't started.** drm-master-probe
-Phases 0–3 already validated the empirical mechanics; the production
-wiring is a later major milestone.
+**What's left** is two independent tranches:
+
+- **Cross-repo deployment to gnomon:** DankGreeter launcher patch in
+  DMS, switchover from `services.greetd.enable` to
+  `services.halmasuit.enable` in gnomon's nix-config, and the
+  real-hardware shakedown on actual nvidia-drm + seatd + xkb.
+- **Phase B (initramfs survival):** drm-master-probe Phases 0–3
+  already validated the empirical mechanics. Production wiring is the
+  major remaining milestone — `initrd-handoff-probe` research crate,
+  `--features initramfs`, `halmasuit-luks`, BGRT-aware first frame,
+  NixOS initrd module wiring, `tests/full-boot-flash.nix`, Plymouth
+  removal.
 
 ## Goal
 
@@ -95,41 +120,48 @@ owned by `compositor`.
 
 ## In scope
 
-Status legend: **Done** (landed + tested) · **In flight** (partial,
-under active iteration) · **Queued** (Phase A scope, not started) ·
-**Deferred to Phase B** (deliberately out of Phase A — initramfs +
-adapter crates).
+Status legend: **Done** (landed + tested) · **Cross-repo** (in-repo work
+complete; remaining work lives in nix-config / DMS / gnomon) ·
+**Deferred to Phase B** (deliberately out of the rootfs compositor —
+initramfs + adapter crates).
 
 | Component | Status | Current state |
 |---|---|---|
 | `halmasuit` binary — smithay scaffolding | Done | smithay 0.7 (pinned to niri's rev); `wl_compositor`, `xdg_wm_base`, `wl_seat`, `wl_output`, `wl_shm` advertised. |
 | `halmasuit` binary — greetd I/O integration | Done | calloop-wired `Listener` (SO_PEERCRED authz) + per-fd `Connection`; the greetd state machine is sans-IO and relays to the `halmasuit-session` broker (per-greeter `BrokerEpisode`, non-blocking broker calloop source — A6/A7/A8). No in-process PAM; no `SpawnRequest` (the broker fork-then-drops the session leader). |
-| `halmasuit` binary — DRM master | Done | `DRM_IOCTL_SET_MASTER` on `/dev/dri/card0` (or `HALMASUIT_DRM_DEVICE`) at startup while still root; FD held for process lifetime. Fail-closed if `HALMASUIT_SKIP_DRM_MASTER` set under euid 0. |
-| `halmasuit` binary — privilege drop | Done | In-process `setresgid` + `setresuid` to configured compositor uid. Final capability posture: `CapPrm=CapEff={CAP_KILL}` (signal authority over the greeter for the session-start kill); **bounding set empty** (`CapBnd=0` — the compositor execs no setuid helper, so any retained cap would be a least-authority regression, R15); `CapInh=CapAmb=∅`. Fail-closed if compositor uid unset and euid is root. |
+| `halmasuit` binary — DRM master | Done | DRM open via `LibSeatSession`/seatd (`backend_session_libseat` smithay feature) — seatd is the registered master; halmasuit holds the DRM fd via libseat. Fail-closed if compositor uid unset and euid is root. |
+| `halmasuit` binary — privilege drop | Done | In-process `setresgid` + `setresuid` to configured compositor uid. Final capability posture: `CapPrm=CapEff={CAP_KILL}` (signal authority over the greeter for the session-start kill); **bounding set empty** (`CapBnd=0` — the compositor execs no setuid helper, so any retained cap would be a least-authority regression, R15); `CapInh=CapAmb=∅`. |
 | `halmasuit` binary — greeter spawning | Done | Fork+exec the configured greeter via `Command::pre_exec`: sigprocmask reset + setresgid + setresuid into greeter system user, minimal env passthrough (XDG_RUNTIME_DIR, WAYLAND_DISPLAY, GREETD_SOCK, PATH). SIGCHLD reaper claims the zombie when the greeter exits. |
 | `halmasuit` binary — greeter kill on session start | Done | `pidfd_send_signal(greeter, SIGKILL)` on the A5 two-key swap. `CAP_KILL` retention crosses the uid boundary (compositor uid → greeter uid). `Event::GreeterTerminated { pid }` records the action. |
-| `halmasuit-session` (privileged broker) | Done | One `pam_handle_t` whole lifecycle; `pam_authenticate` in an ephemeral SIGKILL-able `setrlimit`-bounded fork; fork-then-drop **non-setuid** session leader; identity independently PAM-re-derived (`pam_get_user`→pwent); UID floor in the leader child; `getgrouplist(resolved user)`-only supplementary groups (A9); `pam_getenvlist()`-merged env (A1); single calloop broker, socket-activated, idle-exit, evict-old slot (A2); relay-peer `SO_PEERCRED` gate (R8). `unsafe` confined to `pam_ffi`/`worker`. Two-tier `gambit:review` APPROVED (A9 escalation found + closed). |
+| `halmasuit-session` (privileged broker) | Done | One `pam_handle_t` whole lifecycle; `pam_authenticate` in an ephemeral SIGKILL-able `setrlimit`-bounded fork; fork-then-drop **non-setuid** session leader; identity independently PAM-re-derived (`pam_get_user`→pwent); UID floor in the leader child; `getgrouplist(resolved user)`-only supplementary groups (A9); `pam_getenvlist()`-merged env (A1); single calloop broker, socket-activated, idle-exit, evict-old slot (A2); relay-peer `SO_PEERCRED` gate (R8). Hand-rolled libpam FFI in `crates/halmasuit-session/src/pam_sys.rs` following sudo-rs's pattern; production links `-lpam` directly with zero bindgen / clang-sys / libclang at build time (Epic #5). `unsafe` confined to `pam_ffi`/`worker`. `pam-sys` retained as dev-deps-only audit lever via `tests/pam_ffi_parity.rs` (asserts struct layouts + constants + symbol resolution match bindgen against build-host libpam headers). |
 | `halmasuit-session-ipc` (pure wire contract) | Done | Types + codec for the compositor↔broker relay; A5 one-way `BrokerToCompositor` lifecycle frames (`SessionOpened`/`SessionEnded`); `#![forbid(unsafe_code)]`. |
 | `halmasuit-greetd` | Done | Clean-room wire types from the [protocol spec](https://man.sr.ht/~kennylevinsen/greetd/protocol.md), **fully sans-IO** state machine (emit/suspend/resume, A7), length-prefixed JSON codec, `Listener` (SO_PEERCRED, world-mode rejection). No libpam; relays to the broker. `MAX_SESSION_BUILDS_PER_CONNECTION` removed (R14). |
-| Wallpaper plane (internal to `halmasuit`) | Done | halmasuit composites the configured `HALMASUIT_WALLPAPER_PATH` PNG (`services.halmasuit.wallpaper`) as its bottom-most internal background plane from frame 0 — no separate client. The Phase-B shader-driven evolution stays deferred. |
+| Wallpaper plane — WallpaperEngine + 3 backends | Done | The `WallpaperEngine` owns a pluggable `WallpaperBackend` trait surface; three backends share it. `ImageBackend` decodes the configured PNG and composites it as the bottom-most internal plane from frame 0 (no separate client). `ShaderBackend` wires a live GLSL pipeline with declared-uniforms config. `VideoBackend` (Epic #12) drives a sandboxed `halmasuit-decoder` subprocess (rsmpeg + seccomp-bpf) over a SEQPACKET relay, with restart-or-fallback policy on decoder death — frame-0 invariant preserved through video. Config is the `services.halmasuit.wallpaper = { type = "image" | "shader" | "video"; ... }` discriminated union. |
+| `halmasuit-decoder` / `halmasuit-decoder-ipc` | Done (Epic #12) | Sandboxed subprocess + pure wire contract crate. Decoder is forked + dup2'd to fd 3 by halmasuit, decodes via rsmpeg behind a seccomp-bpf syscall allowlist (33 syscalls, KillProcess default, openat read-only via SeccompCondition + MaskedEq), runs as the compositor uid 998 (no extra capabilities). mmap-backed custom AVIO; PTS-based pacing via `ppoll`; loop-on-EOF works through fresh AVIO context against the same memory region. Production builds bindgen-free via `FFMPEG_BINDING_PATH` (checked-in `ffmpeg_binding.rs`); only `just regenerate-decoder-bindings` invokes bindgen. |
+| Wayland protocol surface | Done (convergence epic) | `wl_surface.frame` callbacks emitted post-vblank (R2); `is_sync_subsurface` aggregation in commit (R3); initial xdg_surface.configure deferred to commit handler (R4); smithay PopupManager + positioner-driven popup geometry (R5); `wl_surface.enter/leave` for xdg-toplevels (R6); focus integration with data-device / primary-selection / text-input (R7); libinput pointer events routed to `wl_pointer` (R8a); visible cursor render via Xcursor theme (R8b); `wp_presentation_feedback` with per-VBlank emission (R9); `zwp_linux_dmabuf_v1` with renderer-derived tranche (R10); Phase-B-1..15 advertise-and-delegate globals (`wp_viewporter`, `xdg_decoration_manager_v1`, `xdg_activation_v1`, idle-inhibit, keyboard-shortcuts-inhibit, `xdg-foreign-v2`, `xdg-wm-dialog`, `xdg-toplevel-icon`, `wl_data_device_manager`, `primary-selection-v1`, `text-input-v3`, `wp_cursor_shape_manager_v1`, `wl_touch`). Real toolkits (GTK4, Qt6/Quickshell) render and accept input end-to-end. |
 | `halmasuit-luks` / `-fsck` / `-emergency` | Deferred to Phase B | Adapter crates that depend on initramfs context. |
 | `halmasuit-kms` / `-protocols` / `-ipc` / `-cli` | Stub | Workspace crates exist as placeholders. Concrete code lands as the consuming task arrives — `halmasuit-kms` likely populates during the Phase B DRM-backend work. |
-| Introspection surface — NDJSON to journald | Done | `halmasuit-introspect` emits `Event` variants through `tracing` + `tracing-subscriber`'s JSON formatter to stderr; systemd captures into journald. Variants in stable use: `Started`, `PhaseEntered` (Init/DrmMasterAcquired/WaylandReady/GreetdReady/Deprivileged), `GreeterSpawned`, `GreeterTerminated`, `SessionRequested`, `Shutdown`, `Fatal`. |
+| Introspection surface — NDJSON to journald | Done | `halmasuit-introspect` emits `Event` variants through `tracing` + `tracing-subscriber`'s JSON formatter to stderr; systemd captures into journald. Variants in stable use: `Started`, `PhaseEntered` (Init/DrmMasterAcquired/WaylandReady/GreetdReady/Deprivileged), `GreeterSpawned`, `GreeterTerminated`, `SessionRequested`, `Shutdown`, `Fatal`, `FrameRendered` (frame_audit-gated). |
 | Introspection surface — frame snapshot (`halmasuit-debug` only) | Done | `org.halmasuit.Debug.Introspect.Snapshot(path)` lives in `halmasuit-debug` (gated on `--features frame_audit`); visual VM tests consume it for byte-exact frame assertions. Deliberately NOT in the production binary (arbitrary-file-write surface). No production snapshot socket is planned: visual defects in halmasuit's domain are transients (sub-frame transitions), which a polled snapshot cannot catch. Field observability for transients, if/when needed, lands as an extension of the NDJSON event stream — `Snapshot()` is not the right shape for it. |
-| `sd_notify` / SIGTERM handling | Phase A done | Graceful SIGTERM emits `Shutdown { reason: signal_term }`; SIGCHLD reaper handles zombie children. Phase B adds `SurviveFinalKillSignal=yes` + `execve` re-pivot to rootfs (drm-master-probe Phases 2+3 validated this works). |
+| `sd_notify` / SIGTERM handling | Done | Graceful SIGTERM emits `Shutdown { reason: signal_term }`; SIGCHLD reaper handles zombie children. Phase B adds `SurviveFinalKillSignal=yes` + `execve` re-pivot to rootfs (drm-master-probe Phases 2+3 validated this works). |
 | NixOS module | Done | `services.halmasuit.enable = true`; socket-activated host-ns `halmasuit-session` broker unit (no standing root when idle) + the hardened deprivileged `halmasuit.service`. **No `security.wrappers` setuid entry** (the setuid `halmasuit-spawn` is deleted — R15); no setuid inode in the closure. PAM service auto-installed; the broker carries `SupplementaryGroups = [ "shadow" ]` so pam_unix's `getspnam` fast-path avoids the `unix_chkpwd` fork (irrelevant to the session — A9 derives leader groups from the resolved user only). `HALMASUIT_BROKER_PEER_UID`/`relay_peer_uid` set to the compositor uid when the compositor is enabled, else the greeter uid. |
-| `tests/login-flash.nix` | Done — GREEN | Measures halmasuit's PID + frame continuity across the real greeter→session transition **through the broker-launched session**. Normal pass/fail hard gate — the old CI `continue-on-error` + Justfile exit-code inversion are deleted and must not return. |
+| `tests/login-flash.nix` | Done — GREEN | Measures halmasuit's PID + frame continuity across the real greeter→session transition **through the broker-launched session**. Normal pass/fail hard gate. |
 | `tests/halmasuit-vm.nix` | Done | Consolidated VM gate: lifecycle events, socket permissions, post-drop process identity, greeter child identity, Wayland globals, full real-PAM auth through the broker + greeter termination, clean shutdown. |
+| `tests/visual-niri-session.nix` | Done | Real upstream niri (`nix-config.inputs.niri-flake.packages.niri-unstable`) nested as the broker-launched session. Software-rendered headless (llvmpipe). Real greetd auth → broker → niri `xdg_toplevel` fullscreen foreground; PID-continuity + `assert_no_flash_stream` across the swap. |
+| `tests/visual-dankgreeter.nix` / `-dankgreeter-auth.nix` | Done | Real DMS DankGreeter (Quickshell+Qt6) as halmasuit's `greeterCommand` over the wallpaper, no-flash invariant intact. The `-auth` variant drives the full Qt6 keystroke auth arc end-to-end: real DMS UI → broker → real `pam_unix` → `SessionOpened` → broker-launched real niri. |
+| `tests/visual-{frame-callbacks,sync-subsurface,deferred-configure,popup,gtk4-smoke}.nix` | Done | Per-contract protocol gates from the wayland-server convergence epic. Real GTK4 client smoke test (`visual-gtk4-smoke`) for cross-toolkit validation. |
+| `tests/visual-wallpaper-video.nix` | Done | Epic #12 gate: real `halmasuit-decoder` sandbox + crash-recovery + budget-exhaustion + login-flash continuity under video wallpaper. |
 | `tests/full-boot-flash.nix` | Deferred to Phase B | Frame-capture continuity from kernel handoff through `SESSION`; depends on initramfs survival being in place. |
-| DankGreeter launcher patch | **Cross-repo** | ~20 lines in DMS (nix-config) to skip its nested-niri spawn when `WAYLAND_DISPLAY` is set by halmasuit. |
+| DankGreeter launcher patch | **Cross-repo** | ~20 lines in DMS (nix-config) to skip its nested-niri spawn when `WAYLAND_DISPLAY` is set by halmasuit. The VM `visual-dankgreeter-auth` gate exercises the module via `${nix-config}/modules/desktop/dms-niri.nix`, so the patch should be additive and small. |
 | dms-niri integration on gnomon | **Cross-repo** | Replace `services.greetd.enable` with `services.halmasuit.enable` in gnomon's host config; declare halmasuit-greeter / halmasuit-compositor users. |
-| Real-hardware shakedown on gnomon | **Cross-repo** | Boot halmasuit on actual KMS hardware (not virtio-gpu); will likely surface integration issues VM tests can't see. |
+| Real-hardware shakedown on gnomon | **Cross-repo** | Boot halmasuit on actual KMS hardware (RTX 5070 Ti / nvidia-drm); will likely surface integration issues VM tests can't see. |
 
 ## Phase B: initramfs survival
 
-**Starting state (as of Phase A close).** The rootfs compositor is
-done end-to-end in VM tests. drm-master-probe Phases 0–3 already
-empirically validated the load-bearing mechanics Phase B builds on:
+**Starting state.** The rootfs compositor is done end-to-end — six
+in-repo epics shipped, real DMS DankGreeter Qt6 auth arc green
+end-to-end. drm-master-probe Phases 0–3 already empirically
+validated the load-bearing mechanics Phase B builds on:
 `DRM_IOCTL_SET_MASTER` survives `setresuid` and fork (Phases 0–1),
 and survives `switch_root` + `execve` with the same FD remaining
 master (Phase 3, `tests/drm-master-probe-phase3.nix`). Phase B is

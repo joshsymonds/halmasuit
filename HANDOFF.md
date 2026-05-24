@@ -1,33 +1,65 @@
 # halmasuit epic — HANDOFF
 
-Canonical branch **`main`** @ `17ae692`, pushed to `origin/main`. This
+Canonical branch **`main`** @ `74dfd25`, pushed to `origin/main`. This
 document is the self-contained cold-start brief for resuming halmasuit.
 
-**State.** The unified **session/pamd privilege-separation epic** (§0) is
-**SHIPPED** — 45 commits, fast-forward-merged to `main`, two-tier
-`gambit:review` APPROVED (round 4, zero gaps; it caught and closed a real
-privilege escalation, Amendment A9 / §0.13). The privileged
-`halmasuit-session` broker is the **live** auth/session path; the
-in-compositor `halmasuit-pam` and the setuid `halmasuit-spawn` are
-**deleted**. Gates green: `just check` 244/244 + `r14-gate`;
-`just test-vm` 14/14 incl. `login-flash` through the broker-launched
-session and the three real-PAM broker gates (`run-pam-auth`,
-`session-r5r6`, `session-onehandle`).
+**State.** Five epics are SHIPPED on `main`:
 
-**Read order.** §0 is now the **decision record** for the shipped
-privilege-separation work — the rationale and the DO-NOT-REVISIT
-conditions (CLAUDE.md cites §0.7–§0.13 as canonical). §§1–4 describe what
-halmasuit is and the visual-compositor layers already landed (A–F2, G0).
-§5 records that the namespace-handoff blocker is **resolved** (Mechanism
-D shipped *as* the broker). **§6 is the live work queue: the visual
-G-layer (G1–G4) is what remains** — it was the thing §0 unblocked.
+1. **Phase A** — rootfs compositor, greetd I/O, DRM master, privilege
+   drop, greeter spawn/kill.
+2. **Privilege-separation** (§0) — `halmasuit-session` broker is the live
+   auth/session path; in-compositor `halmasuit-pam` and the setuid
+   `halmasuit-spawn` deleted. Two-tier `gambit:review` APPROVED
+   (Amendment A9 / §0.13 was caught and closed during it).
+3. **Epic #2 Visual G-layer** — witness composited from frame 0,
+   `assert_no_flash_stream` live, real niri as the broker-launched
+   session, `frame_audit` instrument with ssimulacra2 goldens.
+4. **Epic #5 Hand-rolled libpam FFI** — production halmasuit-session
+   links `-lpam` directly; `pam-sys` is dev-deps-only audit lever via
+   `tests/pam_ffi_parity.rs`. Zero bindgen/clang-sys/libclang at
+   production build time.
+5. **Epic #12 VideoBackend** — sandboxed `halmasuit-decoder` subprocess
+   (rsmpeg + seccomp-bpf), restart-or-fallback policy, frame-0 invariant
+   preserved through video wallpaper.
+6. **Wayland-server convergence epic** — the R2-DankGreeter-pixel tail
+   that Epic #2 explicitly deferred to a successor epic. Delivers
+   `wl_surface.frame` callbacks post-vblank (R2), commit aggregation
+   (R3), deferred xdg-shell configure (R4), PopupManager (R5), surface
+   enter/leave (R6), focus integration / data-device / primary-selection
+   / text-input (R7), libinput pointer + Xcursor render (R8a/R8b),
+   wp_presentation_feedback (R9), zwp_linux_dmabuf_v1 (R10), and the
+   Phase-B-1..15 protocol additions (viewporter, xdg-decoration,
+   xdg-activation, idle-inhibit, keyboard-shortcuts-inhibit,
+   xdg-foreign-v2, xdg-wm-dialog, xdg-toplevel-icon, wl_data_device,
+   primary-selection-v1, text-input-v3, wp_cursor_shape_manager_v1,
+   wl_touch). Real DMS DankGreeter (Quickshell+Qt6) is the greeter; the
+   full Qt6 keystroke auth arc reaches `SessionOpened` end-to-end.
 
-**Branch topology.** Collapsed and resolved. `main` carries everything;
-`feature/session-pamd` was merged and deleted, `feature/visual-compositor`
-/ `fold/...` superseded. **`harden/phase-a-review` is retained** for one
-unique commit, `aa93f4f` (a login-flash DRM-master-continuity assertion).
-That implementation is wrong for v2 — it greps debugfs for the compositor
-PID as DRM master, false-by-construction under the libseat/seatd model
+Gates green: `just check` 336/336 + `r14-gate`; `just test-vm` 24/24
+(`smoke-boot`, `halmasuit-vm`, `run-pam-auth`, `session-r5r6`,
+`session-onehandle`, `login-flash`, `halmasuit-input`,
+`visual-halmasuit-{clear,layer,splash,toplevel}`, `visual-backdrop`,
+`visual-foreground`, `visual-{revert,pidfd-revert}`,
+`visual-niri-session`, `visual-dankgreeter`, `visual-gtk4-smoke`,
+`visual-dankgreeter-auth`, `visual-frame-callbacks`,
+`visual-sync-subsurface`, `visual-deferred-configure`, `visual-popup`,
+`visual-wallpaper-video`).
+
+**Read order.** §0 is the **decision record** for the privilege-separation
+work — the rationale and the DO-NOT-REVISIT conditions (CLAUDE.md cites
+§0.7–§0.13 as canonical). §§1–4 describe what halmasuit is and the
+visual-compositor layers (A–F2, G0–G4) — all on `main`. §5 records that
+the namespace-handoff blocker is resolved (Mechanism D shipped *as* the
+broker). **§6 is the live work queue: cross-repo deployment to gnomon
+and Phase B (initramfs survival).** The in-repo visual G-layer is done.
+
+**Branch topology.** Collapsed. `main` carries everything;
+`feature/session-pamd`, `feature/visual-compositor`,
+`feature/wallpaper-engine`, and `feature/wayland-server-convergence` were
+merged and deleted. **`harden/phase-a-review` is retained** for one unique
+commit, `aa93f4f` (a login-flash DRM-master-continuity assertion). That
+implementation is wrong for v2 — it greps debugfs for the compositor PID
+as DRM master, false-by-construction under the libseat/seatd model
 (seatd is the registered master; halmasuit holds the DRM fd *via*
 libseat). The concept is valuable; the rewrite is the §6 sidecar and the
 branch stays the reference impl until it lands.
@@ -824,57 +856,62 @@ nix-config's own inputs (not a nix-config branch).
 
 ## 3. How far we got — layer by layer
 
-`just check` = **244/244** green incl. `r14-gate`. **14 VM gates** green
-via `just test-vm` (plus the `drm-master-probe` phase probes). Every
-layer below, plus the shipped §0 privilege-separation epic, is committed
-on **`main`** @ `17ae692` and gate-verified.
+`just check` = **336/336** green incl. `r14-gate` + `vis-selftest`. **24 VM
+gates** green via `just test-vm` (plus the `drm-master-probe` phase
+probes). Every layer below is committed on **`main`** @ `74dfd25` and
+gate-verified.
 
-| Layer | What | Gate(s) | Commit | Task |
-|---|---|---|---|---|
-| A | Visual-test infra: `visual.py`, `ssimulacra2_rs`, Snapshot()-based capture | (infra) | `b3f100d`… | #2 ✓ |
-| B | Renderer: DRM+GBM+GlesRenderer+DrmCompositor, layer-shell, wl_shm, `#0a0014`, `frame_audit` split | `visual-halmasuit-clear/-layer/-splash` | `1a01f63`→`35c521e` | #3–8 ✓ |
-| C | Wallpaper plane: halmasuit composites the configured PNG internally as its bottom-most background from frame 0 | `visual-halmasuit-splash` | `996f7c4` | #9 ✓ |
-| D | `visual-backdrop.nix` 4 stand-in scenes + FrameRendered continuity invariant | `visual-backdrop` | `6b73459` | #10 ✓ |
-| E1 | DRM acquisition via `LibSeatSession`/seatd | `drm-master-probe-phase4`, all visual | `482dc1c` (+`2b58e10`) | #11,#14 ✓ |
-| E2 | libinput + `wl_seat` keyboard/pointer + focus routing | `halmasuit-input` | `745e8e9` | #15 ✓ |
-| F1 | Real `xdg_toplevel` fullscreen compositing over splash | `visual-halmasuit-toplevel` | `64a18e0` | #12 ✓ |
-| F2 | greeter→session foreground state machine; no-flash across the **real greetd** transition | `visual-foreground` | `a7078c2` | #16 ✓ |
-| G0 | Pin nix-config→main (user's forks); real DMS stack boots | `smoke-boot` (real greetd+DankGreeter+niri+quickshell) | `1586aaa` | #17 ✓ |
-| §0 | Privilege-separation epic: `halmasuit-session` broker is the live auth/session path; `halmasuit-pam` + setuid `halmasuit-spawn` deleted | `run-pam-auth`, `session-r5r6`, `session-onehandle`, `login-flash` | `17ae692` | SHIPPED ✓ |
-| **G1** | Real niri nested as the broker-launched session | — | **next (§6); unblocked by §0** | pending |
-| G2–G4 | Real DankGreeter; full real-auth arc; interactive proof | — | not started | to-create |
+| Layer | What | Gate(s) | Task |
+|---|---|---|---|
+| A | Visual-test infra: `visual.py`, `ssimulacra2_rs`, Snapshot()-based capture | (infra) | ✓ |
+| B | Renderer: DRM+GBM+GlesRenderer+DrmCompositor, layer-shell, wl_shm, `#0a0014`, `frame_audit` split | `visual-halmasuit-clear/-layer/-splash` | ✓ |
+| C | Wallpaper plane: halmasuit composites the configured PNG internally as its bottom-most background from frame 0; superseded by the wallpaper-engine refactor (ImageBackend / ShaderBackend / VideoBackend trait surface, `WallpaperConfig` discriminated union) | `visual-halmasuit-splash`, `visual-wallpaper-video` | ✓ |
+| D | `visual-backdrop.nix` 4 stand-in scenes + FrameRendered continuity invariant | `visual-backdrop` | ✓ |
+| E1 | DRM acquisition via `LibSeatSession`/seatd | `drm-master-probe-phase4`, all visual | ✓ |
+| E2 | libinput + `wl_seat` keyboard/pointer + focus routing; libinput pointer events routed to `wl_pointer` (R8a); visible Xcursor render path (R8b) | `halmasuit-input` | ✓ |
+| F1 | Real `xdg_toplevel` fullscreen compositing over splash | `visual-halmasuit-toplevel` | ✓ |
+| F2 | greeter→session foreground state machine; no-flash across the **real greetd** transition | `visual-foreground`, `visual-revert`, `visual-pidfd-revert` | ✓ |
+| G0 | Pin nix-config→main (user's forks); real DMS stack boots | `smoke-boot` (real greetd+DankGreeter+niri+quickshell) | ✓ |
+| §0 | Privilege-separation epic: `halmasuit-session` broker is the live auth/session path; `halmasuit-pam` + setuid `halmasuit-spawn` deleted | `run-pam-auth`, `session-r5r6`, `session-onehandle`, `login-flash` | ✓ |
+| G1 | Real niri nested as the broker-launched session, software-rendered headless (llvmpipe) | `visual-niri-session` | ✓ |
+| G2 | Real DMS DankGreeter (Quickshell+Qt6) as `greeterCommand` over the wallpaper plane, no-flash invariant intact | `visual-dankgreeter`, `visual-gtk4-smoke` | ✓ |
+| G3 | Qt6 keystroke auth arc end-to-end: real DankGreeter → broker → real `pam_unix` → `SessionOpened` → real niri | `visual-dankgreeter-auth` | ✓ |
+| W1 | Wayland-server convergence: `wl_surface.frame` callbacks post-vblank (R2), commit aggregation (R3), deferred xdg-shell configure (R4), PopupManager (R5), surface enter/leave (R6), focus integration (R7), `wp_presentation_feedback` (R9), `zwp_linux_dmabuf_v1` (R10), Phase-B-1..15 protocol surface (viewporter, decoration, activation, inhibit pair, foreign-v2, wm-dialog, toplevel-icon, data-device, primary-selection-v1, text-input-v3, cursor-shape, touch) | `visual-frame-callbacks`, `visual-sync-subsurface`, `visual-deferred-configure`, `visual-popup` | ✓ |
+| W2 | Hand-rolled libpam FFI (Epic #5): production halmasuit-session links `-lpam` directly; `pam-sys` is dev-deps-only audit lever via `tests/pam_ffi_parity.rs`; zero bindgen/clang-sys/libclang at production build time | `pam_ffi_parity` (in `just check`) | ✓ |
+| W3 | VideoBackend via sandboxed decoder (Epic #12): forked + fd-3-passed `halmasuit-decoder` subprocess, rsmpeg + seccomp-bpf, restart-or-fallback policy, frame-0 invariant preserved through video wallpaper | `visual-wallpaper-video` | ✓ |
 
-What F2 proved (the no-flash thesis, on the real mechanism): real greetd
-full-auth → `ForegroundChanged{session}` → the session is launched →
-**halmasuit PID continuous across the real greeter→session swap**,
-`FrameRendered` continuity OK across the whole transition, both scene goldens
-matched. F2 used a stand-in only for the *content* of the two endpoints
-(solid-color clients); the mechanism is real. Post-§0, `login-flash`
-proves the same continuity **through the broker-launched session** (the
-session leader is the broker's fork-then-drop child, not a setuid exec).
+What `visual-foreground` proved (the no-flash thesis on the real
+mechanism, retained as a regression gate): real greetd full-auth →
+`ForegroundChanged{session}` → the session is launched → **halmasuit PID
+continuous across the real greeter→session swap**, `FrameRendered`
+continuity OK across the whole transition. Post-§0, `login-flash` proves
+the same continuity **through the broker-launched session** (the session
+leader is the broker's fork-then-drop child, not a setuid exec). G1 then
+substituted real niri for the solid-color session stand-in;
+`visual-dankgreeter-auth` then substituted real DMS DankGreeter (Qt6)
+for the layer-shell greeter stand-in, with real keystroke input driving
+the broker's `pam_unix` to `SessionOpened`.
 
 ---
 
-## 4. G1 attempt — what we learned (knowledge preserved, code discarded)
+## 4. G1–G3 reference notes — durable lessons
 
-An early G1 (real niri as the session) attempt was **deliberately
-discarded** (`git restore`/clean — the test file is cheap to recreate and
-its session-environment section is rewritten for the broker-launched
-session anyway). The *findings* are the value and are durable in memory
-(`session-spawn-namespace-handoff`, `g-layer-pins`) and here:
+The in-repo G-layer is fully shipped. These notes are retained from the
+build-out because they remain load-bearing for anyone touching the
+session-launch path:
 
 - **Real niri works nested under halmasuit.** niri's winit/GL backend
-  connected to halmasuit and halmasuit composited it:
-  `xdg_toplevel mapped as fullscreen foreground w:1280 h:800`. halmasuit's
-  E/F protocol surface is sufficient for real niri's render path. **No
-  halmasuit protocol gap** — the biggest rendering unknown of layer G is
-  retired.
+  connects to halmasuit and halmasuit composites it as an
+  `xdg_toplevel`. halmasuit's E/F protocol surface (extended by the
+  wayland-server convergence epic to include the Phase-B-1..15
+  additions) is sufficient for real niri AND real Quickshell/Qt6
+  DankGreeter.
 - niri runs correctly as the authenticated user. The privilege drop is
-  fine (now the broker's non-setuid fork-then-drop session-leader child).
-- Incidental, still relevant for G1: the session env is minimal —
-  `pam_getenvlist()` merged with a fixed allowlist (A1), not the caller's
-  environment. Pass niri its config via `--config`, not via shell
-  `mkdir`/`cp`. niri (a compositor even when nested) binds its **own**
+  fine (the broker's non-setuid fork-then-drop session-leader child).
+- The session env is minimal — `pam_getenvlist()` merged with a fixed
+  allowlist (A1), not the caller's environment. Pass niri its config via
+  `--config`, not via shell `mkdir`/`cp`. niri (a compositor even when
+  nested) binds its **own**
   client socket in `XDG_RUNTIME_DIR` and needs a writable `$HOME` — which
   the broker now provides via `pam_open_session` (pam_systemd +
   pam_mount) in the host mount namespace.
@@ -947,58 +984,70 @@ Memory: [[pam-killable-subprocess-direction]],
 
 ---
 
-## 6. Remaining work — the visual G-layer (live queue)
+## 6. Live work queue
 
-§0 is shipped; the namespace blocker is gone. The visual G-layer is what
-remains: prove the no-flash compositor on the *real* greeter→session path
-with the *real* software, now running through the broker-launched
-session.
+The in-repo compositor is complete: the visual G-layer, the
+privilege-separation epic, the wayland-server convergence epic
+(real-DankGreeter-pixel surface), Epic #5 (hand-rolled libpam FFI), and
+Epic #12 (VideoBackend) are all on `main`. `just check` 336/336 + `just
+test-vm` 24/24. What remains is **cross-repo deployment** and **Phase B
+(initramfs survival)**, plus one independent in-repo sidecar.
 
-**Mechanism foundation (complete).** The in-repo G-layer instrument is
-done and gated: halmasuit composites the locked wallpaper internally from
-frame 0 (the `halmasuit-splash` client is deleted; config is
-`wallpaper`/`HALMASUIT_WALLPAPER_PATH`); `assert_no_flash_stream` is
-frame-0-anchored and pinned by the no-VM `just vis-selftest` synthetic
-proof; the offscreen GLES readback gives headless deterministic
-pixel-exact assertion (`visual-halmasuit-clear` vs the human-inspected
-wallpaper golden). Full `just test-vm` is green incl. `login-flash` and
-the three broker gates. This instrument is the Phase-B-prepend
-foundation — see ARCHITECTURE.md "### Phase-B foundation (the in-repo
-instrument)". What remains below is the *real-software* tranche on top
-of it. Strict order, each blocked by the previous, **except the
-sidecar** (independent — do it anytime):
+### Cross-repo (rootfs deployment to gnomon)
 
-1. **G1 — real niri nested as the broker-launched session.** Build
-   `tests/visual-niri-session.nix` from `tests/visual-foreground.nix`
-   (swap `sessionCmd` → real niri `--config <minimal kdl>`; niri pkg =
-   `nix-config.inputs.niri-flake.packages.x86_64-linux.niri-unstable`;
-   wire flake.nix check + Justfile). Session env + `$HOME`/
-   `$XDG_RUNTIME_DIR` now flow through the broker's `pam_open_session`
-   (no `ProtectHome=false` carve-out — that is the whole point of §0).
-   Assert: real greetd auth (through the broker) → niri `xdg_toplevel`
-   fullscreen foreground; niri marker (`pgrep -x niri`); PID-continuity
-   across greeter→niri; `assert_no_flash_stream`; Snapshot
-   `niri-session` golden, Read-inspected before commit. Greeter stays
-   the layer-shell stand-in.
-2. **G2 — real DankGreeter as `greeterCommand`** (replaces the stand-in
-   layer client). Talks greetd to halmasuit's socket; enumerate the
-   Wayland protocols it binds and add any halmasuit lacks (never patch
-   DankGreeter). Golden inspected; real keyboard input → DankGreeter.
-3. **G3 — full real-auth arc gate**: boot → splash(user image) → real
-   DankGreeter over splash → emulated keystrokes type the test-user
-   password → PAM success **through the broker** → broker fork-then-drops
-   real niri → niri foreground. Continuity invariant + PID-continuity
-   across the **real** DankGreeter→niri transition; niri marker; goldens
-   (splash → DankGreeter → niri) inspected.
-4. **G4 — interactive bootable proof + docs**: `just` recipe, QEMU GTK
-   window, user's image, the full arc by hand; documented (how to pass
-   the image, what you should see). Plus re-verify `cargo tree -p
-   halmasuit` (no features) clean / production halmasuit zero
-   `frame_audit`.
-5. **Epic close**: layer-G acceptance gate. When all G subtasks are green
-   → `gambit:review` → `finishing-branch`. `login-flash` stays a GREEN
-   hard gate (it already passes through the broker-launched session); the
-   CI inversion is gone — keep it a normal pass/fail check.
+The in-repo work proves halmasuit ships green under VM-headless headless
+GL (llvmpipe) + the real DMS/niri stack. Putting halmasuit on real
+hardware is the cross-repo tail:
+
+1. **DankGreeter launcher patch in DMS** (~20 lines in nix-config's DMS
+   module): skip DankGreeter's nested-niri spawn when `WAYLAND_DISPLAY`
+   is set by halmasuit. The VM `visual-dankgreeter-auth` gate exercises
+   the same module via `${nix-config}/modules/desktop/dms-niri.nix`, so
+   the change should be additive and small.
+2. **gnomon switchover.** Replace `services.greetd.enable = true;` with
+   `services.halmasuit.enable = true;` in `~/nix-config/hosts/gnomon/`;
+   declare `halmasuit-greeter` / `halmasuit-compositor` system users;
+   set `services.halmasuit.wallpaper = { type = "image" | "shader" |
+   "video"; source = ...; };`. The `HALMASUIT_BROKER_PEER_UID` env in
+   `nix/module.nix` already auto-points at the compositor uid when the
+   compositor is enabled.
+3. **Real-hardware shakedown on gnomon.** Boot halmasuit on actual KMS
+   hardware (RTX 5070 Ti / nvidia-drm); will likely surface integration
+   issues VM tests cannot see (DRM master under nvidia-drm vs the
+   virtio-gpu headless rig; real seatd vs the test fixture; xkbcommon
+   layout under the real keyboard).
+
+### Phase B (initramfs survival, not started)
+
+The drm-master-probe Phases 0–3 already validated the load-bearing
+mechanics (`DRM_IOCTL_SET_MASTER` survives `setresuid`, `fork`, and
+`switch_root`+`execve`). Phase B is production wiring on validated
+foundations.
+
+1. **`initrd-handoff-probe`** — research crate analogous to
+   drm-master-probe, exercising halmasuit's full Wayland + greetd +
+   pidfd surface across initramfs→rootfs (stub greetd/PAM for the probe;
+   the goal is the cross-pivot mechanics).
+2. **`halmasuit --features initramfs`** — same crate; differs from the
+   rootfs path only in DRM open (direct, no logind) and password-agent
+   registration.
+3. **`halmasuit-luks`** — systemd password-agent Wayland client.
+   Highest-risk Phase-B surface (sees passphrases). Iced +
+   iced_layershell render. Foreground replacement vs subsurface overlay
+   decision parked until the adapter lands.
+4. **BGRT-aware first frame in halmasuit** (~200 LOC) — flicker-free
+   continuity from firmware splash through halmasuit's first composite.
+5. **NixOS module — initrd wiring** —
+   `boot.initrd.systemd.services.halmasuit`,
+   `boot.initrd.kernelModules` for the target GPU driver, Mesa + ICDs
+   in the initramfs closure.
+6. **`tests/full-boot-flash.nix`** — the Phase B hard gate.
+   Frame-capture continuity from kernel handoff through SESSION;
+   asserts no all-black frames and no DSSIM jump across any
+   transition. Replaces Plymouth's role.
+7. **Plymouth removal on gnomon** — cross-repo; after
+   `full-boot-flash` is green, drop `boot.plymouth.enable` and add
+   `services.halmasuit.enable` with the new initrd options.
 
 **Sidecar (independent — anytime): libseat-aware DRM-master-continuity
 assertion on `login-flash`.** Today `login-flash` proves *PID* continuity
@@ -1018,11 +1067,10 @@ re-gate full `just test-vm`. Delete `harden/phase-a-review` once it
 lands.
 
 Task-tool state: task IDs do NOT carry across sessions — treat the §3
-table + this list as the authoritative state. The visual G-layer has no
-gambit tasks yet; create its epic + first task (G1) via
-`gambit:brainstorming`. Conceptually: layers A–F2 + G0 done; §0
-privilege-separation epic SHIPPED; G1 next (unblocked); G2/G3/G4 created
-iteratively as G1 lands.
+table + this list as the authoritative state. Nothing is in flight
+in-repo; the next epic is either a cross-repo gnomon shakedown
+(`gambit:brainstorming` on the DMS launcher patch + nix-config flip) or
+Phase B (`initrd-handoff-probe` first).
 
 ---
 
