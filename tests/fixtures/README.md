@@ -3,11 +3,12 @@
 ## `splash-test.png`
 
 A deterministic 256×256 four-colour quadrant image consumed by
-halmasuit as its internal witness plane in
-`tests/visual-halmasuit-splash.nix` (via `witnessImage` →
-`HALMASUIT_WITNESS_IMAGE`). It is deliberately **non-uniform** so the
-resulting golden proves halmasuit actually textured the image
-internally, not that it fell back to a clear colour.
+halmasuit as its wallpaper plane in
+`tests/visual-halmasuit-splash.nix` (via `services.halmasuit.wallpaper
+= { type = "image"; source = ...; }` → `HALMASUIT_WALLPAPER_PATH`). It
+is deliberately **non-uniform** so the resulting golden proves
+halmasuit actually textured the image internally, not that it fell
+back to a clear colour.
 
 Quadrants (top-left, top-right, bottom-left, bottom-right):
 
@@ -34,9 +35,9 @@ halmasuit stretches it to fill the output (no aspect preservation),
 so at 1280×800 it still reads as four equal colour quadrants — a
 stable, recognisable golden.
 
-## `witness.png`
+## `wallpaper.png`
 
-The locked **witness** image — the Ḫalmašuit (deified throne)
+The locked **wallpaper** image — the Ḫalmašuit (deified throne)
 enthroned in the Hittite winged sun-disc: cobalt ground, gold/oxblood
 constructivist screenprint. This is the *instrument* of the no-flash
 continuity proof, not branding: it is the one image that must remain
@@ -49,8 +50,8 @@ the pixels are not this image, the no-flash invariant has regressed.
   stretches non-aspect-preserving, so it identity-stretches at 16:10
   outputs (e.g. 1280×800) with no distortion.
 - It is **both** the ssimulacra2 reference the visual gates compare
-  against **and** the source halmasuit composites as its internal
-  witness plane (epic G-layer R3/R7).
+  against **and** the source the wallpaper engine's `ImageBackend`
+  composites as the bottom-most wallpaper plane (epic G-layer R3/R7).
 
 Provenance: a generative composition, locked and human-approved
 2026-05-18 (epic amendment G1). The generation master is kept **out
@@ -60,7 +61,7 @@ re-supplied, finalize it identically (ImageMagick 7):
 
 ```sh
 magick <master>.png -resize '2560x1600!' -colorspace sRGB \
-       -alpha off -strip tests/fixtures/witness.png
+       -alpha off -strip tests/fixtures/wallpaper.png
 ```
 
 Regenerating this fixture changes every visual golden that references

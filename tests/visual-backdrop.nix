@@ -1,16 +1,16 @@
 # tests/visual-backdrop.nix — epic layer D.
 #
 # The no-flash proof harness on stand-in clients. Boots
-# halmasuit-debug with its internal witness plane (composited from
+# halmasuit-debug with its internal wallpaper plane (composited from
 # frame 0, the 4-quadrant fixture) and drives four scenes by
 # starting/stopping extra layer-shell clients (the env-parametrised
 # test client) as systemd services that connect to halmasuit's
 # wayland socket as the greeter uid:
 #
-#   splash-only          — only the witness (background fixture)
+#   splash-only          — only the wallpaper (image fixture)
 #   greeter-over-splash  — + a centred opaque rect on the TOP layer
 #   session-fullscreen   — + a fullscreen opaque OVERLAY client
-#   post-session-splash  — session client stopped; witness visible again
+#   post-session-splash  — session client stopped; wallpaper visible again
 #
 # Two orthogonal gates run together:
 #
@@ -84,7 +84,7 @@ pkgs.testers.runNixOSTest {
         greeterUid     = 999;
         greeterGroup   = "halmasuit-greeter";
         compositorUid  = 998;
-        witnessImage   = fixture;
+        wallpaper = { type = "image"; source = fixture; };
       };
 
       # Scene clients — NOT auto-started; the testScript starts/stops
@@ -178,7 +178,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF client_first_frame", timeout=30
     )
-    wait_cff("background", 30)
+    wait_cff("wallpaper", 30)
     visual.assert_matches_golden(machine, "backdrop-splash-only")
 
     # ── scene: greeter-over-splash ──────────────────────────────────

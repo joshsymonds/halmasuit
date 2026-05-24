@@ -7,9 +7,9 @@
 # Capture is the in-process `Snapshot()` D-Bus method (a CPU readback
 # of the exact composited frame), NOT a QMP screendump.
 #
-# No `witnessImage` is configured here — this gate isolates the
+# No `wallpaper option` is configured here — this gate isolates the
 # layer-shell compositing path (the legacy clear-only base, preserved
-# for non-witness mechanism tests). The golden is uniform green,
+# for non-wallpaper mechanism tests). The golden is uniform green,
 # proving halmasuit actually composites the client.
 
 {

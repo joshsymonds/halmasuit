@@ -30,6 +30,28 @@ let
   brokerPeerUid = if cfg.enable then cfg.compositorUid else cfg.greeterUid;
 in
 {
+  imports = [
+    # Hard-cut, no alias: the prior `witnessImage` option is removed
+    # by the wallpaper-engine epic. Configs setting it now fail with
+    # this message rather than silently mapping to the new option
+    # shape (user preference; see CLAUDE.md "delete replaced code
+    # completely; no backwards-compatibility shims").
+    (lib.mkRemovedOptionModule [ "services" "halmasuit" "witnessImage" ] ''
+      This option was renamed to `services.halmasuit.wallpaper` and
+      reshaped into a discriminated union. Replace the old
+      single-path form with:
+
+        services.halmasuit.wallpaper = {
+          type   = "image";
+          source = ./branding/wallpaper.png;
+        };
+
+      `type = "shader"` and `type = "video"` are Phase-A typed
+      scaffolding; the wallpaper-engine epic's follow-up tasks wire
+      the backends. See ARCHITECTURE.md for the design.
+    '')
+  ];
+
   options.services.halmasuit = {
     enable = lib.mkEnableOption "halmasuit — Linux system compositor";
 
@@ -116,17 +138,93 @@ in
       '';
     };
 
-    witnessImage = lib.mkOption {
-      type        = lib.types.nullOr lib.types.path;
+    wallpaper = lib.mkOption {
+      type = lib.types.nullOr (lib.types.submodule {
+        options = {
+          type = lib.mkOption {
+            type        = lib.types.enum [ "image" "shader" "video" ];
+            default     = "image";
+            description = ''
+              Which wallpaper backend to use. Phase-A wires only
+              `image' (PNG/JPG/WebP); `shader' (GLSL fragment) and
+              `video' (h264/AV1) are typed config entries the
+              wallpaper-engine epic's follow-up tasks fill in. Picking
+              an unwired backend fails the compositor closed at
+              startup with a clear error.
+            '';
+          };
+          source = lib.mkOption {
+            type        = lib.types.path;
+            description = ''
+              Absolute path to the wallpaper file (image / shader
+              source / video). String-interpolated into the unit
+              environment so a path literal is realized into the
+              store; an absolute runtime path interpolates to itself.
+            '';
+          };
+          uniforms = lib.mkOption {
+            type        = lib.types.attrsOf lib.types.anything;
+            default     = {};
+            description = ''
+              Named GLSL uniforms for `type = "shader"'. Phase-A: not
+              yet wired (the shader-uniforms task lands the parser).
+              The schema admits four uniform kinds — auto-*
+              (engine-driven time/resolution/frame/delta/mouse),
+              static-typed (float/vec2/vec3/vec4/int/bool),
+              event-time and event-value (bus-driven, Phase-B).
+            '';
+          };
+          loop = lib.mkOption {
+            type        = lib.types.bool;
+            default     = true;
+            description = ''
+              Whether `type = "video"' wallpapers loop. Defaults to
+              true for wallpaper use.
+            '';
+          };
+          raiseSocketBuffers = lib.mkOption {
+            type        = lib.types.bool;
+            default     = true;
+            description = ''
+              When `type = "video"`, raise `net.core.wmem_max` /
+              `net.core.rmem_max` to 16 MiB so a single RGBA frame
+              (up to 8.3 MiB at 1080p) fits in one SOCK_SEQPACKET
+              datagram. This is a SYSTEM-WIDE sysctl; on hosts with
+              hostile local users it widens unprivileged kernel-
+              memory pinning surface. Set false to keep the
+              kernel defaults; the decoder will then EMSGSIZE on its
+              first frame send and the wallpaper will degrade to the
+              placeholder.
+            '';
+          };
+          fallback = lib.mkOption {
+            type        = lib.types.nullOr lib.types.path;
+            default     = null;
+            description = ''
+              Absolute path to a static image (PNG/JPEG/WebP) the
+              wallpaper engine swaps in when the video decoder's
+              restart budget (3 crashes / 10s) exhausts. Only
+              meaningful for `type = "video"'; ignored otherwise.
+
+              Without a fallback the engine keeps rendering the
+              last good frame (or the 1×1 black placeholder if no
+              frame ever arrived). With one, an `ImageBackend` is
+              constructed against this path the first time the
+              decoder relay reports dead.
+            '';
+          };
+        };
+      });
       default     = null;
-      example     = lib.literalExpression ''./branding/witness.png'';
+      example     = lib.literalExpression ''{ type = "image"; source = ./branding/wallpaper.png; }'';
       description = ''
-        Absolute path to a PNG halmasuit composites as its bottom-most
-        internal background plane from frame 0 (epic G1/R3/R6). When
-        set, exported to halmasuit's unit environment as
-        `HALMASUIT_WITNESS_IMAGE` and decoded by halmasuit itself at
-        startup — there is no separate client. `null` runs halmasuit
-        with no witness (legacy clear-only — non-visual tests).
+        Wallpaper config. The wallpaper engine composites this as the
+        bottom-most plane of every frame from frame 0 (epic G1/R3/R6).
+        When set, the source path is exported to halmasuit's unit
+        environment as `HALMASUIT_WALLPAPER_PATH' and decoded by
+        halmasuit itself at startup — there is no separate client.
+        `null' runs halmasuit with no wallpaper (legacy clear-only —
+        non-visual tests).
       '';
     };
 
@@ -224,6 +322,21 @@ in
           flake-built derivation when iterating without rebuilding
           nixpkgs. Requires the halmasuit overlay (or a manual
           `pkgs.halmasuit-session`) for the default to resolve.
+        '';
+      };
+    };
+
+    decoder = {
+      package = lib.mkOption {
+        type        = lib.types.package;
+        default     = pkgs.halmasuit-decoder;
+        defaultText = lib.literalExpression "pkgs.halmasuit-decoder";
+        description = ''
+          The `halmasuit-decoder` sandboxed video-decoder subprocess
+          package (Epic #12). Forked at runtime by halmasuit's
+          DecoderRelay when `services.halmasuit.wallpaper.type = "video"`.
+          Override with a flake-built derivation for iteration.
+          Unused when the wallpaper type is `image` or `shader`.
         '';
       };
     };
@@ -434,17 +547,82 @@ in
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.
         HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
-      } // lib.optionalAttrs (cfg.witnessImage != null) {
-        # Decoded by halmasuit at startup as the internal witness
-        # plane. See `services.halmasuit.witnessImage`. String
-        # interpolation (NOT `toString`) so a path literal is realized
-        # into the store and is guaranteed present at this path in
-        # halmasuit's closure — `witnessImage` is self-sufficient, not
-        # reliant on some other unit pulling the file in. An absolute
-        # runtime-path string interpolates to itself unchanged.
-        HALMASUIT_WITNESS_IMAGE = "${cfg.witnessImage}";
-      };
+      } // lib.optionalAttrs (cfg.wallpaper != null) (
+        let
+          # Project the Nix option shape onto the JSON schema the
+          # wallpaper engine's serde deserializer expects (see
+          # `wallpaper::config::WallpaperConfig` — discriminator
+          # `type`, snake-case variants, `loop` rather than
+          # `loop_playback`).
+          wp = cfg.wallpaper;
+          jsonContent =
+            if wp.type == "image" then {
+              type   = "image";
+              source = "${wp.source}";
+            } else if wp.type == "shader" then {
+              type     = "shader";
+              source   = "${wp.source}";
+              uniforms = wp.uniforms;
+            } else {
+              type     = "video";
+              source   = "${wp.source}";
+              "loop"   = wp.loop;
+            } // lib.optionalAttrs (wp.fallback != null) {
+              fallback = "${wp.fallback}";
+            };
+          configFile = pkgs.writeText "halmasuit-wallpaper.json"
+            (builtins.toJSON jsonContent);
+        in {
+          # The wallpaper engine prefers HALMASUIT_WALLPAPER_CONFIG
+          # (JSON) over HALMASUIT_WALLPAPER_PATH; the JSON carries
+          # the full discriminated-union shape including shader
+          # uniform bindings. String interpolation (NOT `toString`)
+          # so the Nix path is realized into the store.
+          HALMASUIT_WALLPAPER_CONFIG = "${configFile}";
+          # Also export PATH as a fallback for early diagnostics
+          # (anything that wants "where's the asset" without parsing
+          # the JSON). The engine never reads this when CONFIG is
+          # set; setting both is defense-in-depth, not redundancy.
+          HALMASUIT_WALLPAPER_PATH = "${wp.source}";
+        } // lib.optionalAttrs (wp.type == "video") {
+          # Video wallpapers spawn `halmasuit-decoder` as a sandboxed
+          # subprocess (Epic #12). DecoderRelay reads this env var to
+          # locate the binary at fork-exec time; otherwise it falls
+          # back to `halmasuit-decoder` on PATH, which won't work in
+          # systemd's restricted PATH context.
+          HALMASUIT_DECODER_PATH = lib.getExe cfg.decoder.package;
+        });
     };
+   })
+
+   # Epic #12: kernel socket-buffer ceiling. The decoder→compositor
+   # IPC sends one RGBA frame per SOCK_SEQPACKET datagram (up to
+   # `MAX_FRAME_BYTES` = 16 MiB; 1080p RGBA is 8.3 MiB). Linux's
+   # default `net.core.wmem_max` / `rmem_max` is ~208 KiB; setsockopt
+   # SO_SNDBUF/SO_RCVBUF silently caps at those, so without raising
+   # the sysctls the relay's setsockopt has no effect and the
+   # decoder's first send fails with EMSGSIZE.
+   #
+   # Security trade-off (Epic #12 review finding): these sysctls are
+   # SYSTEM-WIDE. Raising wmem_max/rmem_max from 208 KiB to 16 MiB
+   # (~80×) lets any local process on the host `setsockopt SO_SNDBUF`
+   # up to 16 MiB; a malicious user holding N sockets can pin
+   # N × 16 MiB of unswappable kernel memory. Phase B replaces the
+   # single-datagram model with a shm-pool, eliminating the sysctl
+   # raise entirely; until then the trade-off is "video wallpapers
+   # work" vs. "tighter per-user kernel-memory ceiling". We default
+   # to raising the ceiling because video wallpaper is opt-in (only
+   # raised when `wallpaper.type = "video"`); operators with hostile
+   # local users on the same machine can opt out:
+   #
+   #   services.halmasuit.wallpaper.raiseSocketBuffers = false;
+   #
+   # but the decoder will then EMSGSIZE on first send and the
+   # wallpaper will fall back to the placeholder.
+   (lib.mkIf (cfg.enable && cfg.wallpaper != null && cfg.wallpaper.type == "video"
+              && cfg.wallpaper.raiseSocketBuffers) {
+     boot.kernel.sysctl."net.core.wmem_max" = lib.mkDefault 16777216;
+     boot.kernel.sysctl."net.core.rmem_max" = lib.mkDefault 16777216;
    })
 
    # Epic #1 R6 / Amendment A2: the socket-activated privileged broker.

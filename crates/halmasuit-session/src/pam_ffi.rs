@@ -27,13 +27,13 @@ use std::ffi::{CStr, CString, NulError, c_int, c_void};
 use std::marker::PhantomData;
 use std::{panic, ptr};
 
-use halmasuit_session_ipc::{BrokerToCompositor, Secret};
-use pam_sys::{
+use crate::pam_sys::{
     PAM_BUF_ERR, PAM_CONV_ERR, PAM_DELETE_CRED, PAM_ESTABLISH_CRED, PAM_RUSER, PAM_SUCCESS,
     PAM_TTY, PAM_USER, pam_acct_mgmt, pam_authenticate, pam_close_session, pam_conv, pam_end,
     pam_get_item, pam_getenvlist, pam_handle_t, pam_message, pam_open_session, pam_putenv,
     pam_response, pam_set_item, pam_setcred, pam_start,
 };
+use halmasuit_session_ipc::{BrokerToCompositor, Secret};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -630,6 +630,7 @@ impl Drop for Pam<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pam_sys;
     use halmasuit_session_ipc::{BrokerToCompositor, PromptStyle};
     use std::ffi::{CString, c_void};
 

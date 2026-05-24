@@ -23,10 +23,11 @@ workspace = true
 # `org.halmasuit.Debug.Introspect.Snapshot` method, png encodes the
 # captured frame. Both optional, so production `cargo tree` lists
 # neither (Epic #1 req 7). `image` is a NON-feature production dep
-# (below): halmasuit decodes the witness PNG at startup to composite
-# it as the internal background plane (epic G1/R3/R6) — that is
-# production behavior, not frame_audit. The exact-image audit math
-# (`frame_audit`) is arithmetic over the readback bytes; no `img_hash`.
+# (below): the wallpaper engine's ImageBackend decodes the configured
+# PNG at startup to composite as the bottom-most wallpaper plane
+# (epic G1/R3/R6) — that is production behavior, not frame_audit.
+# The exact-image audit math (`frame_audit`) is arithmetic over the
+# readback bytes; no `img_hash`.
 frame_audit = ["dep:zbus", "dep:png"]
 
 [dependencies]
@@ -41,6 +42,12 @@ halmasuit-greetd     = { path = "../halmasuit-greetd",     version = "0.1" }
 # path (halmasuit-pam, the in-compositor C1 model, is deleted with
 # setuid halmasuit-spawn in the atomic R10/R14/R15 commit).
 halmasuit-session-ipc = { path = "../halmasuit-session-ipc", version = "0.1" }
+# Frozen compositor↔halmasuit-decoder wire contract (Epic #12). The
+# DecoderRelay (wallpaper/decoder_relay.rs) translates VideoBackend
+# control into these frames and validates incoming FrameHeaders before
+# uploading raw RGBA bytes as a GLES texture.
+halmasuit-decoder-ipc = { path = "../halmasuit-decoder-ipc", version = "0.1" }
+thiserror.workspace = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
 # smithay features:
@@ -94,17 +101,25 @@ nix = { workspace = true, features = ["user", "signal", "process", "socket", "ui
 # Linux capabilities for drop_privileges' CAP_KILL preservation —
 # halmasuit must retain signal authority over its greeter child
 # (uid 999) post-deprivilege to uid 998. Pure-Rust over libc.
-# Decode the witness PNG at startup into RGBA8 for the internal
-# background plane (epic G1/R3/R6). NON-optional production dep:
-# halmasuit always composites the witness — there is no pre-client
-# solid phase. `default-features = false, features = ["png"]` at the
-# workspace level (no JPEG/GIF/… codecs pulled in).
+# Decode the wallpaper image at startup into RGBA8 for the bottom-
+# most wallpaper plane (epic G1/R3/R6). NON-optional production dep:
+# the wallpaper engine's ImageBackend always composites — there is
+# no pre-client solid phase. `default-features = false, features =
+# ["png"]` at the workspace level (no JPEG/GIF/… codecs pulled in).
 image = { workspace = true }
 # R8b-render: load Xcursor themes for the visible-cursor render path.
 # Reads $XCURSOR_THEME and $XCURSOR_SIZE at startup; the NixOS module
 # sets these in halmasuit.service's env and the broker propagates them
 # into the session leader's exec env (Amendment A9 allowlist).
 xcursor.workspace = true
+# Wallpaper-engine config deserialization (shader uniform bindings).
+# The Nix module writes a JSON file at HALMASUIT_WALLPAPER_CONFIG; the
+# wallpaper engine deserializes it into `WallpaperConfig`. serde +
+# serde_json are tiny on top of what the workspace already pulls in
+# for tests; making them production deps unifies the dependency
+# graph.
+serde = { workspace = true }
+serde_json.workspace = true
 # frame_audit-only. `optional = true` keeps them out of the default
 # (production) dependency graph entirely; `frame_audit` turns them on.
 zbus = { workspace = true, optional = true }
@@ -118,5 +133,4 @@ libc.workspace = true
 
 [dev-dependencies]
 nix        = { workspace = true, features = ["signal", "user", "ioctl", "process", "socket"] }
-serde_json.workspace = true
 tempfile.workspace   = true

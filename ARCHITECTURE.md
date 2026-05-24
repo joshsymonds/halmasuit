@@ -202,13 +202,13 @@ process — *not* a process restart.
 Phase                  Foreground wl_client          Adapters active
 ─────────────────────────────────────────────────────────────────────────
 INITRAMFS_SPLASH       halmasuit (internal           halmasuit-luks (if
-                        witness plane)                cryptsetup needs a
+                        wallpaper plane)                cryptsetup needs a
                                                       passphrase),
                                                       halmasuit-fsck (if
                                                       fsck needs interaction)
 
 ROOTFS_SPLASH          halmasuit (internal           (none — just waiting
-                        witness plane;                 for system readiness)
+                        wallpaper plane;                 for system readiness)
                         re-attached post-
                         re-exec; same surface
                         on screen as before)
@@ -226,7 +226,7 @@ LOCKED                 ext-session-lock-v1 client    (lock client itself
                                                       brokered by halmasuit)
 
 SHUTDOWN_SPLASH        halmasuit (internal           (none — awaits poweroff)
-                        witness plane;
+                        wallpaper plane;
                         different scene)
 ```
 
@@ -290,7 +290,7 @@ Transitions:
   client exits and niri returns to foreground.
 - **`SESSION → SHUTDOWN_SPLASH`**: triggered by `PrepareForShutdown` signal
   from logind. halmasuit asks niri to exit; once niri has, halmasuit
-  presents its internal witness plane again with a "shutting down" scene
+  presents its internal wallpaper plane again with a "shutting down" scene
   and awaits the logind-driven power-off.
 
 Two invariants hold across every transition:
@@ -327,7 +327,7 @@ threshold across any transition.
 │       └─ halmasuit (as root — no userdb yet in initramfs)            │
 │          • opens /dev/dri/card0, becomes DRM master directly         │
 │          • Wayland server   /run/halmasuit/wayland-0                 │
-│          • foreground: halmasuit (internal witness plane)            │
+│          • foreground: halmasuit (internal wallpaper plane)            │
 │          • adapter listening: halmasuit-luks (systemd password agent)│
 └──────────────────────────────────────────────────────────────────────┘
                               │
@@ -351,14 +351,14 @@ threshold across any transition.
 │                                       Lock signals)                  │
 │          • D-Bus server     → org.halmasuit.Compositor1              │
 │          • foreground wl_client over time:                            │
-│             ├─ PHASE rootfs-splash  halmasuit (witness, internal)    │
+│             ├─ PHASE rootfs-splash  halmasuit (wallpaper, internal)    │
 │             ├─ PHASE greeter        DankGreeter / regreet / …        │
 │             │                       (as 'greeter' user)              │
 │             ├─ PHASE session        niri                             │
 │             │                       (as authenticated user, launched │
 │             │                        by the halmasuit-session broker)│
 │             ├─ PHASE locked         ext-session-lock-v1 client       │
-│             └─ PHASE shutdown       halmasuit (witness, internal)     │
+│             └─ PHASE shutdown       halmasuit (wallpaper, internal)     │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -513,7 +513,7 @@ unmodified.
 
 ## Visual identity
 
-The witness plane is **not** "a logo on a background." It is composited
+The wallpaper plane is **not** "a logo on a background." It is composited
 internally by halmasuit (no separate client) and persists across every
 phase where halmasuit hosts no other foreground client; the Phase-B
 vision evolves it into a full GPU-accelerated shader-driven render path,
@@ -529,26 +529,26 @@ the Phase-B initramfs prepend extends *backward* — through
 `switch_root` and DRM-master-fd survival — without rework. Three
 pieces compose tier-agnostically:
 
-- **The witness plane is a halmasuit-internal full-output element
+- **The wallpaper plane is a halmasuit-internal full-output element
   composited from frame 0** (no external client, no pre-client solid
   phase — amendment G1). The Phase-B initramfs path inherits the same
   internal plane; `switch_root`/re-exec changes *when* halmasuit
   starts, not *what* it composites.
 - **`assert_no_flash_stream` is anchored at frame 0**, not at a
-  later client-first-frame: the witness `ClientFirstFrame{Background}`
+  later client-first-frame: the wallpaper `ClientFirstFrame{Wallpaper}`
   must precede every `frame_rendered`, and every frame is
-  witness-covered. The assertion makes no rootfs-only assumption, so
+  wallpaper-covered. The assertion makes no rootfs-only assumption, so
   Phase-B's `full-boot-flash` gate prepends the initramfs→rootfs
   frames onto the same stream and the same predicate holds across the
   `switch_root` seam without weakening it. The contract is pinned by
   the no-VM `just vis-selftest` synthetic proof.
 - **The offscreen GLES + `ExportMem` readback** is headless and
   Mesa-llvmpipe-deterministic with no GPU/GBM dependency, so the
-  pixel-exact witness assertion runs identically wherever halmasuit
+  pixel-exact wallpaper assertion runs identically wherever halmasuit
   runs — initramfs or rootfs, CI or hardware.
 
 Phase-B is therefore an *extension* of this instrument, not a
-reimplementation: the witness, the frame-0 invariant, and the readback
+reimplementation: the wallpaper, the frame-0 invariant, and the readback
 already exist and are gated; Phase-B adds the earlier tier in front of
 them.
 
@@ -562,7 +562,7 @@ ship:
 - Mesa, trimmed to the driver(s) for target hardware — ~80 MB compressed.
 - `vulkan-loader` + the Vulkan ICD for the target GPU — ~10 MB.
 - `wgpu` (or direct `ash`) statically linked into `halmasuit` (the
-  Phase-B GPU witness path) — ~20 MB.
+  Phase-B GPU wallpaper path) — ~20 MB.
 
 ~100 MB initramfs addition, decompressed once per boot. Trivially
 affordable on any 2026 system; Steam Deck's initramfs is larger and
@@ -630,7 +630,7 @@ These constrain the form, not the ambition.
 
 ### Implementation sketch (deferred to v2 implementation)
 
-What the witness plane actually *renders* is a design question separate
+What the wallpaper plane actually *renders* is a design question separate
 from the architecture and is deferred to the Phase-B visual design notes
 (TBD). halmasuit composites it internally; the architecture's only
 constraint is that the Phase-B GPU path render at the display's native
@@ -1236,11 +1236,11 @@ Scope:
   `ply-renderer-drm.c`.
 - `halmasuit` binary that runs in **both** initramfs and rootfs. Comes
   up early in initramfs, takes DRM master, brings up Wayland server,
-  composites its internal witness plane as the foreground. Re-execs
+  composites its internal wallpaper plane as the foreground. Re-execs
   itself across `switch_root` from the rootfs binary path, preserving
   DRM master fd and Wayland-socket fd across the exec, and drops
   privileges from root to `compositor` system user post-exec.
-- The witness plane: a logo + background composited internally by
+- The wallpaper plane: a logo + background composited internally by
   halmasuit (no separate client). Present in the `INITRAMFS_SPLASH`,
   `ROOTFS_SPLASH`, and `SHUTDOWN_SPLASH` phases.
 - `halmasuit-luks`: systemd password-agent adapter `wl_client`.
@@ -1301,7 +1301,7 @@ matches running niri natively.
 - **Graceful crash recovery.** When niri (or whichever inner WM is
   configured) crashes, halmasuit survives — its sole `wl_client` just
   disconnected. Halmasuit swaps the foreground back to its internal
-  witness plane rendering a "session ended" scene, then transitions to `GREETER`
+  wallpaper plane rendering a "session ended" scene, then transitions to `GREETER`
   phase for re-login. The apps that were running under niri are gone
   (same as today), but the user experience is a clean recovery UI
   rather than a black screen with leaked kernel text. Costs almost
@@ -1355,11 +1355,18 @@ These exist so the scope cannot creep without an explicit decision.
   *True* client preservation is explicitly not on the roadmap (it would
   require forking niri into a non-compositor policy daemon).
 - **NOT in v2:** multi-seat, HDR, VRR pass-through.
-- **NOT in v2:** the animated / shader-driven witness plane. v2 ships
-  a static witness image so "the system didn't brick" is visually
-  obvious. The
-  Vulkan/wgpu "Visual identity" section's full ambition is a Phase B
-  polish pass once the static path works.
+- **v2 ships the wallpaper engine; shader and video backends are
+  typed scaffolding.** The bottom-most plane is owned by
+  `WallpaperEngine` with three pluggable backends (image / shader /
+  video) behind one trait. The image backend is wired and renders
+  the configured PNG/JPEG/WebP. The shader (GLSL ES 100 + declared
+  uniforms, Shadertoy-compat preamble) and video (`ffmpeg-the-third`
+  + minimal libavcodec h264 + dav1d) backends ship as typed stubs
+  that fail closed at construction; the wallpaper-engine epic's
+  follow-up tasks wire them. The Vulkan/wgpu Phase-B initramfs path
+  consumes the same engine surface from the initramfs onward — no
+  re-architecture, just extending backward through the kernel
+  handoff.
 - **NOT in v2 (happy path only):** advanced UX in the adapter crates —
   LUKS retry / advanced options, fsck repair-decision Y/N flow,
   emergency recovery menu. The adapters themselves (`halmasuit-luks`,

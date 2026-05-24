@@ -12,12 +12,17 @@
 //!   module-level `#![forbid(unsafe_code)]`.
 //! - `responder` / `auth` — pure composition; hard module-level
 //!   `#![forbid(unsafe_code)]`.
-//! - `pam_ffi` — unsafe surface #1: the libpam FFI shim.
-//! - `worker` — unsafe surface #2: the ephemeral `fork`/pidfd auth
+//! - `pam_sys` — unsafe surface #1: the hand-rolled libpam FFI
+//!   declarations (Epic #5). One `unsafe extern "C"` block with
+//!   `#[link(name = "pam")]`; declarations only — no call sites, no
+//!   unsafe-block dispatch.
+//! - `pam_ffi` — unsafe surface #2: the libpam FFI shim — every
+//!   `unsafe { … }` call site against `pam_sys`'s declarations.
+//! - `worker` — unsafe surface #3: the ephemeral `fork`/pidfd auth
 //!   child (Epic R4).
 //!
-//! The TWO unsafe modules (`pam_ffi`, `worker`) carry NO module
-//! `#![forbid]`; every unsafe block in them has
+//! The THREE unsafe modules (`pam_sys`, `pam_ffi`, `worker`) carry NO
+//! module `#![forbid]`; every `unsafe` (extern block or call site) has
 //! `#[expect(unsafe_code, reason = "…")]`, so the workspace
 //! `unsafe_code = "warn"` lint (denied under `clippy -D warnings`)
 //! flags any stray or unjustified `unsafe` anywhere in the crate —
@@ -28,6 +33,7 @@ pub mod auth;
 pub mod broker;
 pub mod conv;
 pub mod pam_ffi;
+pub mod pam_sys;
 pub mod responder;
 pub mod session;
 pub mod session_leader;

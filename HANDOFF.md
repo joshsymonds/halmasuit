@@ -746,7 +746,7 @@ empirically**, both visually and over a per-frame event stream, across the
 Design constraints that matter for everything below (full text in
 `ARCHITECTURE.md`, `CLAUDE.md`):
 
-- halmasuit composites. The background is its internal witness plane —
+- halmasuit composites. The background is its internal wallpaper plane —
   halmasuit decodes the configured PNG and composites it itself from
   frame 0 (no separate client); the greeter and niri are unmodified
   upstream clients.
@@ -783,15 +783,15 @@ down):
 - **Renderer**: real DRM scanout via `GlesRenderer` + `DrmCompositor`;
   z-ordered `wlr-layer-shell` compositing; brand clear-color `#0a0014` before
   any client commits.
-- **Witness plane**: halmasuit decodes a configured PNG and composites
+- **Wallpaper plane**: halmasuit decodes a configured PNG and composites
   it itself as its bottom-most internal background plane from frame 0
-  (no separate client); image via `HALMASUIT_WITNESS_IMAGE` /
-  `services.halmasuit.witnessImage`.
+  (no separate client); image via `HALMASUIT_WALLPAPER_PATH` /
+  `services.halmasuit.wallpaper`.
 - **Visual proof**: `frame_audit` Cargo feature gates per-frame
   `Event::FrameRendered` + the `Snapshot()` D-Bus method (production halmasuit
   has zero audit code — verified by `cargo tree`). Goldens in
   `tests/goldens/*.png`, compared with `ssimulacra2_rs` ≥ 90.0, human-inspected.
-  Continuity invariant: from the first `ClientFirstFrame{Background}` onward
+  Continuity invariant: from the first `ClientFirstFrame{Wallpaper}` onward
   every frame has `backdrop_coverage > 0.95` and none has `mean_luminance <
   0.01` — and this must hold across the **real** greeter→niri transition.
 - **Input** (core, not feature-gated): real libinput via **libseat/seatd**
@@ -833,7 +833,7 @@ on **`main`** @ `17ae692` and gate-verified.
 |---|---|---|---|---|
 | A | Visual-test infra: `visual.py`, `ssimulacra2_rs`, Snapshot()-based capture | (infra) | `b3f100d`… | #2 ✓ |
 | B | Renderer: DRM+GBM+GlesRenderer+DrmCompositor, layer-shell, wl_shm, `#0a0014`, `frame_audit` split | `visual-halmasuit-clear/-layer/-splash` | `1a01f63`→`35c521e` | #3–8 ✓ |
-| C | Witness plane: halmasuit composites the configured PNG internally as its bottom-most background from frame 0 | `visual-halmasuit-splash` | `996f7c4` | #9 ✓ |
+| C | Wallpaper plane: halmasuit composites the configured PNG internally as its bottom-most background from frame 0 | `visual-halmasuit-splash` | `996f7c4` | #9 ✓ |
 | D | `visual-backdrop.nix` 4 stand-in scenes + FrameRendered continuity invariant | `visual-backdrop` | `6b73459` | #10 ✓ |
 | E1 | DRM acquisition via `LibSeatSession`/seatd | `drm-master-probe-phase4`, all visual | `482dc1c` (+`2b58e10`) | #11,#14 ✓ |
 | E2 | libinput + `wl_seat` keyboard/pointer + focus routing | `halmasuit-input` | `745e8e9` | #15 ✓ |
@@ -955,13 +955,13 @@ with the *real* software, now running through the broker-launched
 session.
 
 **Mechanism foundation (complete).** The in-repo G-layer instrument is
-done and gated: halmasuit composites the locked witness internally from
+done and gated: halmasuit composites the locked wallpaper internally from
 frame 0 (the `halmasuit-splash` client is deleted; config is
-`witnessImage`/`HALMASUIT_WITNESS_IMAGE`); `assert_no_flash_stream` is
+`wallpaper`/`HALMASUIT_WALLPAPER_PATH`); `assert_no_flash_stream` is
 frame-0-anchored and pinned by the no-VM `just vis-selftest` synthetic
 proof; the offscreen GLES readback gives headless deterministic
 pixel-exact assertion (`visual-halmasuit-clear` vs the human-inspected
-witness golden). Full `just test-vm` is green incl. `login-flash` and
+wallpaper golden). Full `just test-vm` is green incl. `login-flash` and
 the three broker gates. This instrument is the Phase-B-prepend
 foundation — see ARCHITECTURE.md "### Phase-B foundation (the in-repo
 instrument)". What remains below is the *real-software* tranche on top

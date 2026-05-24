@@ -1,0 +1,21 @@
+[package]
+name        = "halmasuit-decoder-ipc"
+description = "Pure wire contract between halmasuit (compositor) and halmasuit-decoder (sandboxed video-decoder subprocess). Types + codec only; no I/O, no FFI, no unsafe (Epic #12)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# JSON-on-the-wire matches halmasuit-session-ipc's posture: small text
+# payloads on the control plane, easy to dump and diff during debugging,
+# and the wire_format_* drift tests pin the shape so an accidental
+# change to the contract fails CI.
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror.workspace = true

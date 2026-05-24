@@ -206,9 +206,18 @@ These are the easy traps to fall into when adding real deps:
   cosmic-comp's current pin, never crates.io 0.7.0 (June 2024,
   pre-DnD-refactor, pre-`delegate_dispatch2!`). Standard
   smithay-downstream pattern.
-- **PAM bindings** — RESOLVED: `pam-sys` (the only libpam consumer,
-  in `halmasuit-session`). The pin + re-audit policy lives in the
-  workspace `Cargo.toml` comment; do not add a second PAM crate.
+- **PAM bindings** — RESOLVED: hand-rolled FFI in
+  `crates/halmasuit-session/src/pam_sys.rs` (Epic #5), following
+  sudo-rs's pattern (the most security-audited Rust libpam consumer
+  in existence). Production halmasuit-session links `-lpam` directly
+  with zero bindgen / clang-sys / libclang at build time. The
+  third-party `pam-sys` crate is retained as a `[dev-dependencies]`
+  audit lever consumed only by `tests/pam_ffi_parity.rs`, which
+  asserts struct layouts + constant values + symbol resolution match
+  bindgen's output against the build host's libpam headers (libpam
+  ABI drift fails CI before the broker hits it). Do not add a second
+  production PAM crate; do not introduce a `build.rs` in
+  halmasuit-session.
 - **D-Bus** — `zbus` 5.x. Do not pull in glib.
 - **wayland-server** + **calloop** are smithay's, follow smithay's
   pin.
@@ -232,7 +241,9 @@ Listed in `ARCHITECTURE.md` § "Open decisions"; the still-open ones:
 2. Final `org.halmasuit.Compositor1` D-Bus surface.
 3. OCR for text-leak detection in frame-capture (tesseract).
 
-(PAM-bindings strategy is RESOLVED — `pam-sys` in `halmasuit-session`.)
+(PAM-bindings strategy is RESOLVED — hand-rolled FFI in
+`halmasuit-session/src/pam_sys.rs`; `pam-sys` is dev-deps-only
+audit lever via `tests/pam_ffi_parity.rs`. See Ecosystem caveats.)
 
 Don't invent answers; flag the decision when the relevant code lands.
 

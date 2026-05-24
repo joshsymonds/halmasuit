@@ -1,0 +1,70 @@
+[package]
+name        = "halmasuit-decoder"
+description = "Sandboxed video-decoder subprocess for halmasuit's wallpaper engine (Epic #12). Decodes h264 + AV1 via rsmpeg; emits RGBA frames to the compositor over a SOCK_SEQPACKET back-channel. NEVER runs as root; fd 3 is the IPC socketpair end the parent dup2'd before exec."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+# Single binary entry point. No library surface; the IPC contract is
+# imported from halmasuit-decoder-ipc.
+[[bin]]
+name = "halmasuit-decoder"
+path = "src/main.rs"
+
+[dependencies]
+# The frozen wire contract with the compositor (Epic #12 task #1).
+halmasuit-decoder-ipc = { path = "../halmasuit-decoder-ipc", version = "0.1" }
+# Tracing for structured stderr logging. JSON formatter so halmasuit
+# can forward decoder logs into its own journald target if needed.
+tracing.workspace            = true
+tracing-subscriber.workspace = true
+# nix: SOCK_SEQPACKET send/recv on the raw fd inherited from the
+# parent, plus signal handling. We use the raw-fd APIs (rather than
+# wrapping in OwnedFd) to keep this skeleton hard-`#![forbid(unsafe_code)]`;
+# later tasks (sandbox primitives, rsmpeg integration) will introduce
+# per-block `#[expect(unsafe_code, reason = "...")]` annotations on
+# the specific FFI sites.
+# nix features:
+# - socket: SOCK_SEQPACKET send/recv on the IPC fd.
+# - signal: signal-mask reset in pre-exec contexts (later subtasks).
+# - process: fork (sandbox tests) + waitpid.
+# - resource: setrlimit for the sandbox (NPROC=0, AS bounded, NOFILE
+#   bounded, CORE=0).
+# - sched: unshare(CLONE_NEW{USER,NET,NS}) for namespace isolation.
+# - fs: open /proc/self/fd for the fd-close iteration.
+nix       = { workspace = true, features = ["socket", "signal", "process", "resource", "sched", "fs", "user", "uio", "poll", "dir"] }
+# libc: PR_SET_NO_NEW_PRIVS via prctl (nix doesn't expose it), plus
+# STDERR_FILENO / STDIN_FILENO etc. constants for the fd-close
+# allowlist.
+libc.workspace      = true
+thiserror.workspace = true
+# Video decoder — MIT-licensed wrapper around FFmpeg's libav*
+# (LGPL-2.1+ dynamic-link). Probes pkg-config for libavformat /
+# libavcodec / libavutil / libswscale at build time; production
+# closure has them via pkgs.ffmpeg-headless. NOT --enable-gpl,
+# so x264/x265 are NOT in scope — h264 via stock libavcodec,
+# AV1 via libdav1d. Spike (Epic #12 task 2) confirmed this dep
+# does not re-trigger clang-sys#128 against halmasuit-session's
+# dev-deps pam-sys.
+rsmpeg = { workspace = true }
+# Memory-map the wallpaper file once at decoder startup. The custom
+# AVIO callbacks read from a cursor over the mmap'd slice; loop-on-
+# EOF rewinds by recreating the AVIO + AVFormatContext over the
+# same mmap (Epic #12 task #24). No fd/position sharing with anything
+# outside the decoder process; no re-read of the underlying file
+# per loop.
+memmap2 = { workspace = true }
+# Compile the seccomp-bpf allowlist (Epic #12 task #27). The
+# `seccompiler` crate is Firecracker's BPF-program compiler: take
+# the allow-list as a Rust expression, emit a `sock_filter[]`, hand
+# to `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ...)`. No libseccomp
+# dynamic dep (the kernel takes raw BPF directly). `default-features
+# = false` drops the serde/JSON parsing path we don't use — the
+# allowlist is a Rust literal in `sandbox.rs::seccomp_filter`.
+seccompiler = { version = "0.5", default-features = false }

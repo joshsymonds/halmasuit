@@ -1,13 +1,20 @@
 // halmasuit/src/drm.rs — DRM backend: GLES + GBM + DrmCompositor.
 //
 // Production renderer wiring. halmasuit owns the DRM device, runs a
-// GLES renderer through smithay's `DrmCompositor`, and composites the
-// internal witness plane as the bottom-most element on every frame —
+// GLES renderer through smithay's `DrmCompositor`, and composites
+// the wallpaper plane as the bottom-most element on every frame —
 // including frame 0, before any wl_client connects. There is no
 // pre-client solid phase (epic amendment G1/R3/R6): the GL clear
-// color is a transient fully covered by the witness on every frame.
-// wlr-layer-shell surfaces, the foreground toplevel, and (in
+// color is a transient fully covered by the wallpaper on every
+// frame. wlr-layer-shell surfaces, the foreground toplevel, and (in
 // halmasuit-debug) frame_audit layer on top of this same pipeline.
+//
+// The wallpaper plane is owned by the [`WallpaperEngine`](crate::wallpaper::WallpaperEngine);
+// three pluggable backends (image / shader / video) share a single
+// trait surface and synchronously commit their first renderable
+// state before halmasuit's first composite. Phase-A wires the image
+// backend; shader and video are typed stubs the wallpaper-engine
+// epic fills in.
 //
 // Pattern lifted from niri's `src/backend/tty.rs` + smithay's anvil
 // example at the pinned `ff5fa7df` rev, simplified to:
@@ -16,7 +23,7 @@
 //     udev hot-plug, no multi-monitor)
 //   * Render loop driven by `DrmEvent::VBlank` from the
 //     `DrmDeviceNotifier` calloop source
-//   * The witness plane is the bottom-most render element; the
+//   * The wallpaper plane is the bottom-most render element; the
 //     front-to-back element list composites every surface over it
 
 use std::io;
@@ -34,7 +41,7 @@ use smithay::backend::renderer::element::memory::{
 };
 use smithay::backend::renderer::element::render_elements;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::element::texture::{TextureBuffer, TextureRenderElement};
+use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::session::Session;
 use smithay::backend::session::libseat::LibSeatSession;
@@ -44,15 +51,20 @@ use smithay::reexports::drm::control::connector;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::DeviceFd;
 
+use crate::wallpaper::{
+    ImageBackend, ShaderBackend, VideoBackend, WallpaperBackend, WallpaperConfig, WallpaperEngine,
+    wallpaper_slot,
+};
+
 /// The transient GL clear color, as the RGB bytes of an `#0a0014`
 /// pixel: `red=0x0A, green=0x00, blue=0x14`. Under epic amendment
-/// G1/R6 there is no observable pre-client solid phase — the witness
-/// plane covers the entire output on every frame including frame 0,
-/// so this clear is never scanned out. It is retained as THE single
-/// source of truth shared by the renderer clear
+/// G1/R6 there is no observable pre-client solid phase — the
+/// wallpaper plane covers the entire output on every frame including
+/// frame 0, so this clear is never scanned out. It is retained as
+/// THE single source of truth shared by the renderer clear
 /// (`HALMASUIT_BRAND_CLEAR` = `xrgb_le(CLEAR_RGB[0..3])`) and
 /// `frame_audit`/`offscreen`: the no-flash audit treats a pixel
-/// byte-equal to this as the uncovered sentinel ("witness not
+/// byte-equal to this as the uncovered sentinel ("wallpaper not
 /// covering"), so renderer and audit must never disagree about its
 /// value. This module is compiled into BOTH `halmasuit` and
 /// `halmasuit-debug` (not `frame_audit`-gated), the only place all
@@ -104,77 +116,25 @@ render_elements! {
     /// cursor surface trees set via `wl_pointer.set_cursor` — they
     /// share the variant; smithay's `Kind::Cursor` marker on the
     /// inner element handles cursor-specific damage tracking).
-    /// `Witness` is halmasuit's internal full-output background
-    /// plane, always the LAST element so every surface composites
-    /// over it (epic G1/R3/R6). `CursorMemory` is the named-cursor
-    /// pixmap from the loaded xcursor theme (R8b-render); always
-    /// prepended at INDEX 0 (topmost) above every client surface.
+    /// `Wallpaper` / `WallpaperShader` are halmasuit's internal
+    /// full-output background plane (image-backed and shader-backed
+    /// respectively), always the LAST element so every surface
+    /// composites over it (epic G1/R3/R6). Exactly one wallpaper
+    /// variant is produced per frame — the engine's active backend
+    /// picks which. `CursorMemory` is the named-cursor pixmap from
+    /// the loaded xcursor theme (R8b-render); always prepended at
+    /// INDEX 0 (topmost) above every client surface.
     pub SceneElement<=GlesRenderer>;
-    Surface      = WaylandSurfaceRenderElement<GlesRenderer>,
-    Witness      = TextureRenderElement<GlesTexture>,
-    CursorMemory = smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement<GlesRenderer>,
+    Surface         = WaylandSurfaceRenderElement<GlesRenderer>,
+    Wallpaper       = TextureRenderElement<GlesTexture>,
+    WallpaperShader = smithay::backend::renderer::gles::element::PixelShaderElement,
+    CursorMemory    = smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement<GlesRenderer>,
 }
 
-/// The index the internal witness plane occupies in the front-to-back
-/// element list, or `None` when no witness is configured.
-///
-/// With `n_surfaces` surface elements already pushed, the witness goes
-/// at index `n_surfaces` — i.e. it is appended LAST, making it the
-/// bottom-most element of the `n_surfaces + 1`-element scene (frame 0,
-/// with no surfaces, is therefore exactly the witness, never a solid
-/// clear). With no witness configured the scene is just the surfaces
-/// (the legacy clear-only path used by non-visual integration tests).
-/// `scene_elements` branches on this; the contract is unit-pinned by
-/// `tests::witness_is_the_bottom_most_element` (no GPU needed).
-#[must_use]
-fn witness_slot(n_surfaces: usize, has_witness: bool) -> Option<usize> {
-    has_witness.then_some(n_surfaces)
-}
-
-/// Decode the witness PNG at `path` into tightly-packed RGBA8 bytes
-/// (`[R, G, B, A]`, the layout `Fourcc::Abgr8888` expects) plus its
-/// pixel dimensions.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be read or is not a decodable
-/// image.
-fn decode_witness(path: &Path) -> io::Result<(Vec<u8>, i32, i32)> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| io::Error::other(format!("read witness {}: {e}", path.display())))?;
-    let img = image::load_from_memory(&bytes)
-        .map_err(|e| io::Error::other(format!("decode witness {}: {e}", path.display())))?
-        .to_rgba8();
-    let (w, h) = img.dimensions();
-    let w = i32::try_from(w).map_err(|_| {
-        io::Error::other(format!(
-            "witness {} width {w} exceeds i32::MAX",
-            path.display()
-        ))
-    })?;
-    let h = i32::try_from(h).map_err(|_| {
-        io::Error::other(format!(
-            "witness {} height {h} exceeds i32::MAX",
-            path.display()
-        ))
-    })?;
-    Ok((img.into_raw(), w, h))
-}
-
-/// The imported witness texture plus its own logical pixel size.
-///
-/// The size is load-bearing for the render element's source rect:
-/// `TextureRenderElement::from_texture_buffer` with `src = None`
-/// defaults the source to the DESTINATION logical size (the full
-/// output), NOT the texture's extent — so the sampler reads far
-/// outside the texture and clamps every output pixel to the edge
-/// texel (a uniform smear of the bottom-right pixel). We therefore
-/// pass an explicit `src` of exactly this texture rectangle so the
-/// whole image is sampled and stretched to the output.
 /// R8b-render cursor state. Lives on `DrmBackend` (next to the
-/// renderer and witness) because cursor pixmap upload uses the same
-/// renderer; main.rs is sans-Renderer and forwards state changes via
-/// `set_cursor_status` / `set_pointer_location`.
+/// renderer and the wallpaper engine) because cursor pixmap upload
+/// uses the same renderer; main.rs is sans-Renderer and forwards
+/// state changes via `set_cursor_status` / `set_pointer_location`.
 struct CursorRenderState {
     theming: crate::cursor::CursorTheming,
     status: smithay::input::pointer::CursorImageStatus,
@@ -201,11 +161,6 @@ struct CachedNamed {
     buffer: MemoryRenderBuffer,
 }
 
-struct Witness {
-    buffer: TextureBuffer<GlesTexture>,
-    size: smithay::utils::Size<i32, smithay::utils::Logical>,
-}
-
 /// The full GLES + GBM + DrmCompositor stack wrapped around a single
 /// DRM device + connector + CRTC. Pinned for the process lifetime in
 /// `HalmasuitState`. Dropping this value releases the master, tears
@@ -225,12 +180,13 @@ pub struct DrmBackend {
     /// GLES renderer bound to the GBM device's EGL display. Used by
     /// `render_frame` every vblank to clear + composite.
     pub renderer: GlesRenderer,
-    /// The internal witness plane, imported once at startup from
-    /// `HALMASUIT_WITNESS_IMAGE` and reused as the bottom-most element
-    /// every frame (epic G1/R3/R6). `None` when no witness is
-    /// configured — the legacy clear-only path for non-visual
-    /// integration tests; production/visual deployments always set it.
-    witness: Option<Witness>,
+    /// The wallpaper engine — owns the active backend (image / shader
+    /// / video) and builds the bottom-most render element every frame
+    /// (epic G1/R3/R6). When no backend is configured the engine
+    /// produces no element — the legacy clear-only path for
+    /// non-visual integration tests; production/visual deployments
+    /// always configure one.
+    wallpaper: WallpaperEngine,
     /// R8b-render cursor state. `theming` is the loaded xcursor theme
     /// (or procedural fallback); `status` is the latest client-
     /// requested CursorImageStatus; `pointer_loc` is the current
@@ -258,6 +214,21 @@ impl DrmBackend {
     #[must_use]
     pub fn snapshot_handle(&self) -> crate::dbus::SnapshotBuffer {
         self.snapshot_buf.clone()
+    }
+
+    /// Periodic tick that drives the wallpaper backend's
+    /// render-loop-independent polling AND the fallback-swap
+    /// check. Called from a calloop timer registered in
+    /// [`setup_drm_backend`] for `WallpaperConfig::Video`
+    /// configurations. For non-video backends this is a no-op.
+    ///
+    /// Returns `true` iff a fallback swap fired this tick — the
+    /// timer callback in `main.rs` uses this to queue an explicit
+    /// render so the newly-installed fallback reaches the screen
+    /// (idle render loop after relay-death produces no vblank to
+    /// pick up the swap otherwise).
+    pub fn tick_wallpaper(&mut self) -> bool {
+        self.wallpaper.tick(&mut self.renderer)
     }
 }
 
@@ -298,7 +269,7 @@ pub fn setup_drm_backend<S, F>(
     path: &Path,
     loop_handle: &smithay::reexports::calloop::LoopHandle<'static, S>,
     drm_event_handler: F,
-    witness_path: Option<&Path>,
+    wallpaper_config: Option<WallpaperConfig>,
 ) -> io::Result<(
     DrmBackend,
     smithay::reexports::calloop::RegistrationToken,
@@ -448,33 +419,35 @@ where
     )
     .map_err(|e| io::Error::other(format!("DrmCompositor::new: {e}")))?;
 
-    // Import the witness PNG once into a GPU texture (reused every
-    // frame as the bottom-most element). `to_rgba8()` yields
-    // `[R,G,B,A]` bytes, which `Fourcc::Abgr8888` reads in that
-    // little-endian order. `renderer` is no longer borrowed (the
-    // immutable `render_formats` borrow above has ended) and is moved
-    // into `DrmBackend` just below.
-    let witness = match witness_path {
-        Some(p) => {
-            let (rgba, iw, ih) = decode_witness(p)?;
-            let buffer = TextureBuffer::from_memory(
-                &mut renderer,
-                &rgba,
-                Fourcc::Abgr8888,
-                (iw, ih),
-                false,
-                1,
-                smithay::utils::Transform::Normal,
-                None,
-            )
-            .map_err(|e| io::Error::other(format!("witness texture import: {e}")))?;
-            // scale=1, transform=Normal ⇒ logical size == pixel size.
-            Some(Witness {
-                buffer,
-                size: smithay::utils::Size::from((iw, ih)),
-            })
+    // Build the wallpaper engine. Each backend's constructor decodes
+    // / compiles synchronously, so the engine is frame-0 ready when
+    // this returns (epic G1/R3/R6 — every frame the renderer
+    // composites after this is wallpaper-covered). `renderer` is no
+    // longer borrowed (the immutable `render_formats` borrow above
+    // has ended) and is moved into `DrmBackend` just below.
+    let wallpaper = match wallpaper_config {
+        Some(cfg) => {
+            let backend: Box<dyn WallpaperBackend> = match cfg {
+                WallpaperConfig::Image { source } => {
+                    Box::new(ImageBackend::new(&mut renderer, &source)?)
+                }
+                WallpaperConfig::Shader { source, uniforms } => {
+                    Box::new(ShaderBackend::new(&mut renderer, &source, uniforms)?)
+                }
+                WallpaperConfig::Video {
+                    source,
+                    loop_playback,
+                    fallback,
+                } => Box::new(VideoBackend::new(
+                    &mut renderer,
+                    &source,
+                    loop_playback,
+                    fallback,
+                )?),
+            };
+            WallpaperEngine::with_backend(backend)
         }
-        None => None,
+        None => WallpaperEngine::empty(),
     };
 
     // Register the DRM event notifier with calloop. The notifier
@@ -489,7 +462,7 @@ where
         DrmBackend {
             compositor,
             renderer,
-            witness,
+            wallpaper,
             cursor: CursorRenderState {
                 theming: crate::cursor::CursorTheming::load(),
                 status: smithay::input::pointer::CursorImageStatus::default_named(),
@@ -664,17 +637,23 @@ impl DrmBackend {
     /// surface subtree as a `SceneElement::Surface`
     /// (`render_elements_from_surface_tree`; the renderer lazily
     /// imports committed `wl_shm` buffers as `GlesTexture`s during the
-    /// draw). The internal witness plane, when configured, is appended
-    /// LAST as `SceneElement::Witness` — the bottom-most element, so
+    /// draw). The wallpaper plane, when configured, is appended LAST
+    /// as `SceneElement::Wallpaper` — the bottom-most element, so
     /// every surface composites over it and frame 0 (no surfaces) is
-    /// already the witness, never a solid clear (epic G1/R3/R6). The
-    /// foreground toplevel sits above the wallpaper layers and below
-    /// OSK/lock/notification overlays.
+    /// already the wallpaper, never a solid clear (epic G1/R3/R6).
+    /// The foreground toplevel sits above the wallpaper layers and
+    /// below OSK/lock/notification overlays.
+    ///
+    /// # Errors
+    ///
+    /// Bubbles any wallpaper-backend render error (the image backend
+    /// is infallible after construction; shader/video backends may
+    /// fail per-frame once they land).
     fn scene_elements(
         &mut self,
         output: &smithay::output::Output,
         foreground: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
-    ) -> Vec<SceneElement> {
+    ) -> io::Result<Vec<SceneElement>> {
         use smithay::backend::renderer::element::Kind;
         use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
         use smithay::desktop::layer_map_for_output;
@@ -731,32 +710,14 @@ impl DrmBackend {
         }
         drop(map);
 
-        if let Some(slot) = witness_slot(elements.len(), self.witness.is_some()) {
-            debug_assert_eq!(slot, elements.len(), "witness is the bottom-most element");
-            let witness = self
-                .witness
-                .as_ref()
-                .expect("witness_slot returns Some only when witness is_some");
+        if let Some(slot) = wallpaper_slot(elements.len(), self.wallpaper.has_backend()) {
+            debug_assert_eq!(slot, elements.len(), "wallpaper is the bottom-most element");
             let osize = output.current_mode().map(|m| m.size).unwrap_or_default();
-            // Destination = the full output (stretch, no aspect
-            // preservation). Source = the witness texture's OWN extent
-            // (NOT None — see `Witness`): smithay scales src→dst, so
-            // this samples the whole image and stretches it to fill.
             let dst =
                 smithay::utils::Size::<i32, smithay::utils::Logical>::from((osize.w, osize.h));
-            let src = smithay::utils::Rectangle::<f64, smithay::utils::Logical>::from_size(
-                witness.size.to_f64(),
-            );
-            elements.push(SceneElement::Witness(
-                TextureRenderElement::from_texture_buffer(
-                    smithay::utils::Point::<f64, smithay::utils::Physical>::from((0.0, 0.0)),
-                    &witness.buffer,
-                    None,
-                    Some(src),
-                    Some(dst),
-                    Kind::Unspecified,
-                ),
-            ));
+            if let Some(element) = self.wallpaper.render_element(&mut self.renderer, dst)? {
+                elements.push(element);
+            }
         }
         // R8b-render: prepend cursor elements so they sit at index 0
         // (topmost). Smithay's render is front-to-back; the cursor
@@ -764,45 +725,47 @@ impl DrmBackend {
         if !cursor_elements.is_empty() {
             let mut combined = cursor_elements;
             combined.append(&mut elements);
-            return combined;
+            return Ok(combined);
         }
-        elements
+        Ok(elements)
     }
 
     /// Render one frame with no foreground toplevel — the frame-0 /
-    /// no-layers shape. The scene is the internal witness plane (when
+    /// no-layers shape. The scene is the wallpaper plane (when
     /// configured); `clear_color` is the transient GL clear the
-    /// witness fully covers (epic G1/R6). With no witness configured
-    /// it is the legacy clear-only path used by non-visual
-    /// integration tests. Returns `Ok(true)` if a frame was queued
-    /// (non-empty damage), `Ok(false)` if nothing changed.
+    /// wallpaper fully covers (epic G1/R6). With no wallpaper
+    /// configured it is the legacy clear-only path used by
+    /// non-visual integration tests. Returns `Ok(true)` if a frame
+    /// was queued (non-empty damage), `Ok(false)` if nothing changed.
     ///
     /// # Errors
     ///
-    /// Returns an error if `render_frame` or `queue_frame` fail.
+    /// Returns an error if `scene_elements`, `render_frame`, or
+    /// `queue_frame` fail.
     pub fn render_one_frame(
         &mut self,
         output: &smithay::output::Output,
         clear_color: [u8; 4],
     ) -> io::Result<bool> {
-        let elements = self.scene_elements(output, None);
+        let elements = self.scene_elements(output, None)?;
         self.render_with_elements_inner(output, &elements, clear_color)
     }
 
     /// Render a frame composed of the mapped layer-shell surfaces and
-    /// the optional foreground toplevel over the internal witness
-    /// plane. See [`scene_elements`](Self::scene_elements) for z-order.
+    /// the optional foreground toplevel over the wallpaper plane.
+    /// See [`scene_elements`](Self::scene_elements) for z-order.
     ///
     /// # Errors
     ///
-    /// Returns an error if `render_frame` or `queue_frame` fail.
+    /// Returns an error if `scene_elements`, `render_frame`, or
+    /// `queue_frame` fail.
     pub fn render_layer_elements(
         &mut self,
         output: &smithay::output::Output,
         foreground: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
         clear_color: [u8; 4],
     ) -> io::Result<bool> {
-        let elements = self.scene_elements(output, foreground);
+        let elements = self.scene_elements(output, foreground)?;
         self.render_with_elements_inner(output, &elements, clear_color)
     }
 
@@ -965,31 +928,8 @@ mod tests {
         assert!((color.a() - 1.0).abs() < eps);
     }
 
-    /// The witness plane is the bottom-most render element: it is
-    /// appended LAST to the front-to-back element list (index 0 =
-    /// topmost), so every wl_client composites over it and frame 0 is
-    /// already the witness — there is no pre-client solid phase (epic
-    /// G1/R3/R6). `scene_elements` branches on `witness_slot`; this
-    /// pins that contract without a GPU.
-    #[test]
-    fn witness_is_the_bottom_most_element() {
-        // Frame 0 / no surfaces, witness configured: the scene is
-        // exactly one element — the witness — at index 0 (== last).
-        assert_eq!(witness_slot(0, true), Some(0));
-
-        // With N surfaces the witness slot is N: the last index of an
-        // (N+1)-element list, i.e. bottom-most.
-        for n in [1, 3, 7] {
-            let slot = witness_slot(n, true).expect("witness configured");
-            assert_eq!(slot, n, "witness must be appended after every surface");
-            let total_len = n + 1;
-            assert_eq!(slot, total_len - 1, "witness must be the LAST element");
-        }
-
-        // No witness configured (non-visual integration paths): no
-        // witness slot — the legacy clear-only scene is unchanged.
-        for n in [0, 1, 5] {
-            assert_eq!(witness_slot(n, false), None);
-        }
-    }
+    // The wallpaper z-order contract is unit-tested by
+    // `crate::wallpaper::tests::wallpaper_is_the_bottom_most_element`
+    // — the `wallpaper_slot` helper now lives there alongside the
+    // engine that consumes it.
 }

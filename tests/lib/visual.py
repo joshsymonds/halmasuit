@@ -27,11 +27,11 @@ The module wraps three concerns:
     supplied to the helper via the `GOLDENS_DIR` environment variable
     so the helper doesn't have to guess.
 
-  * `assert_matches_witness(machine, name, threshold=95.0)` — the
+  * `assert_matches_exact(machine, name, threshold=95.0)` — the
     sampled exact-IMAGE gate. Same capture + ssimulacra2 path as
     `assert_matches_golden`, but the default threshold is the tighter
     95.0 (deterministic offscreen llvmpipe readback of a known scene
-    must match its checked-in witness near-exactly; only sub-JND
+    must match its checked-in golden near-exactly; only sub-JND
     swrast rounding is tolerated). A pixel-exact comparison against a
     reference image at a SETTLED scene — never a "is it dark enough /
     mostly covered" guess. Never bit-exact (epic anti-pattern); never
@@ -41,11 +41,11 @@ The module wraps three concerns:
 
   * `assert_no_flash_stream(machine)` — the 100%-of-`frame_rendered`-
     stream no-flash gate, asserted as EXACT integer/boolean facts
-    (`clear_pixel_count == 0` post-background; never `degenerate`;
+    (`clear_pixel_count == 0` post-wallpaper; never `degenerate`;
     backdrop mapped once and never resized). This is the no-flash
     proof; it runs over EVERY composited frame, not a sample, with
     zero tolerance. Orthogonal to and live ALONGSIDE the sampled
-    witness/golden image gates, never instead of them.
+    golden image gates, never instead of them.
 
 Two environment variables tune behavior:
 
@@ -247,21 +247,21 @@ def assert_matches_golden(
 
 # The exact-image floor. Tighter than DEFAULT_THRESHOLD because the
 # offscreen llvmpipe readback of a deterministic, known scene must match
-# its checked-in witness near-exactly — only sub-JND software-rasterizer
+# its checked-in golden near-exactly — only sub-JND software-rasterizer
 # rounding is allowed. Still strictly above the repo-wide 90.0 floor;
 # never bit-exact (epic anti-pattern).
-WITNESS_THRESHOLD = 95.0
+EXACT_IMAGE_THRESHOLD = 95.0
 
 
-def assert_matches_witness(
+def assert_matches_exact(
     machine,
     name: str,
     *,
-    threshold: float = WITNESS_THRESHOLD,
+    threshold: float = EXACT_IMAGE_THRESHOLD,
 ) -> None:
     """Exact-image gate: capture the real composited frame via the
     offscreen GLES readback and assert it matches the checked-in
-    witness `${GOLDENS_DIR}/{name}.png` with ssimulacra2 ≥ `threshold`
+    golden `${GOLDENS_DIR}/{name}.png` with ssimulacra2 ≥ `threshold`
     (default 95.0).
 
     This is the sampled CONTENT-correctness gate: it compares the
@@ -321,20 +321,20 @@ def assert_no_flash_stream(machine, events=None) -> None:
     zero tolerance.
 
     Anchored at FRAME 0 (epic amendment G1/R3): halmasuit composites
-    the witness plane internally from the very first frame — there is
-    no pre-client solid phase — so EVERY `frame_rendered`, from the
-    first, must already be witness-covered:
+    the wallpaper plane internally from the very first frame — there
+    is no pre-client solid phase — so EVERY `frame_rendered`, from
+    the first, must already be wallpaper-covered:
 
-    - Exactly one `client_first_frame{role:background}` (the internal
-      witness plane, emitted before the first composited frame). Zero
-      ⇒ the witness never composited; >1 ⇒ the backdrop was
-      recreated. Both fail.
-    - That witness cff must PRECEDE every `frame_rendered`: a frame
-      rendered before it means frame 0 was not witness-covered — a
+    - Exactly one `client_first_frame{role:wallpaper}` (the wallpaper
+      plane, emitted before the first composited frame). Zero ⇒ the
+      wallpaper never composited; >1 ⇒ the backdrop was recreated.
+      Both fail.
+    - That wallpaper cff must PRECEDE every `frame_rendered`: a frame
+      rendered before it means frame 0 was not wallpaper-covered — a
       pre-client solid phase / flash. Strictly stronger than the
       pre-4c cff-SUFFIX anchor, which silently excluded such frames
-      (see the synthetic proof's "frame_rendered precedes the witness
-      bg cff" case).
+      (see the synthetic proof's "frame_rendered precedes the
+      wallpaper cff" case).
     - Then EVERY `frame_rendered` (frame 0 onward, not a suffix) must
       have ``clear_pixel_count == 0`` (no sentinel-clear pixel — even
       one is a flash), ``degenerate == False`` (no all-clear,
@@ -352,26 +352,26 @@ def assert_no_flash_stream(machine, events=None) -> None:
     if events is None:
         events = introspect_events(machine)
 
-    bg_cff = [
+    wp_cff = [
         i
         for i, ev in enumerate(events)
-        if ev["event"] == "client_first_frame" and ev.get("role") == "background"
+        if ev["event"] == "client_first_frame" and ev.get("role") == "wallpaper"
     ]
-    if not bg_cff:
+    if not wp_cff:
         raise AssertionError(
-            "no client_first_frame{role:background} in the halmasuit "
-            "event stream — the internal witness plane never "
-            "composited a frame.\n"
+            "no client_first_frame{role:wallpaper} in the halmasuit "
+            "event stream — the wallpaper plane never composited a "
+            "frame.\n"
             f"events seen: {[e['event'] for e in events]}"
         )
-    if len(bg_cff) != 1:
+    if len(wp_cff) != 1:
         raise AssertionError(
-            "background surface was mapped/recreated more than once: "
-            f"{len(bg_cff)} client_first_frame{{role:background}} events "
-            f"at indices {bg_cff} (expected exactly 1 — the witness "
+            "wallpaper plane was mapped/recreated more than once: "
+            f"{len(wp_cff)} client_first_frame{{role:wallpaper}} events "
+            f"at indices {wp_cff} (expected exactly 1 — the wallpaper "
             "plane is created once and never recreated)."
         )
-    first_bg = bg_cff[0]
+    first_wp = wp_cff[0]
 
     fr = [
         (i, ev)
@@ -382,20 +382,21 @@ def assert_no_flash_stream(machine, events=None) -> None:
         raise AssertionError(
             "no frame_rendered events; the exact no-flash stream gate "
             "cannot vacuously pass — frame_audit must be live and the "
-            "witness must have composited at least one frame.\n"
+            "wallpaper must have composited at least one frame.\n"
             f"events seen: {[e['event'] for e in events]}"
         )
     first_fr = fr[0][0]
 
-    # FRAME-0 anchor (epic G1/R3): the witness cff must precede every
-    # composited frame. A frame_rendered before it means frame 0 was
-    # not witness-covered — a pre-client solid phase / flash. Strictly
-    # stronger than the pre-4c suffix anchor (which excluded it).
-    if first_bg > first_fr:
+    # FRAME-0 anchor (epic G1/R3): the wallpaper cff must precede
+    # every composited frame. A frame_rendered before it means frame 0
+    # was not wallpaper-covered — a pre-client solid phase / flash.
+    # Strictly stronger than the pre-4c suffix anchor (which excluded
+    # it).
+    if first_wp > first_fr:
         raise AssertionError(
-            f"frame_rendered @#{first_fr} precedes the witness "
-            f"client_first_frame{{background}} @#{first_bg}: frame 0 "
-            "was NOT witness-covered — a pre-client solid phase / "
+            f"frame_rendered @#{first_fr} precedes the wallpaper "
+            f"client_first_frame{{wallpaper}} @#{first_wp}: frame 0 "
+            "was NOT wallpaper-covered — a pre-client solid phase / "
             "flash, the exact thing epic G1/R3 forbids."
         )
 
@@ -407,7 +408,7 @@ def assert_no_flash_stream(machine, events=None) -> None:
     if clear_viol or degen_viol or size_viol:
         raise AssertionError(
             "frame_rendered no-flash invariant VIOLATED "
-            f"({len(fr)} frames; witness bg cff @#{first_bg}, first "
+            f"({len(fr)} frames; wallpaper cff @#{first_wp}, first "
             f"frame_rendered @#{first_fr}):\n"
             f"  clear_pixel_count != 0: {clear_viol[:5]}\n"
             f"  degenerate frame: {degen_viol[:5]}\n"
@@ -418,7 +419,7 @@ def assert_no_flash_stream(machine, events=None) -> None:
             {
                 "no_flash_stream": "OK",
                 "frames": len(fr),
-                "first_background_cff_index": first_bg,
+                "first_wallpaper_cff_index": first_wp,
                 "first_frame_rendered_index": first_fr,
                 "pixel_count": sizes[0],
             }
@@ -500,9 +501,9 @@ def record_boot(
 # contract test feeding it synthetic event streams (the `events=`
 # parameter), run as a hard gate by `just vis-selftest` (wired into
 # `just check`) — no VM, no GPU. It pins, in particular, the FRAME-0
-# anchor (epic G1): the witness is composited from frame 0, so a
-# `frame_rendered` that precedes the witness
-# `client_first_frame{background}` is a flash and MUST fail — the
+# anchor (epic G1): the wallpaper is composited from frame 0, so a
+# `frame_rendered` that precedes the wallpaper
+# `client_first_frame{wallpaper}` is a flash and MUST fail — the
 # pre-4c cff-suffix anchor silently excluded such frames.
 # ───────────────────────────────────────────────────────────────────
 
@@ -529,35 +530,36 @@ def _raises(events) -> bool:
 
 
 def _selftest() -> None:
-    # Clean frame-0-anchored stream: bg cff precedes every frame,
-    # every frame witness-covered, one bg cff, constant size → PASS.
-    clean = [_cff("background"), _fr(), _fr(), _fr()]
+    # Clean frame-0-anchored stream: wallpaper cff precedes every
+    # frame, every frame wallpaper-covered, one wallpaper cff,
+    # constant size → PASS.
+    clean = [_cff("wallpaper"), _fr(), _fr(), _fr()]
     assert_no_flash_stream(None, events=clean)  # must NOT raise
 
     cases = {
-        "clear_pixel_count != 0 on a post-bg frame": [
-            _cff("background"), _fr(), _fr(clear=1)
+        "clear_pixel_count != 0 on a post-wallpaper frame": [
+            _cff("wallpaper"), _fr(), _fr(clear=1)
         ],
         "a degenerate frame": [
-            _cff("background"), _fr(), _fr(degenerate=True)
+            _cff("wallpaper"), _fr(), _fr(degenerate=True)
         ],
-        "two background cff (backdrop recreated)": [
-            _cff("background"), _fr(), _cff("background"), _fr()
+        "two wallpaper cff (wallpaper recreated)": [
+            _cff("wallpaper"), _fr(), _cff("wallpaper"), _fr()
         ],
-        "zero background cff": [_cff("top"), _fr(), _fr()],
+        "zero wallpaper cff": [_cff("top"), _fr(), _fr()],
         "no frame_rendered (non-vacuous: cannot vacuously pass)": [
-            _cff("background")
+            _cff("wallpaper")
         ],
-        "pixel_count not constant (backdrop resized)": [
-            _cff("background"), _fr(pixel_count=1024000), _fr(pixel_count=999)
+        "pixel_count not constant (wallpaper resized)": [
+            _cff("wallpaper"), _fr(pixel_count=1024000), _fr(pixel_count=999)
         ],
         # STRICTLY-STRONGER (epic G1/4c): a frame_rendered BEFORE the
-        # witness bg cff. The pre-4c cff-suffix anchor (post_bg = i >=
-        # first_bg) silently EXCLUDED this frame and PASSED the stream.
-        # Frame 0 must already be witness-covered — this is a flash and
-        # MUST now fail.
-        "frame_rendered precedes the witness bg cff (frame 0 not covered)": [
-            _fr(), _cff("background"), _fr(), _fr()
+        # wallpaper cff. The pre-4c cff-suffix anchor (post_wp = i >=
+        # first_wp) silently EXCLUDED this frame and PASSED the
+        # stream. Frame 0 must already be wallpaper-covered — this is
+        # a flash and MUST now fail.
+        "frame_rendered precedes the wallpaper cff (frame 0 not covered)": [
+            _fr(), _cff("wallpaper"), _fr(), _fr()
         ],
     }
     failed = [name for name, ev in cases.items() if not _raises(ev)]
