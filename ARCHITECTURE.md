@@ -491,18 +491,18 @@ Flow:
 7. Halmasuit's Wayland server now hosts niri as its sole foreground
    client.
 
-> **Status (epic §0 / [`HANDOFF.md`](HANDOFF.md) §0.7–§0.12).**
-> The privilege-separated `halmasuit-session` broker described in
-> steps 4–6 is the **live** auth/session path: the unprivileged
-> compositor relays the greetd conversation to it over a
+> **Status.** The privilege-separated `halmasuit-session` broker
+> described in steps 4–6 is the **live** auth/session path: the
+> unprivileged compositor relays the greetd conversation to it over a
 > `SOCK_SEQPACKET` channel (sans-IO; Amendments A6/A7/A8). The former
 > in-compositor `crates/halmasuit-pam` and the setuid `halmasuit-spawn`
 > helper are **deleted** — single libpam surface (`halmasuit-session`),
-> no setuid inode in the closure (Epic R10/R14/R15, landed atomically
-> with the broker going live, Amendment A4). Proven end-to-end with
-> real `pam_unix` + `pam_mount` and no mocks, including `login-flash`
-> (PID + frame continuity through the broker-launched session). See
-> "Authentication and session lifecycle" and `HANDOFF.md` §0.7–§0.12.
+> no setuid inode in the closure (landed atomically with the broker
+> going live, Amendment A4). Proven end-to-end with real `pam_unix` +
+> `pam_mount` and no mocks, including `login-flash` (PID + frame
+> continuity through the broker-launched session). See "Authentication
+> and session lifecycle" below and
+> [`PLAN.md`'s "Privilege-separation decision record"](PLAN.md#privilege-separation-decision-record).
 
 DMS patch needed: roughly twenty lines in the `dms-greeter` launcher
 script to skip its nested-niri spawn when `WAYLAND_DISPLAY` is already
@@ -691,8 +691,9 @@ execve(cmd, sanitized_argv, pam_getenvlist-MERGED env)   # absolute path, no PAT
 No intervening syscalls touch user-controlled state between the first
 `setres*` and `execve`. The supplementary groups are
 `getgrouplist(PAM-resolved user, primary gid)` **ONLY** — the
-OpenSSH/login/GDM identity-derived shape (Amendment A9, HANDOFF
-§0.13) — **never** the privileged broker's own `getgroups()`. Under R1
+OpenSSH/login/GDM identity-derived shape (Amendment A9; see
+[`PLAN.md`](PLAN.md#privilege-separation-decision-record)) —
+**never** the privileged broker's own `getgroups()`. Under R1
 `pam_setcred` runs in the broker, which carries its own groups (e.g.
 `shadow` for pam_unix's in-process getspnam); sourcing the leader's
 set from that process is the CVE-2021-41617 / sddm#1159
@@ -813,23 +814,25 @@ PAM transaction. Identity is PAM-derived and independently
 re-verified by the broker (`pam_get_user` → pwent, UID/GID floor,
 pwent cross-check) — never the pre-auth client-supplied string.
 
-> **Status (2026-05; [`HANDOFF.md`](HANDOFF.md) §0.8).** This broker
-> is built, deployed (socket-activated host-ns unit), and VM-proven
-> end-to-end with real PAM and no mocks: `run-pam-auth` (auth in the
-> killable fork), `session-r5r6` (evict-old reachable from the event
-> loop + no-standing-root idle-exit + lossless re-activation), and the
-> flagship `session-onehandle` (real `pam_mount` decrypts+mounts a
-> LUKS `$HOME` at `pam_open_session` using the auth-phase password
-> recovered from the **same** `pam_handle_t` — a split handle would
-> silently fail this). The unprivileged compositor relays to this
-> broker over a sans-IO `SOCK_SEQPACKET` channel (Amendments A6/A7/A8);
-> the broker's SO_PEERCRED gate authorizes its trusted **relay peer**
-> (the compositor in the live topology — the greeter is gated at the
+> **Status.** This broker is built, deployed (socket-activated
+> host-ns unit), and VM-proven end-to-end with real PAM and no mocks:
+> `run-pam-auth` (auth in the killable fork), `session-r5r6` (evict-old
+> reachable from the event loop + no-standing-root idle-exit + lossless
+> re-activation), and the flagship `session-onehandle` (real
+> `pam_mount` decrypts+mounts a LUKS `$HOME` at `pam_open_session`
+> using the auth-phase password recovered from the **same**
+> `pam_handle_t` — a split handle would silently fail this). The
+> unprivileged compositor relays to this broker over a sans-IO
+> `SOCK_SEQPACKET` channel (Amendments A6/A7/A8); the broker's
+> SO_PEERCRED gate authorizes its trusted **relay peer** (the
+> compositor in the live topology — the greeter is gated at the
 > compositor's own greetd socket; identity is independently
 > PAM-derived, R8). The former in-process `crates/halmasuit-pam` +
 > setuid `halmasuit-spawn` are **deleted** atomically with the broker
-> becoming live (Epic R10/R14/R15, Amendment A4). `HANDOFF.md`
-> §0.7–§0.12 (Amendments A1–A8) is the canonical decision record.
+> becoming live (Amendment A4).
+> [`PLAN.md`'s "Privilege-separation decision record"](PLAN.md#privilege-separation-decision-record)
+> is the canonical decision record (Amendments A1–A9, with primary-
+> source derivations and DO-NOT-REVISIT conditions).
 
 ---
 
@@ -1224,8 +1227,9 @@ B** (initramfs survival). The split is execution sequencing only;
 the architectural commitment is unchanged. Phase A is complete and its
 auth/session model has since been rebuilt by the privilege-separation
 epic (the `halmasuit-session` broker; see "Authentication and session
-lifecycle" above and [`HANDOFF.md`](HANDOFF.md) §0). See
-[`PLAN.md`](PLAN.md) for the in-scope status table.
+lifecycle" above and
+[`PLAN.md`'s "Privilege-separation decision record"](PLAN.md#privilege-separation-decision-record)).
+See [`PLAN.md`](PLAN.md) for the in-scope status table.
 
 Scope:
 
@@ -1397,8 +1401,9 @@ Things we will not do regardless of pressure:
   **deleted** — there is no setuid inode in the closure at all
   (Epic R15); no setuid spawn path may be re-introduced.
 - **NO sourcing the session-leader child's supplementary groups from
-  the privileged broker's own `getgroups()`** (Amendment A9, HANDOFF
-  §0.13). They are `getgrouplist(PAM-resolved user, primary gid)`
+  the privileged broker's own `getgroups()`** (Amendment A9; see
+  [`PLAN.md`](PLAN.md#privilege-separation-decision-record)). They
+  are `getgrouplist(PAM-resolved user, primary gid)`
   ONLY — the OpenSSH/login/GDM identity-derived shape. The broker
   carries its own privileged groups (e.g. `shadow`); grafting them
   onto the dropped session is the CVE-2021-41617 / sddm#1159

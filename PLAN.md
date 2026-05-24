@@ -232,7 +232,7 @@ consuming code lands.
 - ~~**PAM bindings strategy.**~~ **RESOLVED:** hand-rolled libpam FFI in `crates/halmasuit-session/src/pam_sys.rs` (Epic #5), following sudo-rs's pattern. Production halmasuit-session links `-lpam` directly with zero bindgen / clang-sys / libclang at build time. Originally in `halmasuit-pam` with `pam-sys` as the binding crate; **superseded twice** — first by the privilege-separation epic (which moved the FFI surface to the privileged `halmasuit-session` broker; `halmasuit-pam` deleted; `r14-gate` enforces the single libpam surface), then by Epic #5 (which replaced the `pam-sys` dependency with the hand-rolled extern block; pam-sys retained as `[dev-dependencies]`-only audit lever via `tests/pam_ffi_parity.rs`).
 - ~~**smithay revision pin.**~~ **RESOLVED:** pinned to niri's current git revision (`ff5fa7df...`) in workspace `Cargo.toml`.
 - ~~**Build order within "broadly working."**~~ **RESOLVED** (Phase A): introspection sink first, then the smithay spine, then `halmasuit-greetd`, then calloop wiring + DRM master + privilege drop + greeter spawn + login-flash flip.
-- ~~**Privilege-drop mechanism + setuid wrapper.**~~ **SUPERSEDED by the privilege-separation epic.** Phase A's setuid-`halmasuit-spawn` model is **deleted**. The compositor drops in-process via `setresgid`/`setresuid` after binding sockets and acquiring DRM master to a post-drop posture of `CapPrm=CapEff={CAP_KILL}` with an **empty bounding set** (it execs no setuid helper — R15). Privilege-drop+exec exists only in the `halmasuit-session` broker's **non-setuid** fork-then-drop session-leader child (already root — R7/R11). No `security.wrappers` setuid entry; no `NoNewPrivileges` constraint from a setuid handoff (there is none). See HANDOFF §0 / ARCHITECTURE.md "Authentication and session lifecycle".
+- ~~**Privilege-drop mechanism + setuid wrapper.**~~ **SUPERSEDED by the privilege-separation epic.** The setuid-`halmasuit-spawn` model is deleted. The compositor drops in-process via `setresgid`/`setresuid` after binding sockets and acquiring DRM master to a post-drop posture of `CapPrm=CapEff={CAP_KILL}` with an empty bounding set (it execs no setuid helper). Privilege-drop+exec exists only in the `halmasuit-session` broker's non-setuid fork-then-drop session-leader child (already root). No `security.wrappers` setuid entry; no `NoNewPrivileges` constraint from a setuid handoff (there is none). See the "Privilege-separation decision record" below and ARCHITECTURE.md "Authentication and session lifecycle".
 - ~~**login-flash measurement target.**~~ **RESOLVED:** measures halmasuit's `MainPID` (the long-lived compositor) across greeter→session, replacing the v1 baseline's niri-PID assertion (greetd-architecture-specific). Same assertion intent — no compositor restart — different process under measurement.
 
 ### Open
@@ -242,6 +242,193 @@ consuming code lands.
 - **`org.halmasuit.Debug.Introspect` surface shape.** Single `Snapshot()` method vs. signal-based event stream over D-Bus vs. both. Exact NDJSON schema (surface roles, geometry units, phase enum). Redaction policy for `pam_message` content. *Decision deferred to the snapshot-socket task; the stderr/tracing half is already shipping and is schema-flexible.*
 - **OCR in `full-boot-flash` test.** May defer text-leak detection if tesseract bindings prove fiddly. *Decision deferred to Phase B (when full-boot-flash is built).*
 - **Initramfs handoff mechanism.** `SurviveFinalKillSignal=yes` is the validated path (drm-master-probe Phase 2); the optional additional `execve` re-pivot to the rootfs-systemd MainPID (Phase 3) is a refinement. *Decision deferred to the Phase B `halmasuit-in-initrd` task — pick the simplest combination that makes `full-boot-flash` go green.*
+
+## Privilege-separation decision record
+
+The locked-in shape of halmasuit's PAM/session boundary. CLAUDE.md
+codifies the hard rules; this section records *why* they are the way
+they are and the rejected alternatives that must not be revisited.
+The amendments (A1–A9) name specific decisions that were made during
+the broker epic and stabilized via primary-source research.
+
+### Core invariant
+
+**One `pam_handle_t`, owned by the broker, never split across processes
+and never `execve`'d between auth and session.** Credential-passing PAM
+modules (`pam_mount` unlocking encrypted `$HOME`, `pam_gnome_keyring`,
+`pam_krb5`) require the same handle to span `pam_authenticate` →
+`pam_open_session`. greetd's `worker.rs` is the canonical statement of
+this; the research is unanimous (OpenSSH, GDM, SDDM). A two-handle
+design silently breaks: `$HOME` stays locked, the keyring is empty, no
+error surfaces. The "killable, SIGKILL-anytime" property is satisfied
+by running `pam_authenticate` in an ephemeral SIGKILL-able
+`setrlimit`-bounded fork that reports back to the handle-owning parent
+— not by making the handle-owner killable.
+
+### Vulnerability cured
+
+C1: the pre-broker compositor ran each PAM attempt in a detached worker
+thread, and libpam has no cancellation point. A malicious greeter
+looping CreateSession/CancelSession (including disconnect/reconnect to
+reset any per-connection cap) accumulated unbounded uncancellable
+workers. `MAX_SESSION_BUILDS_PER_CONNECTION` was per-`Connection` —
+reconnect-churn defeats it. The killable-subprocess + global single-slot
+model bounds the flood to O(1) regardless of churn, also fixes a hung
+network-PAM module wedging a thread forever, and makes CancelSession
+actually cancel.
+
+### Locked decisions
+
+1. **Separate worker binary** (`halmasuit-pam-worker`), not re-exec-self
+   — keeps smithay/compositor code out of the auth process address space.
+2. **Supervisor-owned teardown:** the broker holds a
+   `WorkerHandle{pid,pidfd}`; the greetd state machine stays a pure
+   `step()` machine that never learns a pid exists. Kill via
+   `pidfd_send_signal`, reap via the existing R4 reaper. Process control
+   never lives in the pure protocol crate. Teardown is NOT `Drop`-based
+   (`Drop` cannot `waitpid` — std and tokio both document this; reaping
+   in `Drop` produces zombies).
+3. **`SOCK_SEQPACKET` socketpair** for the broker IPC — kernel message
+   boundaries; serde-framed typed messages; challenge/response buffers
+   `Zeroizing` on both sides; `wire_format_*` roundtrip drift tests pin
+   the JSON shape.
+4. **No `MAX_SESSION_BUILDS_PER_CONNECTION`.** The single-slot model
+   makes it redundant, and its presence implies a defense it doesn't
+   provide.
+5. **SIGKILL directly, no SIGTERM grace, for the auth worker.** The
+   worker is blocked in `pam_authenticate`; it has no session/children
+   to wind down (auth-only, no `pam_open_session`). Destroying the
+   address space is stronger credential hygiene than zeroize-then-
+   continue. greetd's SIGTERM→grace→SIGKILL is for post-auth *sessions*,
+   which the auth worker is not.
+6. **Single-slot scope: GLOBAL.** One seat, one greeter, one auth at a
+   time. Mirrors greetd's single `current` slot. Bounds live workers to
+   O(1) across any churn including disconnect/reconnect (the C1 attack)
+   with no per-connection counter. "New CreateSession evicts in-flight"
+   is the correct single-slot semantic.
+
+### Rejected — DO NOT REVISIT unless the cited condition changes
+
+- **Re-exec-self PAM worker.** Larger auth-process address space; the
+  project idiom is a separate microscopic binary.
+- **RAII `Drop`-kills-worker teardown.** `Drop` cannot `waitpid` →
+  zombies; puts a kill primitive in the pure crate.
+- **`cancel()` threaded through the protocol state machine.** Spreads
+  process control into the pure protocol crate.
+- **SIGTERM→grace→SIGKILL for the auth worker.** That is the session
+  teardown pattern; an auth worker has nothing to wind down.
+- **Per-connection single-slot.** Reconnect-churn defeats it (the C1
+  attack); only GLOBAL is the bound.
+- **Pure rate-limiter instead of the structural cure.** A limiter only
+  paces it; process-isolation + single-slot eliminates the class.
+- **Two-handle / cross-process-handle PAM design.** Silently breaks
+  credential-passing modules (locked `$HOME`, no error).
+- **Mechanism A: `setns(/proc/1/ns/mnt)` from a sandboxed compositor
+  spawning the session.** Needs `CAP_SYS_ADMIN`+`CAP_SYS_CHROOT` in the
+  spawner; breaks the forbid-unsafe and minimal-caps posture; inverts
+  the UID-floor threat model. The shipped resolution is Mechanism D
+  (the deliberately-unsandboxed privileged broker unit in the host
+  mount namespace — `run0`/`machinectl`/logind precedent), so this is
+  not an open avenue.
+
+### Amendments (the rules CLAUDE.md cites)
+
+- **A1 — env merge.** Session leader's `execve` env is
+  `pam_getenvlist()` MERGED with the fixed allowlist, never a blind
+  env-replace. Blind replace clobbers pam_env, pam_systemd, pam_mount.
+- **A2 — single calloop broker, idle-exit, evict-old slot.** One
+  event loop in the broker; socket-activated so there's no standing
+  root daemon when idle; a new CreateSession evicts the in-flight one.
+- **A4 — atomic deletion of the old path.** The R3 compositor→broker
+  relay landing is what deletes `halmasuit-pam` + the setuid
+  `halmasuit-spawn` + `MAX_SESSION_BUILDS_PER_CONNECTION`. They are
+  not deleted before the replacement lands (breaks the compositor),
+  and not left behind after it lands (forbidden two-libpam-surface
+  anti-pattern). The deferral pattern ("ship the broker, delete the
+  old path later") is RESCINDED.
+- **A5 — session lifecycle is one-way broker→compositor.** Lifecycle
+  frames exist only in `BrokerToCompositor`, never in
+  `CompositorToBroker`. The compositor emits no lifecycle frame; it
+  is a pure sink. Structurally kills (a) a compromised greeter
+  forging a force-logout, and (b) forging "session ready" to phish
+  the post-login surface. The visible greeter→session swap is gated
+  on AND(`SessionOpened`, the compositor's own first-non-empty session
+  frame) — never `SessionOpened` alone (that reintroduces the flash;
+  Mir/USC `is_session_ready_for_display = session && ready`,
+  `WindowWlSurfaceRole` first-non-empty-buffer gate). The broker is
+  the sole reaper; any SCM_RIGHTS leader pidfd the compositor holds is
+  poll-only.
+- **A6 — single owner of the broker socket.** The compositor's
+  per-greeter-connection `BrokerEpisode` owns the broker
+  `SeqpacketChannel` (`OwnedFd`) for the whole episode. Auth state is
+  a sans-IO payload-only enum that owns nothing transport. No `dup`,
+  `Rc<RefCell>`, or `Arc<Mutex>` of the privilege-crossing fd:
+  `dup` reintroduces premature-/no-EOF + a second writer +
+  reused-fd double-close (OpenSSH CVE-2015-6563 / CVE-2015-6564 class);
+  Rc/Arc reintroduce the premature-close hazard.
+- **A7 — fully sans-IO greetd boundary; no blocking IPC on the
+  compositor calloop thread.** The compositor never does a blocking
+  `recv` on the broker socket — not brief, not with a timeout. A
+  timeout only trades unbounded stall for bounded multi-vblank stall
+  and adds an `SO_RCVTIMEO`/`EINTR` hazard (Mir hit this exactly;
+  upstream fix branch was named `no-ipc-on-compositor-threads`). The
+  broker SEQPACKET fd is a per-connection non-blocking calloop source.
+  greetd's PAM boundary emits/suspends/resumes (h11 `NEED_DATA` /
+  rustls `read_tls`+`process_new_packets` pattern). A synchronous
+  `PamSession::step` that does send + blocking recv internally is the
+  forbidden sans-IO anti-pattern.
+- **A8 — calloop source over a non-owning borrowed-fd newtype.**
+  calloop's `Generic<F: AsFd>` takes `F` by value and closes via its
+  destructor; the episode is the sole `OwnedFd`, so the calloop source
+  is a `Generic` over `struct …Fd(RawFd); impl AsFd { unsafe
+  BorrowedFd::borrow_raw }` with no `Drop`. `insert_source`'s bound is
+  `S: EventSource + 'l` (not `'static`); a `RawFd`-holding newtype
+  satisfies it. Close-exactly-once: the `RegistrationToken` is
+  `loop_handle.remove`d BEFORE the episode is dropped — asserted by
+  test, not assumed. SEQPACKET + `MSG_DONTWAIT` both directions makes
+  the no-block invariant structural; no outbox/Ping/idle machinery is
+  needed.
+- **A9 — supplementary groups from PAM-resolved user, never the
+  handle-owner's `getgroups()`.** The session leader's supplementary
+  groups are `getgrouplist(PAM-resolved username, PAM-resolved primary
+  gid)` ONLY, computed in the fork-drop child from the PAM-derived
+  identity. The handle-owner's own `getgroups()` is NEVER a source.
+  Primary sources: `pam_setcred(3)` man page (verbatim: "credentials
+  should be established, by the application, prior to a call to this
+  function… `initgroups(2)` (or equivalent) should have been
+  performed"); OpenSSH `do_setusercontext()`; util-linux `login(1)`
+  `init_groups()`; GDM `gdm-session-worker.c`. The opposite ("capture
+  the daemon's `getgroups()` and graft it onto the user") is
+  CVE-2021-41617 (OpenSSH ≤8.7) / sddm #1159 — a named CVE class. The
+  R7/R11 "getgrouplist-MERGE the established supplementary set" clause
+  is RESCINDED by A9; `initgroups`-equivalent from the resolved
+  identity is the correct, mandated behavior. `pam_group`/`group.conf`
+  conditional grants are out of scope under the one-handle-in-parent
+  architecture.
+
+### Why a privileged broker (not a sandboxed spawner)
+
+niri (or any real session), as a child of the hardened
+`halmasuit.service`, would inherit its `ProtectHome=true` /
+`ProtectSystem=strict` / `PrivateTmp=true` mount namespace. `setresuid`
+does not change the mount namespace; fork/exec does not escape it.
+`/home/$USER` and `/run/user/$UID` — created correctly on the host by
+`pam_systemd`/logind — would be invisible to the session. Four
+research agents (sshd, systemd-logind/pam_systemd, greetd/GDM/SDDM,
+namespace mechanics) converged: `pam_systemd`/logind is NOT a
+namespace-escape mechanism (it creates `/run/user/$UID` in the PAM
+caller's existing mount namespace; "register with logind" alone does
+NOT fix this). Every existing DM/sshd avoids the problem by not
+sandboxing the spawner; greetd's own source comments that
+`pam_open_session`/`pam_close_session` must run as root in the host
+ns. The shipped resolution is Mechanism D: a deliberately-unsandboxed
+privileged unit (`halmasuit-session`) that PID 1 socket-activates →
+host namespace. Hardened halmasuit asks it, over SO_PEERCRED-
+authenticated IPC, only after the greetd state machine reaches
+PAM-verified `start_session`; that unit runs the `pam_systemd` tail
+and `execve`s the session in the host ns. halmasuit stays fully
+hardened; the privileged surface stays tiny and separately auditable;
+no `CAP_SYS_ADMIN` anywhere.
 
 ## See also
 

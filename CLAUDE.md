@@ -12,7 +12,6 @@ Eliminates the visible black flash that exists today between greeter and
 session on every greetd-based Linux desktop.
 
 Read **`ARCHITECTURE.md`** for the design, threat model, and roadmap.
-Read **`PLAN.md`** for v2's implementation scope and "in / out" decisions.
 Read **`RESEARCH.md`** for the empirically validated architectural
 foundations (drm-master-probe Phase 0 + Phase 1).
 
@@ -21,80 +20,62 @@ roadmap milestones in `ARCHITECTURE.md`, not crate versions.
 
 ## Where the project is
 
-The compositor exists and is the live system. The
-privilege-separated PAM/session epic has landed: the privileged
-`halmasuit-session` broker is the **live** auth/session path; the
-compositor is an unprivileged sans-IO relay to it; the in-compositor
-`halmasuit-pam` and the setuid `halmasuit-spawn` helper are **deleted**
-(single libpam surface = `halmasuit-session`; no setuid inode in the
-closure). `login-flash` passes **through the broker-launched session**
-— PID and frame continuity hold across the real greeter→session
-transition. The assertion is never modified to pass; the system under
-test changes, the assertion does not.
+The compositor exists and is the live system. The privileged
+`halmasuit-session` broker is the live auth/session path; the compositor
+is an unprivileged sans-IO relay to it; the in-compositor `halmasuit-pam`
+and the setuid `halmasuit-spawn` helper are deleted (single libpam
+surface = `halmasuit-session`; no setuid inode in the closure).
+`login-flash` passes through the broker-launched session — PID and frame
+continuity hold across the real greeter→session transition. The
+assertion is never modified to pass; the system under test changes, the
+assertion does not.
 
 ## Hard rules
 
-These are anti-patterns from `ARCHITECTURE.md` codified as Claude rules.
-Do not relax them without explicit user direction:
+These are anti-patterns codified as Claude rules. Do not relax them
+without explicit user direction.
 
 - **`login-flash` is a GREEN hard gate.** It proves halmasuit's PID
   and `assert_no_flash_stream` hold across the real greeter→session
-  transition *through the broker-launched session* — no compositor
+  transition through the broker-launched session — no compositor
   restart, no flash. Never weaken, skip, invert, or conditionalize the
   assertion to keep it green; an unexpected FAIL means the flash
   invariant regressed (the thing this project exists to prevent). The
-  `just test-vm` exit-code inversion is gone; the CI gate must run it
-  as a normal pass/fail check (see CI).
-- **The privileged surface is the `halmasuit-session` broker.** It
-  owns ONE `pam_handle_t` for the whole lifecycle (auth → setcred →
-  open_session → … → close_session → pam_end), runs `pam_authenticate`
-  in an ephemeral SIGKILL-able `setrlimit`-bounded privileged fork,
-  and launches the session by forking once and dropping privileges in
-  a **non-setuid child** (it is already root — greetd/OpenSSH/GDM/su
-  shape). It is a single socket-activated unit with no standing root
-  when idle. `unsafe` is confined to its `pam_ffi`/`worker` modules;
-  every change to this crate's privileged boundary is a
-  security-review event — surface diffs prominently. See
-  ARCHITECTURE.md "Authentication and session lifecycle" and
-  `HANDOFF.md` §0.7–§0.12 (the canonical amendment record A1–A8).
+  CI gate runs it as a normal pass/fail check, never inverted.
+- **The privileged surface is the `halmasuit-session` broker.** Every
+  change to its privileged boundary is a security-review event —
+  surface diffs prominently.
 - **`halmasuit-pam` and the setuid `halmasuit-spawn` are DELETED.**
   There is exactly one libpam surface (`halmasuit-session`) and NO
-  setuid inode in the closure (Epic R10/R14/R15, landed atomically
-  with the broker going live). Do NOT re-introduce an in-compositor
+  setuid inode in the closure. Do NOT re-introduce an in-compositor
   PAM path, a setuid spawn helper, a `security.wrappers` setuid entry,
   a second libpam consumer, or `halmasuit-greetd`'s
   `MAX_SESSION_BUILDS_PER_CONNECTION`. Privilege-drop+exec exists ONLY
   in the broker's non-setuid session-leader child (fork-then-drop from
-  already-root — R7/R11).
+  already-root).
 - **The compositor retains zero escalation capability.** After its
   in-process privilege drop the bounding set is emptied entirely; it
   keeps only `CAP_KILL` (to signal its greeter child). Do NOT re-add
   `{CAP_SETUID,CAP_SETGID}` (or anything) to the compositor bounding
   set — it execs no setuid helper, so any retained cap is a
-  least-authority regression (R15).
+  least-authority regression.
 - **UID floor is load-bearing — enforced by the broker's
   session-leader child.** Refuse any `uid`/`gid < UID_MIN` (typically
   1000); reject `(uid_t)-1`/overflow. The broker independently
   re-derives identity from PAM (`pam_get_user` → pwent) and never
   trusts a compositor-asserted identity. This is what makes a
   compromised halmasuit *not* a root compromise. Removing it is
-  security theater. See ARCHITECTURE.md threat model row 11.
-- **Broker SO_PEERCRED authorizes its trusted RELAY peer, not the
-  greeter.** In the live topology that peer is the unprivileged
-  compositor (greeter→[compositor's greetd greeter-gate]→compositor→
-  [broker's relay-peer gate]→broker). `SO_PEERCRED` authenticates the
-  peer; it never authorizes the action — identity is independently
-  PAM-derived (R8). The env/var is `HALMASUIT_BROKER_PEER_UID` /
-  `relay_peer_uid`; `nix/module.nix` sets it to the compositor uid
-  when the compositor is enabled, else the greeter uid (standalone
-  direct-broker deploys/tests). Do NOT rename it back to "greeter" or
-  point the broker gate at the greeter uid in the live path.
+  security theater.
+- **Broker SO_PEERCRED authorizes the relay peer, not the greeter.**
+  The env var is `HALMASUIT_BROKER_PEER_UID` / `relay_peer_uid`; do
+  not rename it back to "greeter" or point the broker gate at the
+  greeter uid in the live path.
 - **One `pam_handle_t`, never split, owner never `execve`s between
   auth and session.** No two-handle / cross-process-handle design
   (pam_mount/keyring/krb5 silently break — locked `$HOME`, no error).
   The session leader's supplementary groups are
-  `getgrouplist(PAM-resolved user, primary gid)` ONLY (Amendment A9),
-  derived from the R8 identity — NEVER the privileged broker's own
+  `getgrouplist(PAM-resolved user, primary gid)` ONLY, derived from
+  the PAM-resolved identity — NEVER the privileged broker's own
   `getgroups()` (sourcing the handle-owner's set leaks `shadow` into
   every session: CVE-2021-41617 / sddm#1159). Its `execve` env is
   `pam_getenvlist()` MERGED with the fixed allowlist, never a blind
@@ -106,16 +87,17 @@ Do not relax them without explicit user direction:
   exactly one crate (`halmasuit-session`); the compositor relays only
   length-bounded conversation frames.
 - **The compositor never blocks the render/calloop thread on broker
-  IPC (A7).** greetd's PAM boundary is fully sans-IO
-  (emit/suspend/resume); the broker fd is a per-connection NON-blocking
-  calloop source. No blocking `recv`/`send`-then-`recv`, with or
-  without a timeout; no synchronous `PamSession::step`.
+  IPC.** greetd's PAM boundary is fully sans-IO (emit/suspend/resume);
+  the broker fd is a per-connection NON-blocking calloop source. No
+  blocking `recv`/`send`-then-`recv`, with or without a timeout; no
+  synchronous `PamSession::step`.
 - **One per-greeter-episode object owns the broker socket the whole
-  episode (A6/A8).** It is the sole `OwnedFd`; the calloop source is a
+  episode.** It is the sole `OwnedFd`; the calloop source is a
   `Generic` over a NON-owning borrowed-fd newtype; the source token is
   removed before the episode drops. No `dup`/`Rc`/`Arc` of the broker
-  socket, ever (premature-EOF / least-authority; CVE-2015-6563/6564).
-- **Session lifecycle is one-way broker→compositor (A5).** No
+  socket, ever (premature-EOF / least-authority;
+  CVE-2015-6563/6564).
+- **Session lifecycle is one-way broker→compositor.** No
   compositor-emitted lifecycle frame (no such `CompositorToBroker`
   variant — keep it type-impossible). The visible greeter→session swap
   is gated on AND(`SessionOpened`, the compositor's own
@@ -206,18 +188,17 @@ These are the easy traps to fall into when adding real deps:
   cosmic-comp's current pin, never crates.io 0.7.0 (June 2024,
   pre-DnD-refactor, pre-`delegate_dispatch2!`). Standard
   smithay-downstream pattern.
-- **PAM bindings** — RESOLVED: hand-rolled FFI in
-  `crates/halmasuit-session/src/pam_sys.rs` (Epic #5), following
-  sudo-rs's pattern (the most security-audited Rust libpam consumer
-  in existence). Production halmasuit-session links `-lpam` directly
-  with zero bindgen / clang-sys / libclang at build time. The
-  third-party `pam-sys` crate is retained as a `[dev-dependencies]`
-  audit lever consumed only by `tests/pam_ffi_parity.rs`, which
-  asserts struct layouts + constant values + symbol resolution match
-  bindgen's output against the build host's libpam headers (libpam
-  ABI drift fails CI before the broker hits it). Do not add a second
-  production PAM crate; do not introduce a `build.rs` in
-  halmasuit-session.
+- **PAM bindings** — hand-rolled FFI in
+  `crates/halmasuit-session/src/pam_sys.rs`, following sudo-rs's
+  pattern (the most security-audited Rust libpam consumer in
+  existence). Production halmasuit-session links `-lpam` directly with
+  zero bindgen / clang-sys / libclang at build time. The third-party
+  `pam-sys` crate is retained as a `[dev-dependencies]` audit lever
+  consumed only by `tests/pam_ffi_parity.rs`, which asserts struct
+  layouts + constant values + symbol resolution match bindgen's output
+  against the build host's libpam headers (libpam ABI drift fails CI
+  before the broker hits it). Do not add a second production PAM
+  crate; do not introduce a `build.rs` in halmasuit-session.
 - **D-Bus** — `zbus` 5.x. Do not pull in glib.
 - **wayland-server** + **calloop** are smithay's, follow smithay's
   pin.
@@ -233,37 +214,27 @@ either solve the headless GL backend or shell out to a real GPU runner.
 Do not pretend the headless screenshots are valid — they are
 deliberately not.
 
-## Open decisions parked for v2 implementation
+## Open decisions
 
 Listed in `ARCHITECTURE.md` § "Open decisions"; the still-open ones:
 
-1. smithay revision pin (above).
+1. smithay revision pin (see Ecosystem caveats above).
 2. Final `org.halmasuit.Compositor1` D-Bus surface.
 3. OCR for text-leak detection in frame-capture (tesseract).
-
-(PAM-bindings strategy is RESOLVED — hand-rolled FFI in
-`halmasuit-session/src/pam_sys.rs`; `pam-sys` is dev-deps-only
-audit lever via `tests/pam_ffi_parity.rs`. See Ecosystem caveats.)
 
 Don't invent answers; flag the decision when the relevant code lands.
 
 ## CI
 
 GHA on `ubuntu-24.04`, actions pinned to commit SHAs. Consumes (does
-not push to) `joshsymonds.cachix.org`. `login-flash` is now a normal
-pass/fail gate (it passes through the broker-launched session); the
-old `continue-on-error: true` + `expected-fail`-as-success inversion
-is the deleted/superseded model and must NOT remain in the workflow —
-if any inversion is still present in `.github/`, removing it is a
-tracked follow-up.
+not push to) `joshsymonds.cachix.org`. `login-flash` runs as a normal
+pass/fail gate; do not introduce `continue-on-error` or any inversion
+that turns FAIL into success.
 
 ## Where to look
 
 - `RESEARCH.md` — empirically validated architectural foundations.
 - `ARCHITECTURE.md` — full design, threat model, roadmap.
-- `HANDOFF.md` §0.7–§0.12 — the canonical privilege-separation epic
-  decision record (Amendments A1–A8, with primary-source derivations
-  and DO-NOT-REVISIT conditions).
 - `Justfile` — every command, local and CI.
 - `tests/login-flash.nix` — the canonical no-flash gate; reading it
   end-to-end is the fastest way to understand the testing posture.
@@ -273,4 +244,4 @@ tracked follow-up.
   reaping, relay-peer SO_PEERCRED gate).
 - `crates/halmasuit/src/broker_session.rs` — the compositor's
   per-greeter `BrokerEpisode`: owns the broker `SeqpacketChannel`,
-  drives the sans-IO greetd machine, relays to the broker (A6/A7/A8).
+  drives the sans-IO greetd machine, relays to the broker.
