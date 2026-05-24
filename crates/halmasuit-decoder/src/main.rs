@@ -35,6 +35,8 @@ use halmasuit_decoder_ipc::{
     CompositorToDecoder, DecoderToCompositor, FrameFormat, MAX_CONTROL_MSG_BYTES, WIRE_VERSION,
     encode_control, try_decode_control,
 };
+use std::time::{Duration, Instant};
+
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg, send};
 use thiserror::Error;
 use tracing::{Level, error, info, warn};
@@ -141,6 +143,23 @@ enum LifecycleState {
         state: DecoderState,
         loop_playback: bool,
         next_frame_idx: u64,
+        /// PTS-pacing anchor (Epic #12 task #31). When set,
+        /// `(anchor_pts_us, anchor_wall)` pin the timeline so the
+        /// next frame's PTS is held until `Instant::now()` reaches
+        /// `anchor_wall + (frame.pts_us - anchor_pts_us)`. Reset
+        /// to `None` on:
+        /// - LoadFile (fresh stream, first frame sets the anchor),
+        /// - Resume from Pause (avoid replaying the pause duration
+        ///   as frame-drop pressure on the compositor),
+        /// - EOF-loop rewind (PTS resets to 0; re-anchor).
+        ///
+        /// Without pacing the decoder runs flat-out at software-
+        /// decode max speed (~3× the wire-needed rate for 30 fps
+        /// source), pinning a CPU core continuously for a
+        /// decorative surface. With pacing, steady-state CPU
+        /// matches actual decode-of-one-frame cost per source
+        /// frame interval (~20–30% of a core at 1080p h264).
+        pacing: Option<PtsAnchor>,
     },
     Paused {
         state: DecoderState,
@@ -148,6 +167,14 @@ enum LifecycleState {
         next_frame_idx: u64,
     },
     EofWaiting,
+}
+
+/// Wall-clock anchor for PTS-based pacing. See the `pacing` field
+/// on [`LifecycleState::Decoding`].
+#[derive(Debug, Clone, Copy)]
+struct PtsAnchor {
+    anchor_pts_us: i64,
+    anchor_wall: Instant,
 }
 
 /// Drive the lifecycle state machine on `fd`. Sends `Ready` on
@@ -173,6 +200,7 @@ fn run(fd: RawFd) -> Result<(), DecoderError> {
                 state: dec_state,
                 loop_playback,
                 next_frame_idx,
+                pacing,
             } => {
                 // Poll for control non-blockingly first.
                 if let Some((msg, fds)) = recv_one_nonblocking(fd)? {
@@ -183,6 +211,38 @@ fn run(fd: RawFd) -> Result<(), DecoderError> {
 
                 match decode::decode_next_frame(dec_state) {
                     Ok(Some(frame)) => {
+                        // PTS pacing (Epic #12 task #31). On the
+                        // first frame after a fresh stream / Resume
+                        // / loop-rewind, set the anchor at
+                        // `(frame.pts_us, Instant::now())`. On
+                        // subsequent frames, hold until the frame's
+                        // presentation time has actually arrived.
+                        // The wait is poll-driven so a Pause /
+                        // Shutdown / etc. interrupts within ms.
+                        if let Some(anchor) = *pacing {
+                            let delta = frame.pts_us.saturating_sub(anchor.anchor_pts_us);
+                            if delta > 0 {
+                                let due = anchor.anchor_wall
+                                    + Duration::from_micros(u64::try_from(delta).unwrap_or(0));
+                                if wait_until_due_or_control(fd, due)? {
+                                    // Control arrived during the
+                                    // wait. Drain it via the next
+                                    // outer-loop iteration's poll —
+                                    // do NOT send this frame; the
+                                    // control may transition us to
+                                    // Paused/Idle, in which case
+                                    // the frame is stale.
+                                    continue;
+                                }
+                            }
+                            // delta <= 0 (clock skew or decoder
+                            // behind real time) → send immediately.
+                        } else {
+                            *pacing = Some(PtsAnchor {
+                                anchor_pts_us: frame.pts_us,
+                                anchor_wall: Instant::now(),
+                            });
+                        }
                         // Bump next_frame_idx whether or not the
                         // wire send dropped — frame_idx is a stream
                         // counter, not a per-delivered-frame
@@ -209,6 +269,9 @@ fn run(fd: RawFd) -> Result<(), DecoderError> {
                                 DecoderError::Decode(err)
                             })?;
                             *next_frame_idx = 0;
+                            // PTS resets to 0 on the new stream;
+                            // re-anchor on the next frame.
+                            *pacing = None;
                         } else {
                             // No loop; emit EndOfFile and switch to
                             // blocking await for next control.
@@ -259,6 +322,8 @@ fn apply_control(
                 state: new_state,
                 loop_playback,
                 next_frame_idx: 0,
+                // Fresh stream — next frame sets the PTS anchor.
+                pacing: None,
             })
         }
         CompositorToDecoder::Pause => match current {
@@ -266,6 +331,7 @@ fn apply_control(
                 state,
                 loop_playback,
                 next_frame_idx,
+                pacing: _, // dropped on entry to Paused
             }
             | LifecycleState::Paused {
                 state,
@@ -290,6 +356,10 @@ fn apply_control(
                 state,
                 loop_playback,
                 next_frame_idx,
+                // Pause duration MUST NOT show up as frame-drop
+                // pressure on the compositor; re-anchor on the
+                // next frame so timing restarts from "now".
+                pacing: None,
             }),
             other => {
                 warn!("decoder: Resume ignored in non-paused state");
@@ -301,6 +371,7 @@ fn apply_control(
                 mut state,
                 loop_playback,
                 next_frame_idx: _,
+                pacing: _,
             }
             | LifecycleState::Paused {
                 mut state,
@@ -315,6 +386,9 @@ fn apply_control(
                     state,
                     loop_playback,
                     next_frame_idx: 0,
+                    // Seek changed the source-timeline position;
+                    // re-anchor on the next frame.
+                    pacing: None,
                 })
             }
             other => {
@@ -356,6 +430,51 @@ fn recv_one_nonblocking(
         Ok(pair) => Ok(Some(pair)),
         Err(DecoderError::Recv(nix::errno::Errno::EAGAIN)) => Ok(None),
         Err(err) => Err(err),
+    }
+}
+
+/// Wait until either `due` arrives (returns `Ok(false)`) OR a
+/// control message becomes readable on `fd` (returns `Ok(true)`).
+/// Used for PTS-paced frame delivery: between two frames the
+/// decoder calls this to hold the next frame until its
+/// presentation time, but a Pause/Resume/Shutdown still
+/// interrupts within ~milliseconds.
+fn wait_until_due_or_control(fd: RawFd, due: Instant) -> Result<bool, DecoderError> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    loop {
+        let now = Instant::now();
+        if now >= due {
+            return Ok(false);
+        }
+        let remaining = due.saturating_duration_since(now);
+        // PollTimeout takes u16 milliseconds via From<u16>; clamp.
+        // Frame intervals at typical rates (30/60 fps = 33/16 ms)
+        // fit easily; very low source rates would be clamped to
+        // ~65 s which is still poll-friendly.
+        let timeout_ms =
+            u16::try_from(remaining.as_millis().min(u128::from(u16::MAX))).unwrap_or(u16::MAX);
+        #[expect(
+            unsafe_code,
+            reason = "fd is the long-lived IPC socket; BorrowedFd::borrow_raw is the safe wrapper pattern"
+        )]
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::from(timeout_ms)) {
+            Ok(0) => return Ok(false),
+            Ok(_) => {
+                if fds[0]
+                    .revents()
+                    .is_some_and(|r| r.contains(PollFlags::POLLIN))
+                {
+                    return Ok(true);
+                }
+                // Spurious wakeup or POLLHUP/POLLERR; let the next
+                // outer-loop iteration re-evaluate.
+            }
+            // EINTR: let the next outer-loop iteration retry.
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(err) => return Err(DecoderError::Recv(err)),
+        }
     }
 }
 
