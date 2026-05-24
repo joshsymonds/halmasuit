@@ -197,7 +197,7 @@ impl DecoderChannel {
     /// Wire v2 (Epic #12 task 10): a FRAME datagram packs
     /// `[length_prefix:4][header_json:N][payload:M]` into one atomic
     /// `recvmsg` — no second recv, no half-frame deadlock.
-    fn recv_one(&self) -> Result<Option<RecvOutcome>, IpcError> {
+    fn recv_one(&self, payload_out: &mut Vec<u8>) -> Result<Option<RecvOutcome>, IpcError> {
         let mut buf = self.recv_buf.borrow_mut();
         let mut iov = [std::io::IoSliceMut::new(&mut buf)];
         let r = match recvmsg::<()>(self.fd.as_raw_fd(), &mut iov, None, MsgFlags::MSG_DONTWAIT) {
@@ -243,14 +243,16 @@ impl DecoderChannel {
                     // violation (oversized or truncated).
                     return Err(IpcError::PartialFrame);
                 }
-                let payload = buf[payload_start..payload_end].to_vec();
                 let _ = pts_us; // not yet consumed downstream
-                Ok(Some(RecvOutcome::Frame(LatestFrame {
-                    width,
-                    height,
-                    bytes: payload,
-                    frame_idx,
-                })))
+                let _ = frame_idx; // overwritten by the relay's monotonic counter
+                // Fill the caller-owned payload buffer in place;
+                // poll_frames swaps it with the existing
+                // LatestFrame.bytes Vec so capacity is reused
+                // across calls (eliminates the per-frame 8 MiB
+                // allocation the prior `.to_vec()` caused).
+                payload_out.clear();
+                payload_out.extend_from_slice(&buf[payload_start..payload_end]);
+                Ok(Some(RecvOutcome::Frame(FrameMeta { width, height })))
             }
             DecoderToCompositor::Ready { wire_version } => {
                 if wire_version != WIRE_VERSION {
@@ -279,15 +281,24 @@ impl AsFd for DecoderChannel {
 
 /// Outcome of one `recv_one` call. Pulled out so the relay's
 /// `poll_frames` can act on each message kind without re-decoding.
+/// `Frame` carries only metadata; the payload bytes are filled
+/// into the caller-owned scratch passed to `recv_one`.
 #[derive(Debug)]
 enum RecvOutcome {
     Ready,
-    Frame(LatestFrame),
+    Frame(FrameMeta),
     EndOfFile,
     DecoderError {
         code: halmasuit_decoder_ipc::DecoderErrorCode,
         message: String,
     },
+}
+
+/// Per-frame metadata extracted from the wire header.
+#[derive(Debug)]
+struct FrameMeta {
+    width: u32,
+    height: u32,
 }
 
 /// Per-video-wallpaper relay. Owns the IPC socket, the decoder
@@ -305,6 +316,13 @@ pub struct DecoderRelay {
     /// Wallpaper source path, kept so [`Self::respawn`] can re-open
     /// the file and re-send `LoadFile` after a decoder failure.
     source: PathBuf,
+    /// Reusable RGBA payload buffer for the recv path. On a
+    /// successful frame recv, `recv_one` fills this in place
+    /// (clear + extend_from_slice into preserved capacity); then
+    /// `poll_frames` swaps it with the existing
+    /// `LatestFrame.bytes` Vec, so capacity is reused both sides
+    /// of the swap. Steady-state recv produces ZERO allocations.
+    payload_scratch: RefCell<Vec<u8>>,
     latest_frame: RefCell<Option<LatestFrame>>,
     /// Monotonic frame counter assigned by the relay across the
     /// relay's entire lifetime (NOT per decoder session). The wire-
@@ -335,6 +353,7 @@ impl DecoderRelay {
             pidfd: RefCell::new(pidfd),
             decoder_pid: Cell::new(decoder_pid),
             source: wallpaper_path.to_path_buf(),
+            payload_scratch: RefCell::new(Vec::new()),
             latest_frame: RefCell::new(None),
             next_frame_idx: Cell::new(0),
             restart_history: RefCell::new(Vec::new()),
@@ -377,15 +396,21 @@ impl DecoderRelay {
             // Pull the result into a local so the RefCell borrow on
             // `chan` is released before any [`Self::note_failure`]
             // call below — note_failure's respawn path needs
-            // `borrow_mut` on the same cell.
-            let recv = self.chan.borrow().recv_one();
+            // `borrow_mut` on the same cell. recv_one writes the
+            // payload bytes into `payload_scratch` if it returns a
+            // Frame; we swap that Vec into latest_frame.bytes below
+            // so capacity is preserved across calls.
+            let recv = {
+                let mut scratch = self.payload_scratch.borrow_mut();
+                self.chan.borrow().recv_one(&mut scratch)
+            };
             match recv {
                 Ok(None) => break, // EAGAIN: drained
                 Ok(Some(RecvOutcome::Ready)) => {
                     *self.ready.borrow_mut() = true;
                     debug!("wallpaper: decoder Ready");
                 }
-                Ok(Some(RecvOutcome::Frame(mut frame))) => {
+                Ok(Some(RecvOutcome::Frame(meta))) => {
                     if !*self.ready.borrow() {
                         warn!("wallpaper: frame before Ready; protocol violation");
                         self.note_failure();
@@ -398,8 +423,18 @@ impl DecoderRelay {
                     // LoadFile; relay-local is unique forever.
                     let idx = self.next_frame_idx.get();
                     self.next_frame_idx.set(idx.wrapping_add(1));
-                    frame.frame_idx = idx;
-                    *self.latest_frame.borrow_mut() = Some(frame);
+                    // Swap the freshly-filled payload_scratch with
+                    // the old LatestFrame's bytes Vec — both Vecs
+                    // are reused next iteration.
+                    let mut slot = self.latest_frame.borrow_mut();
+                    let mut bytes = slot.take().map(|f| f.bytes).unwrap_or_default();
+                    std::mem::swap(&mut bytes, &mut *self.payload_scratch.borrow_mut());
+                    *slot = Some(LatestFrame {
+                        width: meta.width,
+                        height: meta.height,
+                        bytes,
+                        frame_idx: idx,
+                    });
                     got_frame = true;
                 }
                 Ok(Some(RecvOutcome::EndOfFile)) => {

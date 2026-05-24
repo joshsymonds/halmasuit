@@ -37,7 +37,7 @@ use halmasuit_decoder_ipc::{
 };
 use std::time::{Duration, Instant};
 
-use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg, send};
+use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg, send, sendmsg};
 use thiserror::Error;
 use tracing::{Level, error, info, warn};
 
@@ -547,9 +547,17 @@ fn send_frame(ipc_fd: RawFd, frame: &RgbaFrame, frame_idx: u64) -> Result<bool, 
         format: FrameFormat::Rgba8,
         bytes_len,
     };
-    let datagram = halmasuit_decoder_ipc::encode_frame_datagram(&header, &frame.bytes)
-        .map_err(DecoderError::Codec)?;
-    match send_datagram_or_drop(ipc_fd, &datagram)? {
+    // Encode just the header prefix (length-prefix + JSON) into a
+    // small Vec — sub-KiB, allocation cost is negligible. Then
+    // gather-write the header + payload via sendmsg with two
+    // iovecs; SOCK_SEQPACKET concatenates them into one atomic
+    // datagram on the receiver side (matches the wire-v2 format
+    // `[length_prefix:4][header_json:N][payload:M]`). This avoids
+    // the previous 8 MiB allocation that concatenated header +
+    // payload into a single owned Vec per frame.
+    let header_bytes =
+        halmasuit_decoder_ipc::encode_control(&header).map_err(DecoderError::Codec)?;
+    match send_frame_gather_or_drop(ipc_fd, &header_bytes, frame.bytes)? {
         SendOutcome::Sent => {
             info!(
                 width = frame.width,
@@ -598,24 +606,30 @@ fn send_all(fd: RawFd, bytes: &[u8]) -> Result<(), DecoderError> {
     }
 }
 
-/// Outcome of [`send_datagram_or_drop`].
+/// Outcome of [`send_frame_gather_or_drop`].
 enum SendOutcome {
     Sent,
     Dropped,
 }
 
-/// Send one datagram with EAGAIN treated as a recoverable "drop this
-/// frame, continue" signal. Used for FRAME sends — the relay's
-/// Phase A pacing model lets the decoder produce faster than the
-/// compositor consumes, with the kernel's queue absorbing the
-/// difference. Once the queue saturates, dropping is the only
-/// non-deadlocking option (a blocking send doesn't actually wait
-/// on AF_UNIX SEQPACKET — the kernel returns EAGAIN regardless).
-fn send_datagram_or_drop(fd: RawFd, bytes: &[u8]) -> Result<SendOutcome, DecoderError> {
+/// Gather-write a frame as one atomic `SOCK_SEQPACKET` datagram:
+/// the kernel concatenates `header` + `payload` from two iovecs
+/// into a single datagram. Avoids the per-frame ~8 MiB allocation
+/// the prior `encode_frame_datagram` (which built one owned Vec
+/// holding both) caused. EAGAIN handling matches
+/// [`send_datagram_or_drop`].
+fn send_frame_gather_or_drop(
+    fd: RawFd,
+    header: &[u8],
+    payload: &[u8],
+) -> Result<SendOutcome, DecoderError> {
+    let iov = [
+        std::io::IoSlice::new(header),
+        std::io::IoSlice::new(payload),
+    ];
     loop {
-        match send(fd, bytes, MsgFlags::MSG_DONTWAIT) {
+        match sendmsg::<()>(fd, &iov, &[], MsgFlags::MSG_DONTWAIT, None) {
             Ok(_) => return Ok(SendOutcome::Sent),
-            // EINTR: fall through; loop iterates naturally.
             Err(nix::errno::Errno::EINTR) => {}
             Err(nix::errno::Errno::EAGAIN) => return Ok(SendOutcome::Dropped),
             Err(err) => return Err(DecoderError::Send(err)),

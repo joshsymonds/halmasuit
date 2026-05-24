@@ -70,13 +70,18 @@ const MAX_WALLPAPER_BYTES: u64 = 256 * 1024 * 1024;
 /// and plenty for our streaming-from-memory case.
 const AVIO_READ_BUFFER_BYTES: usize = 4 * 1024;
 
-/// One RGBA8 frame extracted from the decoder. Caller (the IPC
-/// driver in main.rs) owns the bytes and writes them to the wire.
-pub struct RgbaFrame {
+/// One RGBA8 frame extracted from the decoder. The `bytes` slice
+/// borrows from a reusable scratch buffer owned by
+/// [`DecoderState`]; the caller (the IPC driver in main.rs) reads
+/// the slice and writes it to the wire, and the borrow ends when
+/// the frame drops at end-of-iteration. This avoids the per-frame
+/// `Vec<u8>` allocation (8.3 MiB at 1080p × ~30 fps = ~250 MiB/s
+/// of allocator churn) that the previous owned-bytes shape caused.
+pub struct RgbaFrame<'a> {
     pub width: u32,
     pub height: u32,
     pub pts_us: i64,
-    pub bytes: Vec<u8>,
+    pub bytes: &'a [u8],
 }
 
 /// State held between [`open_video_input`] / [`rewind`] and the
@@ -103,6 +108,12 @@ pub struct DecoderState {
     /// frames at fixed dimensions to avoid an 8 MiB libavutil alloc
     /// per 1080p frame.
     dst: Option<DstFrameCacheEntry>,
+    /// Reusable RGBA scratch buffer. `convert_frame_to_rgba` clears
+    /// it and fills with the tight-packed RGBA bytes; the returned
+    /// `RgbaFrame` borrows the slice. Reusing the buffer eliminates
+    /// the per-frame 8 MiB Vec alloc that previously dominated
+    /// allocator churn.
+    rgba_scratch: Vec<u8>,
 }
 
 /// Cache key + value for the sws_scale context. Recreated when any
@@ -275,6 +286,7 @@ fn build_state(wallpaper: Arc<Mmap>) -> Result<DecoderState, DecodeError> {
         wallpaper,
         sws: None,
         dst: None,
+        rgba_scratch: Vec::new(),
     })
 }
 
@@ -361,10 +373,17 @@ pub fn rewind(state: &mut DecoderState) -> Result<(), DecodeError> {
 }
 
 /// Read packets and decode until the next video frame emerges;
-/// convert to RGBA8 via `SwsContext`. Returns `Ok(None)` when the
-/// stream is at EOF (after the decoder has been fully drained).
-pub fn decode_next_frame(state: &mut DecoderState) -> Result<Option<RgbaFrame>, DecodeError> {
-    loop {
+/// convert to RGBA8 via `SwsContext`. The returned `RgbaFrame`
+/// borrows `state.rgba_scratch`; the borrow ends when the frame
+/// drops. Returns `Ok(None)` when the stream is at EOF (after the
+/// decoder has been fully drained).
+pub fn decode_next_frame(state: &mut DecoderState) -> Result<Option<RgbaFrame<'_>>, DecodeError> {
+    // Two-phase: receive an AVFrame into a local, THEN convert. We
+    // can't `return convert(state, &frame)` from inside the match
+    // arm because `state.dec.receive_frame()` borrows `state.dec`
+    // for the duration of the match expression, and convert needs
+    // `state: &mut`. The owned AVFrame outlives the borrow.
+    let frame = loop {
         let packet = state.ictx.read_packet().map_err(DecodeError::Codec)?;
         let Some(packet) = packet else {
             // EOF: flush the decoder and drain any pending frames.
@@ -379,23 +398,25 @@ pub fn decode_next_frame(state: &mut DecoderState) -> Result<Option<RgbaFrame>, 
             .send_packet(Some(&packet))
             .map_err(DecodeError::Codec)?;
         match state.dec.receive_frame() {
-            Ok(frame) => return convert_frame_to_rgba(state, &frame).map(Some),
+            Ok(f) => break f,
             // Need more packets; loop iterates naturally.
             Err(RsmpegError::DecoderDrainError) => {}
             Err(err) => return Err(DecodeError::Codec(err)),
         }
-    }
+    };
+    convert_frame_to_rgba(state, &frame).map(Some)
 }
 
 /// Drain ONE frame from the codec after EOF flush. Returns
 /// `Ok(None)` if the codec is fully drained (we've delivered every
 /// frame and `read_packet` is now hitting EOF).
-fn drain_one_frame(state: &mut DecoderState) -> Result<Option<RgbaFrame>, DecodeError> {
-    match state.dec.receive_frame() {
-        Ok(frame) => convert_frame_to_rgba(state, &frame).map(Some),
-        Err(RsmpegError::DecoderFlushedError) => Ok(None),
-        Err(err) => Err(DecodeError::Codec(err)),
-    }
+fn drain_one_frame(state: &mut DecoderState) -> Result<Option<RgbaFrame<'_>>, DecodeError> {
+    let frame = match state.dec.receive_frame() {
+        Ok(f) => f,
+        Err(RsmpegError::DecoderFlushedError) => return Ok(None),
+        Err(err) => return Err(DecodeError::Codec(err)),
+    };
+    convert_frame_to_rgba(state, &frame).map(Some)
 }
 
 /// Seek the format context to `pts_us` (microseconds). Flushes the
@@ -421,10 +442,10 @@ pub fn seek_to_pts(state: &mut DecoderState, pts_us: i64) -> Result<(), DecodeEr
     clippy::too_many_lines,
     reason = "linear convert pipeline: validate size → sws cache check → dst cache check → scale → copy out → pts conversion. Splitting would scatter the AVFrame lifetime across helpers."
 )]
-fn convert_frame_to_rgba(
-    state: &mut DecoderState,
+fn convert_frame_to_rgba<'a>(
+    state: &'a mut DecoderState,
     frame: &rsmpeg::avutil::AVFrame,
-) -> Result<RgbaFrame, DecodeError> {
+) -> Result<RgbaFrame<'a>, DecodeError> {
     let time_base = state.time_base;
     let width = u32::try_from(frame.width).unwrap_or(0);
     let height = u32::try_from(frame.height).unwrap_or(0);
@@ -513,7 +534,12 @@ fn convert_frame_to_rgba(
         actual_linesize as usize
     };
     let expected_usize = expected_bytes as usize;
-    let mut bytes = Vec::with_capacity(expected_usize);
+    // Reuse state.rgba_scratch: clear preserves capacity; the
+    // single reserve+extend below is the only allocation, and only
+    // on first use or dimension change (capacity grows monotonically
+    // up to the largest frame seen).
+    state.rgba_scratch.clear();
+    state.rgba_scratch.reserve(expected_usize);
     // SAFETY: dst.data[0] points to a buffer of linesize[0] * height
     // bytes (libavutil's documented contract); we read it as a slice
     // of that length and copy out the tightly-packed RGBA.
@@ -528,7 +554,7 @@ fn convert_frame_to_rgba(
         for row in 0..height_usize {
             let row_start = src_ptr.add(row * row_stride);
             let row_slice = std::slice::from_raw_parts(row_start, tight_row);
-            bytes.extend_from_slice(row_slice);
+            state.rgba_scratch.extend_from_slice(row_slice);
         }
     }
 
@@ -548,7 +574,7 @@ fn convert_frame_to_rgba(
         width,
         height,
         pts_us,
-        bytes,
+        bytes: &state.rgba_scratch,
     })
 }
 

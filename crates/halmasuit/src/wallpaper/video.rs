@@ -230,58 +230,62 @@ impl WallpaperBackend for VideoBackend {
         }
 
         // If a new frame is available, re-upload as the current
-        // texture. We rebuild TextureBuffer (rather than mutating
-        // in-place) — smithay's TextureBuffer doesn't expose a
-        // raw-texel-update API, and the GPU driver makes the
-        // rebuild cheap for stable sizes.
-        let new_frame_data: Option<(u64, u32, u32, Vec<u8>)> = {
+        // texture. The upload happens INSIDE the relay's
+        // `latest_frame()` borrow so smithay's `from_memory` reads
+        // the bytes directly out of the relay's buffer — avoids the
+        // per-frame `Vec::clone()` (8 MiB at 1080p) the prior shape
+        // forced. We rebuild TextureBuffer (rather than mutating in
+        // place) — smithay's TextureBuffer doesn't expose a raw-
+        // texel-update API, and the GPU driver makes the rebuild
+        // cheap for stable sizes.
+        let upload: Option<(u64, i32, i32, TextureBuffer<GlesTexture>)> =
             self.relay.borrow().as_ref().and_then(|r| {
                 r.latest_frame().and_then(|frame| {
                     if Some(frame.frame_idx) == self.last_uploaded_idx {
-                        None
-                    } else {
-                        Some((
-                            frame.frame_idx,
-                            frame.width,
-                            frame.height,
-                            frame.bytes.clone(),
-                        ))
+                        return None;
+                    }
+                    let Ok(w_i32) = i32::try_from(frame.width) else {
+                        error!(width = frame.width, "video: frame width > i32::MAX");
+                        return None;
+                    };
+                    let Ok(h_i32) = i32::try_from(frame.height) else {
+                        error!(height = frame.height, "video: frame height > i32::MAX");
+                        return None;
+                    };
+                    match TextureBuffer::from_memory(
+                        renderer,
+                        &frame.bytes,
+                        Fourcc::Abgr8888,
+                        (w_i32, h_i32),
+                        false,
+                        1,
+                        Transform::Normal,
+                        None,
+                    ) {
+                        Ok(buffer) => Some((frame.frame_idx, w_i32, h_i32, buffer)),
+                        Err(err) => {
+                            // Log but keep the previous frame. A
+                            // texture import failure shouldn't break
+                            // the wallpaper.
+                            error!(
+                                error = %err,
+                                "video: texture import failed; keeping last frame"
+                            );
+                            None
+                        }
                     }
                 })
-            })
-        };
-        if let Some((idx, w, h, bytes)) = new_frame_data {
-            let w_i32 = i32::try_from(w)
-                .map_err(|_| io::Error::other(format!("video frame width {w} > i32::MAX")))?;
-            let h_i32 = i32::try_from(h)
-                .map_err(|_| io::Error::other(format!("video frame height {h} > i32::MAX")))?;
-            match TextureBuffer::from_memory(
-                renderer,
-                &bytes,
-                Fourcc::Abgr8888,
-                (w_i32, h_i32),
-                false,
-                1,
-                Transform::Normal,
-                None,
-            ) {
-                Ok(buffer) => {
-                    self.current_buffer = buffer;
-                    self.current_size = Size::from((w_i32, h_i32));
-                    self.last_uploaded_idx = Some(idx);
-                    debug!(
-                        frame_idx = idx,
-                        width = w,
-                        height = h,
-                        "video: uploaded frame"
-                    );
-                }
-                Err(err) => {
-                    // Log but keep the previous frame. A texture
-                    // import failure shouldn't break the wallpaper.
-                    error!(error = %err, "video: texture import failed; keeping last frame");
-                }
-            }
+            });
+        if let Some((idx, w_i32, h_i32, buffer)) = upload {
+            self.current_buffer = buffer;
+            self.current_size = Size::from((w_i32, h_i32));
+            self.last_uploaded_idx = Some(idx);
+            debug!(
+                frame_idx = idx,
+                width = w_i32,
+                height = h_i32,
+                "video: uploaded frame"
+            );
         }
 
         // 3. Render whatever's current (placeholder until first frame
