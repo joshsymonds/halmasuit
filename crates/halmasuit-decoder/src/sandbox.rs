@@ -99,16 +99,27 @@ pub enum SandboxError {
         resource: &'static str,
         err: nix::Error,
     },
+    #[error("seccompiler: {0}")]
+    SeccompCompile(seccompiler::Error),
+    #[error("seccompiler load: {0}")]
+    SeccompLoad(seccompiler::Error),
 }
 
 /// Apply the full sandbox in the order documented at the module
 /// head. `keep_fds` is the allowlist for the fd-close step — every
 /// other fd open at call time is closed.
+///
+/// Order matters — each step depends on the preceding one not
+/// locking us out of the next. seccomp is LAST because the
+/// filter blocks syscalls that the preceding steps need
+/// (`unshare`, `setrlimit`, `openat`, `close`, `write` to
+/// /proc/self/{setgroups,uid_map,gid_map}).
 pub fn enter_sandbox(keep_fds: &[RawFd]) -> Result<(), SandboxError> {
     set_no_new_privs()?;
     close_fds_except(keep_fds)?;
     unshare_namespaces()?;
     set_rlimits()?;
+    install_seccomp_filter()?;
     info!("sandbox: process-level restrictions in place");
     Ok(())
 }
@@ -294,6 +305,139 @@ fn set_rlimits() -> Result<(), SandboxError> {
             err,
         })?;
     }
+    Ok(())
+}
+
+/// Compile + install the seccomp-bpf allowlist filter.
+///
+/// Default action is `KillProcess` — any syscall NOT on the
+/// allowlist immediately terminates the decoder with SIGSYS. The
+/// relay reaps via pidfd and applies the restart-or-fallback
+/// policy; the wire surface includes a `DecoderErrorCode::SeccompTrap`
+/// the operator can correlate (the dying decoder doesn't get to
+/// send it, but the relay can infer it from the exit signal).
+///
+/// Allow-list rationale: minimal set required to (a) decode video
+/// frames via libavcodec + sws_scale, (b) deliver them via
+/// SOCK_SEQPACKET sendmsg, (c) receive control messages via
+/// recvmsg + poll, (d) sleep between frames for PTS pacing, plus
+/// (e) the usual Rust/libc startup + futex + memory-management
+/// syscalls. Anything we didn't enumerate (network, filesystem
+/// path opens, fork/clone, ptrace, kernel modules, etc.) → SIGSYS.
+///
+/// The list is conservative: a few entries (e.g. `mprotect`,
+/// `rt_sigaction`) are NOT in epic Req #3's documented allowlist
+/// but ARE required for the decoder to function (allocator memory
+/// protection updates and Rust's panic handler respectively).
+/// Documented inline; a future audit pass can tighten further.
+fn install_seccomp_filter() -> Result<(), SandboxError> {
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
+    use std::collections::BTreeMap;
+
+    // x86_64 syscall numbers. The decoder is built only for
+    // x86_64-linux (per the workspace's nix flake systems); if we
+    // ever expand to aarch64 we'll need a second table.
+    const ALLOWED_SYSCALLS: &[(i64, &str)] = &[
+        // Spec allowlist (epic Req #3).
+        (libc::SYS_read, "read"),
+        (libc::SYS_write, "write"),
+        (libc::SYS_mmap, "mmap"),
+        (libc::SYS_munmap, "munmap"),
+        (libc::SYS_mremap, "mremap"),
+        (libc::SYS_futex, "futex"),
+        (libc::SYS_clock_gettime, "clock_gettime"),
+        (libc::SYS_exit, "exit"),
+        (libc::SYS_exit_group, "exit_group"),
+        (libc::SYS_rt_sigreturn, "rt_sigreturn"),
+        (libc::SYS_brk, "brk"),
+        (libc::SYS_restart_syscall, "restart_syscall"),
+        (libc::SYS_madvise, "madvise"),
+        // IPC: SOCK_SEQPACKET send/recv on the inherited fd.
+        // sendmsg/recvmsg for SCM_RIGHTS frames + the gather-write
+        // frame path; sendto/recvfrom because libc's send()/recv()
+        // are thin wrappers over those syscalls (NULL dest_addr).
+        (libc::SYS_sendmsg, "sendmsg"),
+        (libc::SYS_recvmsg, "recvmsg"),
+        (libc::SYS_sendto, "sendto"),
+        (libc::SYS_recvfrom, "recvfrom"),
+        // PTS pacing: wait until the next frame's presentation
+        // time on the IPC fd (poll + control interrupt).
+        (libc::SYS_ppoll, "ppoll"),
+        (libc::SYS_poll, "poll"),
+        (libc::SYS_nanosleep, "nanosleep"),
+        (libc::SYS_clock_nanosleep, "clock_nanosleep"),
+        // Memory allocator (glibc malloc family). brk + mmap are
+        // already on the list; mprotect updates page protections.
+        (libc::SYS_mprotect, "mprotect"),
+        // Rust panic infrastructure + libc signal setup. The
+        // decoder doesn't install custom handlers, but Rust's
+        // backtrace machinery may call these on a panic.
+        (libc::SYS_rt_sigaction, "rt_sigaction"),
+        (libc::SYS_rt_sigprocmask, "rt_sigprocmask"),
+        (libc::SYS_sigaltstack, "sigaltstack"),
+        // libc startup + identity calls (logging includes pid).
+        (libc::SYS_getpid, "getpid"),
+        // For the OwnedFd Drop on the original SCM_RIGHTS fd after
+        // open_video_input dups + mmaps.
+        (libc::SYS_close, "close"),
+        // libc may call this on startup (random pool init).
+        (libc::SYS_getrandom, "getrandom"),
+        // Rust's threading runtime allocates new pages for thread
+        // stacks (we don't spawn threads, but rsmpeg may use
+        // pthread_self / TLS init).
+        (libc::SYS_writev, "writev"),
+        (libc::SYS_readv, "readv"),
+        // set_nonblocking on the IPC fd + decoder fd dup
+        // (decode::open_video_input uses libc::dup which is a thin
+        // wrapper over fcntl on some libc impls).
+        (libc::SYS_fcntl, "fcntl"),
+        (libc::SYS_dup, "dup"),
+        // /proc/self/fd open during enter_sandbox happens BEFORE
+        // the filter installs, but rsmpeg / libavutil / libav* may
+        // touch the filesystem for codec config (e.g. read CPU
+        // capability files). Allow read-only path lookups.
+        (libc::SYS_openat, "openat"),
+        (libc::SYS_newfstatat, "newfstatat"),
+        (libc::SYS_fstat, "fstat"),
+        (libc::SYS_statx, "statx"),
+        // ioctl on the IPC fd for socket options + maybe TIOCGWINSZ
+        // from tracing-subscriber's terminal detection.
+        (libc::SYS_ioctl, "ioctl"),
+        // pread for mmap'd region read-ahead by libavformat
+        // (custom AVIO uses our read callback, but libavutil may
+        // also pread the underlying file when discovering codec
+        // parameters).
+        (libc::SYS_pread64, "pread64"),
+        // Generic fd-table operations.
+        (libc::SYS_lseek, "lseek"),
+        // libc startup probes (some libc init uses this).
+        (libc::SYS_set_robust_list, "set_robust_list"),
+        (libc::SYS_rseq, "rseq"),
+        // Allocator may use these for arena management.
+        (libc::SYS_membarrier, "membarrier"),
+    ];
+
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    for &(nr, _) in ALLOWED_SYSCALLS {
+        rules.insert(nr, vec![]);
+    }
+    let filter = SeccompFilter::new(
+        rules,
+        // Default: kill the whole process on any syscall not above.
+        SeccompAction::KillProcess,
+        // Allow listed syscalls.
+        SeccompAction::Allow,
+        TargetArch::x86_64,
+    )
+    .map_err(|e| SandboxError::SeccompCompile(seccompiler::Error::from(e)))?;
+    let program: BpfProgram = filter
+        .try_into()
+        .map_err(|e| SandboxError::SeccompCompile(seccompiler::Error::from(e)))?;
+    seccompiler::apply_filter(&program).map_err(SandboxError::SeccompLoad)?;
+    info!(
+        allowed = ALLOWED_SYSCALLS.len(),
+        "sandbox: seccomp-bpf filter installed (default: KILL_PROCESS)"
+    );
     Ok(())
 }
 

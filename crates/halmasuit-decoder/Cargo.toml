@@ -60,3 +60,11 @@ rsmpeg = { workspace = true }
 # outside the decoder process; no re-read of the underlying file
 # per loop.
 memmap2 = { workspace = true }
+# Compile the seccomp-bpf allowlist (Epic #12 task #27). The
+# `seccompiler` crate is Firecracker's BPF-program compiler: take
+# the allow-list as a Rust expression, emit a `sock_filter[]`, hand
+# to `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ...)`. No libseccomp
+# dynamic dep (the kernel takes raw BPF directly). `default-features
+# = false` drops the serde/JSON parsing path we don't use — the
+# allowlist is a Rust literal in `sandbox.rs::seccomp_filter`.
+seccompiler = { version = "0.5", default-features = false }

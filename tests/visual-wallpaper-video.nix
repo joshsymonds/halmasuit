@@ -327,9 +327,27 @@ pkgs.testers.runNixOSTest {
             "spawned before the compositor's privilege drop "
             "(regression of task #25's lazy-spawn fix)."
         )
+    # Epic Req #3: "seccomp-bpf allowlist: read, write, mmap, ...
+    # Everything else → SIGSYS." /proc/<pid>/status's Seccomp line
+    # reports the filter mode: 0=disabled, 1=strict, 2=filter
+    # (which is what `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)`
+    # produces). 2 means our allowlist is active. Anything else is
+    # a regression of task #27.
+    decoder_seccomp_mode = machine.succeed(
+        f"grep '^Seccomp:' /proc/{initial_decoder_pid}/status"
+    ).strip()
+    seccomp_value = decoder_seccomp_mode.split()[-1]
+    if seccomp_value != "2":
+        raise AssertionError(
+            "GATE 1 FAIL: decoder seccomp mode is not "
+            f"FILTER (2); got: {decoder_seccomp_mode!r}.\n"
+            "Epic Req #3 violation: the seccomp-bpf allowlist "
+            "must be active."
+        )
     print(
         f"GATE 1 PASS: halmasuit-decoder spawned pid={initial_decoder_pid} "
-        f"uid={decoder_uid} (uid_map: {decoder_uid_map})"
+        f"uid={decoder_uid} (uid_map: {decoder_uid_map}) "
+        f"seccomp_mode=FILTER"
     )
 
     # ── Gate 4 (early — captures pre-kill PID continuity) ──
