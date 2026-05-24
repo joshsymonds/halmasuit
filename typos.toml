@@ -21,4 +21,9 @@ extend-exclude = [
     "target/",
     "result*",
     "*.lock",
+    # Auto-generated FFmpeg bindings (rusty_ffmpeg's binding.rs,
+    # checked in to keep production bindgen-free per Epic #12 task
+    # #28). Contains FFmpeg API identifiers like "MaxCLL" (max
+    # content light level) that typos misreads.
+    "crates/halmasuit-decoder/ffmpeg_binding.rs",
 ]

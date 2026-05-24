@@ -323,14 +323,22 @@
           # under PR_SET_NO_NEW_PRIVS + rlimits. Links FFmpeg (LGPL,
           # dynamic) via rsmpeg's link_system_ffmpeg feature. NOT
           # --enable-gpl; h264 via stock libavcodec, AV1 via libdav1d.
-          # libclang IS needed in nativeBuildInputs because rsmpeg's
-          # build.rs runs bindgen against the ffmpeg-headless headers
-          # at build time (the Epic #5 hand-roll only removed bindgen
-          # from halmasuit-session's production path; rsmpeg is its
-          # own bindgen consumer and that's fine — it's NOT the
-          # privileged broker, and the clang-sys feature-unification
-          # bug is mitigated workspace-wide by the vendored pam-sys
-          # patch).
+          #
+          # Bindgen-free production (Epic #12 task #28 / Epic #5
+          # commitment): the rsmpeg → rusty_ffmpeg build.rs uses the
+          # checked-in `ffmpeg_binding.rs` via `FFMPEG_BINDING_PATH`
+          # instead of running bindgen at build time. libclang is
+          # therefore NOT in this derivation's nativeBuildInputs —
+          # matches the anti-pattern "NO libclang in nativeBuildInputs
+          # (production must stay bindgen-free)" and Epic #5's
+          # commitment to a libclang-free production closure.
+          #
+          # Regenerating ffmpeg_binding.rs (when ffmpeg-headless pins
+          # bump):  just regenerate-decoder-bindings  (runs cargo
+          # build inside the devShell with libclang, captures the
+          # generated binding.rs from target/, copies it back). The
+          # file lives in crates/halmasuit-decoder/ffmpeg_binding.rs
+          # and is checked in like a generated lockfile.
           halmasuit-decoder = rustPlatform.buildRustPackage {
             pname   = "halmasuit-decoder";
             version = "0.1.0";
@@ -340,15 +348,13 @@
               allowBuiltinFetchGit = true;
             };
             cargoBuildFlags   = [ "-p" "halmasuit-decoder" ];
-            nativeBuildInputs = [ pkgs.pkg-config pkgs.llvmPackages.libclang ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs       = [ pkgs.ffmpeg-headless ];
-            # bindgen invokes clang directly (bypasses NIX_CFLAGS_COMPILE);
-            # point it at ffmpeg + glibc headers so rsmpeg's build.rs
-            # finds <libavformat/avformat.h> etc.
             env = {
-              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-              BINDGEN_EXTRA_CLANG_ARGS =
-                "-I${pkgs.ffmpeg-headless.dev}/include -I${pkgs.glibc.dev}/include";
+              # Use the checked-in pre-generated bindings; this makes
+              # rusty_ffmpeg's build.rs skip its bindgen invocation
+              # entirely (no libclang needed at build time).
+              FFMPEG_BINDING_PATH = "${./crates/halmasuit-decoder/ffmpeg_binding.rs}";
             };
             doCheck = false;
             meta = {

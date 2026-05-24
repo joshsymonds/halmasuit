@@ -1,0 +1,19 @@
+# Workspace cargo config.
+#
+# `[env]` makes `cargo` set environment variables for every build
+# command at this workspace, so dev workflows (cargo build / test /
+# nextest) match the production flake build's behavior — both use
+# the checked-in pre-generated ffmpeg bindings instead of running
+# bindgen at build time (Epic #12 task #28 / Epic #5 commitment:
+# no libclang at production build time, no clang-sys feature-
+# unification conflict with halmasuit-session's dev-deps pam-sys).
+#
+# Path uses CARGO_WORKSPACE_DIR (cargo 1.75+) so it resolves
+# relative to whichever directory in the worktree cargo was
+# invoked from; alternative `relative = true` syntax requires
+# nightly.
+#
+# Regenerate the bindings file with `just regenerate-decoder-bindings`
+# when the workspace's ffmpeg-headless pin changes.
+[env]
+FFMPEG_BINDING_PATH = { value = "crates/halmasuit-decoder/ffmpeg_binding.rs", relative = true }
