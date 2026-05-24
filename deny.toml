@@ -8,7 +8,17 @@ all-features = true
 version             = 2
 yanked              = "deny"
 # RustSec advisory IDs to ignore (with written justification).
-ignore = []
+ignore = [
+    # paste 1.0.15 — "no longer maintained". Pulled transitively by
+    # rsmpeg → bon-macros (Epic #12 video decoder). `paste` is a
+    # proc-macro for token pasting whose function (turning identifier
+    # fragments into a single ident) is feature-complete; the
+    # "unmaintained" status means the upstream repo went unattended,
+    # not that the existing version is broken. No CVE, no behavior
+    # change. Remove when bon-macros drops the dep upstream OR rsmpeg
+    # gains a `paste`-free path.
+    { id = "RUSTSEC-2024-0436", reason = "feature-complete proc-macro; transitive via rsmpeg→bon-macros (Epic #12)" },
+]
 
 [licenses]
 version    = 2

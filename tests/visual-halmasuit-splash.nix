@@ -2,7 +2,7 @@
 # (Snapshot()).
 #
 # Boots halmasuit (halmasuit-debug, frame_audit on) and proves it
-# composites the configured `HALMASUIT_WITNESS_IMAGE` PNG as its
+# composites the configured `HALMASUIT_WALLPAPER_PATH` PNG as its
 # bottom-most internal background plane from frame 0 — no separate
 # client. Capture is the in-process `Snapshot()` D-Bus method.
 #
@@ -10,7 +10,7 @@
 # tests/fixtures/README.md), stretched to fill — so the golden proves
 # halmasuit actually textured a PNG internally, distinct from both
 # the brand clear and the solid-colour layer client. This gate stays
-# distinct from the future witness.png/ssimulacra2 gate.
+# distinct from the future wallpaper.png/ssimulacra2 gate.
 
 {
   system,
@@ -53,9 +53,9 @@ pkgs.testers.runNixOSTest {
         compositorUid  = 998;
         # Exercises the module option's option→unit-Environment
         # wiring (Epic #1 req 4): the path is exported as
-        # HALMASUIT_WITNESS_IMAGE and decoded by halmasuit itself at
-        # startup as its internal witness plane.
-        witnessImage   = fixture;
+        # HALMASUIT_WALLPAPER_PATH and decoded by halmasuit itself at
+        # startup as its internal wallpaper plane.
+        wallpaper = { type = "image"; source = fixture; };
       };
 
       # Snapshot() writes post-privilege-drop (uid 998) under

@@ -1,6 +1,6 @@
 # tests/visual-dankgreeter.nix — epic G-layer R2/R4 (HANDOFF §6 G2):
-# the REAL DankGreeter as halmasuit's greeter, over the internal
-# witness.
+# the REAL DankGreeter as halmasuit's greeter, over the wallpaper
+# plane.
 #
 # The real greeter stack (gnomon's, unmodified, pinned via nix-config's
 # dms flake): the `dms` greeter NixOS module builds the `dms-greeter`
@@ -17,7 +17,7 @@
 # QT_QUICK_BACKEND=software.
 #
 # G2 scope: real DankGreeter LAUNCHES + RENDERS as halmasuit's greeter
-# foreground over the witness, no-flash across boot→witness→greeter.
+# foreground over the wallpaper, no-flash across boot→wallpaper→greeter.
 # The full keystroke auth arc (DankGreeter UI → broker → real niri) is
 # G3 (next task) — not driven here.
 
@@ -89,7 +89,7 @@ pkgs.testers.runNixOSTest {
         greeterUid      = 999;
         greeterGroup    = "halmasuit-greeter";
         compositorUid   = 998;
-        witnessImage    = ./fixtures/witness.png;
+        wallpaper = { type = "image"; source = ./fixtures/wallpaper.png; };
         # Launch the REAL dms-greeter (the module-produced greetd
         # command) as halmasuit's tracked greeter child. Env:
         #  - its own XDG_RUNTIME_DIR (greeter-niri binds a socket there;
@@ -181,7 +181,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF scanout_active", timeout=30
     )
-    # Witness composited internally from frame 0.
+    # Wallpaper composited from frame 0.
     machine.wait_until_succeeds(
         "journalctl -u halmasuit -o cat | grep -qF client_first_frame", timeout=30
     )
@@ -193,7 +193,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds("pgrep -x niri", timeout=90)
     machine.wait_until_succeeds("pgrep -f quickshell", timeout=90)
 
-    # DankGreeter is halmasuit's foreground over the witness.
+    # DankGreeter is halmasuit's foreground over the wallpaper plane.
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF foreground_changed", timeout=60
     )
@@ -202,7 +202,7 @@ pkgs.testers.runNixOSTest {
     time.sleep(3)  # let the Quickshell UI settle into the snapshot buffer
     visual.assert_matches_golden(machine, "dankgreeter")
 
-    # No black/uncovered/degenerate frame across boot→witness→real
+    # No black/uncovered/degenerate frame across boot→wallpaper→real
     # DankGreeter — 100% of the frame_rendered stream, frame-0
     # anchored, zero tolerance (epic G1/R3).
     visual.assert_no_flash_stream(machine)

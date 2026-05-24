@@ -1,11 +1,11 @@
 # tests/visual-niri-session.nix — epic G-layer R2/R4: the REAL niri
-# as the broker-launched session, over the internal witness.
+# as the broker-launched session, over the wallpaper.
 #
 # Forks visual-foreground.nix, swapping the xdg_toplevel STAND-IN
 # session for unmodified upstream niri (pinned via nix-config's
 # niri-flake — the same revision gnomon runs). The arc:
 #
-#   halmasuit (witness from frame 0) + a layer-shell greeter stand-in
+#   halmasuit (wallpaper from frame 0) + a layer-shell greeter stand-in
 #   → halmasuit-vm-client drives a REAL greetd full-auth → compositor
 #   relays to the privileged halmasuit-session broker (real pam_unix)
 #   → halmasuit kills the greeter and the broker forks-then-drops the
@@ -131,8 +131,8 @@ pkgs.testers.runNixOSTest {
         greeterUid      = 999;
         greeterGroup    = "halmasuit-greeter";
         compositorUid   = 998;
-        witnessImage    = ./fixtures/witness.png;
-        # Greeter: the layer-shell stand-in over the witness (real
+        wallpaper = { type = "image"; source = ./fixtures/wallpaper.png; };
+        # Greeter: the layer-shell stand-in over the wallpaper (real
         # DankGreeter is the next task). halmasuit's tracked child —
         # killed on start_session.
         greeterCommand = "${pkgs.writeShellScript "halmasuit-niri-greeter" ''
@@ -215,7 +215,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF scanout_active", timeout=30
     )
-    # Witness composited internally from frame 0.
+    # Wallpaper composited from frame 0.
     machine.wait_until_succeeds(
         "journalctl -u halmasuit -o cat | grep -qF client_first_frame", timeout=30
     )

@@ -100,8 +100,10 @@
             # via libloading; not a build-time link dep. libdrm comes
             # transitively via drm-rs / gbm-sys.
             # libpam is for the halmasuit-session broker's FFI — the
-            # SOLE libpam surface in the workspace (Epic #1 R14;
-            # pam-sys links libpam.so.0 via `links = "pam"`).
+            # SOLE libpam surface in the workspace (Epic #1 R14; Epic #5
+            # replaced the pam-sys dep with a hand-rolled `unsafe extern
+            # "C"` block in `halmasuit_session::pam_sys` that links
+            # libpam.so.0 directly via `#[link(name = "pam")]`).
             buildInputs = with pkgs; [
               libxkbcommon
               wayland
@@ -116,12 +118,26 @@
               # libinput.pc for smithay's backend_libinput (input-sys)
               # under the same feature.
               libinput
+              # FFmpeg headers + libs for the halmasuit-decoder
+              # subsystem (Epic #12). rsmpeg's link_system_ffmpeg
+              # feature probes pkg-config for libavformat /
+              # libavcodec / libavutil / libswscale at build time.
+              # Without ffmpeg-headless here, devShell `cargo check`
+              # of anything depending on rsmpeg fails at the
+              # pkg-config probe. Production halmasuit-decoder has
+              # its own derivation below with this in buildInputs.
+              ffmpeg-headless
             ];
 
-            # bindgen (used transitively by pam-sys at build time) needs
-            # libclang.so available; LIBCLANG_PATH points it at the right
-            # one. Without this, `cargo build` panics inside clang-sys's
-            # build script when it can't find libclang.
+            # libclang is required ONLY by the dev-deps-only pam-sys
+            # parity audit lever (`crates/halmasuit-session/tests/pam_ffi_parity.rs`,
+            # Epic #5): pam-sys lives in [dev-dependencies] of
+            # halmasuit-session and runs bindgen at build time when
+            # compiled by `cargo test`. Production builds use the
+            # hand-rolled `halmasuit_session::pam_sys` FFI module — they
+            # link `-lpam` directly with zero bindgen / clang-sys /
+            # libclang involvement (and the production Nix packages
+            # below DO NOT include libclang in their nativeBuildInputs).
             #
             # pkg-config is needed by smithay-client-toolkit (and
             # transitively xkbcommon-sys) at build time to find
@@ -135,10 +151,12 @@
               export CARGO_HOME="$PWD/.cargo-home"
               export RUSTUP_HOME="$PWD/.rustup-home"
               export PATH="$CARGO_HOME/bin:$PATH"
+              # libclang + bindgen wiring for the pam-sys parity test
+              # (dev-deps-only). bindgen invokes clang directly,
+              # bypassing NIX_CFLAGS_COMPILE; point it at PAM + glibc
+              # headers so pam-sys's build.rs finds
+              # <security/pam_appl.h> and its transitive <unistd.h>.
               export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
-              # bindgen invokes clang directly, bypassing NIX_CFLAGS_COMPILE.
-              # Point it at PAM + glibc headers so pam-sys's build.rs
-              # finds <security/pam_appl.h> and its transitive <unistd.h>.
               export BINDGEN_EXTRA_CLANG_ARGS="-I${pkgs.pam}/include -I${pkgs.glibc.dev}/include"
               mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
             '';
@@ -173,16 +191,18 @@
             cargoBuildFlags    = [ "-p" "halmasuit" ];
             # Native deps:
             # - pkg-config: smithay's build script probes for libwayland.
-            # - llvmPackages.libclang: bindgen (transitively via pam-sys)
-            #   runs clang at build time. The dev shell exports this via
-            #   shellHook; rustPlatform.buildRustPackage has its own
-            #   sandboxed env, so we duplicate the wiring here.
-            nativeBuildInputs = [ pkgs.pkg-config pkgs.llvmPackages.libclang ];
+            #
+            # libclang is NOT in this list: the compositor binary has
+            # no bindgen consumer in its dep graph (verified via
+            # `cargo tree -p halmasuit --edges normal,build`). The
+            # privileged broker's libpam FFI is hand-rolled in
+            # `halmasuit_session::pam_sys` and the compositor never
+            # links libpam at all (CLAUDE.md: "No PAM in the
+            # compositor's address space").
+            nativeBuildInputs = [ pkgs.pkg-config ];
             # Runtime + link deps:
             # - libxkbcommon: smithay needs it for keymap handling.
             # - wayland: smithay's protocol scanner.
-            # - pam: pam-sys links against libpam.so.0 at runtime via
-            #   `links = "pam"` in its Cargo.toml.
             # - libgbm: smithay's `backend_gbm` + `renderer_gl` link
             #   against libgbm.so via gbm-sys at build time.
             # - libGL (libglvnd): provides `libEGL.so.1` which smithay
@@ -198,24 +218,22 @@
             #   (smithay backend_libinput/backend_udev; input-sys
             #   hardcodes -lxkbcommon). udev: libudev for seat-scoped
             #   device discovery.
+            #
+            # NOT included: libpam. The compositor has no PAM in its
+            # address space (CLAUDE.md hard rule); the privileged
+            # broker (`halmasuit-session`) is the sole libpam consumer
+            # and has its own derivation below with `pkgs.pam` in its
+            # buildInputs. `cargo tree -p halmasuit | grep -i pam` is
+            # empty.
             buildInputs       = [
               pkgs.libxkbcommon
               pkgs.wayland
-              pkgs.pam
               pkgs.libgbm
               pkgs.libGL
               pkgs.seatd
               pkgs.libinput
               pkgs.udev
             ];
-            # bindgen invokes clang directly (bypassing NIX_CFLAGS_COMPILE).
-            # Mirror the shellHook so pam-sys's build.rs finds
-            # <security/pam_appl.h> and its transitive <unistd.h>.
-            env = {
-              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-              BINDGEN_EXTRA_CLANG_ARGS =
-                "-I${pkgs.pam}/include -I${pkgs.glibc.dev}/include";
-            };
             # Integration tests spawn the binary and send POSIX signals; the
             # Nix sandbox doesn't permit that cleanly. `just check` is the
             # canonical gate; the NixOS VM test (next task) is the deployment-side gate.
@@ -273,10 +291,13 @@
           };
 
           # halmasuit-session — the socket-activated privileged
-          # PAM-lifecycle broker (Epic #1 R6). Links pam-sys (the SOLE
-          # libpam surface, R14) so it needs the same bindgen + libpam
-          # wiring as the testdriver, but none of smithay's
-          # wayland/GL/seatd stack.
+          # PAM-lifecycle broker (Epic #1 R6). The sole libpam-linking
+          # crate in the workspace (R14), now via the hand-rolled
+          # `halmasuit_session::pam_sys` FFI module (Epic #5). Production
+          # links `-lpam` directly — no bindgen, no clang-sys, no
+          # libclang at build time. pam-sys is a [dev-dependencies]
+          # audit lever for the parity test only (`doCheck = false`
+          # below means this derivation never sees dev-deps).
           halmasuit-session = rustPlatform.buildRustPackage {
             pname   = "halmasuit-session";
             version = "0.1.0";
@@ -286,13 +307,8 @@
               allowBuiltinFetchGit = true;
             };
             cargoBuildFlags   = [ "-p" "halmasuit-session" "--bin" "halmasuit-session" ];
-            nativeBuildInputs = [ pkgs.pkg-config pkgs.llvmPackages.libclang ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs       = [ pkgs.pam ];
-            env = {
-              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-              BINDGEN_EXTRA_CLANG_ARGS =
-                "-I${pkgs.pam}/include -I${pkgs.glibc.dev}/include";
-            };
             doCheck = false;
             meta = {
               description = "halmasuit socket-activated privileged PAM-lifecycle broker";
@@ -301,12 +317,57 @@
             };
           };
 
+          # halmasuit-decoder — sandboxed video-decoder subprocess
+          # (Epic #12). Forked by halmasuit at runtime via
+          # DecoderRelay; lives in a private user/net/mount namespace
+          # under PR_SET_NO_NEW_PRIVS + rlimits. Links FFmpeg (LGPL,
+          # dynamic) via rsmpeg's link_system_ffmpeg feature. NOT
+          # --enable-gpl; h264 via stock libavcodec, AV1 via libdav1d.
+          #
+          # Bindgen-free production (Epic #12 task #28 / Epic #5
+          # commitment): the rsmpeg → rusty_ffmpeg build.rs uses the
+          # checked-in `ffmpeg_binding.rs` via `FFMPEG_BINDING_PATH`
+          # instead of running bindgen at build time. libclang is
+          # therefore NOT in this derivation's nativeBuildInputs —
+          # matches the anti-pattern "NO libclang in nativeBuildInputs
+          # (production must stay bindgen-free)" and Epic #5's
+          # commitment to a libclang-free production closure.
+          #
+          # Regenerating ffmpeg_binding.rs (when ffmpeg-headless pins
+          # bump):  just regenerate-decoder-bindings  (runs cargo
+          # build inside the devShell with libclang, captures the
+          # generated binding.rs from target/, copies it back). The
+          # file lives in crates/halmasuit-decoder/ffmpeg_binding.rs
+          # and is checked in like a generated lockfile.
+          halmasuit-decoder = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-decoder";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags   = [ "-p" "halmasuit-decoder" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [ pkgs.ffmpeg-headless ];
+            env = {
+              # Use the checked-in pre-generated bindings; this makes
+              # rusty_ffmpeg's build.rs skip its bindgen invocation
+              # entirely (no libclang needed at build time).
+              FFMPEG_BINDING_PATH = "${./crates/halmasuit-decoder/ffmpeg_binding.rs}";
+            };
+            doCheck = false;
+            meta = {
+              description = "halmasuit sandboxed video-decoder subprocess";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-decoder";
+            };
+          };
+
           # halmasuit-session-pam-testdriver — test-only driver for the
-          # real-PAM gate (Epic #1 R12). Links pam-sys (via
-          # halmasuit-session) so it needs the same bindgen + libpam
-          # build wiring as `halmasuit` (clang for pam-sys's build.rs,
-          # pam headers, libpam.so.0 to link) — but NOT smithay's
-          # wayland/GL/seatd stack (halmasuit-session has none of it).
+          # real-PAM gate (Epic #1 R12). Reaches libpam via
+          # halmasuit-session's hand-rolled FFI (Epic #5); no bindgen
+          # at build time, no libclang.
           halmasuit-session-pam-testdriver = rustPlatform.buildRustPackage {
             pname   = "halmasuit-session-pam-testdriver";
             version = "0.1.0";
@@ -316,13 +377,8 @@
               allowBuiltinFetchGit = true;
             };
             cargoBuildFlags   = [ "-p" "halmasuit-session-pam-testdriver" ];
-            nativeBuildInputs = [ pkgs.pkg-config pkgs.llvmPackages.libclang ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs       = [ pkgs.pam ];
-            env = {
-              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-              BINDGEN_EXTRA_CLANG_ARGS =
-                "-I${pkgs.pam}/include -I${pkgs.glibc.dev}/include";
-            };
             doCheck = false;
             meta = {
               description = "halmasuit-session real-PAM VM-gate driver (test-only)";
@@ -495,6 +551,17 @@
           halmasuit            = self.packages.x86_64-linux.halmasuit;
           halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
         };
+        # Epic #12 task 10: end-to-end video wallpaper gate. Real
+        # h264, real rsmpeg, real sandbox; asserts decoder spawn,
+        # crash-recovery respawn within budget, budget-exhaustion
+        # fallback, AND login-flash continuity under video wallpaper.
+        visual-wallpaper-video = import ./tests/visual-wallpaper-video.nix {
+          system            = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-decoder = self.packages.x86_64-linux.halmasuit-decoder;
+        };
         halmasuit-vm = import ./tests/halmasuit-vm.nix {
           system    = "x86_64-linux";
           inherit nixpkgs;
@@ -521,7 +588,8 @@
         };
         # Epic #1 FLAGSHIP gate (headline): ONE pam_handle_t spans
         # auth→session — real pam_unix, pam_mount-equivalent authtok
-        # witness, getgrouplist-MERGE, Amendment-A1.3 env survival.
+        # continuity across phases, getgrouplist-MERGE, Amendment-A1.3
+        # env survival.
         session-onehandle = import ./tests/session-onehandle.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
@@ -582,7 +650,7 @@
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
         # Epic layer F1: real xdg_toplevel composited fullscreen
-        # over halmasuit's internal witness plane.
+        # over halmasuit's internal wallpaper plane.
         visual-halmasuit-toplevel = import ./tests/visual-halmasuit-toplevel.nix {
           system = "x86_64-linux";
           inherit nixpkgs;

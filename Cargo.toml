@@ -11,6 +11,13 @@ members = [
     "crates/halmasuit-session-ipc",
     # Privileged PAM-lifecycle broker (Epic: unified session/pamd).
     "crates/halmasuit-session",
+    # Pure wire contract for the compositor↔halmasuit-decoder video-decode
+    # relay (Epic #12: sandboxed-decoder VideoBackend). Types + codec only.
+    "crates/halmasuit-decoder-ipc",
+    # Sandboxed video-decoder subprocess (Epic #12). Forked + dup2'd to
+    # fd 3 by halmasuit; decodes via rsmpeg behind a seccomp/namespace
+    # boundary; emits RGBA frames back to the compositor.
+    "crates/halmasuit-decoder",
     # Test-only: real-PAM VM gate driver for halmasuit-session (R12).
     "crates/halmasuit-session-pam-testdriver",
     "crates/halmasuit-cli",
@@ -45,18 +52,26 @@ authors       = ["Josh Symonds <veraticus@gmail.com>"]
 # `thiserror` for error enums that benefit from Display derives. Used
 # by halmasuit-greetd's StateMachineError.
 thiserror          = "2"
-# PAM FFI for the privileged halmasuit-session broker (the sole
-# libpam-linking crate, Epic #1 R2/R14). Direct thin FFI (no wrapper
-# crate) per ARCHITECTURE.md "Open decisions" row 1 — wrappers flatten
-# PAM's message-style enum that our AuthMessageType already mirrors.
+# pam-sys: dev-dependencies-only audit lever (Epic #5).
 #
-# NOTE: 1.0.0-alpha5 is a pre-release (last released 2023-11) at a
-# privilege-critical FFI boundary. The crate has shipped alphas for
-# years and downstream consumers (the `pam` and `pam-client` wrapper
-# crates) pin to this exact version, so it is de-facto stable. Track
-# upstream (https://github.com/1wilkens/pam-sys) and RustSec for
-# advisories before each release tag; if a stable 1.0 ships, update
-# the pin and re-audit any signature changes (esp. pam_conv).
+# Production libpam FFI for the halmasuit-session broker is hand-rolled
+# in `crates/halmasuit-session/src/pam_sys.rs`, following sudo-rs's
+# pattern. Production builds link `-lpam` directly: NO bindgen,
+# NO clang-sys, NO libclang at build time.
+#
+# This dependency is consumed ONLY by
+# `crates/halmasuit-session/tests/pam_ffi_parity.rs` (an integration
+# test, listed under halmasuit-session's `[dev-dependencies]`, not its
+# `[dependencies]`). The parity test asserts struct layouts, constant
+# values, and `extern "C"` symbol resolution between our hand-rolled
+# FFI and pam-sys's bindgen output. Any libpam ABI drift fails CI
+# before the broker hits it in production.
+#
+# pam-sys upstream (https://github.com/1wilkens/pam-sys) has been
+# dormant since 2023-11. That is acceptable risk for a dev-deps-only
+# audit lever — the worst-case "pam-sys breaks on a new bindgen" only
+# affects the parity test, never the production binary. The hand-roll
+# is what removes the bus-factor exposure.
 pam-sys            = "1.0.0-alpha5"
 # C types and constants for the halmasuit-session libpam FFI surface.
 libc               = "0.2"
@@ -103,11 +118,57 @@ caps               = "0.5"
 # halmasuit-session privilege-drop primitives lean on it for
 # boundary-condition coverage.
 proptest           = "1"
-# Witness-PNG decoder used by the `halmasuit` compositor: it decodes
-# the configured `HALMASUIT_WITNESS_IMAGE` PNG and composites it as
-# its bottom-most internal background plane from frame 0 (epic G1
-# R3/R6). default-features off; only the `png` codec is enabled.
+# Wallpaper-image decoder used by the `halmasuit` compositor: the
+# wallpaper engine's ImageBackend decodes the configured
+# `HALMASUIT_WALLPAPER_PATH` file and composites it as the
+# bottom-most wallpaper plane from frame 0 (epic G1/R3/R6).
+# default-features off; only the `png` codec is enabled.
 image              = { version = "0.25", default-features = false, features = ["png"] }
+# Video decoder for the wallpaper engine's VideoBackend, consumed
+# by the sandboxed `halmasuit-decoder` subprocess (Epic #12). MIT-
+# licensed wrapper around FFmpeg's libav* (LGPL-2.1+ dynamic-link;
+# NOT --enable-gpl, so x264/x265 are NOT in the closure — h264 via
+# stock libavcodec, AV1 via libdav1d). `link_system_ffmpeg` probes
+# pkg-config for libavformat etc. at build time; ffmpeg-headless
+# is the production buildInput. `ffmpeg8` matches our nix
+# ffmpeg-headless version. The bindgen-conflict spike (Epic #12
+# task #14) confirmed rsmpeg 0.18 coexists with halmasuit-session's
+# dev-deps pam-sys without re-triggering clang-sys#128 (rsmpeg
+# pins rusty_ffmpeg 0.16.7 with bindgen 0.71, whose feature
+# defaults don't collide with pam-sys's bindgen 0.69).
+rsmpeg             = { version = "0.18.0", default-features = false, features = ["link_system_ffmpeg", "ffmpeg8"] }
+
+# Memory-map the wallpaper file in halmasuit-decoder once at startup
+# so the decoder's loop-on-EOF path can rewind via fresh AVIO+AVFormat
+# context creation against the SAME memory region (Epic #12 task #24).
+# Previously the decoder opened /dev/fd/N path-based for each loop
+# iteration, but Linux's /dev/fd/N semantics give the new file struct
+# the EXISTING fd's position, so after one full decode pass the shared
+# position was at EOF and every re-open immediately saw zero packets
+# (livelock). mmap removes the fd-position concern entirely — the
+# AVIO custom-callback layer reads from a cursor over the mmap'd
+# slice. No fd, no positional state shared with anything outside the
+# decoder process.
+memmap2            = "0.9"
+
+# Vendored `[patch.crates-io]` override (Epic #12): the dev-deps-only
+# pam-sys audit lever (halmasuit-session/tests/pam_ffi_parity.rs)
+# coexists with rsmpeg's transitive bindgen 0.71. Without this patch,
+# pam-sys's bindgen 0.69 (`default-features = false`) and rsmpeg's
+# bindgen 0.71 (runtime ON) collide at the unified clang-sys feature
+# set — `cargo nextest run --all-features` panics in clang-sys 1.8.1
+# at "a `libclang` shared library is not loaded on this thread"
+# (clang-sys#128, open since 2021). The vendored copy is byte-identical
+# to upstream 1.0.0-alpha5 except for a single Cargo.toml line:
+# bindgen's `default-features = false` → `default-features = true`,
+# which enables bindgen's runtime feature so its build.rs calls
+# clang_sys::load() itself. The patch affects ONLY the dev-deps audit
+# lever; production halmasuit-session uses the hand-rolled FFI in
+# `crates/halmasuit-session/src/pam_sys.rs` (Epic #5) and never touches
+# pam-sys. Re-evaluate when pam-sys upstream ships 1.0 final or when
+# clang-sys#128 lands a fix.
+[patch.crates-io]
+pam-sys = { path = "vendor/pam-sys-1.0.0-alpha5-runtime-feature" }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

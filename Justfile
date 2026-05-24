@@ -32,7 +32,7 @@ r14-gate:
 # (`assert_no_flash_stream`, epic R3/R9). Runs the contract test in
 # tests/lib/visual.py with NO VM/GPU: a clean frame-0-anchored stream
 # must pass and every flaw class (incl. the frame-0-anchor
-# strengthening — a frame_rendered preceding the witness cff) must be
+# strengthening — a frame_rendered preceding the wallpaper cff) must be
 # rejected. A hard gate so the load-bearing assertion can never
 # silently weaken.
 vis-selftest:
@@ -110,6 +110,11 @@ test-vm:
     # Real broker-launched niri, software-rendered headless (llvmpipe).
     echo "── visual-niri-session ──"
     nix build .#checks.x86_64-linux.visual-niri-session -L --print-build-logs --no-link
+    echo
+    # Epic #12: real halmasuit-decoder sandbox + crash-recovery +
+    # budget-exhaustion + login-flash continuity under video wallpaper.
+    echo "── visual-wallpaper-video ──"
+    nix build .#checks.x86_64-linux.visual-wallpaper-video -L --print-build-logs --no-link
 
 # Regenerate one or all visual-test goldens. Runs the named test
 # interactively (driverInteractive), with HALMASUIT_GOLDEN_REGEN=1 and
@@ -236,6 +241,37 @@ test-vm-drive-stop:
 # RustSec advisory check only (subset of `cargo deny check`).
 audit:
     cargo deny check advisories
+
+# Regenerate crates/halmasuit-decoder/ffmpeg_binding.rs from the
+# devShell-pinned ffmpeg-headless headers. Bindgen runs ONCE here;
+# the resulting bindings.rs is checked in, and the production flake
+# derivation reuses them via FFMPEG_BINDING_PATH (no libclang at
+# production build time — Epic #12 task #28 / Epic #5 commitment).
+#
+# Run this when the ffmpeg-headless pin changes (rare). The git
+# diff will be enormous (27K lines of generated bindings); inspect
+# the commit message, not the diff.
+regenerate-decoder-bindings:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Regenerating crates/halmasuit-decoder/ffmpeg_binding.rs"
+    echo "This invokes rusty_ffmpeg's build.rs bindgen against the"
+    echo "current devShell's ffmpeg-headless headers."
+    echo
+    # The build needs libclang + ffmpeg headers in scope; devShell
+    # provides both. Force a rebuild by removing the rusty_ffmpeg
+    # build artifact dir so bindgen reruns even if no source changed.
+    rm -rf target/debug/build/rusty_ffmpeg-*
+    cargo build -p halmasuit-decoder
+    # Pick the most-recently-built binding.rs (there may be stale
+    # ones from prior incremental builds with different feature
+    # flag sets).
+    src="$(ls -t target/debug/build/rusty_ffmpeg-*/out/binding.rs | head -1)"
+    dst="crates/halmasuit-decoder/ffmpeg_binding.rs"
+    cp "$src" "$dst"
+    echo "Wrote $dst (size: $(wc -c < $dst) bytes)"
+    echo "Inspect the commit diff and ship if it looks like a pure"
+    echo "ffmpeg-version bump."
 
 # ── Nightly / per-release gates ─────────────────────────────────────────────
 

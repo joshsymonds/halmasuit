@@ -1,28 +1,28 @@
-# tests/visual-halmasuit-clear.nix — the witness gate: the real
+# tests/visual-halmasuit-clear.nix — the wallpaper gate: the real
 # halmasuit binary (halmasuit-debug, frame_audit on) compositing the
-# LOCKED witness art.
+# LOCKED wallpaper art.
 #
 # Pins that halmasuit alone — no greeter, no session, no external
-# client — composites the locked witness (`tests/fixtures/witness.png`,
-# the Ḫalmašuit emblem) as its internal bottom plane from frame 0
-# (epic amendment G1/R3/R6: there is no pre-client solid phase). Two
-# orthogonal, always-live gates:
+# client — composites the locked wallpaper
+# (`tests/fixtures/wallpaper.png`, the Ḫalmašuit emblem) as its
+# bottom-most plane from frame 0 (epic amendment G1/R3/R6: there is
+# no pre-client solid phase). Two orthogonal, always-live gates:
 #
-#   * Exact-image content: `assert_matches_witness` compares the
+#   * Exact-image content: `assert_matches_exact` compares the
 #     in-process `Snapshot()` PNG — a CPU readback of the OFFSCREEN
 #     GLES render target (Mesa llvmpipe, no GPU, no GBM scanout; the
 #     exact scene the production pipeline composites, deterministic
 #     run-to-run even fully headless on virtio-gpu-pci) — to the
-#     checked-in `halmasuit-witness` golden with ssimulacra2 ≥ 95.0.
+#     checked-in `halmasuit-wallpaper` golden with ssimulacra2 ≥ 95.0.
 #     The golden is the 1280×800 render itself, HUMAN-INSPECTED
-#     against the 2560×1600 `tests/fixtures/witness.png` source before
-#     commit (the human bridges fixture→golden faithfulness; the gate
-#     then pins regression). Never CI-regenerated.
+#     against the 2560×1600 `tests/fixtures/wallpaper.png` source
+#     before commit (the human bridges fixture→golden faithfulness;
+#     the gate then pins regression). Never CI-regenerated.
 #
 #   * 100%-stream no-flash: `assert_no_flash_stream` over every
-#     `frame_rendered` — the witness cff precedes frame 0 and every
-#     frame is witness-covered (epic G1/R3, frame-0 anchor). This
-#     gate uniquely proves the witness-ALONE no-flash from frame 0.
+#     `frame_rendered` — the wallpaper cff precedes frame 0 and every
+#     frame is wallpaper-covered (epic G1/R3, frame-0 anchor). This
+#     gate uniquely proves the wallpaper-ALONE no-flash from frame 0.
 #
 # Greeter is `sleep infinity` — no auth is driven here; the test
 # waits for `scanout_active` + the D-Bus name, then Snapshot().
@@ -68,12 +68,16 @@ pkgs.testers.runNixOSTest {
         greeterUid     = 999;
         greeterGroup   = "halmasuit-greeter";
         compositorUid  = 998;
-        # The locked witness, composited by halmasuit internally as
-        # its bottom plane from frame 0 (epic G1/R3/R6).
-        witnessImage   = ./fixtures/witness.png;
+        # The locked wallpaper, composited by halmasuit's wallpaper
+        # engine as the bottom-most plane from frame 0 (epic
+        # G1/R3/R6).
+        wallpaper = {
+          type   = "image";
+          source = ./fixtures/wallpaper.png;
+        };
         # No greeter activity — this gate tests halmasuit's own
-        # witness compositing, not greeter flow.
-        greeterCommand = "${pkgs.writeShellScript "halmasuit-witness-test-greeter" ''
+        # wallpaper compositing, not greeter flow.
+        greeterCommand = "${pkgs.writeShellScript "halmasuit-wallpaper-test-greeter" ''
           exec ${pkgs.coreutils}/bin/sleep infinity
         ''}";
       };
@@ -148,16 +152,16 @@ pkgs.testers.runNixOSTest {
     )
 
     # Exact-image gate (ssimulacra2 >= 95.0): the offscreen readback
-    # of halmasuit's internal witness plane vs the human-inspected
-    # `halmasuit-witness` golden. Headless llvmpipe; no GPU, no GBM
+    # of halmasuit's wallpaper plane vs the human-inspected
+    # `halmasuit-wallpaper` golden. Headless llvmpipe; no GPU, no GBM
     # scanout — the offscreen GLES target is what makes this
     # pixel-correct and reproducible run-to-run.
-    visual.assert_matches_witness(machine, "halmasuit-witness")
+    visual.assert_matches_exact(machine, "halmasuit-wallpaper")
 
-    # 100%-stream no-flash, frame-0 anchored (epic G1/R3): the witness
-    # is composited from frame 0, so every frame_rendered must already
-    # be witness-covered. This gate uniquely exercises the
-    # witness-ALONE stream (no greeter/session frames in it).
+    # 100%-stream no-flash, frame-0 anchored (epic G1/R3): the
+    # wallpaper is composited from frame 0, so every frame_rendered
+    # must already be wallpaper-covered. This gate uniquely exercises
+    # the wallpaper-ALONE stream (no greeter/session frames in it).
     visual.assert_no_flash_stream(machine)
 
     print("visual-halmasuit-clear: ALL ASSERTIONS PASSED")

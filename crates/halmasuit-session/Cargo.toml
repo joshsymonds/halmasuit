@@ -39,12 +39,18 @@ thiserror.workspace  = true
 # Trait bounds for the generic framed send/recv (same as the codec in
 # halmasuit-session-ipc). Pure data traits — no I/O.
 serde.workspace      = true
-# libpam FFI (pam_ffi module only). This crate is the SOLE libpam-
-# linking surface in the workspace (Epic #1 R2/R14) and halmasuit-pam's
-# successor. Same pins/rationale as halmasuit-pam's FFI (see CLAUDE.md
-# "Ecosystem caveats": pam-sys is a de-facto-stable pre-release).
-pam-sys              = { workspace = true }
 libc.workspace       = true
 # Wipe credential buffers handed to libpam immediately after strdup
 # copies them into PAM-owned memory (Epic #1 R11).
 zeroize.workspace    = true
+
+[dev-dependencies]
+# pam-sys is dev-deps-only — the bindgen-generated parity audit lever
+# consumed by `tests/pam_ffi_parity.rs` (Epic #5). The broker's libpam
+# FFI surface is now hand-rolled in `src/pam_sys.rs` following sudo-rs's
+# pattern; pam-sys does not enter the production cargo tree, and
+# bindgen / clang-sys / libclang are no longer required at production
+# build time. The parity test asserts our hand-rolled struct layouts,
+# constants, and function-pointer signatures match bindgen's output
+# against the build host's libpam headers, so libpam ABI drift fails CI.
+pam-sys              = { workspace = true }
