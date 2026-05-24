@@ -111,6 +111,36 @@ test-vm:
     echo "── visual-niri-session ──"
     nix build .#checks.x86_64-linux.visual-niri-session -L --print-build-logs --no-link
     echo
+    # R13 forcing function: real DMS DankGreeter (Quickshell+Qt6) as
+    # halmasuit's greeter over the wallpaper, no-flash invariant intact.
+    echo "── visual-dankgreeter ──"
+    nix build .#checks.x86_64-linux.visual-dankgreeter -L --print-build-logs --no-link
+    echo
+    # R12 (GTK4 half): minimal GTK4 wayland client end-to-end.
+    echo "── visual-gtk4-smoke ──"
+    nix build .#checks.x86_64-linux.visual-gtk4-smoke -L --print-build-logs --no-link
+    echo
+    # R13(b): G3 keystroke auth arc end-to-end through real DMS
+    # DankGreeter → broker → real pam_unix → session_opened.
+    echo "── visual-dankgreeter-auth ──"
+    nix build .#checks.x86_64-linux.visual-dankgreeter-auth -L --print-build-logs --no-link
+    echo
+    # Convergence epic R2: wl_surface.frame callbacks (no Mesa-EGL wedge).
+    echo "── visual-frame-callbacks ──"
+    nix build .#checks.x86_64-linux.visual-frame-callbacks -L --print-build-logs --no-link
+    echo
+    # Convergence epic R3: sync-subsurface commits aggregate to parent.
+    echo "── visual-sync-subsurface ──"
+    nix build .#checks.x86_64-linux.visual-sync-subsurface -L --print-build-logs --no-link
+    echo
+    # Convergence epic R4: initial xdg_surface.configure deferred to commit handler.
+    echo "── visual-deferred-configure ──"
+    nix build .#checks.x86_64-linux.visual-deferred-configure -L --print-build-logs --no-link
+    echo
+    # Convergence epic R5: smithay PopupManager + positioner-driven popup geometry.
+    echo "── visual-popup ──"
+    nix build .#checks.x86_64-linux.visual-popup -L --print-build-logs --no-link
+    echo
     # Epic #12: real halmasuit-decoder sandbox + crash-recovery +
     # budget-exhaustion + login-flash continuity under video wallpaper.
     echo "── visual-wallpaper-video ──"

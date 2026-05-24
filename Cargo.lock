@@ -846,6 +846,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "tracing-subscriber",
+ "xcursor",
  "zbus",
 ]
 
@@ -875,6 +876,15 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "halmasuit-deferred-configure-test-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]
@@ -910,6 +920,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "smithay-client-toolkit",
+]
+
+[[package]]
+name = "halmasuit-popup-test-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]
@@ -950,6 +969,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "halmasuit-subsurface-test-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "smithay-client-toolkit",
+ "wayland-client",
+]
+
+[[package]]
 name = "halmasuit-test"
 version = "0.1.0"
 
@@ -970,6 +998,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

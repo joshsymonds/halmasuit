@@ -32,6 +32,17 @@ members = [
     # Throwaway xdg_toplevel test client — exercises halmasuit's F1
     # xdg-shell compositing path.
     "crates/halmasuit-toplevel-test-client",
+    # Throwaway sync-subsurface test client — exercises halmasuit's
+    # wl_compositor commit aggregation per the wl_subsurface contract.
+    "crates/halmasuit-subsurface-test-client",
+    # Throwaway raw-protocol test client — observes the timing of the
+    # initial xdg_surface.configure event relative to the client's
+    # first wl_surface.commit (xdg-shell deferred-configure contract).
+    "crates/halmasuit-deferred-configure-test-client",
+    # Throwaway raw-protocol test client — observes the geometry the
+    # compositor forwards on xdg_popup.configure (xdg-shell positioner
+    # pipeline / PopupManager wiring contract).
+    "crates/halmasuit-popup-test-client",
     "xtask",
 ]
 
@@ -124,6 +135,10 @@ proptest           = "1"
 # bottom-most wallpaper plane from frame 0 (epic G1/R3/R6).
 # default-features off; only the `png` codec is enabled.
 image              = { version = "0.25", default-features = false, features = ["png"] }
+# Xcursor theme loader for R8b-render (visible cursor compositing).
+# Matches smithay anvil's pin (0.3.x). Reads $XCURSOR_THEME + $XCURSOR_SIZE
+# at compositor startup, returns animated frames for named cursors.
+xcursor            = "0.3"
 # Video decoder for the wallpaper engine's VideoBackend, consumed
 # by the sandboxed `halmasuit-decoder` subprocess (Epic #12). MIT-
 # licensed wrapper around FFmpeg's libav* (LGPL-2.1+ dynamic-link;

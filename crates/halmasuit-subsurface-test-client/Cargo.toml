@@ -1,0 +1,24 @@
+[package]
+name        = "halmasuit-subsurface-test-client"
+description = "Test wl_client that exercises wl_subsurface sync semantics. Maps an xdg_toplevel + a sync subsurface, then drives a deterministic commit sequence the compositor's commit-aggregation contract is tested against. Not production code."
+
+version.workspace        = true
+edition.workspace        = true
+license.workspace        = true
+repository.workspace     = true
+authors.workspace        = true
+
+# Throwaway test client: built via nixpkgs's pinned rustc, looser MSRV
+# than the workspace pin is fine (same as the other test clients).
+rust-version       = "1.87"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow                 = "1"
+smithay-client-toolkit = "0.20"
+# Raw wayland-client for direct wl_subcompositor / wl_subsurface
+# methods — sctk's high-level abstractions don't cover the explicit
+# sync/desync sequencing this test needs.
+wayland-client         = "0.31"

@@ -36,6 +36,9 @@ use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmSurface};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::Color32F;
+use smithay::backend::renderer::element::memory::{
+    MemoryRenderBuffer, MemoryRenderBufferRenderElement,
+};
 use smithay::backend::renderer::element::render_elements;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
@@ -109,17 +112,53 @@ pub fn xrgb_le_to_color32f(bytes: [u8; 4]) -> Color32F {
 render_elements! {
     /// One frame's render elements. smithay element lists are
     /// front-to-back (index 0 = topmost, drawn last). `Surface` wraps
-    /// a committed wl_client subtree; `Wallpaper` /
-    /// `WallpaperShader` are halmasuit's internal full-output
-    /// background plane (image-backed and shader-backed
+    /// a committed wl_client subtree (including client-attached
+    /// cursor surface trees set via `wl_pointer.set_cursor` — they
+    /// share the variant; smithay's `Kind::Cursor` marker on the
+    /// inner element handles cursor-specific damage tracking).
+    /// `Wallpaper` / `WallpaperShader` are halmasuit's internal
+    /// full-output background plane (image-backed and shader-backed
     /// respectively), always the LAST element so every surface
     /// composites over it (epic G1/R3/R6). Exactly one wallpaper
     /// variant is produced per frame — the engine's active backend
-    /// picks which.
+    /// picks which. `CursorMemory` is the named-cursor pixmap from
+    /// the loaded xcursor theme (R8b-render); always prepended at
+    /// INDEX 0 (topmost) above every client surface.
     pub SceneElement<=GlesRenderer>;
-    Surface = WaylandSurfaceRenderElement<GlesRenderer>,
-    Wallpaper = TextureRenderElement<GlesTexture>,
+    Surface         = WaylandSurfaceRenderElement<GlesRenderer>,
+    Wallpaper       = TextureRenderElement<GlesTexture>,
     WallpaperShader = smithay::backend::renderer::gles::element::PixelShaderElement,
+    CursorMemory    = smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement<GlesRenderer>,
+}
+
+/// R8b-render cursor state. Lives on `DrmBackend` (next to the
+/// renderer and the wallpaper engine) because cursor pixmap upload
+/// uses the same renderer; main.rs is sans-Renderer and forwards
+/// state changes via `set_cursor_status` / `set_pointer_location`.
+struct CursorRenderState {
+    theming: crate::cursor::CursorTheming,
+    status: smithay::input::pointer::CursorImageStatus,
+    /// Current pointer position in PHYSICAL pixels (= LOGICAL for
+    /// halmasuit's 1:1 scale single output). `(0, 0)` until the first
+    /// pointer-motion event arrives.
+    pointer_loc: smithay::utils::Point<i32, smithay::utils::Physical>,
+    /// `true` once a pointer event has arrived. The cursor render
+    /// path no-ops while this is `false` — a system compositor at
+    /// idle (greeter waiting, no user input yet) shows no cursor,
+    /// matching the UX of every production display server and
+    /// keeping deterministic boot-frame goldens cursor-free.
+    has_moved: bool,
+    /// Cached `(name, hotspot, buffer)` for the currently displayed
+    /// Named cursor. Re-baked from the xcursor theme when `status`
+    /// changes to a different name.
+    cached: Option<CachedNamed>,
+    started_at: std::time::Instant,
+}
+
+struct CachedNamed {
+    name: String,
+    hotspot: (i32, i32),
+    buffer: MemoryRenderBuffer,
 }
 
 /// The full GLES + GBM + DrmCompositor stack wrapped around a single
@@ -148,6 +187,15 @@ pub struct DrmBackend {
     /// non-visual integration tests; production/visual deployments
     /// always configure one.
     wallpaper: WallpaperEngine,
+    /// R8b-render cursor state. `theming` is the loaded xcursor theme
+    /// (or procedural fallback); `status` is the latest client-
+    /// requested CursorImageStatus; `pointer_loc` is the current
+    /// pointer position in physical pixels; `cached` is the
+    /// MemoryRenderBuffer for the currently-displayed Named icon
+    /// (re-baked when `status` changes to a different name).
+    /// `started_at` anchors animation timing — `Instant`-based
+    /// elapsed time chooses the active animation frame.
+    cursor: CursorRenderState,
     /// Monotonic frame counter for the `frame_audit` `FrameRendered`
     /// stream. Only exists in `halmasuit-debug`.
     #[cfg(feature = "frame_audit")]
@@ -415,6 +463,14 @@ where
             compositor,
             renderer,
             wallpaper,
+            cursor: CursorRenderState {
+                theming: crate::cursor::CursorTheming::load(),
+                status: smithay::input::pointer::CursorImageStatus::default_named(),
+                pointer_loc: (0, 0).into(),
+                has_moved: false,
+                cached: None,
+                started_at: std::time::Instant::now(),
+            },
             #[cfg(feature = "frame_audit")]
             frame_counter: 0,
             #[cfg(feature = "frame_audit")]
@@ -426,6 +482,154 @@ where
 }
 
 impl DrmBackend {
+    /// R8b-render: install the latest `CursorImageStatus` from the
+    /// focused client (or halmasuit's own default). When the status
+    /// transitions to a new Named icon, drop the cached buffer so
+    /// the next render bakes the new pixmap from the xcursor theme.
+    pub fn set_cursor_status(&mut self, status: smithay::input::pointer::CursorImageStatus) {
+        let name_changed = match (&self.cursor.status, &status) {
+            (
+                smithay::input::pointer::CursorImageStatus::Named(a),
+                smithay::input::pointer::CursorImageStatus::Named(b),
+            ) => a != b,
+            _ => true,
+        };
+        if name_changed {
+            self.cursor.cached = None;
+        }
+        self.cursor.status = status;
+    }
+
+    /// R8b-render: latest pointer location in physical pixels. Called
+    /// from main.rs's pointer-motion / touch handlers after they
+    /// route the event through smithay's `PointerHandle`.
+    pub fn set_pointer_location(
+        &mut self,
+        loc: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) {
+        // Halmasuit's single output is 1:1 scale, so logical == physical;
+        // round-to-nearest for pixel alignment.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "cursor position bounded by output dimensions, well within i32"
+        )]
+        let (x, y) = (loc.x.round() as i32, loc.y.round() as i32);
+        self.cursor.pointer_loc = (x, y).into();
+        self.cursor.has_moved = true;
+    }
+
+    /// R8b-render: build the cursor render element(s) for the current
+    /// status + location. Returns empty when Hidden, the cached or
+    /// freshly-baked Named pixmap when Named, or surface-tree
+    /// elements when Surface. Always at index 0 (topmost — drawn LAST
+    /// in front-to-back order).
+    fn cursor_elements(&mut self) -> Vec<SceneElement> {
+        use smithay::backend::renderer::element::Kind;
+        use smithay::input::pointer::CursorImageStatus;
+
+        // Skip the default-named cursor at boot before the user
+        // moves the mouse. A client-attached cursor surface
+        // (`set_cursor(surface)`) overrides this — that's an
+        // explicit client request to display its own cursor and
+        // honored regardless of `has_moved`.
+        if !self.cursor.has_moved && !matches!(self.cursor.status, CursorImageStatus::Surface(_)) {
+            return Vec::new();
+        }
+        let scale = smithay::utils::Scale::from(1.0);
+        match self.cursor.status.clone() {
+            CursorImageStatus::Hidden => Vec::new(),
+            CursorImageStatus::Named(name) => {
+                let name_str = name.name();
+                let elapsed = self.cursor.started_at.elapsed();
+                let needs_bake = self
+                    .cursor
+                    .cached
+                    .as_ref()
+                    .is_none_or(|c| c.name != name_str);
+                if needs_bake {
+                    let icons = self.cursor.theming.load_named(name_str);
+                    let frame = icons.current_frame(elapsed);
+                    #[allow(
+                        clippy::cast_possible_wrap,
+                        reason = "xcursor image dimensions ≤ a sane cursor size, fit i32"
+                    )]
+                    let size = (frame.width as i32, frame.height as i32);
+                    let buf = MemoryRenderBuffer::from_slice(
+                        &frame.pixels_rgba,
+                        Fourcc::Argb8888,
+                        size,
+                        1,
+                        smithay::utils::Transform::Normal,
+                        None,
+                    );
+                    #[allow(
+                        clippy::cast_possible_wrap,
+                        reason = "hotspot ≤ image size ≤ sane cursor dimension; fits i32"
+                    )]
+                    let hotspot = (frame.xhot as i32, frame.yhot as i32);
+                    self.cursor.cached = Some(CachedNamed {
+                        name: name_str.to_owned(),
+                        hotspot,
+                        buffer: buf,
+                    });
+                }
+                let cached = self
+                    .cursor
+                    .cached
+                    .as_ref()
+                    .expect("just baked above if needs_bake was true");
+                let loc = smithay::utils::Point::from((
+                    self.cursor.pointer_loc.x - cached.hotspot.0,
+                    self.cursor.pointer_loc.y - cached.hotspot.1,
+                ));
+                match MemoryRenderBufferRenderElement::from_buffer(
+                    &mut self.renderer,
+                    loc.to_f64(),
+                    &cached.buffer,
+                    None,
+                    None,
+                    None,
+                    Kind::Cursor,
+                ) {
+                    Ok(el) => vec![SceneElement::CursorMemory(el)],
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cursor MemoryRenderBufferRenderElement::from_buffer");
+                        Vec::new()
+                    }
+                }
+            }
+            CursorImageStatus::Surface(surface) => {
+                // Client-attached cursor surface tree. Hotspot is on
+                // the smithay-side `CursorImageSurfaceData` set by
+                // `wl_pointer.set_cursor`'s hot_x/hot_y; smithay
+                // tracks it via the surface's data map.
+                let hotspot = smithay::wayland::compositor::with_states(&surface, |states| {
+                    states
+                        .data_map
+                        .get::<std::sync::Mutex<smithay::input::pointer::CursorImageAttributes>>()
+                        .map_or((0, 0), |d| {
+                            let l = d.lock().unwrap();
+                            (l.hotspot.x, l.hotspot.y)
+                        })
+                });
+                let loc = smithay::utils::Point::from((
+                    self.cursor.pointer_loc.x - hotspot.0,
+                    self.cursor.pointer_loc.y - hotspot.1,
+                ));
+                let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                    smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
+                        &mut self.renderer,
+                        &surface,
+                        loc,
+                        scale,
+                        1.0,
+                        Kind::Cursor,
+                    );
+                elements.into_iter().map(SceneElement::Surface).collect()
+            }
+        }
+    }
+
     /// Build one frame's front-to-back render-element list (index 0 =
     /// topmost). Walks the output's LayerMap in scene z-order — top →
     /// bottom: Overlay, Top, the foreground xdg toplevel
@@ -458,6 +662,10 @@ impl DrmBackend {
 
         let scale = Scale::from(1.0);
         let map = layer_map_for_output(output);
+        // R8b-render: cursor goes at INDEX 0 (topmost — drawn LAST in
+        // front-to-back order). Build first so we can prepend at the
+        // end without an extra Vec move.
+        let cursor_elements = self.cursor_elements();
         let mut elements: Vec<SceneElement> = Vec::new();
         let mut push_surface_at =
             |renderer: &mut GlesRenderer,
@@ -510,6 +718,14 @@ impl DrmBackend {
             if let Some(element) = self.wallpaper.render_element(&mut self.renderer, dst)? {
                 elements.push(element);
             }
+        }
+        // R8b-render: prepend cursor elements so they sit at index 0
+        // (topmost). Smithay's render is front-to-back; the cursor
+        // composites OVER all layers + foreground.
+        if !cursor_elements.is_empty() {
+            let mut combined = cursor_elements;
+            combined.append(&mut elements);
+            return Ok(combined);
         }
         Ok(elements)
     }

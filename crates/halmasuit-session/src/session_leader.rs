@@ -62,6 +62,16 @@ const ENV_ALLOWLIST: &[&str] = &[
     "USER",
     "LOGNAME",
     "SHELL",
+    // R8b-render — cursor theme unification. Halmasuit reads these
+    // at startup to load the xcursor theme it composites for its own
+    // surface tree; the session leader (niri / cosmic-comp / sway /
+    // any child compositor) reads the same env keys to render the
+    // same theme inside its surface, so the cursor looks consistent
+    // across the halmasuit → child boundary. Pure path/integer
+    // values, no shell-injection / library-loader surface (unlike
+    // LD_*) — safe to pass through unaltered.
+    "XCURSOR_THEME",
+    "XCURSOR_SIZE",
 ];
 
 /// Why a session spec / group merge was refused. Fail-closed on every

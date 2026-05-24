@@ -1,0 +1,19 @@
+[package]
+name        = "halmasuit-popup-test-client"
+description = "Raw-protocol wl_client that creates an xdg_toplevel + xdg_popup with a deliberate positioner and observes the popup's initial configure geometry. Used by tests/visual-popup.nix to assert R5 (PopupManager-driven popup geometry, not zero-rect fallback)."
+
+version.workspace        = true
+edition.workspace        = true
+license.workspace        = true
+repository.workspace     = true
+authors.workspace        = true
+
+rust-version       = "1.87"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow             = "1"
+wayland-client     = "0.31"
+wayland-protocols  = { version = "0.32", features = ["client"] }

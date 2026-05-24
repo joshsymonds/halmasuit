@@ -107,6 +107,11 @@ nix = { workspace = true, features = ["user", "signal", "process", "socket", "ui
 # no pre-client solid phase. `default-features = false, features =
 # ["png"]` at the workspace level (no JPEG/GIF/… codecs pulled in).
 image = { workspace = true }
+# R8b-render: load Xcursor themes for the visible-cursor render path.
+# Reads $XCURSOR_THEME and $XCURSOR_SIZE at startup; the NixOS module
+# sets these in halmasuit.service's env and the broker propagates them
+# into the session leader's exec env (Amendment A9 allowlist).
+xcursor.workspace = true
 # Wallpaper-engine config deserialization (shader uniform bindings).
 # The Nix module writes a JSON file at HALMASUIT_WALLPAPER_CONFIG; the
 # wallpaper engine deserializes it into `WallpaperConfig`. serde +

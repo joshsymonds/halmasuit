@@ -199,6 +199,14 @@ pkgs.testers.runNixOSTest {
     )
     assert "greeter" in fg_events(), f"expected greeter foreground; got {fg_events()}"
 
+    # Pin VM clock to a fixed instant before snapshot. The DMS
+    # Quickshell UI binds Date.now() into the clock + date labels,
+    # which would otherwise drift every test run and make a stable
+    # perceptual golden impossible. Disable NTP, force the wall
+    # clock to a known moment, sleep enough for Quickshell's QML
+    # Timer to tick the new value into the bound text, then capture.
+    machine.succeed("timedatectl set-ntp false || true")
+    machine.succeed("date -s '2026-05-22 15:30:00'")
     time.sleep(3)  # let the Quickshell UI settle into the snapshot buffer
     visual.assert_matches_golden(machine, "dankgreeter")
 

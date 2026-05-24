@@ -490,6 +490,79 @@
             };
           };
 
+          # halmasuit-subsurface-test-client — exercises halmasuit's
+          # wl_compositor commit-aggregation contract (R3): an
+          # xdg_toplevel parent + a sync wl_subsurface child, driven
+          # through a deterministic commit sequence the regression
+          # test asserts against.
+          halmasuit-subsurface-test-client = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-subsurface-test-client";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [ "-p" "halmasuit-subsurface-test-client" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [ pkgs.libxkbcommon pkgs.wayland ];
+            doCheck = false;
+            meta = {
+              description = "wl_subsurface sync-semantics test client (R3)";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-subsurface-test-client";
+            };
+          };
+
+          # halmasuit-deferred-configure-test-client — observes the
+          # protocol-level timing of halmasuit's initial
+          # xdg_surface.configure (R4): raw wayland-client (no SCTK
+          # Window), drives a deterministic two-phase observation
+          # (pre-commit, post-commit) emitting two stderr markers the
+          # VM test asserts against.
+          halmasuit-deferred-configure-test-client = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-deferred-configure-test-client";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [ "-p" "halmasuit-deferred-configure-test-client" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [ pkgs.wayland ];
+            doCheck = false;
+            meta = {
+              description = "xdg-shell deferred-configure timing observer (R4)";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-deferred-configure-test-client";
+            };
+          };
+
+          # halmasuit-popup-test-client — observes the geometry the
+          # compositor forwards on xdg_popup.configure (R5
+          # PopupManager-driven positioner pipeline). Raw protocol;
+          # creates xdg_toplevel + xdg_popup with a deliberate
+          # positioner and emits POPUP_CONFIGURE: x=..y=..w=..h=..
+          halmasuit-popup-test-client = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-popup-test-client";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [ "-p" "halmasuit-popup-test-client" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [ pkgs.wayland ];
+            doCheck = false;
+            meta = {
+              description = "xdg-shell popup positioner / geometry observer (R5)";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-popup-test-client";
+            };
+          };
+
           # ssimulacra2_rs — pure-Rust port of the SSIMULACRA2
           # perceptual image-diff metric. Used by visual VM tests as
           # the golden-comparison engine. Chosen over the C++
@@ -681,6 +754,82 @@
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
           halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # R13 forcing function (the reason this epic exists): the
+        # real DMS DankGreeter (Quickshell/Qt6 + greeter-niri) as
+        # halmasuit's greeter. Scaffolded at epic #2 close (8925ca5);
+        # turned on once R2 + the rest of the Phase A/B contracts
+        # landed in this convergence epic.
+        visual-dankgreeter = import ./tests/visual-dankgreeter.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+          ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # R13(b) GATE: real DMS DankGreeter as halmasuit's greeter,
+        # real keystrokes → broker → real pam_unix → session_opened.
+        # The end-to-end chain through the upstream client we
+        # actually deploy with on gnomon.
+        visual-dankgreeter-auth = import ./tests/visual-dankgreeter-auth.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+          ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # R12 (GTK4 half): real GTK4 wayland client as halmasuit's
+        # greeter. Qt6 is covered by visual-dankgreeter (Quickshell);
+        # this proves the parallel GTK4 path through the same
+        # halmasuit registry surface.
+        visual-gtk4-smoke = import ./tests/visual-gtk4-smoke.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+          ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Convergence epic R2: wl_surface.frame callbacks fire so
+        # Mesa-EGL clients don't wedge in dri2_wl_surface_throttle.
+        visual-frame-callbacks = import ./tests/visual-frame-callbacks.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+          ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Convergence epic R3: sync wl_subsurface commits are
+        # aggregated to the parent atomic state, NOT applied
+        # immediately (smithay smallvil pattern).
+        visual-sync-subsurface = import ./tests/visual-sync-subsurface.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                        = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-subsurface-test-client = self.packages.x86_64-linux.halmasuit-subsurface-test-client;
+          ssimulacra2-cli                  = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Convergence epic R4: halmasuit defers the initial
+        # xdg_surface.configure to the commit handler (per xdg-shell
+        # spec: configure is sent in response to the client's first
+        # wl_surface.commit, not eagerly at xdg_toplevel creation).
+        visual-deferred-configure = import ./tests/visual-deferred-configure.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                                 = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                         = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-deferred-configure-test-client  = self.packages.x86_64-linux.halmasuit-deferred-configure-test-client;
+          ssimulacra2-cli                           = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Convergence epic R5: smithay PopupManager + positioner-driven
+        # xdg_popup geometry (no more zero-rect default configure).
+        visual-popup = import ./tests/visual-popup.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                  = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session          = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-popup-test-client = self.packages.x86_64-linux.halmasuit-popup-test-client;
+          ssimulacra2-cli            = self.packages.x86_64-linux.ssimulacra2-cli;
         };
         # Amendment A5.6: poll-only leader pidfd backstop — SCM_RIGHTS
         # worker→broker→compositor armed + fires on leader exit.

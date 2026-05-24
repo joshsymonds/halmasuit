@@ -1,21 +1,37 @@
 // halmasuit — Linux system compositor.
 //
-// v2 Phase A spine. This binary lives from `multi-user.target` to shutdown
-// and will host greeter + session as nested wl_clients. Today it brings
-// up smithay's Wayland-server event loop, binds a Wayland socket, and
-// advertises foundational protocol globals: `wl_compositor`,
-// `wl_subcompositor`, `xdg_wm_base`, `wl_seat`, `wl_output`, `wl_shm`.
-// Connecting clients can create surfaces, top-levels, software buffers,
-// and discover inputs/outputs. Scanout is via a dumb-buffer clear color
-// (`#0a0014` brand purple); the GLES + DrmCompositor renderer is a
-// subsequent subtask. The advertised wl_output stays at a synthesized
-// 1920×1080@60Hz placeholder until smithay's output state is wired to
-// real DRM mode info (also a subsequent subtask). Additional globals
-// (`linux-dmabuf-v1`, `presentation-time`, `ext-session-lock-v1`, …)
-// land later. See ARCHITECTURE.md.
+// Long-lived display-server process owning the GPU from
+// `graphical.target` to shutdown. Hosts the greeter and the user
+// session as nested wayland clients of itself, replacing greetd
+// entirely. The convergence epic (#12) made halmasuit's protocol
+// surface conformant for arbitrary Qt 6 + GTK 4 toolkits:
+//
+//   wayland.xml core (6):   wl_compositor, wl_subcompositor, wl_shm,
+//                           wl_output, wl_seat (kbd/ptr/touch),
+//                           wl_data_device_manager
+//   stable (5):             xdg_wm_base, wp_viewporter, wp_presentation,
+//                           zwp_linux_dmabuf_v1, zwp_tablet_manager_v2
+//   unstable (4):           zxdg_output_manager_v1, zxdg_exporter_v2,
+//                           zwp_pointer_gestures_v1,
+//                           zwp_primary_selection_device_manager_v1
+//   staging (5):            xdg_activation_v1, wp_fractional_scale_v1,
+//                           wp_cursor_shape_manager_v1, xdg_wm_dialog_v1,
+//                           xdg_toplevel_icon_manager_v1
+//   Qt parity (2):          zxdg_decoration_manager_v1,
+//                           zwp_text_input_manager_v3
+//   GTK parity (3):         zwp_idle_inhibit_manager_v1,
+//                           zwp_keyboard_shortcuts_inhibit_manager_v1,
+//                           wp_single_pixel_buffer_manager_v1
+//   wlr family (1):         zwlr_layer_shell_v1
+//
+// Render path: GLES + DrmCompositor via smithay. Output mode is the
+// real DRM mode from the kernel; on the SKIP/no-DRM test bypass a
+// synthesized 1280×800@60 Hz placeholder stands in. See
+// ARCHITECTURE.md for the full design and roadmap.
 
 mod broker_relay;
 mod broker_session;
+mod cursor;
 #[cfg(feature = "frame_audit")]
 mod dbus;
 mod drm;
@@ -36,6 +52,7 @@ use std::time::Duration;
 
 use calloop::generic::Generic;
 use calloop::signals::{Signal, Signals};
+use calloop::timer::{TimeoutAction, Timer};
 // calloop's `Mode` and smithay's `output::Mode` collide; rename calloop's
 // to keep the smithay one as `Mode` (used more often).
 use calloop::{
@@ -47,12 +64,18 @@ use halmasuit_greetd::server::{SpawnRequest, bind_socket, peer_credentials};
 
 use crate::broker_session::{BrokerEpisode, connect_broker};
 use halmasuit_introspect::{Event, Phase, ShutdownReason, emit};
-use smithay::backend::input::{Event as InputEventTrait, InputEvent, KeyboardKeyEvent};
+use smithay::backend::input::{
+    AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState,
+    Event as InputEventTrait, InputEvent, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+    PointerMotionEvent,
+};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::session::Session;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::desktop::layer_map_for_output;
+use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::keyboard::FilterResult;
+use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
@@ -109,6 +132,155 @@ struct HalmasuitState {
     /// `layer_map_for_output`). Composited in z-order during
     /// `render_with_elements` from the commit-driven render path.
     layer_shell_state: WlrLayerShellState,
+    /// `zwp_linux_dmabuf_v1` state. The global is created at startup
+    /// from the renderer's supported dmabuf formats; the
+    /// `dmabuf_state` field stores the smithay-side bookkeeping and
+    /// is referenced via `delegate_dmabuf!`. On the SKIP (no-DRM)
+    /// path there is no renderer, so no global is advertised —
+    /// clients fall back to wl_shm cleanly. R10 (convergence).
+    dmabuf_state: smithay::wayland::dmabuf::DmabufState,
+    /// The dmabuf global handle. `None` on the SKIP path (no
+    /// renderer → no formats to advertise).
+    _dmabuf_global: Option<smithay::wayland::dmabuf::DmabufGlobal>,
+    /// `wp_presentation` global state. Created at startup with
+    /// `CLOCK_MONOTONIC`. Clients use this to receive
+    /// `wp_presentation_feedback.presented` for surfaces that asked
+    /// for it; halmasuit emits the events from the VBlank handler.
+    /// R9 (convergence).
+    _presentation_state: smithay::wayland::presentation::PresentationState,
+    /// Monotonic counter for the presentation `sequence` field —
+    /// increments once per VBlank. R9.
+    presentation_seq: u64,
+    /// Cursor image state — the latest `wl_pointer.set_cursor` from
+    /// the focused client. R8b tracks this; R8b-render will
+    /// composite the `Surface` variant as an overlay above the
+    /// foreground tree at `PointerHandle::current_location()` minus
+    /// the surface's hotspot. Today the field is set but not
+    /// rendered — clients' `set_cursor` succeeds (no protocol error)
+    /// but no visible cursor appears.
+    cursor_status: CursorImageStatus,
+    /// P1 (review-round-3): coalesce per-commit repaints.
+    /// `commit()` is called once per `wl_surface.commit` — a single
+    /// logical frame from a Qt/GTK client commonly fires 10+ commits
+    /// (root + N subsurfaces + cursor + popups). Pre-fix the commit
+    /// handler synchronously called `repaint()` each time, burning
+    /// the GPU on a tree that wouldn't update visibly until the next
+    /// VBlank anyway. Now the commit handler just sets this flag;
+    /// the main loop drains it once between dispatch and
+    /// flush_clients, doing one repaint per dispatch cycle regardless
+    /// of how many commits arrived. Swap / layer-destroy /
+    /// toplevel-destroy still render synchronously because those are
+    /// rare visible-state transitions that benefit from immediate
+    /// feedback.
+    frame_pending: bool,
+    /// Cached output mode (width, height in logical pixels).
+    /// `Output::current_mode()` is an Arc-locked lookup; pointer +
+    /// touch input handlers call it at libinput event rate (up to
+    /// 1000/s for gaming mice) for clamping / absolute-coord
+    /// transform. v1's output mode is fixed at startup (no hot-plug),
+    /// so caching here removes the lock from every input event. The
+    /// `(1280, 800)` default mirrors the SKIP/no-DRM bypass mode.
+    output_size: (i32, i32),
+    /// Cached VBlank refresh period derived once from the output's
+    /// `current_mode()`. Recomputing `1_000_000_000_000 / refresh_mhz`
+    /// every VBlank closure runs is wasteful and pointless — the mode
+    /// is stable across the compositor's lifetime in v1. Used by the
+    /// presentation-feedback `Refresh::fixed(...)` payload.
+    refresh_period: std::time::Duration,
+    /// `wp_viewporter` state (Phase B). Smithay handles all the
+    /// crop+scale logic via the protocol's own state; this field
+    /// just owns the global. Both Qt 6 and GTK 4 bind viewporter
+    /// for HiDPI fractional-scale composition / subsurface scaling.
+    _viewporter_state: smithay::wayland::viewporter::ViewporterState,
+    /// `wp_fractional_scale_manager_v1` state (Phase B). HiDPI
+    /// fractional-scale negotiation; smithay manages the per-surface
+    /// scale advertisement.
+    _fractional_scale_state: smithay::wayland::fractional_scale::FractionalScaleManagerState,
+    /// `wp_single_pixel_buffer_manager_v1` state (Phase B). GTK 4
+    /// uses this for solid-color backgrounds without allocating a
+    /// shm/dmabuf.
+    _single_pixel_buffer_state: smithay::wayland::single_pixel_buffer::SinglePixelBufferState,
+    /// `zwp_pointer_gestures_v1` state (Phase B). GTK 4 touchpad
+    /// gesture protocol — swipe / pinch / hold passthrough.
+    _pointer_gestures_state: smithay::wayland::pointer_gestures::PointerGesturesState,
+    /// `zwp_tablet_manager_v2` state (Phase B). Tablet input
+    /// (stylus, eraser, tablet pad). Both toolkits expose tablet
+    /// API; protocol is the wire layer.
+    _tablet_manager_state: smithay::wayland::tablet_manager::TabletManagerState,
+    /// `zxdg_decoration_manager_v1` state (Phase B). Qt 6 binds
+    /// this to ask whether to draw its own titlebar; halmasuit
+    /// hosts one fullscreen toplevel and draws no decorations, so
+    /// we always answer `ServerSide` (= "no decoration is the
+    /// server's contribution"; client also draws none).
+    _xdg_decoration_state: smithay::wayland::shell::xdg::decoration::XdgDecorationState,
+    /// `xdg_activation_v1` state (Phase B). Qt 6 / GTK 4 use this
+    /// to ask for window activation. halmasuit's foreground is
+    /// driven by the greeter→session lifecycle, not by client
+    /// activation requests — we accept tokens (default) and
+    /// log+ignore the activation requests themselves. Field is
+    /// `pub`(crate) because the handler returns a `&mut` to it.
+    xdg_activation_state: smithay::wayland::xdg_activation::XdgActivationState,
+    /// `zwp_idle_inhibit_manager_v1` state (Phase B). GTK 4 binds.
+    /// halmasuit has no idle behavior in v1; inhibit/uninhibit are
+    /// no-ops protocol-side, smithay tracks the inhibitor set.
+    _idle_inhibit_state: smithay::wayland::idle_inhibit::IdleInhibitManagerState,
+    /// `zwp_keyboard_shortcuts_inhibit_manager_v1` state (Phase B).
+    /// halmasuit has no global keyboard shortcuts to intercept (all
+    /// keyboard input goes straight to the focused client), so the
+    /// protocol records inhibitor requests but they're effectively
+    /// no-ops. `pub`(crate) because the handler returns a `&mut`.
+    keyboard_shortcuts_inhibit_state:
+        smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState,
+    /// `xdg_foreign_v2` state (Phase B). KDE / GNOME settings panels
+    /// and dialog-spawning toolkit code use this to export/import
+    /// toplevel handles across processes. halmasuit hosts a single
+    /// fullscreen toplevel per phase so cross-client embedding is
+    /// inert in v1; smithay tracks handles via the handler's
+    /// `xdg_foreign_state()` accessor.
+    xdg_foreign_state: smithay::wayland::xdg_foreign::XdgForeignState,
+    /// `xdg_wm_dialog_v1` state (Phase B). GTK 4 / Qt 6 use this to
+    /// mark a toplevel as a modal/non-modal dialog. halmasuit takes
+    /// no action on the hint — smithay's default no-op
+    /// `dialog_hint_changed` is fine.
+    _xdg_dialog_state: smithay::wayland::shell::xdg::dialog::XdgDialogState,
+    /// `xdg_toplevel_icon_manager_v1` state (Phase B). Modern Qt 6 /
+    /// GTK 4 set toplevel icons via this protocol. halmasuit shows
+    /// no titlebars or task list in v1 so the icon is unused; smithay
+    /// caches the request, default no-op `set_icon` handler is fine.
+    _xdg_toplevel_icon_manager: smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager,
+    /// `wl_data_device_manager` state (Phase B — first focus-bearing
+    /// semantic protocol). The `wayland.xml` core selection/DnD
+    /// global. halmasuit hosts one fullscreen toplevel per phase so
+    /// cross-client DnD is non-existent in v1; selection (clipboard)
+    /// routing between clients is handled internally by smithay. The
+    /// handler returns `&mut` from `data_device_state()`, so the
+    /// field is `pub`(crate)-visible without the leading underscore.
+    data_device_state: smithay::wayland::selection::data_device::DataDeviceState,
+    /// `zwp_primary_selection_device_manager_v1` state (Phase B —
+    /// second focus-bearing protocol). X11-style middle-click primary
+    /// buffer. Shares the single `SelectionHandler` impl with
+    /// `data_device_state` (smithay routes both via
+    /// `SelectionTarget::{Primary,Clipboard}`). Field is `pub`(crate)
+    /// because `PrimarySelectionHandler::primary_selection_state`
+    /// returns `&mut`.
+    primary_selection_state: smithay::wayland::selection::primary_selection::PrimarySelectionState,
+    /// `zwp_text_input_manager_v3` state (Phase B — third and final
+    /// focus-bearing protocol). Qt-mandatory IME protocol. halmasuit
+    /// hosts no input-method server (input-method-v2 is out of the
+    /// 25-protocol scope), so clients that bind text-input-v3 won't
+    /// get IM service — but they bind successfully, can call
+    /// `enable`/`disable`, and the compositor tracks focus through
+    /// `TextInputSeat::text_input().set_focus(...)`. Stored as a
+    /// field (anvil discards) so the global's lifetime is explicit.
+    _text_input_manager_state: smithay::wayland::text_input::TextInputManagerState,
+    /// `wp_cursor_shape_manager_v1` state (Phase B — staging tier).
+    /// Clients call `set_shape(serial, shape)` to request a named
+    /// cursor (Default, Pointer, Text, etc.). Smithay routes the
+    /// request directly through `SeatHandler::cursor_image` as
+    /// `CursorImageStatus::Named(CursorIcon)`, which halmasuit's
+    /// R8b-state implementation already stores. Visible cursor
+    /// compositing is the orthogonal R8b-render follow-up.
+    _cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
     /// Layer roles for which `Event::ClientFirstFrame` has already
     /// been emitted (emit-once-per-role). The visual-backdrop
     /// continuity assertion keys off the first
@@ -118,6 +290,13 @@ struct HalmasuitState {
     /// (greeter/session). v1 is one output, no window management — at
     /// most one toplevel is the foreground.
     foreground_toplevel: Option<ToplevelSurface>,
+    /// Smithay popup tracker. `track_popup` on `new_popup`,
+    /// `commit` per surface commit, `cleanup` once per VBlank.
+    /// Popup grabs (`grab` handler) still log-and-ignore until R8
+    /// wires `wl_seat` for pointer routing — at that point the grab
+    /// will go through `PopupManager::grab_popup` and a `PopupGrab`
+    /// installed on the seat's pointer.
+    popups: PopupManager,
     /// Which client is the foreground, driven by the greetd lifecycle
     /// (req 17): `Greeter` until `start_session` succeeds, then
     /// `Session`. Gates keyboard focus (greeter layer vs session
@@ -208,6 +387,13 @@ struct HalmasuitState {
     /// the session client commits many frames; the introspect marker
     /// and the gate input fire on the first non-empty one only.
     session_first_frame_emitted: bool,
+    /// Compositor-monotonic baseline for `wl_callback.done(uint time)`.
+    /// `start_time.elapsed()` is `CLOCK_MONOTONIC`-by-construction, so
+    /// the timestamps we hand to `wl_surface.frame` callbacks satisfy
+    /// the spec's monotonic-non-decreasing requirement (Wayland
+    /// Appendix A). Truncated to u32 ms at the call site (~49.7-day
+    /// wrap, per the protocol wire format).
+    start_time: std::time::Instant,
 }
 
 /// Greeter identity post-spawn. The pidfd is the load-bearing
@@ -241,25 +427,270 @@ impl ClientData for ClientState {
 
 impl HalmasuitState {
     /// Route one libinput event to the seat. Keyboard keys go to the
-    /// keyboard-focused client (focus is set by
-    /// [`Self::set_keyboard_focus`], driven by the layer-shell
-    /// keyboard-interactivity policy in the commit handler — layer F
-    /// replaces that with the greeter→session machine). Pointer
-    /// capability exists; full pointer routing (focus-follows,
-    /// cursor) is layer F's concern, so non-keyboard events are
-    /// accepted but not yet dispatched.
+    /// keyboard-focused client; pointer events (motion, button, axis)
+    /// go to the keyboard-focused client as well — halmasuit hosts
+    /// one fullscreen surface at a time, so the surface under the
+    /// pointer trivially equals the keyboard focus. Per-protocol
+    /// `frame()` batching is emitted after each event group.
     fn dispatch_libinput(&mut self, event: InputEvent<LibinputInputBackend>) {
-        if let InputEvent::Keyboard { event } = event {
-            let Some(keyboard) = self.seat.get_keyboard() else {
-                return;
-            };
-            let serial = SERIAL_COUNTER.next_serial();
-            let time = event.time_msec();
-            let code = event.key_code();
-            let key_state = event.state();
-            keyboard.input::<(), _>(self, code, key_state, serial, time, |_, _, _| {
-                FilterResult::Forward
-            });
+        match event {
+            InputEvent::Keyboard { event } => {
+                let Some(keyboard) = self.seat.get_keyboard() else {
+                    return;
+                };
+                let serial = SERIAL_COUNTER.next_serial();
+                let time = event.time_msec();
+                let code = event.key_code();
+                let key_state = event.state();
+                keyboard.input::<(), _>(self, code, key_state, serial, time, |_, _, _| {
+                    FilterResult::Forward
+                });
+            }
+            InputEvent::PointerMotion { event } => self.on_pointer_relative_motion(&event),
+            InputEvent::PointerMotionAbsolute { event } => {
+                self.on_pointer_absolute_motion(&event);
+            }
+            InputEvent::PointerButton { event } => self.on_pointer_button(&event),
+            InputEvent::PointerAxis { event } => self.on_pointer_axis(&event),
+            InputEvent::TouchDown { event } => self.on_touch_down(&event),
+            InputEvent::TouchUp { event } => self.on_touch_up(&event),
+            InputEvent::TouchMotion { event } => self.on_touch_motion(&event),
+            InputEvent::TouchFrame { event: _ } => self.on_touch_frame(),
+            InputEvent::TouchCancel { event: _ } => self.on_touch_cancel(),
+            _ => {
+                // Tablet, switch — not in v1 scope. Future epics.
+            }
+        }
+    }
+
+    /// Output-local pointer focus + coordinates for the foreground
+    /// surface. Returns `None` if no input-accepting surface exists.
+    /// halmasuit hosts one fullscreen surface, so the location is
+    /// always the output origin (0, 0).
+    fn pointer_focus(
+        &self,
+    ) -> Option<(
+        WlSurface,
+        smithay::utils::Point<f64, smithay::utils::Logical>,
+    )> {
+        let keyboard = self.seat.get_keyboard()?;
+        keyboard
+            .current_focus()
+            .map(|s| (s, smithay::utils::Point::from((0.0_f64, 0.0_f64))))
+    }
+
+    /// Clamp absolute pointer coords to the output extents.
+    fn clamp_pointer(
+        &self,
+        pos: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) -> smithay::utils::Point<f64, smithay::utils::Logical> {
+        let (w_i, h_i) = self.output_size;
+        let (w, h) = (f64::from(w_i), f64::from(h_i));
+        smithay::utils::Point::from((pos.x.clamp(0.0, w), pos.y.clamp(0.0, h)))
+    }
+
+    fn on_pointer_relative_motion<E: PointerMotionEvent<LibinputInputBackend>>(&mut self, evt: &E) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        let delta = evt.delta();
+        let mut location = pointer.current_location() + delta;
+        location = self.clamp_pointer(location);
+        let focus = self.pointer_focus();
+        pointer.motion(
+            self,
+            focus,
+            &MotionEvent {
+                location,
+                serial,
+                time: evt.time_msec(),
+            },
+        );
+        pointer.frame(self);
+        // R8b-render: feed the cursor render position.
+        if let Some(backend) = self.drm_backend.as_mut() {
+            backend.set_pointer_location(location);
+        }
+    }
+
+    fn on_pointer_absolute_motion<E: AbsolutePositionEvent<LibinputInputBackend>>(
+        &mut self,
+        evt: &E,
+    ) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let (w, h) = self.output_size;
+        let location = evt.position_transformed((w, h).into());
+        let focus = self.pointer_focus();
+        pointer.motion(
+            self,
+            focus,
+            &MotionEvent {
+                location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time: evt.time_msec(),
+            },
+        );
+        pointer.frame(self);
+        // R8b-render: feed the cursor render position.
+        if let Some(backend) = self.drm_backend.as_mut() {
+            backend.set_pointer_location(location);
+        }
+    }
+
+    fn on_pointer_button<E: PointerButtonEvent<LibinputInputBackend>>(&mut self, evt: &E) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        let button = evt.button_code();
+        let state: ButtonState = evt.state();
+        pointer.button(
+            self,
+            &ButtonEvent {
+                button,
+                state,
+                serial,
+                time: evt.time_msec(),
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn on_pointer_axis<E: PointerAxisEvent<LibinputInputBackend>>(&mut self, evt: &E) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let h = evt
+            .amount(Axis::Horizontal)
+            .unwrap_or_else(|| evt.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.0);
+        let v = evt
+            .amount(Axis::Vertical)
+            .unwrap_or_else(|| evt.amount_v120(Axis::Vertical).unwrap_or(0.0) * 15.0 / 120.0);
+        let mut frame = AxisFrame::new(evt.time_msec()).source(evt.source());
+        if h != 0.0 {
+            frame = frame
+                .relative_direction(Axis::Horizontal, evt.relative_direction(Axis::Horizontal))
+                .value(Axis::Horizontal, h);
+            if let Some(d) = evt.amount_v120(Axis::Horizontal) {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "wl_pointer.axis_v120 is i32 per protocol; smithay's libinput \
+                              backend returns f64 but the source is an integer scancode \
+                              from the kernel evdev REL_WHEEL_HI_RES axis, always small \
+                              and well within i32"
+                )]
+                let discrete = d as i32;
+                frame = frame.v120(Axis::Horizontal, discrete);
+            }
+        }
+        if v != 0.0 {
+            frame = frame
+                .relative_direction(Axis::Vertical, evt.relative_direction(Axis::Vertical))
+                .value(Axis::Vertical, v);
+            if let Some(d) = evt.amount_v120(Axis::Vertical) {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "wl_pointer.axis_v120 is i32 per protocol; smithay's libinput \
+                              backend returns f64 but the source is an integer scancode \
+                              from the kernel evdev REL_WHEEL_HI_RES axis, always small \
+                              and well within i32"
+                )]
+                let discrete = d as i32;
+                frame = frame.v120(Axis::Vertical, discrete);
+            }
+        }
+        if evt.source() == AxisSource::Finger {
+            if evt.amount(Axis::Horizontal) == Some(0.0) {
+                frame = frame.stop(Axis::Horizontal);
+            }
+            if evt.amount(Axis::Vertical) == Some(0.0) {
+                frame = frame.stop(Axis::Vertical);
+            }
+        }
+        // Suppress unused-import warning when no axis source is Finger:
+        let _ = AxisRelativeDirection::Identical;
+        pointer.axis(self, frame);
+        pointer.frame(self);
+    }
+
+    // Touch handlers. halmasuit hosts one fullscreen toplevel/layer
+    // surface per phase, so the touch target trivially equals the
+    // keyboard focus (same as the pointer model). Touch absolute
+    // coords come from the libinput event transformed against the
+    // current output extents.
+
+    fn on_touch_down<E: smithay::backend::input::TouchDownEvent<LibinputInputBackend>>(
+        &mut self,
+        evt: &E,
+    ) {
+        let Some(touch) = self.seat.get_touch() else {
+            return;
+        };
+        let (w, h) = self.output_size;
+        let location = evt.position_transformed((w, h).into());
+        let focus = self.pointer_focus();
+        touch.down(
+            self,
+            focus,
+            &smithay::input::touch::DownEvent {
+                slot: evt.slot(),
+                location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time: evt.time_msec(),
+            },
+        );
+    }
+
+    fn on_touch_up<E: smithay::backend::input::TouchUpEvent<LibinputInputBackend>>(
+        &mut self,
+        evt: &E,
+    ) {
+        let Some(touch) = self.seat.get_touch() else {
+            return;
+        };
+        touch.up(
+            self,
+            &smithay::input::touch::UpEvent {
+                slot: evt.slot(),
+                serial: SERIAL_COUNTER.next_serial(),
+                time: evt.time_msec(),
+            },
+        );
+    }
+
+    fn on_touch_motion<E: smithay::backend::input::TouchMotionEvent<LibinputInputBackend>>(
+        &mut self,
+        evt: &E,
+    ) {
+        let Some(touch) = self.seat.get_touch() else {
+            return;
+        };
+        let (w, h) = self.output_size;
+        let location = evt.position_transformed((w, h).into());
+        let focus = self.pointer_focus();
+        touch.motion(
+            self,
+            focus,
+            &smithay::input::touch::MotionEvent {
+                slot: evt.slot(),
+                location,
+                time: evt.time_msec(),
+            },
+        );
+    }
+
+    fn on_touch_frame(&mut self) {
+        if let Some(touch) = self.seat.get_touch() {
+            touch.frame(self);
+        }
+    }
+
+    fn on_touch_cancel(&mut self) {
+        if let Some(touch) = self.seat.get_touch() {
+            touch.cancel(self);
         }
     }
 
@@ -359,132 +790,242 @@ impl CompositorHandler for HalmasuitState {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        // Advance smithay's per-surface buffer tracking state. This
-        // is what makes committed shm buffers visible to the renderer
-        // when WaylandSurfaceRenderElement is built. Without this,
-        // render_elements_from_surface_tree sees no current buffer
+        // Advance smithay's per-surface buffer tracking state — must
+        // be called on the ORIGINAL committed surface so smithay's
+        // per-surface cache sees the right key. Without it,
+        // `render_elements_from_surface_tree` sees no current buffer
         // and the surface paints nothing.
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
 
-        // wlr-layer-shell initial configure. The spec requires the
-        // initial configure to be sent in response to the client's
-        // first commit (which carries its anchor/exclusive-zone/size
-        // requests). `arrange` here therefore sees the committed
-        // anchor state — for a fully-anchored background that yields
-        // the full output size instead of the half-output fallback
-        // `arrange` uses for unanchored zero-size surfaces.
-        {
-            let mut map = layer_map_for_output(&self.output);
-            if let Some(layer) = map
-                .layer_for_surface(surface, smithay::desktop::WindowSurfaceType::TOPLEVEL)
+        // R3 (convergence epic): a synchronized subsurface's commit
+        // is CACHED at the parent and applied only when the parent
+        // commits (wl_subsurface contract). Skip downstream work —
+        // smithay holds the state until the parent's commit
+        // propagates it (smallvil pattern).
+        if smithay::wayland::compositor::is_sync_subsurface(surface) {
+            return;
+        }
+        // A commit on a desync subsurface implicitly commits the root
+        // tree, so all remaining work acts on the root.
+        let mut root = surface.clone();
+        while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
+            root = parent;
+        }
+        let surface = &root;
+
+        self.send_deferred_xdg_initial_configure(surface);
+        self.handle_layer_shell_commit(surface);
+        self.maybe_emit_session_first_frame(surface);
+        self.maybe_focus_foreground_toplevel(surface);
+        // P1: coalesce per-commit repaints. The main loop drains
+        // `frame_pending` once per dispatch cycle, doing one repaint
+        // per N commits instead of N repaints. See the field doc.
+        self.frame_pending = true;
+    }
+}
+
+impl HalmasuitState {
+    /// R4 (convergence epic) + R5 (PopupManager): send the deferred
+    /// initial xdg-shell configure on the client's first commit, per
+    /// xdg-shell.xml `xdg_surface`: "The client must call
+    /// wl_surface.commit ... before it will receive the initial
+    /// configure event." Smithay canonical pattern (smallvil
+    /// `handlers/xdg_shell.rs:152-189`):
+    ///   1. Advance the PopupManager state machine for popup
+    ///      commits (positioner caching, unmapped→mapped move).
+    ///   2. For toplevels: check `is_initial_configure_sent()` on
+    ///      the `ToplevelSurface` inventory and send once.
+    ///   3. For popups: `find_popup(surface)` returns the
+    ///      `PopupKind`; check `is_initial_configure_sent()` and
+    ///      send once. Initial popup configure is always allowed
+    ///      (smithay returns `NotReactive` only on RE-configure of
+    ///      a non-reactive popup).
+    fn send_deferred_xdg_initial_configure(&mut self, surface: &WlSurface) {
+        self.popups.commit(surface);
+
+        // P3: O(1) toplevel-role + initial-configure-sent check via
+        // the surface's data map, before the O(N)
+        // toplevel_surfaces().iter().find — which is the only place
+        // we can recover the `ToplevelSurface` to call
+        // `send_configure()`. The common case (post-initial-configure
+        // commits) short-circuits at the data-map check; the rare
+        // case (first commit of a toplevel) does one linear scan
+        // (over the in-scope toplevel count, currently 1 in v1).
+        let needs_initial_configure =
+            smithay::wayland::compositor::with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                    .is_some_and(|d| !d.lock().unwrap().initial_configure_sent)
+            });
+        if needs_initial_configure
+            && let Some(toplevel) = self
+                .xdg_shell_state
+                .toplevel_surfaces()
+                .iter()
+                .find(|t| t.wl_surface() == surface)
                 .cloned()
-            {
-                let initial_configure_sent =
-                    smithay::wayland::compositor::with_states(surface, |states| {
-                        states
-                            .data_map
-                            .get::<smithay::wayland::shell::wlr_layer::LayerSurfaceData>()
-                            .is_some_and(|d| d.lock().unwrap().initial_configure_sent)
-                    });
-                map.arrange();
-                // Release the LayerMap lock before `send_configure` /
-                // the render path below: `render_layer_elements` calls
-                // `layer_map_for_output` again on the same output and
-                // would re-borrow this same map.
-                drop(map);
-                if !initial_configure_sent {
-                    layer.layer_surface().send_configure();
-                }
-
-                // Emit `ClientFirstFrame { role }` once per layer
-                // role, the first time a surface of that role has a
-                // committed buffer halmasuit will composite. Drives
-                // the visual-backdrop continuity assertion (Epic #1
-                // req 11). Unconditional (not frame_audit-gated) — a
-                // cheap state-transition marker.
-                let has_buffer =
-                    smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
-                        s.buffer().is_some()
-                    })
-                    .unwrap_or(false);
-                if has_buffer {
-                    let role = match layer.layer() {
-                        Layer::Background => halmasuit_introspect::LayerRole::Background,
-                        Layer::Bottom => halmasuit_introspect::LayerRole::Bottom,
-                        Layer::Top => halmasuit_introspect::LayerRole::Top,
-                        Layer::Overlay => halmasuit_introspect::LayerRole::Overlay,
-                    };
-                    if self.seen_layer_roles.insert(role) {
-                        emit(&Event::ClientFirstFrame { role });
-                    }
-                    // Focus-follows-foreground (req 17): a
-                    // keyboard-interactive layer client (the greeter)
-                    // gets keyboard focus only while the foreground is
-                    // `Greeter`. After `start_session` the foreground
-                    // is `Session`, so a lingering/teardown greeter
-                    // layer never steals focus from the session.
-                    if self.foreground == halmasuit_introspect::Foreground::Greeter
-                        && layer.cached_state().keyboard_interactivity
-                            != smithay::wayland::shell::wlr_layer::KeyboardInteractivity::None
-                    {
-                        self.set_keyboard_focus(Some(surface.clone()));
-                    }
-                }
-            }
-        }
-
-        // Amendment A5 key 2: the session Wayland client's first
-        // committed buffer of non-zero size. The client is identified
-        // by its SO_PEERCRED uid == `session_uid` — connection
-        // identity is NOT authority (that is PAM-derived, R8), but it
-        // IS how the compositor knows WHOSE pixels just arrived.
-        // Emit-once; feeds the two-key `SwapGate` (key 1 is the
-        // broker's `SessionOpened`). Swapping before this point would
-        // show the session "window" before it has painted — the exact
-        // flash this project deletes.
-        if !self.session_first_frame_emitted
-            && let Some(suid) = self.session_uid
-            && surface_client_uid(surface) == Some(suid)
         {
-            let non_empty =
-                smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
-                    s.buffer_size().is_some_and(|sz| sz.w > 0 && sz.h > 0)
-                })
-                .unwrap_or(false);
-            if non_empty {
-                self.session_first_frame_emitted = true;
-                emit(&Event::SessionClientFirstFrame);
-                let a = self.swap.session_first_frame();
-                self.apply_swap_action(a);
-            }
+            toplevel.send_configure();
+        }
+        if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface)
+            && !popup.is_initial_configure_sent()
+        {
+            let _ = popup.send_configure();
+        }
+    }
+
+    /// wlr-layer-shell commit work: send the deferred initial
+    /// configure (the spec requires it in response to the client's
+    /// first commit, which carries anchor/exclusive-zone/size — so
+    /// `arrange` sees the committed anchor state), arrange the layer
+    /// map, then emit `ClientFirstFrame` and apply
+    /// focus-follows-foreground on the first buffered commit per
+    /// role.
+    fn handle_layer_shell_commit(&mut self, surface: &WlSurface) {
+        let mut map = layer_map_for_output(&self.output);
+        let Some(layer) = map
+            .layer_for_surface(surface, smithay::desktop::WindowSurfaceType::TOPLEVEL)
+            .cloned()
+        else {
+            return;
+        };
+        let initial_configure_sent = smithay::wayland::compositor::with_states(surface, |states| {
+            states
+                .data_map
+                .get::<smithay::wayland::shell::wlr_layer::LayerSurfaceData>()
+                .is_some_and(|d| d.lock().unwrap().initial_configure_sent)
+        });
+        map.arrange();
+        // Release the LayerMap lock before `send_configure` and any
+        // downstream render path — `render_layer_elements` calls
+        // `layer_map_for_output` again on the same output and would
+        // re-borrow this same map.
+        drop(map);
+        if !initial_configure_sent {
+            layer.layer_surface().send_configure();
         }
 
-        // Focus-follows-foreground (req 17): the session's
-        // xdg_toplevel gets keyboard focus on its first buffered
-        // commit, but only once the greetd lifecycle has put the
-        // foreground in `Session` (set by the A5 swap gate) — never on
-        // connection identity alone.
+        let has_buffer =
+            smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
+                s.buffer().is_some()
+            })
+            .unwrap_or(false);
+        if !has_buffer {
+            return;
+        }
+
+        // Emit `ClientFirstFrame { role }` once per layer role, the
+        // first time a surface of that role has a committed buffer
+        // halmasuit will composite. Drives the visual-backdrop
+        // continuity assertion (Epic #1 req 11). Cheap
+        // state-transition marker (not frame_audit-gated).
+        let role = match layer.layer() {
+            Layer::Background => halmasuit_introspect::LayerRole::Background,
+            Layer::Bottom => halmasuit_introspect::LayerRole::Bottom,
+            Layer::Top => halmasuit_introspect::LayerRole::Top,
+            Layer::Overlay => halmasuit_introspect::LayerRole::Overlay,
+        };
+        if self.seen_layer_roles.insert(role) {
+            emit(&Event::ClientFirstFrame { role });
+        }
+        // Focus-follows-foreground (req 17): a keyboard-interactive
+        // layer client (the greeter) gets keyboard focus only while
+        // the foreground is `Greeter`. After `start_session` the
+        // foreground is `Session`, so a lingering/teardown greeter
+        // layer never steals focus from the session.
+        if self.foreground == halmasuit_introspect::Foreground::Greeter
+            && layer.cached_state().keyboard_interactivity
+                != smithay::wayland::shell::wlr_layer::KeyboardInteractivity::None
+        {
+            self.set_keyboard_focus(Some(surface.clone()));
+        }
+    }
+
+    /// Amendment A5 key 2: the session Wayland client's first
+    /// committed buffer of non-zero size. The client is identified
+    /// by its SO_PEERCRED uid == `session_uid` — connection identity
+    /// is NOT authority (that is PAM-derived, R8), but it IS how the
+    /// compositor knows WHOSE pixels just arrived. Emit-once; feeds
+    /// the two-key `SwapGate` (key 1 is the broker's
+    /// `SessionOpened`). Swapping before this point would show the
+    /// session "window" before it has painted — the exact flash this
+    /// project deletes.
+    fn maybe_emit_session_first_frame(&mut self, surface: &WlSurface) {
+        if self.session_first_frame_emitted {
+            return;
+        }
+        let Some(suid) = self.session_uid else {
+            return;
+        };
+        if surface_client_uid(surface) != Some(suid) {
+            return;
+        }
+        let non_empty =
+            smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
+                s.buffer_size().is_some_and(|sz| sz.w > 0 && sz.h > 0)
+            })
+            .unwrap_or(false);
+        if !non_empty {
+            return;
+        }
+        self.session_first_frame_emitted = true;
+        emit(&Event::SessionClientFirstFrame);
+        let a = self.swap.session_first_frame();
+        self.apply_swap_action(a);
+    }
+
+    /// Focus-follows-foreground (req 17 / R13b): the foreground
+    /// xdg_toplevel gets keyboard focus on its first buffered commit.
+    /// The function runs every commit but is bound to the
+    /// foreground_toplevel identity check + has-buffer guard, so it
+    /// becomes effective exactly once per toplevel mapping. Applies
+    /// to BOTH the greeter (greeter-niri's toplevel) and the session
+    /// (the broker-execed session leader's toplevel) — keystrokes
+    /// flow into whatever client owns the foreground surface, which
+    /// is the chain visual-dankgreeter exercises end-to-end.
+    fn maybe_focus_foreground_toplevel(&mut self, surface: &WlSurface) {
+        let fg = self
+            .foreground_toplevel
+            .as_ref()
+            .map(|t| t.wl_surface().clone());
+        if fg.as_ref() != Some(surface) {
+            return;
+        }
+        let has_buffer =
+            smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
+                s.buffer().is_some()
+            })
+            .unwrap_or(false);
+        if has_buffer {
+            // Emit a transition marker ONCE per focus change. The
+            // current_focus check avoids spamming the log on every
+            // VBlank-driven commit. VM tests poll this marker to
+            // synchronize on "halmasuit has delivered wl_keyboard.
+            // enter to the greeter" instead of sleeping a wall-clock
+            // window.
+            let already_focused = self
+                .seat
+                .get_keyboard()
+                .and_then(|kb| kb.current_focus())
+                .as_ref()
+                == Some(surface);
+            if !already_focused {
+                tracing::info!("FOREGROUND_TOPLEVEL_KEYBOARD_FOCUSED");
+            }
+            self.set_keyboard_focus(Some(surface.clone()));
+        }
+    }
+
+    /// Re-render the scene with the now-current buffers (synchronous
+    /// one-frame-per-commit; fine for these low-frequency scenes).
+    /// The foreground toplevel is composited above the layer
+    /// background by `render_layer_elements`.
+    fn repaint(&mut self) {
         let fg_surface = self
             .foreground_toplevel
             .as_ref()
             .map(|t| t.wl_surface().clone());
-        if self.foreground == halmasuit_introspect::Foreground::Session
-            && fg_surface.as_ref() == Some(surface)
-        {
-            let has_buffer =
-                smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
-                    s.buffer().is_some()
-                })
-                .unwrap_or(false);
-            if has_buffer {
-                self.set_keyboard_focus(Some(surface.clone()));
-            }
-        }
-
-        // Re-render the scene with the now-current buffers (synchronous
-        // one-frame-per-commit; fine for these low-frequency scenes).
-        // The foreground toplevel is composited above the layer
-        // background by `render_layer_elements`.
         if let Some(backend) = self.drm_backend.as_mut()
             && let Err(e) = backend.render_layer_elements(
                 &self.output,
@@ -579,8 +1120,11 @@ impl XdgShellHandler for HalmasuitState {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         // halmasuit hosts exactly one fullscreen toplevel above the
         // splash (the greeter, then the session — F2 makes the swap
-        // greetd-driven). Configure it to the output mode, fullscreen
-        // + activated, so the client paints full-screen immediately.
+        // greetd-driven). Stage the pending state (output mode,
+        // fullscreen + activated) — the initial `xdg_surface.configure`
+        // is sent from the commit handler on the client's first
+        // wl_surface.commit, per xdg-shell spec (smithay smallvil
+        // pattern; see commit handler R4 block).
         use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
         let (w, h): (i32, i32) = self
             .output
@@ -591,21 +1135,46 @@ impl XdgShellHandler for HalmasuitState {
             state.states.set(xdg_toplevel::State::Activated);
             state.states.set(xdg_toplevel::State::Fullscreen);
         });
-        surface.send_configure();
+        // R6 (convergence epic): emit `wl_surface.enter` for the
+        // toplevel so the client picks the correct buffer scale,
+        // transform, and frame timing for this output. Layer-shell
+        // surfaces already receive this via `LayerMap::arrange`;
+        // xdg-toplevels were missing it. Sub-tree walks (subsurfaces
+        // under the toplevel) are out of scope until a client needs
+        // them (the root surface is sufficient for HiDPI / scale
+        // negotiation in Qt 6 / GTK 4).
+        self.output.enter(surface.wl_surface());
         tracing::info!(w, h, "xdg_toplevel mapped as fullscreen foreground");
         self.foreground_toplevel = Some(surface);
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // R6 (convergence epic): mirror of the `enter` in
+        // `new_toplevel` — pair the wl_surface.enter sent at mapping
+        // with a wl_surface.leave on destruction. Smithay's
+        // `Output::leave` is idempotent (no-op if not in the set), so
+        // this is safe even when the toplevel never reached mapping.
+        self.output.leave(surface.wl_surface());
+
         if self.foreground_toplevel.as_ref() == Some(&surface) {
-            // Post-`spawned` the foreground toplevel IS the session
-            // client (its toplevel replaced the greeter's in
-            // `new_toplevel`); its destruction = the session Wayland
-            // client disconnected — Amendment A5.5 revert trigger (the
-            // authoritative signal is still the broker's `SessionEnded`
-            // frame; whichever arrives first reverts, the gate makes
-            // the other inert).
-            let was_session = self.session_uid.is_some();
+            // The destroyed toplevel was the foreground. If it
+            // belongs to the SESSION client (matched via SO_PEERCRED
+            // uid == session_uid), it's the A5.5 revert trigger —
+            // the session Wayland client disconnected, and the
+            // authoritative signal (broker's `SessionEnded`) will
+            // arrive too (whichever first reverts, the gate makes
+            // the other inert). If the surface belongs to the
+            // greeter (different uid), this is just the greeter
+            // exiting at the swap point — already-paired with
+            // session_first_frame elsewhere; do NOT call
+            // session_client_gone (which would inappropriately
+            // disarm the swap gate while session_opened or
+            // session_first_frame is still pending).
+            let surface_uid = surface_client_uid(surface.wl_surface());
+            let was_session = match (self.session_uid, surface_uid) {
+                (Some(sid), Some(suid)) => sid == suid,
+                _ => false,
+            };
             self.foreground_toplevel = None;
             // The foreground is gone — clear keyboard focus and
             // re-composite so the layers beneath (splash) reappear
@@ -624,11 +1193,39 @@ impl XdgShellHandler for HalmasuitState {
         }
     }
 
-    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
-        tracing::debug!("new xdg_popup");
-        // Popups need a `send_configure` once we have geometry; for
-        // now ack the surface so the client doesn't stall.
-        let _ = surface.send_configure();
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        // R5 (convergence epic): stage the positioner-derived geometry
+        // and register the popup with `PopupManager`. The popup's
+        // initial `xdg_popup.configure` is sent from the commit
+        // handler on the client's first wl_surface.commit, gated on
+        // `is_initial_configure_sent()` (xdg-shell deferred-configure
+        // contract, R4). Unconstrain-against-the-output is intentionally
+        // omitted: halmasuit hosts one fullscreen toplevel whose
+        // geometry equals the output, so the positioner's own geometry
+        // is already screen-relative-correct; full unconstrain logic
+        // (smallvil `unconstrain_popup`) needs the
+        // window-geometry-on-output knowledge a `Space` would provide,
+        // which v1 doesn't have.
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        match self.popups.track_popup(PopupKind::Xdg(surface)) {
+            Ok(()) => {
+                // R5 observable: visual-popup.nix grep's for this exact
+                // string to assert PopupManager has accepted the popup
+                // into its tracking tree. Without `track_popup`, smithay's
+                // `PopupSurface::send_configure` still answers from the
+                // staged positioner state — so a "configure geometry was
+                // non-zero" assertion would pass even with track_popup
+                // ripped out. The marker here is the load-bearing R5
+                // signal: it is emitted ONLY on successful track_popup,
+                // and find_popup / popups.cleanup / popup-grab routing
+                // all depend on the surface being in this tree.
+                tracing::info!("POPUP_TRACKED: PopupManager::track_popup ok");
+            }
+            Err(e) => tracing::warn!(error = %e, "PopupManager::track_popup failed"),
+        }
     }
 
     fn grab(
@@ -644,10 +1241,17 @@ impl XdgShellHandler for HalmasuitState {
     fn reposition_request(
         &mut self,
         surface: PopupSurface,
-        _positioner: PositionerState,
+        positioner: PositionerState,
         token: u32,
     ) {
-        // Acknowledge the reposition with the token; real placement comes later.
+        // Apply the new positioner state (geometry + positioner) and
+        // emit a `repositioned` event with the client's token, per
+        // xdg-shell. Smallvil pattern: `with_pending_state` + the
+        // matching `send_repositioned`.
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
         surface.send_repositioned(token);
     }
 }
@@ -661,10 +1265,42 @@ impl SeatHandler for HalmasuitState {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&Self::KeyboardFocus>) {
-        // Focus tracking lands when there are multiple foreground
-        // clients to switch between. Phase A hosts at most one
-        // wl_client at a time.
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&Self::KeyboardFocus>) {
+        // R7 (convergence epic) — COMPLETE. focus_changed updates
+        // every focus subsystem atomically with keyboard focus:
+        //   - data-device (selection/clipboard owner)
+        //   - primary-selection (X11-style middle-click buffer)
+        //   - text-input-v3 (IME focus; clients see enter/leave)
+        // The data-device and primary-selection setters take a
+        // kernel-validated Client (resolved from the focused
+        // WlSurface). text-input takes the surface directly via the
+        // seat's lazily-initialized TextInputHandle.
+        use smithay::wayland::text_input::TextInputSeat;
+        let client = focused.and_then(|surface| self.display_handle.get_client(surface.id()).ok());
+        smithay::wayland::selection::data_device::set_data_device_focus(
+            &self.display_handle,
+            seat,
+            client.clone(),
+        );
+        smithay::wayland::selection::primary_selection::set_primary_focus(
+            &self.display_handle,
+            seat,
+            client,
+        );
+        seat.text_input().set_focus(focused.cloned());
+    }
+
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        // R8b state-tracking (kept) + R8b-render forward (new): mirror
+        // the latest CursorImageStatus into the DRM backend's cursor
+        // state. The renderer rebakes the named pixmap from the
+        // xcursor theme on the next scene_elements call when the icon
+        // name changes; Hidden / Surface variants short-circuit
+        // there.
+        self.cursor_status = image.clone();
+        if let Some(backend) = self.drm_backend.as_mut() {
+            backend.set_cursor_status(image);
+        }
     }
 }
 
@@ -675,6 +1311,186 @@ impl ShmHandler for HalmasuitState {
         &self.shm_state
     }
 }
+
+impl smithay::wayland::dmabuf::DmabufHandler for HalmasuitState {
+    fn dmabuf_state(&mut self) -> &mut smithay::wayland::dmabuf::DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &smithay::wayland::dmabuf::DmabufGlobal,
+        dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+        notifier: smithay::wayland::dmabuf::ImportNotifier,
+    ) {
+        // Try importing the dmabuf into the GLES renderer. On
+        // success the client may now attach this dmabuf as a buffer
+        // to any wl_surface; on failure the client gets a buffer
+        // error and may fall back to wl_shm.
+        use smithay::backend::renderer::ImportDma;
+        let imported = self
+            .drm_backend
+            .as_mut()
+            .is_some_and(|b| b.renderer.import_dmabuf(&dmabuf, None).is_ok());
+        if imported {
+            let _ = notifier.successful::<Self>();
+        } else {
+            notifier.failed();
+        }
+    }
+}
+smithay::delegate_dmabuf!(HalmasuitState);
+smithay::delegate_presentation!(HalmasuitState);
+smithay::delegate_viewporter!(HalmasuitState);
+smithay::delegate_fractional_scale!(HalmasuitState);
+smithay::delegate_single_pixel_buffer!(HalmasuitState);
+smithay::delegate_pointer_gestures!(HalmasuitState);
+smithay::delegate_tablet_manager!(HalmasuitState);
+
+// Phase B handlers: smithay traits with sensible default impls.
+// Nothing protocol-visible to customize for v1.
+impl smithay::wayland::fractional_scale::FractionalScaleHandler for HalmasuitState {}
+impl smithay::wayland::tablet_manager::TabletSeatHandler for HalmasuitState {}
+
+// Phase B: xdg-decoration handler. halmasuit always answers
+// `ServerSide` — its single fullscreen toplevel needs no decoration,
+// and `ServerSide` means "no client-side draws contribute either"
+// (which is what fullscreen-greeter / fullscreen-session want).
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+impl smithay::wayland::shell::xdg::decoration::XdgDecorationHandler for HalmasuitState {
+    fn new_decoration(&mut self, toplevel: smithay::wayland::shell::xdg::ToplevelSurface) {
+        toplevel.with_pending_state(|s| s.decoration_mode = Some(DecorationMode::ServerSide));
+        toplevel.send_pending_configure();
+    }
+    fn request_mode(
+        &mut self,
+        toplevel: smithay::wayland::shell::xdg::ToplevelSurface,
+        _mode: DecorationMode,
+    ) {
+        toplevel.with_pending_state(|s| s.decoration_mode = Some(DecorationMode::ServerSide));
+        toplevel.send_pending_configure();
+    }
+    fn unset_mode(&mut self, toplevel: smithay::wayland::shell::xdg::ToplevelSurface) {
+        toplevel.with_pending_state(|s| s.decoration_mode = Some(DecorationMode::ServerSide));
+        toplevel.send_pending_configure();
+    }
+}
+smithay::delegate_xdg_decoration!(HalmasuitState);
+
+impl smithay::wayland::xdg_activation::XdgActivationHandler for HalmasuitState {
+    fn activation_state(&mut self) -> &mut smithay::wayland::xdg_activation::XdgActivationState {
+        &mut self.xdg_activation_state
+    }
+    fn request_activation(
+        &mut self,
+        _token: smithay::wayland::xdg_activation::XdgActivationToken,
+        _token_data: smithay::wayland::xdg_activation::XdgActivationTokenData,
+        _surface: WlSurface,
+    ) {
+        // halmasuit's foreground is greeter→session lifecycle driven.
+        // Client activation requests are accepted (token tracked) but
+        // do not switch focus or surface visibility in v1.
+        tracing::debug!("xdg_activation: request_activation (ignored in v1)");
+    }
+}
+smithay::delegate_xdg_activation!(HalmasuitState);
+
+// Phase B: zwp_idle_inhibit — no idle behavior in v1; inhibit/
+// uninhibit are no-ops.
+impl smithay::wayland::idle_inhibit::IdleInhibitHandler for HalmasuitState {
+    fn inhibit(&mut self, _surface: WlSurface) {}
+    fn uninhibit(&mut self, _surface: WlSurface) {}
+}
+smithay::delegate_idle_inhibit!(HalmasuitState);
+
+// Phase B: zwp_keyboard_shortcuts_inhibit — no global shortcuts in
+// v1; smithay tracks inhibitor objects, default trait methods are
+// fine (new_inhibitor / inhibitor_destroyed are no-ops).
+impl smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitHandler
+    for HalmasuitState
+{
+    fn keyboard_shortcuts_inhibit_state(
+        &mut self,
+    ) -> &mut smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState {
+        &mut self.keyboard_shortcuts_inhibit_state
+    }
+}
+smithay::delegate_keyboard_shortcuts_inhibit!(HalmasuitState);
+
+// Phase B: xdg_foreign_v2 — cross-client toplevel handle export/import.
+// halmasuit hosts one fullscreen toplevel per phase so cross-client
+// embedding is inert in v1; smithay tracks handle bookkeeping.
+impl smithay::wayland::xdg_foreign::XdgForeignHandler for HalmasuitState {
+    fn xdg_foreign_state(&mut self) -> &mut smithay::wayland::xdg_foreign::XdgForeignState {
+        &mut self.xdg_foreign_state
+    }
+}
+smithay::delegate_xdg_foreign!(HalmasuitState);
+
+// Phase B: xdg_wm_dialog_v1 — GTK 4 / Qt 6 mark toplevels as
+// modal/non-modal dialogs via this. halmasuit takes no action on the
+// hint; smithay's default no-op `dialog_hint_changed` is fine.
+impl smithay::wayland::shell::xdg::dialog::XdgDialogHandler for HalmasuitState {}
+smithay::delegate_xdg_dialog!(HalmasuitState);
+
+// Phase B: xdg_toplevel_icon_manager_v1 — toolkits set toplevel icons
+// via this protocol. halmasuit shows no titlebars/task list in v1;
+// smithay caches the request, default no-op `set_icon` is fine.
+impl smithay::wayland::xdg_toplevel_icon::XdgToplevelIconHandler for HalmasuitState {}
+smithay::delegate_xdg_toplevel_icon!(HalmasuitState);
+
+// Phase B: wl_data_device_manager — wayland.xml core selection/DnD.
+// Selection (clipboard) routing between clients is internal to
+// smithay; the handler is the dispatch entry. halmasuit's
+// SelectionUserData is `()` because there is no xwayland-to-Wayland
+// selection forwarding (the anvil pattern that uses non-unit user
+// data). DnD grab handlers use smithay defaults:
+// `WaylandDndGrabHandler::dnd_requested` cancels the source (correct
+// for the single-fullscreen-toplevel model), and the DndGrabHandler
+// reap path is a no-op.
+impl smithay::wayland::selection::data_device::DataDeviceHandler for HalmasuitState {
+    fn data_device_state(
+        &mut self,
+    ) -> &mut smithay::wayland::selection::data_device::DataDeviceState {
+        &mut self.data_device_state
+    }
+}
+impl smithay::wayland::selection::data_device::WaylandDndGrabHandler for HalmasuitState {}
+impl smithay::input::dnd::DndGrabHandler for HalmasuitState {}
+impl smithay::wayland::selection::SelectionHandler for HalmasuitState {
+    type SelectionUserData = ();
+}
+smithay::delegate_data_device!(HalmasuitState);
+
+// Phase B: zwp_primary_selection_device_manager_v1 — X11-style
+// middle-click primary buffer. Shares the SelectionHandler with
+// data-device; smithay routes via SelectionTarget::{Primary,Clipboard}
+// at the single entry point. Only the state accessor is required;
+// `new_selection` / `send_selection` defaults from SelectionHandler
+// are reused (halmasuit does no xwayland forwarding).
+impl smithay::wayland::selection::primary_selection::PrimarySelectionHandler for HalmasuitState {
+    fn primary_selection_state(
+        &mut self,
+    ) -> &mut smithay::wayland::selection::primary_selection::PrimarySelectionState {
+        &mut self.primary_selection_state
+    }
+}
+smithay::delegate_primary_selection!(HalmasuitState);
+
+// Phase B: zwp_text_input_manager_v3 — Qt-mandatory IME protocol.
+// No explicit handler trait; the delegate macro provides all dispatch.
+// halmasuit hosts no input-method-v2 server, so text-input clients
+// bind successfully and track focus via TextInputHandle in seat
+// user_data, but never receive preedit/commit events.
+smithay::delegate_text_input_manager!(HalmasuitState);
+
+// Phase B: wp_cursor_shape_manager_v1 — named-cursor protocol.
+// Smithay's delegate routes set_shape requests through
+// SeatHandler::cursor_image as CursorImageStatus::Named(...). The
+// existing R8b-state cursor_image impl stores the latest status,
+// so no additional handler is needed; visible cursor compositing
+// from that state is the orthogonal R8b-render follow-up.
+smithay::delegate_cursor_shape!(HalmasuitState);
 
 impl BufferHandler for HalmasuitState {
     fn buffer_destroyed(
@@ -764,8 +1580,23 @@ impl std::os::fd::AsFd for BorrowedBrokerFd {
                   loop_handle.remove(broker_token) (A8.2)."
     )]
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        // SAFETY: see the #[expect] reason — the fd is live for as long
-        // as this source is registered (A8.2 teardown ordering).
+        // SAFETY: `self.0` is a live OS fd for the duration of any
+        // call to this method. Soundness:
+        //  - The sole `OwnedFd` for this fd lives in
+        //    `ConnState::episode`'s broker `SeqpacketChannel` (A6: one
+        //    owner per episode).
+        //  - calloop only ever invokes `as_fd()` on this borrow during
+        //    epoll register/reregister/unregister; it never calls
+        //    `close(2)` on a `BorrowedFd`.
+        //  - The `RegistrationToken` for this source is removed via
+        //    `loop_handle.remove(broker_token)` BEFORE the owning
+        //    `OwnedFd` drops at end-of-episode (A8.2 teardown order).
+        //  - No `dup`/`Rc`/`Arc` of this fd exists anywhere (A8.3),
+        //    so no race where another path closes it early can occur.
+        // Consequence: the fd referenced by `self.0` is valid every
+        // time `as_fd()` runs, satisfying `BorrowedFd::borrow_raw`'s
+        // contract that the caller guarantees fd validity for the
+        // returned `BorrowedFd<'_>`'s lifetime.
         unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0) }
     }
 }
@@ -791,8 +1622,23 @@ impl std::os::fd::AsFd for BorrowedLeaderPidfd {
                   (A8.2)."
     )]
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        // SAFETY: see the #[expect] reason — the fd is live as long as
-        // this source is registered (A8.2 teardown ordering).
+        // SAFETY: `self.0` is a live OS pidfd for the duration of any
+        // call to this method. Soundness:
+        //  - The sole `OwnedFd` for this pidfd lives in
+        //    `ConnState::leader_pidfd`, received once from the broker
+        //    via SCM_RIGHTS on `SessionOpened` (A5.6).
+        //  - calloop only ever invokes `as_fd()` on this borrow during
+        //    epoll register/reregister/unregister; it never calls
+        //    `close(2)` on a `BorrowedFd`.
+        //  - The one-shot calloop callback returns `PostAction::Remove`
+        //    on EPOLLIN, deregistering the source BEFORE the owning
+        //    `OwnedFd` is dropped (A8.2). Full-teardown paths also
+        //    remove the token before dropping `ConnState`.
+        //  - The compositor only ever EPOLL-WATCHES this pidfd; it
+        //    never `waitid`/`pidfd_send_signal`s it (R9/A5 — broker is
+        //    the sole reaper). The borrow's read-only nature combined
+        //    with A8.2 teardown order keeps the underlying fd valid
+        //    for every `as_fd()` call.
         unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0) }
     }
 }
@@ -2038,6 +2884,11 @@ fn main() -> io::Result<()> {
     seat.add_keyboard(smithay::input::keyboard::XkbConfig::default(), 200, 25)
         .map_err(|e| io::Error::other(format!("seat.add_keyboard: {e}")))?;
     seat.add_pointer();
+    // wl_touch capability — locked in the 25-protocol scope. libinput
+    // touch events route through this handle in `dispatch_libinput`;
+    // even on systems without a touch device the capability is
+    // advertised, matching wl_seat's contract.
+    seat.add_touch();
 
     let output_manager_state =
         OutputManagerState::new_with_xdg_output::<HalmasuitState>(&display_handle);
@@ -2083,11 +2934,97 @@ fn main() -> io::Result<()> {
             &loop_handle,
             |event, _meta, state: &mut HalmasuitState| match event {
                 smithay::backend::drm::DrmEvent::VBlank(_crtc) => {
+                    // R5 (convergence epic): release dead popups
+                    // before any per-frame work — once per VBlank is
+                    // the smithay-recommended cadence and keeps the
+                    // popup tree from accumulating zombies between
+                    // commits.
+                    state.popups.cleanup();
                     if let Some(backend) = state.drm_backend.as_mut()
                         && let Err(e) = backend.frame_submitted()
                     {
                         tracing::warn!(error = %e, "DRM frame_submitted failed");
                     }
+                    // R2 (convergence epic): post-present frame-callback
+                    // emission. Wayland spec Appendix A `wl_surface::frame`
+                    // requires the server to notify clients when it's a
+                    // good time to draw the next frame; Mesa's
+                    // `dri2_wl_surface_throttle` (in `libEGL_mesa`) blocks
+                    // `eglSwapBuffers` until that callback arrives, so a
+                    // server that never fires wedges every EGL client on
+                    // its second swap. Walk the surfaces visible on the
+                    // just-presented output and send via smithay's
+                    // canonical helpers; explicit clones drop the
+                    // `LayerMap` guard before send_frame iterates.
+                    let time = state.start_time.elapsed();
+                    // P2 (review-round-3): the per-VBlank allocations
+                    // below are bounded by design:
+                    //  - `Vec<LayerSurface>::collect()` size ≤ 4
+                    //    (Layer enum cardinality: Background / Bottom
+                    //    / Top / Overlay). One heap alloc / 16 ms.
+                    //  - `output.clone()` is an Arc bump (~50 ns).
+                    //    Per-surface invocations inside the closures
+                    //    below are bounded by the foreground tree
+                    //    size; smithay's `Output` is internally
+                    //    Arc-counted.
+                    // Explicit collect-then-iter drops the LayerMap
+                    // guard before `send_frame` runs (re-entering the
+                    // LayerMap inside send_frame would deadlock).
+                    let output = state.output.clone();
+                    let layers: Vec<smithay::desktop::LayerSurface> =
+                        smithay::desktop::layer_map_for_output(&output)
+                            .layers()
+                            .cloned()
+                            .collect();
+                    for layer in &layers {
+                        layer.send_frame(&output, time, None, |_, _| Some(output.clone()));
+                    }
+                    if let Some(toplevel) = state.foreground_toplevel.as_ref() {
+                        smithay::desktop::utils::send_frames_surface_tree(
+                            toplevel.wl_surface(),
+                            &output,
+                            time,
+                            None,
+                            |_, _| Some(output.clone()),
+                        );
+                    }
+
+                    // R9 (convergence): emit wp_presentation_feedback.presented
+                    // for any surface that requested it on its last commit.
+                    // smithay's `take_presentation_feedback_surface_tree` walks
+                    // the cached feedback per surface; we drive it for the
+                    // foreground tree + each layer. The
+                    // primary-scanout-output closure unconditionally returns
+                    // the single output (halmasuit hosts one output and
+                    // every visible surface is on it).
+                    let kind = smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync;
+                    let mut feedback =
+                        smithay::desktop::utils::OutputPresentationFeedback::new(&output);
+                    if let Some(toplevel) = state.foreground_toplevel.as_ref() {
+                        smithay::desktop::utils::take_presentation_feedback_surface_tree(
+                            toplevel.wl_surface(),
+                            &mut feedback,
+                            |_, _| Some(output.clone()),
+                            |_, _| kind,
+                        );
+                    }
+                    for layer in &layers {
+                        smithay::desktop::utils::take_presentation_feedback_surface_tree(
+                            layer.wl_surface(),
+                            &mut feedback,
+                            |_, _| Some(output.clone()),
+                            |_, _| kind,
+                        );
+                    }
+                    let refresh =
+                        smithay::wayland::presentation::Refresh::fixed(state.refresh_period);
+                    state.presentation_seq = state.presentation_seq.wrapping_add(1);
+                    feedback.presented::<_, smithay::utils::Monotonic>(
+                        time,
+                        refresh,
+                        state.presentation_seq,
+                        smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync,
+                    );
                 }
                 smithay::backend::drm::DrmEvent::Error(e) => {
                     tracing::warn!(error = %e, "DRM device error");
@@ -2140,6 +3077,137 @@ fn main() -> io::Result<()> {
         synth.set_preferred(output_mode);
         (None, None, synth, None)
     };
+
+    // R10 (convergence): zwp_linux_dmabuf_v1 global. Mesa-EGL
+    // clients prefer dmabuf over wl_shm — without this global they
+    // operate at significantly degraded performance and extra wedge
+    // surface area. Format list comes from the renderer's
+    // `dmabuf_formats()` when the DRM backend is present; on the
+    // SKIP path (no renderer) we don't advertise the global at all
+    // (advertising a global we can't serve is the
+    // `linux-dmabuf-v1`-lie anti-pattern the epic codifies).
+    // Phase B: wp_viewporter — crop+scale-to-output (subsurface
+    // scaling, HiDPI fractional-scale composition). Both Qt 6 and
+    // GTK 4 bind this; smithay handles all the per-surface logic.
+    let viewporter_state =
+        smithay::wayland::viewporter::ViewporterState::new::<HalmasuitState>(&display_handle);
+    // Phase B: wp_fractional_scale_manager_v1 — HiDPI fractional
+    // scale negotiation. Smithay manages per-surface state.
+    let fractional_scale_state =
+        smithay::wayland::fractional_scale::FractionalScaleManagerState::new::<HalmasuitState>(
+            &display_handle,
+        );
+    // Phase B: wp_single_pixel_buffer_manager_v1 — solid-color
+    // buffers without an allocator. GTK 4 uses for backgrounds.
+    let single_pixel_buffer_state =
+        smithay::wayland::single_pixel_buffer::SinglePixelBufferState::new::<HalmasuitState>(
+            &display_handle,
+        );
+    // Phase B: zwp_pointer_gestures_v1 — GTK 4 touchpad gestures
+    // (swipe / pinch / hold). Smithay manages the per-gesture
+    // dispatch from libinput passthrough.
+    let pointer_gestures_state = smithay::wayland::pointer_gestures::PointerGesturesState::new::<
+        HalmasuitState,
+    >(&display_handle);
+    // Phase B: zwp_tablet_manager_v2 — stylus / eraser / tablet pad.
+    // Smithay manages the per-tool state on the seat.
+    let tablet_manager_state = smithay::wayland::tablet_manager::TabletManagerState::new::<
+        HalmasuitState,
+    >(&display_handle);
+    // Phase B: zxdg_decoration_manager_v1 — always answer ServerSide
+    // (= "no decoration is server's contribution") for halmasuit's
+    // fullscreen toplevel model. Qt avoids double titlebars.
+    let xdg_decoration_state = smithay::wayland::shell::xdg::decoration::XdgDecorationState::new::<
+        HalmasuitState,
+    >(&display_handle);
+    // Phase B: xdg_activation_v1 — Qt 6 / GTK 4 use this for
+    // window activation requests. halmasuit's foreground is
+    // greeter→session lifecycle driven; we accept tokens (smithay
+    // default) and log+ignore activations.
+    let xdg_activation_state = smithay::wayland::xdg_activation::XdgActivationState::new::<
+        HalmasuitState,
+    >(&display_handle);
+    // Phase B: zwp_idle_inhibit_manager_v1 — GTK 4 binds. No idle
+    // behavior in v1; inhibit/uninhibit handlers are no-ops.
+    let idle_inhibit_state = smithay::wayland::idle_inhibit::IdleInhibitManagerState::new::<
+        HalmasuitState,
+    >(&display_handle);
+    // Phase B: zwp_keyboard_shortcuts_inhibit_manager_v1 — halmasuit
+    // has no global keyboard shortcuts; inhibitor requests are
+    // tracked but inert.
+    let keyboard_shortcuts_inhibit_state =
+        smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState::new::<
+            HalmasuitState,
+        >(&display_handle);
+    // Phase B: xdg_foreign_v2 — cross-client toplevel handle
+    // export/import. v1 hosts one fullscreen toplevel per phase so
+    // embedding is inert; smithay tracks handle bookkeeping.
+    let xdg_foreign_state =
+        smithay::wayland::xdg_foreign::XdgForeignState::new::<HalmasuitState>(&display_handle);
+    // Phase B: xdg_wm_dialog_v1 — GTK 4 / Qt 6 mark dialog toplevels
+    // via this. halmasuit takes no action on the hint.
+    let xdg_dialog_state = smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<
+        HalmasuitState,
+    >(&display_handle);
+    // Phase B: xdg_toplevel_icon_manager_v1 — toolkits attach icons
+    // to toplevels via this protocol. halmasuit shows no titlebar/
+    // task list in v1; icon is cached but unused.
+    let xdg_toplevel_icon_manager =
+        smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager::new::<HalmasuitState>(
+            &display_handle,
+        );
+    // Phase B: wl_data_device_manager — wayland.xml core selection/
+    // DnD global. Selection (clipboard) routing between clients is
+    // handled internally by smithay. Cross-client DnD is non-
+    // existent in halmasuit's single-fullscreen-toplevel-per-phase
+    // model; smithay's default `dnd_requested` gracefully cancels
+    // the source.
+    let data_device_state = smithay::wayland::selection::data_device::DataDeviceState::new::<
+        HalmasuitState,
+    >(&display_handle);
+    // Phase B: zwp_primary_selection_device_manager_v1 — X11-style
+    // middle-click primary buffer. Shares the SelectionHandler with
+    // data-device (smithay routes via SelectionTarget::Primary).
+    let primary_selection_state =
+        smithay::wayland::selection::primary_selection::PrimarySelectionState::new::<HalmasuitState>(
+            &display_handle,
+        );
+    // Phase B: zwp_text_input_manager_v3 — Qt-mandatory IME protocol.
+    // No input-method-v2 paired (out of scope), so clients bind and
+    // track focus but receive no preedit/commit_string events. Per-
+    // seat TextInputHandle is lazily inserted into Seat user_data on
+    // first GetTextInput request.
+    let text_input_manager_state =
+        smithay::wayland::text_input::TextInputManagerState::new::<HalmasuitState>(&display_handle);
+    // Phase B: wp_cursor_shape_manager_v1 — clients request named
+    // cursors instead of attaching their own buffers. Smithay routes
+    // set_shape through SeatHandler::cursor_image as
+    // CursorImageStatus::Named(CursorIcon); R8b-state already stores
+    // it, so this is a pure advertise-and-delegate.
+    let cursor_shape_state = smithay::wayland::cursor_shape::CursorShapeManagerState::new::<
+        HalmasuitState,
+    >(&display_handle);
+
+    // R9 (convergence): wp_presentation global. CLOCK_MONOTONIC is
+    // what halmasuit's start_time / VBlank timestamps use, so the
+    // client's `presented` event timestamps are directly comparable
+    // to its other monotonic samples.
+    let presentation_state = smithay::wayland::presentation::PresentationState::new::<HalmasuitState>(
+        &display_handle,
+        u32::try_from(libc::CLOCK_MONOTONIC)
+            .expect("CLOCK_MONOTONIC is c_int=1 on Linux; fits u32"),
+    );
+
+    let mut dmabuf_state = smithay::wayland::dmabuf::DmabufState::new();
+    let dmabuf_global = drm_backend.as_ref().map(|b| {
+        use smithay::backend::renderer::ImportDma;
+        let formats: Vec<_> = b.renderer.dmabuf_formats().into_iter().collect();
+        tracing::info!(
+            count = formats.len(),
+            "advertising zwp_linux_dmabuf_v1 with renderer-derived format tranche"
+        );
+        dmabuf_state.create_global::<HalmasuitState>(&display_handle, formats)
+    });
 
     // Bind the Wayland listening socket. smithay's ListeningSocketSource
     // places the socket at $XDG_RUNTIME_DIR/<name>; production halmasuit's
@@ -2246,6 +3314,25 @@ fn main() -> io::Result<()> {
         )
         .map_err(io::Error::other)?;
 
+    // R5 fallback: PopupManager cleanup runs from the DRM VBlank
+    // handler at ~60Hz on the production path. The SKIP/no-DRM test
+    // bypass has no VBlank source, so without this timer popups
+    // would accumulate across the compositor's lifetime if a client
+    // creates+disconnects without destroying them. The timer is
+    // always-armed (production AND SKIP); on production the VBlank
+    // path still does the dominant per-frame cleanup, this timer is
+    // a coarse safety net. 1 s cadence is well below any visible-
+    // popup lifetime; cleanup() over an empty tree is O(1).
+    loop_handle
+        .insert_source(
+            Timer::from_duration(Duration::from_secs(1)),
+            |_deadline, (), state: &mut HalmasuitState| {
+                state.popups.cleanup();
+                TimeoutAction::ToDuration(Duration::from_secs(1))
+            },
+        )
+        .map_err(|e| io::Error::other(format!("insert popup-cleanup timer: {e}")))?;
+
     // greetd socket setup. Production: NixOS module sets
     // HALMASUIT_GREETD_SOCKET to `/run/halmasuit/greetd.sock` and
     // HALMASUIT_GREETER_UID to the greeter system user's uid.
@@ -2286,6 +3373,19 @@ fn main() -> io::Result<()> {
         None
     };
 
+    // Cache output-mode-derived constants once; the mode is stable
+    // across the compositor's lifetime in v1 (no hot-plug), so input
+    // and VBlank hot paths read these cached values rather than
+    // re-locking `output.current_mode()` per event/frame.
+    let output_size = output
+        .current_mode()
+        .map_or((1280_i32, 800_i32), |m| (m.size.w, m.size.h));
+    let refresh_period = std::time::Duration::from_nanos(
+        1_000_000_000_000_u64
+            / u64::try_from(output.current_mode().map_or(60_000, |m| m.refresh).max(1))
+                .expect("refresh clamped to >=1"),
+    );
+
     let mut state = HalmasuitState {
         running: true,
         display_handle,
@@ -2297,8 +3397,33 @@ fn main() -> io::Result<()> {
         output,
         shm_state,
         layer_shell_state,
+        dmabuf_state,
+        _dmabuf_global: dmabuf_global,
+        _presentation_state: presentation_state,
+        presentation_seq: 0,
+        cursor_status: CursorImageStatus::default_named(),
+        frame_pending: false,
+        output_size,
+        refresh_period,
+        _viewporter_state: viewporter_state,
+        _fractional_scale_state: fractional_scale_state,
+        _single_pixel_buffer_state: single_pixel_buffer_state,
+        _pointer_gestures_state: pointer_gestures_state,
+        _tablet_manager_state: tablet_manager_state,
+        _xdg_decoration_state: xdg_decoration_state,
+        xdg_activation_state,
+        _idle_inhibit_state: idle_inhibit_state,
+        keyboard_shortcuts_inhibit_state,
+        xdg_foreign_state,
+        _xdg_dialog_state: xdg_dialog_state,
+        _xdg_toplevel_icon_manager: xdg_toplevel_icon_manager,
+        data_device_state,
+        primary_selection_state,
+        _text_input_manager_state: text_input_manager_state,
+        _cursor_shape_state: cursor_shape_state,
         seen_layer_roles: std::collections::HashSet::new(),
         foreground_toplevel: None,
+        popups: PopupManager::default(),
         foreground: halmasuit_introspect::Foreground::Greeter,
         _libseat_session: libseat_session,
         loop_handle: loop_handle.clone(),
@@ -2314,6 +3439,7 @@ fn main() -> io::Result<()> {
         session_uid: None,
         swap: swap_gate::SwapGate::new(),
         session_first_frame_emitted: false,
+        start_time: std::time::Instant::now(),
     };
 
     // The wallpaper plane is composited from frame 0 (epic G1/R3/R6):
@@ -2474,6 +3600,13 @@ fn main() -> io::Result<()> {
             event_loop
                 .dispatch(Some(Duration::from_millis(16)), &mut state)
                 .map_err(io::Error::other)?;
+            // P1: drain coalesced commit-driven repaints. Many
+            // wl_surface.commits in one dispatch cycle (root +
+            // subsurfaces + popups) become a single repaint here.
+            if state.frame_pending {
+                state.frame_pending = false;
+                state.repaint();
+            }
             state
                 .display_handle
                 .flush_clients()

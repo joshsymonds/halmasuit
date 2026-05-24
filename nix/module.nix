@@ -228,6 +228,34 @@ in
       '';
     };
 
+    cursor = {
+      theme = lib.mkOption {
+        type        = lib.types.str;
+        default     = "default";
+        example     = "Adwaita";
+        description = ''
+          Xcursor theme halmasuit loads at startup for the
+          visible-cursor render path (R8b-render). Exported as
+          `XCURSOR_THEME` in halmasuit.service's environment AND
+          passed through the broker's session-leader env allowlist
+          so the child compositor (niri / cosmic-comp / etc.)
+          renders the same theme inside its own surface tree.
+          Falls back to a procedural arrow if the theme cannot be
+          loaded.
+        '';
+      };
+      size = lib.mkOption {
+        type        = lib.types.int;
+        default     = 24;
+        example     = 32;
+        description = ''
+          Xcursor size in logical pixels. Exported as
+          `XCURSOR_SIZE` alongside the theme; same propagation
+          path through the broker session-leader allowlist.
+        '';
+      };
+    };
+
     pamService = lib.mkOption {
       type        = lib.types.str;
       default     = "halmasuit";
@@ -509,6 +537,12 @@ in
         # service with no logind session, so libseat's autodetect
         # (logind → seatd → builtin) is ambiguous; pin it.
         LIBSEAT_BACKEND = "seatd";
+        # R8b-render — xcursor theme + size for halmasuit's visible
+        # cursor render path. Propagated through the broker
+        # session-leader env allowlist so the child compositor
+        # renders the same theme. See `services.halmasuit.cursor`.
+        XCURSOR_THEME = cfg.cursor.theme;
+        XCURSOR_SIZE  = toString cfg.cursor.size;
       } // lib.optionalAttrs (cfg.greeterCommand != null) {
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.
