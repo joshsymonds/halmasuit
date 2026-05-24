@@ -94,7 +94,7 @@ pkgs.testers.runNixOSTest {
         greeterUid      = 999;
         greeterGroup    = "halmasuit-greeter";
         compositorUid   = 998;
-        witnessImage    = ./fixtures/witness.png;
+        wallpaper       = { type = "image"; source = ./fixtures/wallpaper.png; };
         greeterCommand  = "${greeterCmd}";
       };
 
