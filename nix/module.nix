@@ -197,6 +197,22 @@ in
               placeholder.
             '';
           };
+          fallback = lib.mkOption {
+            type        = lib.types.nullOr lib.types.path;
+            default     = null;
+            description = ''
+              Absolute path to a static image (PNG/JPEG/WebP) the
+              wallpaper engine swaps in when the video decoder's
+              restart budget (3 crashes / 10s) exhausts. Only
+              meaningful for `type = "video"'; ignored otherwise.
+
+              Without a fallback the engine keeps rendering the
+              last good frame (or the 1×1 black placeholder if no
+              frame ever arrived). With one, an `ImageBackend` is
+              constructed against this path the first time the
+              decoder relay reports dead.
+            '';
+          };
         };
       });
       default     = null;
@@ -517,6 +533,8 @@ in
               type     = "video";
               source   = "${wp.source}";
               "loop"   = wp.loop;
+            } // lib.optionalAttrs (wp.fallback != null) {
+              fallback = "${wp.fallback}";
             };
           configFile = pkgs.writeText "halmasuit-wallpaper.json"
             (builtins.toJSON jsonContent);

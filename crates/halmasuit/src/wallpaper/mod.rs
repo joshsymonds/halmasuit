@@ -79,31 +79,78 @@ impl WallpaperEngine {
     /// over the wallpaper (epic G1/R3/R6 — frame 0 must already be
     /// wallpaper-covered).
     ///
+    /// Before rendering, asks the active backend whether it wants
+    /// the engine to swap in a fallback ([`WallpaperBackend::requested_fallback`]).
+    /// If yes, constructs the fallback and atomically replaces the
+    /// active backend BEFORE the render call. The swap is bounded —
+    /// a fallback that itself requests a fallback is logged but not
+    /// recursed.
+    ///
     /// # Errors
     ///
     /// Bubbles any backend-specific render error (e.g. shader compile
-    /// fault on first call, video frame decode failure).
+    /// fault on first call, video frame decode failure). Fallback-
+    /// construction failures are logged but NOT propagated — the
+    /// existing backend keeps rendering whatever it already had.
     pub fn render_element(
         &mut self,
         renderer: &mut GlesRenderer,
         output_size: Size<i32, Logical>,
     ) -> io::Result<Option<SceneElement>> {
+        self.maybe_swap_fallback(renderer);
         self.backend.as_mut().map_or_else(
             || Ok(None),
             |b| b.render_element(renderer, output_size).map(Some),
         )
     }
 
+    /// If the active backend has requested a fallback, construct it
+    /// and atomically replace the active backend. Idempotent (the
+    /// freshly-installed fallback's `requested_fallback` returns
+    /// `None`); errors are logged and the existing backend stays.
+    fn maybe_swap_fallback(&mut self, renderer: &mut GlesRenderer) {
+        let request = self.backend.as_ref().and_then(|b| b.requested_fallback());
+        let Some(kind) = request else {
+            return;
+        };
+        match kind {
+            backend::FallbackKind::Image(path) => match ImageBackend::new(renderer, &path) {
+                Ok(img) => {
+                    tracing::info!(
+                        path = %path.display(),
+                        "wallpaper: swapping to fallback image (relay-dead)"
+                    );
+                    self.backend = Some(Box::new(img));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        path = %path.display(),
+                        "wallpaper: fallback ImageBackend construction failed; \
+                         keeping current backend"
+                    );
+                }
+            },
+        }
+    }
+
     /// Periodic background tick — dispatched by a calloop timer
-    /// independent of the render path. Delegates to the active
-    /// backend's [`WallpaperBackend::poll_pending`]. Today only
-    /// [`VideoBackend`] makes meaningful use of this hook (it
-    /// drives `DecoderRelay::poll_frames`); the default no-op
-    /// keeps the call free for image/shader/empty configurations.
-    pub fn poll_pending(&self) {
+    /// independent of the render path. Two responsibilities:
+    /// 1. Delegate to the active backend's
+    ///    [`WallpaperBackend::poll_pending`] (currently only
+    ///    [`VideoBackend`] does useful work; drives
+    ///    `DecoderRelay::poll_frames`).
+    /// 2. Check for and execute a fallback swap if the active
+    ///    backend has requested one. The render path's
+    ///    [`Self::render_element`] does the same check, but after
+    ///    the relay dies the render loop idles (no new content =
+    ///    no vblank = no render); the timer is the only thing that
+    ///    keeps firing.
+    pub fn tick(&mut self, renderer: &mut GlesRenderer) {
         if let Some(b) = self.backend.as_ref() {
             b.poll_pending();
         }
+        self.maybe_swap_fallback(renderer);
     }
 
     /// Private swap entry point — exists so future epics (bus-event

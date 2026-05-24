@@ -83,6 +83,21 @@ let
     test -s $out
   '';
 
+  # Fallback image (PNG) the WallpaperEngine should swap in once the
+  # decoder relay's restart budget exhausts. Solid blue so a future
+  # visual-frame-capture gate can pixel-distinguish the swap; today
+  # the test asserts via the log line emitted by
+  # `WallpaperEngine::maybe_swap_fallback`.
+  fallbackFixture = pkgs.runCommand "halmasuit-test-fallback.png" {
+    nativeBuildInputs = [ pkgs.ffmpeg ];
+  } ''
+    ffmpeg -y -hide_banner -loglevel error \
+      -f lavfi -i 'color=c=blue:s=320x240:d=1' \
+      -frames:v 1 \
+      $out
+    test -s $out
+  '';
+
   # Auth driver — same shape as login-flash.nix's: connects to the
   # GREETD_SOCK halmasuit exports to its greeter child, drives auth,
   # starts a sleep-infinity session, then idles so halmasuit's
@@ -188,9 +203,10 @@ pkgs.testers.runNixOSTest {
         # The whole point of this test — video wallpaper backend
         # configured against a real h264 fixture, looping.
         wallpaper = {
-          type   = "video";
-          source = videoFixture;
-          loop   = true;
+          type     = "video";
+          source   = videoFixture;
+          loop     = true;
+          fallback = fallbackFixture;
         };
 
         # Drives the real greeter→session auth path for the
@@ -427,51 +443,27 @@ pkgs.testers.runNixOSTest {
     # math, and count_after stays ≤3, so the relay respawns instead
     # of going dead. Solution: do the rapid kills in ONE bash loop
     # on the VM side, no test-driver round-trips between iterations.
-    # Drive 5 rapid kills, each gated on the relay observing the
-    # previous decoder's death (one new "wallpaper: decoder closed
-    # connection" log entry per kill). State-based polling per
-    # CLAUDE.md memory `state-based-polling`: no fixed sleeps.
-    # Five kills (one extra past the 4 needed to exhaust) is
-    # robust against pgrep racing with the relay's respawn cycle.
-    pre_close_count = machine.succeed(
-        "journalctl -u halmasuit | "
-        "grep -c 'wallpaper: decoder closed connection' || true"
-    ).strip()
-    pre_close_count_int = int(pre_close_count) if pre_close_count else 0
-    closes_observed = pre_close_count_int
-    for k in range(5):
-        # `|| true` on each piped step so an empty pgrep result
-        # doesn't trip nixos-test's `set -euo pipefail` shell.
-        kill_result = machine.succeed(
-            "set +e; "
-            "pid=$(pgrep -af halmasuit-decoder | "
-            "       grep -v 'pgrep -af' | awk '{print $1}' | "
-            "       head -1); "
-            "if [ -n \"$pid\" ]; then "
-            "  kill -9 \"$pid\" 2>/dev/null && echo \"killed=$pid\"; "
-            "else echo \"no-decoder\"; fi"
-        ).strip()
-        if kill_result == "no-decoder":
-            # Relay marked dead before this iteration; budget already
-            # exhausted. Break out and let the post-loop assertions
-            # verify the dead state.
-            print(
-                f"  iter {k+1}: no decoder running ({kill_result}); "
-                "budget already exhausted"
-            )
-            break
-        target = closes_observed + 1
-        # Wait for the relay to observe the close — guarantees the
-        # next pgrep+kill iteration targets a different decoder than
-        # this one, and that this kill registered against the
-        # restart-budget window. Bounded under 10 s so the budget
-        # window won't slide between kills.
-        machine.wait_until_succeeds(
-            "test \"$(journalctl -u halmasuit | "
-            f"grep -c 'wallpaper: decoder closed connection')\" -ge {target}",
-            timeout=10,
-        )
-        closes_observed = target
+    # Drive 5 rapid kills in a single VM-side bash loop. The 0.3s
+    # sleep between iterations is NOT the test-driver `time.sleep`
+    # the state-based-polling memory warns against — it's a tight
+    # pacing INSIDE one bash command, well above the relay's 100 ms
+    # tick. Doing one Python iteration per kill is unworkable here:
+    # nixos-test-driver's SSH/QEMU-monitor round-trip is ~1–2s per
+    # `machine.succeed`, which blows the 5 kills past the relay's
+    # 10s restart-budget window, so older failures get pruned and
+    # the count never exceeds the threshold. Five kills (one extra
+    # past the 4 needed to exhaust) is robust against pgrep racing
+    # with the respawn cycle. `|| true` keeps a missing pgrep from
+    # tripping `set -e`.
+    machine.succeed(
+        "for i in 1 2 3 4 5; do "
+        "  pid=$(pgrep -af halmasuit-decoder | "
+        "        grep -v 'pgrep -af' | awk '{print $1}' | head -1 "
+        "        || true); "
+        "  if [ -n \"$pid\" ]; then kill -9 \"$pid\" 2>/dev/null || true; fi; "
+        "  sleep 0.3; "
+        "done"
+    )
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF "
         "'decoder restart budget exhausted'",
@@ -512,6 +504,29 @@ pkgs.testers.runNixOSTest {
     print(
         f"GATE 3 PASS (continuation): halmasuit pid={halmasuit_pid_final} "
         "still active, identical to before decoder kills"
+    )
+
+    # ── Gate 6: fallback-to-ImageBackend on relay-dead ──
+    # Epic Req #4 ("After exhausted, drop the relay and fall back to
+    # ImageBackend") and Req #10 ("Asserts fallback: after N forced
+    # crashes, halmasuit falls back to image without crashing"). The
+    # operator configured `wallpaper.fallback = fallbackFixture` in
+    # the test machine config; after Gate 3's budget exhaustion the
+    # WallpaperEngine should swap the active backend from
+    # VideoBackend to ImageBackend on the next render tick.
+    #
+    # Headless VM tests can't pixel-distinguish the fallback (per
+    # CLAUDE.md "Test-VM rendering gotcha"); instead assert via the
+    # canonical log line emitted by
+    # `WallpaperEngine::maybe_swap_fallback`.
+    machine.wait_until_succeeds(
+        "journalctl -u halmasuit | grep -qF "
+        "'wallpaper: swapping to fallback image (relay-dead)'",
+        timeout=15,
+    )
+    print(
+        "GATE 6 PASS: WallpaperEngine swapped to ImageBackend "
+        "fallback after relay-dead"
     )
 
     print("visual-wallpaper-video: ALL GATES PASSED")

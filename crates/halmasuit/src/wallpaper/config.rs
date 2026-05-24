@@ -63,6 +63,15 @@ pub enum WallpaperConfig {
         /// wallpaper use.
         #[serde(default = "default_loop", rename = "loop")]
         loop_playback: bool,
+        /// Absolute path to a static image to swap the wallpaper to
+        /// when the decoder's restart budget exhausts (Epic #12 Req
+        /// #4/#10). `None` keeps the last-good-frame / placeholder
+        /// behavior. When set, an `ImageBackend` is constructed
+        /// against this path the first time the relay reports
+        /// [`crate::wallpaper::decoder_relay::DecoderRelay::is_dead`]
+        /// and swapped in via [`crate::wallpaper::WallpaperEngine`].
+        #[serde(default)]
+        fallback: Option<PathBuf>,
     },
 }
 
@@ -201,6 +210,7 @@ pub fn infer_from_path(path: PathBuf) -> WallpaperConfig {
         Some("mp4" | "webm" | "mkv") => WallpaperConfig::Video {
             source: path,
             loop_playback: true,
+            fallback: None,
         },
         // Default: image. Covers .png/.jpg/.jpeg/.webp and anything
         // else the `image` crate can decode — the decode itself is
@@ -364,9 +374,11 @@ mod tests {
             WallpaperConfig::Video {
                 source,
                 loop_playback,
+                fallback,
             } => {
                 assert_eq!(source, PathBuf::from("/x.mp4"));
                 assert!(!loop_playback);
+                assert!(fallback.is_none(), "fallback defaults to None");
             }
             other => panic!("expected Video, got {other:?}"),
         }
@@ -379,6 +391,18 @@ mod tests {
         match cfg {
             WallpaperConfig::Video { loop_playback, .. } => {
                 assert!(loop_playback, "loop defaults to true");
+            }
+            other => panic!("expected Video, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_video_config_with_fallback_deserializes() {
+        let json = r#"{"type":"video","source":"/x.mp4","fallback":"/y.png"}"#;
+        let cfg: WallpaperConfig = serde_json::from_str(json).expect("video config parses");
+        match cfg {
+            WallpaperConfig::Video { fallback, .. } => {
+                assert_eq!(fallback, Some(PathBuf::from("/y.png")));
             }
             other => panic!("expected Video, got {other:?}"),
         }

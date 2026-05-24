@@ -13,11 +13,22 @@
 // `VideoBackend` it will mean decoding the first frame synchronously.
 
 use std::io;
+use std::path::PathBuf;
 
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Size};
 
 use crate::drm::SceneElement;
+
+/// What kind of fallback a backend is asking the engine to swap in
+/// (Epic #12 Req #4/#10 — relay-dead fallback for the video backend).
+/// Phase A: image only. Future expansions (solid color, shader) plug
+/// in here without changing the engine's swap logic.
+#[derive(Debug, Clone)]
+pub enum FallbackKind {
+    /// Construct an `ImageBackend` against this path and swap.
+    Image(PathBuf),
+}
 
 /// One pluggable wallpaper backend. See
 /// [`super::ImageBackend`](super::ImageBackend) for the live
@@ -55,4 +66,18 @@ pub trait WallpaperBackend: Send {
     /// `render_element` ALSO calls `poll_frames` when it runs; this
     /// hook is the keepalive that doesn't rely on the render loop.
     fn poll_pending(&self) {}
+
+    /// Has this backend hit a terminal failure and want the engine
+    /// to swap in a fallback? Default `None` (no fallback requested).
+    /// [`super::VideoBackend`] returns `Some(FallbackKind::Image(_))`
+    /// once its `DecoderRelay` exhausts its restart budget AND the
+    /// operator configured a fallback image (Epic #12 Req #4/#10).
+    ///
+    /// `WallpaperEngine` calls this on every `render_element` cycle
+    /// and performs the swap before the render call. The swap is
+    /// expected to be idempotent at the engine level — implementers
+    /// may return `Some` repeatedly until swapped out.
+    fn requested_fallback(&self) -> Option<FallbackKind> {
+        None
+    }
 }

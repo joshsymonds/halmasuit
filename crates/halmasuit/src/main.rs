@@ -2396,7 +2396,7 @@ fn main() -> io::Result<()> {
             .insert_source(
                 wallpaper_tick,
                 |_deadline, &mut (), state: &mut HalmasuitState| {
-                    if let Some(backend) = state.drm_backend.as_ref() {
+                    if let Some(backend) = state.drm_backend.as_mut() {
                         backend.tick_wallpaper();
                     }
                     calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(100))

@@ -169,11 +169,12 @@ impl DrmBackend {
     }
 
     /// Periodic tick that drives the wallpaper backend's
-    /// render-loop-independent polling. Called from a calloop timer
-    /// registered in [`setup_drm_backend`] for `WallpaperConfig::Video`
+    /// render-loop-independent polling AND the fallback-swap
+    /// check. Called from a calloop timer registered in
+    /// [`setup_drm_backend`] for `WallpaperConfig::Video`
     /// configurations. For non-video backends this is a no-op.
-    pub fn tick_wallpaper(&self) {
-        self.wallpaper.poll_pending();
+    pub fn tick_wallpaper(&mut self) {
+        self.wallpaper.tick(&mut self.renderer);
     }
 }
 
@@ -382,7 +383,13 @@ where
                 WallpaperConfig::Video {
                     source,
                     loop_playback,
-                } => Box::new(VideoBackend::new(&mut renderer, &source, loop_playback)?),
+                    fallback,
+                } => Box::new(VideoBackend::new(
+                    &mut renderer,
+                    &source,
+                    loop_playback,
+                    fallback,
+                )?),
             };
             WallpaperEngine::with_backend(backend)
         }

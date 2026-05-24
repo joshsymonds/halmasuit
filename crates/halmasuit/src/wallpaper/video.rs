@@ -59,7 +59,7 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 use tracing::{debug, error, info, warn};
 
-use super::backend::WallpaperBackend;
+use super::backend::{FallbackKind, WallpaperBackend};
 use super::decoder_relay::DecoderRelay;
 use crate::drm::SceneElement;
 
@@ -83,6 +83,12 @@ pub struct VideoBackend {
     /// handles transient decoder crashes; failure to even fork-exec
     /// is treated as terminal).
     spawn_attempted: std::cell::Cell<bool>,
+    /// Optional fallback image path to swap to when the decoder
+    /// relay exhausts its restart budget (Epic #12 Req #4/#10).
+    /// `None` keeps the last-good-frame / placeholder behavior;
+    /// `Some(path)` makes [`Self::requested_fallback`] return
+    /// `FallbackKind::Image(path)` once the relay is dead.
+    fallback: Option<PathBuf>,
     /// Currently-uploaded GLES texture. Initially a 1×1 black
     /// placeholder so frame-0 has something to paint; replaced with
     /// each new decoded frame.
@@ -113,6 +119,7 @@ impl VideoBackend {
         renderer: &mut GlesRenderer,
         source: &Path,
         _loop_playback: bool,
+        fallback: Option<PathBuf>,
     ) -> io::Result<Self> {
         // Phase A: always loop the wallpaper (decoder's loop_playback
         // = true sent unconditionally by DecoderRelay::spawn). The
@@ -139,6 +146,7 @@ impl VideoBackend {
             source: source.to_path_buf(),
             relay: RefCell::new(None),
             spawn_attempted: std::cell::Cell::new(false),
+            fallback,
             current_buffer: buffer,
             current_size: Size::from((1, 1)),
             last_uploaded_idx: None,
@@ -173,6 +181,21 @@ impl VideoBackend {
 }
 
 impl WallpaperBackend for VideoBackend {
+    fn requested_fallback(&self) -> Option<FallbackKind> {
+        // Only request a fallback when (a) the relay has been spawned
+        // (otherwise there's nothing to fail), (b) the relay is dead
+        // (budget exhausted), AND (c) the operator configured one.
+        // Without (c) the engine keeps the last-good-frame /
+        // placeholder behavior as documented in the module header.
+        let relay = self.relay.borrow();
+        let relay_dead = relay.as_ref().is_some_and(DecoderRelay::is_dead);
+        if relay_dead {
+            self.fallback.clone().map(FallbackKind::Image)
+        } else {
+            None
+        }
+    }
+
     fn poll_pending(&self) {
         // Lazy-spawn on the first call. The wallpaper-tick calloop
         // timer in main.rs is registered before the privilege-drop
