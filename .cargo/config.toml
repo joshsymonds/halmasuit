@@ -8,10 +8,10 @@
 # no libclang at production build time, no clang-sys feature-
 # unification conflict with halmasuit-session's dev-deps pam-sys).
 #
-# Path uses CARGO_WORKSPACE_DIR (cargo 1.75+) so it resolves
-# relative to whichever directory in the worktree cargo was
-# invoked from; alternative `relative = true` syntax requires
-# nightly.
+# `relative = true` is stable in `[env]` (cargo 1.74+) and
+# resolves the value against this config file's directory — i.e.
+# the workspace root — so the path stays correct no matter which
+# crate directory cargo is invoked from.
 #
 # Regenerate the bindings file with `just regenerate-decoder-bindings`
 # when the workspace's ffmpeg-headless pin changes.

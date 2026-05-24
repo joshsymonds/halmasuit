@@ -173,8 +173,14 @@ impl DrmBackend {
     /// check. Called from a calloop timer registered in
     /// [`setup_drm_backend`] for `WallpaperConfig::Video`
     /// configurations. For non-video backends this is a no-op.
-    pub fn tick_wallpaper(&mut self) {
-        self.wallpaper.tick(&mut self.renderer);
+    ///
+    /// Returns `true` iff a fallback swap fired this tick — the
+    /// timer callback in `main.rs` uses this to queue an explicit
+    /// render so the newly-installed fallback reaches the screen
+    /// (idle render loop after relay-death produces no vblank to
+    /// pick up the swap otherwise).
+    pub fn tick_wallpaper(&mut self) -> bool {
+        self.wallpaper.tick(&mut self.renderer)
     }
 }
 

@@ -97,7 +97,7 @@ impl WallpaperEngine {
         renderer: &mut GlesRenderer,
         output_size: Size<i32, Logical>,
     ) -> io::Result<Option<SceneElement>> {
-        self.maybe_swap_fallback(renderer);
+        let _ = self.maybe_swap_fallback(renderer);
         self.backend.as_mut().map_or_else(
             || Ok(None),
             |b| b.render_element(renderer, output_size).map(Some),
@@ -105,13 +105,18 @@ impl WallpaperEngine {
     }
 
     /// If the active backend has requested a fallback, construct it
-    /// and atomically replace the active backend. Idempotent (the
-    /// freshly-installed fallback's `requested_fallback` returns
-    /// `None`); errors are logged and the existing backend stays.
-    fn maybe_swap_fallback(&mut self, renderer: &mut GlesRenderer) {
+    /// and atomically replace the active backend. Returns `true`
+    /// when an actual swap happened (so timer-driven callers can
+    /// queue an explicit render — without it, an idle render loop
+    /// would leave the user staring at the last-decoded frame
+    /// indefinitely instead of the configured fallback).
+    /// Idempotent (the freshly-installed fallback's
+    /// `requested_fallback` returns `None`); construction errors
+    /// are logged and the existing backend stays.
+    fn maybe_swap_fallback(&mut self, renderer: &mut GlesRenderer) -> bool {
         let request = self.backend.as_ref().and_then(|b| b.requested_fallback());
         let Some(kind) = request else {
-            return;
+            return false;
         };
         match kind {
             backend::FallbackKind::Image(path) => match ImageBackend::new(renderer, &path) {
@@ -121,6 +126,7 @@ impl WallpaperEngine {
                         "wallpaper: swapping to fallback image (relay-dead)"
                     );
                     self.backend = Some(Box::new(img));
+                    true
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -129,6 +135,7 @@ impl WallpaperEngine {
                         "wallpaper: fallback ImageBackend construction failed; \
                          keeping current backend"
                     );
+                    false
                 }
             },
         }
@@ -146,11 +153,17 @@ impl WallpaperEngine {
     ///    the relay dies the render loop idles (no new content =
     ///    no vblank = no render); the timer is the only thing that
     ///    keeps firing.
-    pub fn tick(&mut self, renderer: &mut GlesRenderer) {
+    ///
+    /// Returns `true` iff a fallback swap actually fired this
+    /// tick. Callers use this to queue an explicit render so the
+    /// newly-installed fallback reaches the screen instead of
+    /// waiting for the next external render trigger (which, after
+    /// a relay-death, may never come).
+    pub fn tick(&mut self, renderer: &mut GlesRenderer) -> bool {
         if let Some(b) = self.backend.as_ref() {
             b.poll_pending();
         }
-        self.maybe_swap_fallback(renderer);
+        self.maybe_swap_fallback(renderer)
     }
 
     /// Private swap entry point — exists so future epics (bus-event

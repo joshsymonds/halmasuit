@@ -2372,14 +2372,23 @@ fn main() -> io::Result<()> {
     }
 
     // Wallpaper-engine background tick: a calloop timer at 100 ms
-    // drives [`DrmBackend::tick_wallpaper`], which delegates to the
-    // active wallpaper backend's [`WallpaperBackend::poll_pending`].
-    // Only `VideoBackend` does useful work in the tick (drains the
-    // decoder's IPC socket independently of the render path). For
-    // image/shader/no-wallpaper configurations, registering the
-    // timer would wake the compositor 10× per second forever for a
-    // no-op — preventing deep-idle CPU states on battery-backed
-    // hardware. Gate the registration on the wallpaper type.
+    // drives [`DrmBackend::tick_wallpaper`], which delegates to
+    // [`WallpaperEngine::tick`]. Tick has two responsibilities:
+    // (1) call the active backend's
+    //     [`WallpaperBackend::poll_pending`] — only `VideoBackend`
+    //     does useful work, draining the decoder's IPC socket
+    //     independently of the render path; and
+    // (2) check whether the active backend has requested a
+    //     fallback swap (e.g. relay-dead after the restart budget
+    //     exhausted) and execute it — load-bearing for VM-test
+    //     Gate 6 / Epic #12 Req 10's "fallback after N forced
+    //     crashes" criterion.
+    //
+    // For image/shader/no-wallpaper configurations, registering
+    // the timer would wake the compositor 10× per second forever
+    // for a no-op — preventing deep-idle CPU states on battery-
+    // backed hardware. Gate the registration on the wallpaper
+    // type.
     //
     // 100 ms is a deliberate compromise: low enough to bound
     // crash-recovery latency below human-perceptible levels, high
@@ -2389,6 +2398,12 @@ fn main() -> io::Result<()> {
     // timer is the keepalive for periods when the render loop has
     // stopped (wallpaper content stabilized → no new vblanks).
     //
+    // When tick reports a fallback swap fired, the callback
+    // queues an explicit `render_one_frame` — otherwise the
+    // newly-installed fallback would sit in the engine without
+    // reaching the screen, because a dead relay produces no
+    // content → no vblank → no render path activation.
+    //
     // Wraps around forever via `TimeoutAction::ToDuration(period)`.
     if wallpaper_is_video {
         let wallpaper_tick = calloop::timer::Timer::immediate();
@@ -2396,8 +2411,15 @@ fn main() -> io::Result<()> {
             .insert_source(
                 wallpaper_tick,
                 |_deadline, &mut (), state: &mut HalmasuitState| {
-                    if let Some(backend) = state.drm_backend.as_mut() {
-                        backend.tick_wallpaper();
+                    if let Some(backend) = state.drm_backend.as_mut()
+                        && backend.tick_wallpaper()
+                        && let Err(e) =
+                            backend.render_one_frame(&state.output, HALMASUIT_BRAND_CLEAR)
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "wallpaper-tick: render after fallback swap failed",
+                        );
                     }
                     calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(100))
                 },

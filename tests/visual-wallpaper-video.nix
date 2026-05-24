@@ -387,40 +387,34 @@ pkgs.testers.runNixOSTest {
     # decode::rewind, which drops the AVFormatContext + AVIO and
     # rebuilds them over the SAME wallpaper mmap with cursor at 0.
     # libavformat sees a brand-new input and starts producing
-    # frames again. We count the decoder's "decoder: sent frame"
-    # log lines and assert the total exceeds one full file's
-    # worth of frames (giving a margin to prove at least one
-    # complete loop iteration happened).
+    # frames again. We gate on the "decoder: rewound for loop"
+    # info-level log line, which fires every loop turnover: each
+    # rewind proves a full file's worth of frames was produced
+    # AND the EOF-loop path actually fired (a stronger invariant
+    # than counting individual frames). The per-frame send log is
+    # debug-level and intentionally suppressed at production
+    # RUST_LOG=info — counting it from journald is fragile against
+    # log-level tuning.
     #
     # Pre-T24 the loop livelocked at "open returned EOF" forever,
-    # producing exactly one decode pass before going silent.
+    # producing exactly one decode pass before going silent (zero
+    # rewinds).
     machine.wait_until_succeeds(
-        # >= 90 frames = 60 first-pass + at least 30 from a second
-        # loop iteration. Conservative margin against frame-drop
-        # noise from the relay's queue-full backpressure.
+        # >= 2 rewinds = 60-frame fixture played through at least
+        # 3 times. Conservative margin against PTS-pacing variance
+        # so a slow CI runner still satisfies the gate.
         "test \"$(journalctl -u halmasuit | "
-        "grep -c 'decoder: sent frame')\" -ge 90",
+        "grep -c 'decoder: rewound for loop')\" -ge 2",
         timeout=30,
     )
-    sent_frames = machine.succeed(
-        "journalctl -u halmasuit | "
-        "grep -c 'decoder: sent frame'"
-    ).strip()
     rewind_count = machine.succeed(
         "journalctl -u halmasuit | "
-        "grep -c 'decoder: rewound for loop' || true"
+        "grep -c 'decoder: rewound for loop'"
     ).strip()
-    if int(rewind_count) < 1:
-        raise AssertionError(
-            "GATE 5 FAIL: decoder did not log any 'rewound for "
-            f"loop' messages. sent_frames={sent_frames}, "
-            f"rewind_count={rewind_count}.\n"
-            "The mmap + custom-AVIO loop path (task #24) "
-            "regressed."
-        )
     print(
-        f"GATE 5 PASS: decoder produced {sent_frames} frames "
-        f"across {rewind_count}+ loop iterations"
+        f"GATE 5 PASS: decoder completed {rewind_count}+ loop "
+        "iterations (loop-on-EOF working; mmap-AVIO rewind path "
+        "intact)"
     )
 
     # ── Gate 2: crash recovery within budget ──

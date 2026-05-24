@@ -331,12 +331,23 @@ fn set_rlimits() -> Result<(), SandboxError> {
 /// protection updates and Rust's panic handler respectively).
 /// Documented inline; a future audit pass can tighten further.
 fn install_seccomp_filter() -> Result<(), SandboxError> {
-    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
+    use seccompiler::{
+        BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+        SeccompRule, TargetArch,
+    };
     use std::collections::BTreeMap;
 
-    // x86_64 syscall numbers. The decoder is built only for
-    // x86_64-linux (per the workspace's nix flake systems); if we
-    // ever expand to aarch64 we'll need a second table.
+    // x86_64 syscall numbers + a `TargetArch::x86_64` filter head.
+    // Hard-fail the build on any other arch so a future
+    // `aarch64-linux` flake build doesn't silently produce a
+    // decoder that SIGSYSes on first syscall.
+    #[cfg(not(target_arch = "x86_64"))]
+    compile_error!(
+        "halmasuit-decoder's seccomp filter is x86_64-only \
+         (ALLOWED_SYSCALLS uses libc::SYS_* constants whose values \
+         differ on aarch64). Add an aarch64 syscall table and \
+         conditionally select TargetArch before re-enabling."
+    );
     const ALLOWED_SYSCALLS: &[(i64, &str)] = &[
         // Spec allowlist (epic Req #3).
         (libc::SYS_read, "read"),
@@ -395,7 +406,12 @@ fn install_seccomp_filter() -> Result<(), SandboxError> {
         // /proc/self/fd open during enter_sandbox happens BEFORE
         // the filter installs, but rsmpeg / libavutil / libav* may
         // touch the filesystem for codec config (e.g. read CPU
-        // capability files). Allow read-only path lookups.
+        // capability files). openat is given an argument-filter
+        // below — entry kept here only to seat the syscall in the
+        // rules map; the empty Vec is REPLACED before SeccompFilter
+        // build with rdonly_only_rules. Bare allowlist would also
+        // permit O_WRONLY/O_RDWR/O_CREAT/O_TMPFILE on this
+        // mount-ns-inherited host filesystem view.
         (libc::SYS_openat, "openat"),
         (libc::SYS_newfstatat, "newfstatat"),
         (libc::SYS_fstat, "fstat"),
@@ -421,6 +437,39 @@ fn install_seccomp_filter() -> Result<(), SandboxError> {
     for &(nr, _) in ALLOWED_SYSCALLS {
         rules.insert(nr, vec![]);
     }
+
+    // openat: restrict to read-only. AND of two MaskedEq
+    // conditions on arg 2 (flags):
+    //   (flags & O_ACCMODE) == O_RDONLY     (== 0; rejects O_WRONLY/O_RDWR)
+    //   (flags & (O_CREAT|O_TMPFILE)) == 0  (rejects file creation)
+    // Conditions within a single SeccompRule are AND'd; if BOTH
+    // hold the rule matches (Allow), else the default action
+    // (KillProcess) fires. libavformat's config probes use openat
+    // for read-only path lookups (codec capability files, etc.) —
+    // this allow-list keeps them working while denying any write
+    // path into the mount-ns-inherited host filesystem view.
+    let o_accmode: u64 = u64::from(libc::O_ACCMODE as u32);
+    let o_rdonly: u64 = u64::from(libc::O_RDONLY as u32);
+    let create_flags: u64 = u64::from((libc::O_CREAT | libc::O_TMPFILE) as u32);
+    let openat_readonly = SeccompRule::new(vec![
+        SeccompCondition::new(
+            2,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(o_accmode),
+            o_rdonly,
+        )
+        .map_err(|e| SandboxError::SeccompCompile(seccompiler::Error::from(e)))?,
+        SeccompCondition::new(
+            2,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(create_flags),
+            0,
+        )
+        .map_err(|e| SandboxError::SeccompCompile(seccompiler::Error::from(e)))?,
+    ])
+    .map_err(|e| SandboxError::SeccompCompile(seccompiler::Error::from(e)))?;
+    rules.insert(libc::SYS_openat, vec![openat_readonly]);
+
     let filter = SeccompFilter::new(
         rules,
         // Default: kill the whole process on any syscall not above.

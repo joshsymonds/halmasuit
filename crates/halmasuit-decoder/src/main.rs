@@ -30,13 +30,12 @@ mod sandbox;
 use std::io::IoSliceMut;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::process::ExitCode;
-
-use halmasuit_decoder_ipc::{
-    CompositorToDecoder, DecoderToCompositor, FrameFormat, MAX_CONTROL_MSG_BYTES, WIRE_VERSION,
-    encode_control, try_decode_control,
-};
 use std::time::{Duration, Instant};
 
+use halmasuit_decoder_ipc::{
+    CompositorToDecoder, DecoderToCompositor, FrameFormat, MAX_CONTROL_MSG_BYTES, MAX_FRAME_BYTES,
+    WIRE_VERSION, encode_control, try_decode_control,
+};
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg, send, sendmsg};
 use thiserror::Error;
 use tracing::{Level, error, info, warn};
@@ -222,9 +221,19 @@ fn run(fd: RawFd) -> Result<(), DecoderError> {
                         if let Some(anchor) = *pacing {
                             let delta = frame.pts_us.saturating_sub(anchor.anchor_pts_us);
                             if delta > 0 {
-                                let due = anchor.anchor_wall
-                                    + Duration::from_micros(u64::try_from(delta).unwrap_or(0));
-                                if wait_until_due_or_control(fd, due)? {
+                                // checked_add: an overflow here would
+                                // be an Instant past the platform's
+                                // representable range — `+` would
+                                // panic-abort the decoder. With
+                                // sane PTS values (seconds) this is
+                                // unreachable; the guard is defense
+                                // against pathological streams.
+                                let due = anchor.anchor_wall.checked_add(Duration::from_micros(
+                                    u64::try_from(delta).unwrap_or(0),
+                                ));
+                                if let Some(due) = due
+                                    && wait_until_due_or_control(fd, due)?
+                                {
                                     // Control arrived during the
                                     // wait. Drain it via the next
                                     // outer-loop iteration's poll —
@@ -439,27 +448,29 @@ fn recv_one_nonblocking(
 /// decoder calls this to hold the next frame until its
 /// presentation time, but a Pause/Resume/Shutdown still
 /// interrupts within ~milliseconds.
+///
+/// Uses `ppoll` (kernel-side ns-resolution `timespec` argument)
+/// rather than `poll` (ms-resolution `int` argument); at 30 fps
+/// the inter-frame interval is 33.333 ms — ms truncation drifts
+/// presentation time forward by ~1% (cosmetic for a wallpaper,
+/// but free to avoid).
 fn wait_until_due_or_control(fd: RawFd, due: Instant) -> Result<bool, DecoderError> {
-    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use nix::poll::{PollFd, PollFlags, ppoll};
+    use nix::sys::time::TimeSpec;
     loop {
         let now = Instant::now();
         if now >= due {
             return Ok(false);
         }
         let remaining = due.saturating_duration_since(now);
-        // PollTimeout takes u16 milliseconds via From<u16>; clamp.
-        // Frame intervals at typical rates (30/60 fps = 33/16 ms)
-        // fit easily; very low source rates would be clamped to
-        // ~65 s which is still poll-friendly.
-        let timeout_ms =
-            u16::try_from(remaining.as_millis().min(u128::from(u16::MAX))).unwrap_or(u16::MAX);
+        let timeout = TimeSpec::from_duration(remaining);
         #[expect(
             unsafe_code,
             reason = "fd is the long-lived IPC socket; BorrowedFd::borrow_raw is the safe wrapper pattern"
         )]
         let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
         let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
-        match poll(&mut fds, PollTimeout::from(timeout_ms)) {
+        match ppoll(&mut fds, Some(timeout), None) {
             Ok(0) => return Ok(false),
             Ok(_) => {
                 if fds[0]
@@ -536,9 +547,20 @@ fn send_frame(ipc_fd: RawFd, frame: &RgbaFrame, frame_idx: u64) -> Result<bool, 
     let bytes_len = u32::try_from(frame.bytes.len()).map_err(|_| {
         DecoderError::Codec(halmasuit_decoder_ipc::CodecError::OversizedFrame(
             u32::MAX,
-            halmasuit_decoder_ipc::MAX_FRAME_BYTES,
+            MAX_FRAME_BYTES,
         ))
     })?;
+    // Defense-in-depth: cap the wire payload at MAX_FRAME_BYTES
+    // even though the recv side independently validates the header.
+    // In normal operation the dimension checks in
+    // `convert_frame_to_rgba` already bound this; the explicit
+    // send-side ceiling protects the IPC contract if a future
+    // refactor relaxes those checks.
+    if bytes_len > MAX_FRAME_BYTES {
+        return Err(DecoderError::Codec(
+            halmasuit_decoder_ipc::CodecError::OversizedFrame(bytes_len, MAX_FRAME_BYTES),
+        ));
+    }
     let header = DecoderToCompositor::FrameHeader {
         frame_idx,
         pts_us: frame.pts_us,
@@ -559,7 +581,11 @@ fn send_frame(ipc_fd: RawFd, frame: &RgbaFrame, frame_idx: u64) -> Result<bool, 
         halmasuit_decoder_ipc::encode_control(&header).map_err(DecoderError::Codec)?;
     match send_frame_gather_or_drop(ipc_fd, &header_bytes, frame.bytes)? {
         SendOutcome::Sent => {
-            info!(
+            // debug, not info: at 60 fps this fires 60×/s and the
+            // per-frame info log otherwise allocates + formats four
+            // fields on the steady-state hot path that the rest of
+            // the pipeline is zero-alloc.
+            tracing::debug!(
                 width = frame.width,
                 height = frame.height,
                 bytes = frame.bytes.len(),
