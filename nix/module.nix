@@ -55,6 +55,22 @@ in
   options.services.halmasuit = {
     enable = lib.mkEnableOption "halmasuit — Linux system compositor";
 
+    fromInitrd.enable = lib.mkEnableOption ''
+      halmasuit started from initramfs (Phase B).
+
+      Registers halmasuit as a `boot.initrd.systemd.services.halmasuit`
+      unit with `SurviveFinalKillSignal=yes`, so the same process
+      spans kernel handoff → initramfs → switch_root → rootfs without
+      restarting. halmasuit holds DRM master directly (no libseat /
+      seatd in this deployment) and emits a single NDJSON event
+      stream across the pivot, observable in rootfs journald.
+
+      Mutually exclusive with `services.halmasuit.enable`: each is a
+      different deployment shape (rootfs-only vs boot-from-initrd) and
+      they cannot coexist on the same system. drm-master-probe Phases
+      1+2 validated the survival mechanics this option deploys
+    '';
+
     package = lib.mkOption {
       type        = lib.types.package;
       default     = pkgs.halmasuit;
@@ -734,6 +750,142 @@ in
          '';
        }
      ];
+   })
+
+   # Phase B: boot-from-initrd deployment. halmasuit registered as an
+   # initramfs systemd unit; SurviveFinalKillSignal=yes keeps the
+   # process alive across switch_root (RESEARCH.md Phase 2 / Plymouth's
+   # mechanism). NOT registered in rootfs systemd — rootfs systemd
+   # observes the surviving PID via /proc but doesn't manage it, same
+   # shape as `tests/drm-master-probe-phase2.nix`.
+   #
+   # The deployment is mutually exclusive with `services.halmasuit.enable`:
+   # rootfs-only and boot-from-initrd are two different topologies, not
+   # composable. The assertion below enforces this.
+   (lib.mkIf cfg.fromInitrd.enable {
+     assertions = [
+       {
+         assertion = !cfg.enable;
+         message   = ''
+           services.halmasuit.fromInitrd.enable and
+           services.halmasuit.enable cannot both be true. They are
+           mutually exclusive deployment shapes:
+             - enable = true       → rootfs-only, libseat-brokered DRM
+             - fromInitrd.enable   → boot-from-initrd, direct DRM
+         '';
+       }
+     ];
+
+     # Same Mesa runtime story as the rootfs deployment: halmasuit's
+     # renderer dlopens libEGL/libGL via libglvnd, then Mesa's DRI
+     # driver. `hardware.graphics.enable = true` provisions the
+     # `/run/opengl-driver/lib` farm in rootfs; that path also exists
+     # post-pivot here since rootfs systemd brings it up after the
+     # pivot, but halmasuit needs Mesa reachable BEFORE the pivot.
+     # The initramfs storePaths list below ships Mesa + libglvnd into
+     # the initramfs closure; LD_LIBRARY_PATH points the binary at
+     # those store paths directly (no `/run/opengl-driver/lib`
+     # indirection in initramfs).
+     hardware.graphics.enable = true;
+
+     # `boot.initrd.systemd.enable = true` is required for
+     # `boot.initrd.systemd.services.*` to take effect. NixOS's older
+     # initramfs (without systemd) can't host a long-running unit.
+     boot.initrd.systemd.enable = true;
+     # virtio_gpu for the VM test; real-hardware deployments add
+     # nvidia-drm / amdgpu / i915 themselves outside this option.
+     boot.initrd.availableKernelModules = [ "virtio_gpu" ];
+     boot.initrd.kernelModules = [ "virtio_gpu" ];
+
+     # Ship halmasuit + its full GLES runtime closure into the
+     # initramfs. `boot.initrd.systemd.storePaths` follows each entry's
+     # transitive closure, so naming the package roots is enough.
+     #
+     # xkeyboard-config is a dlopen target xkbcommon resolves through a
+     # compile-time baked-in path; it's not a regular link dep, so the
+     # halmasuit binary closure misses it and add_keyboard fails with
+     # "Cannot load XKB rules 'evdev'". Smithay's `add_keyboard` is
+     # called regardless of the initramfs/rootfs path (the seat is one
+     # initialization site above the DRM branching), so xkbcommon needs
+     # its data files reachable before any post-pivot Wayland client.
+     boot.initrd.systemd.storePaths = [
+       "${cfg.package}/bin/halmasuit"
+       "${pkgs.mesa}"
+       "${pkgs.libglvnd}"
+       "${pkgs.xkeyboard-config}"
+     ];
+
+     # The Phase B unit. Registered ONLY in initramfs systemd; the
+     # rootfs side will observe the surviving PID via /proc but not
+     # manage a unit for it.
+     boot.initrd.systemd.services.halmasuit = {
+       description = "halmasuit (Phase B: initramfs survival)";
+       wantedBy    = [ "initrd.target" ];
+       after       = [ "systemd-modules-load.service" "systemd-udev-settle.service" ];
+       # The pivot kill spree (systemd-shutdown's killall) runs
+       # BEFORE initrd-switch-root.service. We must be wantedBy
+       # initrd.target so we start before the pivot, AND we must be
+       # ordered before initrd-switch-root.service so we're registered
+       # by the time the kill spree fires.
+       before      = [ "initrd-switch-root.service" ];
+       unitConfig = {
+         DefaultDependencies = false;
+         IgnoreOnIsolate     = true;
+         # THE survival mechanism. Belongs in [Unit], not [Service]
+         # (RESEARCH.md L131-136: load-fragment-gperf.gperf.in maps
+         # Unit.SurviveFinalKillSignal, NOT Service.*; misplacement
+         # is silently dropped as "Unknown key"). The VM test
+         # asserts both placement and effect.
+         SurviveFinalKillSignal = "yes";
+       };
+       serviceConfig = {
+         Type           = "simple";
+         # ExecStartPre sets up two paths halmasuit needs before its
+         # main() reaches them, in the initramfs context:
+         #
+         # 1. `/run/opengl-driver` symlink. Mesa's GBM loader has a
+         #    baked-in search path `/run/opengl-driver/lib/gbm/<drv>_gbm.so`
+         #    that ignores `LIBGL_DRIVERS_PATH`. The rootfs systemd
+         #    activation script (hardware.graphics.enable) builds the
+         #    symlink farm at rootfs boot; in initramfs that activation
+         #    never runs. Pointing at `${pkgs.mesa}` satisfies the loader
+         #    because its `lib/gbm/dri_gbm.so` is in the initramfs
+         #    storePaths closure.
+         # 2. `/run/halmasuit/`. The Wayland socket lives here per
+         #    XDG_RUNTIME_DIR. Created by mkdir rather than
+         #    `RuntimeDirectory=` — `RuntimeDirectory=` makes systemd
+         #    consider this unit eligible for the rootfs's
+         #    `initrd-cleanup.service` sweep, which sends SIGTERM
+         #    post-pivot and breaks halmasuit's survival (the probe in
+         #    drm-master-probe-phase2 doesn't use `RuntimeDirectory=`
+         #    and survives cleanly).
+         ExecStartPre = [
+           "${pkgs.coreutils}/bin/ln -sfn ${pkgs.mesa} /run/opengl-driver"
+           "${pkgs.coreutils}/bin/mkdir -p /run/halmasuit"
+         ];
+         ExecStart      = lib.getExe cfg.package;
+         Restart        = "no";
+         StandardOutput = "journal";
+         StandardError  = "journal";
+       };
+       environment = {
+         RUST_LOG        = cfg.logLevel;
+         XDG_RUNTIME_DIR = "/run/halmasuit";
+         # No HALMASUIT_GREETER_UID / HALMASUIT_COMPOSITOR_UID /
+         # HALMASUIT_GREETER_COMMAND: the initramfs path skips
+         # greetd + greeter spawn + privilege drop entirely (see
+         # `crates/halmasuit/src/main.rs` initramfs branching). The
+         # PAM/auth surface lands when halmasuit-luks does.
+
+         # Mesa runtime. /run/opengl-driver symlink is created by the
+         # ExecStartPre above; LD_LIBRARY_PATH carries libglvnd's
+         # libEGL/libGL dispatch and Mesa's libgallium.
+         # llvmpipe is forced for the VM-test virtio-gpu-pci substrate
+         # (matches the rootfs unit's LIBGL_ALWAYS_SOFTWARE=1).
+         LIBGL_ALWAYS_SOFTWARE = "1";
+         LD_LIBRARY_PATH       = "${pkgs.libglvnd}/lib:${pkgs.mesa}/lib";
+       };
+     };
    })
   ];
 }

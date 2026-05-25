@@ -68,6 +68,9 @@ test-vm:
     echo "── halmasuit-vm ──"
     nix build .#checks.x86_64-linux.halmasuit-vm -L --print-build-logs --no-link
     echo
+    echo "── initrd-survival ──"
+    nix build .#checks.x86_64-linux.initrd-survival -L --print-build-logs --no-link
+    echo
     echo "── run-pam-auth ──"
     nix build .#checks.x86_64-linux.run-pam-auth -L --print-build-logs --no-link
     echo
@@ -220,6 +223,16 @@ test-drm-probe-phase3:
 # privilege model; the conclusion is recorded in RESEARCH.md Phase 4.
 test-drm-probe-phase4:
     nix build .#checks.x86_64-linux.drm-master-probe-phase4 -L --print-build-logs --no-link
+
+# Phase B initrd-survival gate: the production halmasuit binary
+# registered via `services.halmasuit.fromInitrd.enable`. Composes
+# RESEARCH.md Phase 2 mechanism (`SurviveFinalKillSignal=yes` in
+# unitConfig) with halmasuit's runtime initramfs detection. Asserts
+# PID + DRM-master + Wayland-socket continuity across switch_root,
+# and that the NDJSON event stream emits both `initramfs_init`
+# (pre-pivot) and `rootfs_ready` (post-pivot) from the SAME pid.
+test-vm-initrd-survival:
+    nix build .#checks.x86_64-linux.initrd-survival -L --print-build-logs --no-link
 
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.

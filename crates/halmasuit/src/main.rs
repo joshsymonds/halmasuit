@@ -3339,12 +3339,30 @@ fn main() -> io::Result<()> {
 
     // Signal source. Register BEFORE the first dispatch so a SIGTERM
     // racing startup is still caught.
+    //
+    // Initramfs gating (Phase B): when halmasuit was started from the
+    // initramfs (`in_initramfs == true`), `initrd-cleanup.service`
+    // sends SIGTERM to every initramfs unit during the pivot to rootfs
+    // (`IgnoreOnIsolate=yes` doesn't prevent this — systemd 256+
+    // explicitly stops the unit, not just removes its watch). The
+    // boot-from-initrd deployment needs halmasuit to outlast that
+    // signal, mirroring drm-master-probe-phase2's
+    // `diagnostic_signal_handler` which logs SIGTERM and continues.
+    // The post-pivot graceful-shutdown path lands alongside the
+    // post-pivot privilege drop in a follow-up task.
     let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT, Signal::SIGCHLD])?;
+    let started_from_initramfs = in_initramfs;
     loop_handle
         .insert_source(
             signals,
-            |event, (), state: &mut HalmasuitState| match event.signal() {
+            move |event, (), state: &mut HalmasuitState| match event.signal() {
                 Signal::SIGCHLD => reap_zombie_children(state),
+                Signal::SIGTERM if started_from_initramfs => {
+                    tracing::info!(
+                        "SIGTERM ignored (started_from_initramfs=true). \
+                         Post-pivot graceful shutdown lands in a follow-up Phase B task."
+                    );
+                }
                 sig => {
                     let reason = match sig {
                         Signal::SIGTERM => ShutdownReason::SignalTerm,

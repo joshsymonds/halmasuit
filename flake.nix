@@ -688,6 +688,15 @@
           system = "x86_64-linux";
           inherit nixpkgs;
         };
+        # Phase B (initramfs survival): real halmasuit binary in
+        # boot.initrd.systemd.services with SurviveFinalKillSignal=yes,
+        # asserts PID + DRM-master + Wayland-socket continuity across
+        # switch_root, single NDJSON stream observable post-pivot.
+        initrd-survival = import ./tests/initrd-survival.nix {
+          system    = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit = self.packages.x86_64-linux.halmasuit;
+        };
         # Visual gates consume `halmasuit-debug` (frame_audit on): the
         # capture path is the in-process `Snapshot()` D-Bus method,
         # not QMP screendump. Structural tests above stay on the
