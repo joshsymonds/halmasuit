@@ -753,6 +753,21 @@
           inherit nixpkgs;
           halmasuit-luks = self.packages.x86_64-linux.halmasuit-luks;
         };
+        # Phase B kernel-handoff-to-session pixmap continuity gate.
+        # The Plymouth-removability proof: extends the same
+        # exact-stream no-flash mechanism the rootfs visual-* family
+        # uses (frame_audit build + frame_rendered events +
+        # assert_no_flash_stream) to the boot-from-initrd timeline.
+        # Consumes halmasuit-debug, same as the visual-* checks.
+        visual-initrd-pixmap = import ./tests/visual-initrd-pixmap.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit           = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # Visual gates consume `halmasuit-debug` (frame_audit on): the
         # capture path is the in-process `Snapshot()` D-Bus method,
         # not QMP screendump. Structural tests above stay on the

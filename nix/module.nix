@@ -29,6 +29,45 @@ let
   # greeter uid, as the direct-broker VM gates do) is the peer.
   brokerPeerUid =
     if cfg.enable || cfg.fromInitrd.enable then cfg.compositorUid else cfg.greeterUid;
+
+  # Wallpaper config JSON — the file halmasuit's wallpaper engine
+  # reads via HALMASUIT_WALLPAPER_CONFIG. Computed once here so both
+  # the env attrs AND the initramfs storePaths can reference the
+  # same store path. `null` when `cfg.wallpaper == null`.
+  wallpaperConfigFile =
+    if cfg.wallpaper == null then null else
+    let
+      wp = cfg.wallpaper;
+      jsonContent =
+        if wp.type == "image" then {
+          type   = "image";
+          source = "${wp.source}";
+        } else if wp.type == "shader" then {
+          type     = "shader";
+          source   = "${wp.source}";
+          uniforms = wp.uniforms;
+        } else {
+          type   = "video";
+          source = "${wp.source}";
+          "loop" = wp.loop;
+        } // lib.optionalAttrs (wp.fallback != null) {
+          fallback = "${wp.fallback}";
+        };
+    in pkgs.writeText "halmasuit-wallpaper.json" (builtins.toJSON jsonContent);
+
+  # Wallpaper env attrs — consumed by BOTH the rootfs `enable`
+  # halmasuit unit AND the `fromInitrd.enable` initramfs unit so the
+  # wallpaper plane composites from frame 0 in both deployments
+  # (G1/R3 — no pre-client solid phase). Returns `{}` when
+  # `cfg.wallpaper == null`; otherwise the JSON config file path +
+  # the path fallback + the decoder path for video wallpapers.
+  wallpaperEnv =
+    if cfg.wallpaper == null then {} else {
+      HALMASUIT_WALLPAPER_CONFIG = "${wallpaperConfigFile}";
+      HALMASUIT_WALLPAPER_PATH   = "${cfg.wallpaper.source}";
+    } // lib.optionalAttrs (cfg.wallpaper.type == "video") {
+      HALMASUIT_DECODER_PATH = lib.getExe cfg.decoder.package;
+    };
 in
 {
   imports = [
@@ -606,51 +645,7 @@ in
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.
         HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
-      } // lib.optionalAttrs (cfg.wallpaper != null) (
-        let
-          # Project the Nix option shape onto the JSON schema the
-          # wallpaper engine's serde deserializer expects (see
-          # `wallpaper::config::WallpaperConfig` — discriminator
-          # `type`, snake-case variants, `loop` rather than
-          # `loop_playback`).
-          wp = cfg.wallpaper;
-          jsonContent =
-            if wp.type == "image" then {
-              type   = "image";
-              source = "${wp.source}";
-            } else if wp.type == "shader" then {
-              type     = "shader";
-              source   = "${wp.source}";
-              uniforms = wp.uniforms;
-            } else {
-              type     = "video";
-              source   = "${wp.source}";
-              "loop"   = wp.loop;
-            } // lib.optionalAttrs (wp.fallback != null) {
-              fallback = "${wp.fallback}";
-            };
-          configFile = pkgs.writeText "halmasuit-wallpaper.json"
-            (builtins.toJSON jsonContent);
-        in {
-          # The wallpaper engine prefers HALMASUIT_WALLPAPER_CONFIG
-          # (JSON) over HALMASUIT_WALLPAPER_PATH; the JSON carries
-          # the full discriminated-union shape including shader
-          # uniform bindings. String interpolation (NOT `toString`)
-          # so the Nix path is realized into the store.
-          HALMASUIT_WALLPAPER_CONFIG = "${configFile}";
-          # Also export PATH as a fallback for early diagnostics
-          # (anything that wants "where's the asset" without parsing
-          # the JSON). The engine never reads this when CONFIG is
-          # set; setting both is defense-in-depth, not redundancy.
-          HALMASUIT_WALLPAPER_PATH = "${wp.source}";
-        } // lib.optionalAttrs (wp.type == "video") {
-          # Video wallpapers spawn `halmasuit-decoder` as a sandboxed
-          # subprocess (Epic #12). DecoderRelay reads this env var to
-          # locate the binary at fork-exec time; otherwise it falls
-          # back to `halmasuit-decoder` on PATH, which won't work in
-          # systemd's restricted PATH context.
-          HALMASUIT_DECODER_PATH = lib.getExe cfg.decoder.package;
-        });
+      } // wallpaperEnv;
     };
    })
 
@@ -916,6 +911,23 @@ in
        "${pkgs.mesa}"
        "${pkgs.libglvnd}"
        "${pkgs.xkeyboard-config}"
+     ] ++ lib.optionals (cfg.wallpaper != null) [
+       # Wallpaper assets must be in the initramfs closure so the
+       # wallpaper plane can composite from frame 0 (G1/R3 — no
+       # pre-client solid phase). `cfg.wallpaper.source` is the
+       # primary asset; the JSON config file is what halmasuit reads
+       # via HALMASUIT_WALLPAPER_CONFIG. For video wallpapers, the
+       # decoder binary and fallback image too.
+       "${cfg.wallpaper.source}"
+       "${wallpaperConfigFile}"
+     ] ++ lib.optionals (cfg.wallpaper != null && cfg.wallpaper.type == "video") [
+       "${cfg.decoder.package}/bin/halmasuit-decoder"
+     ] ++ lib.optionals (
+       cfg.wallpaper != null
+       && cfg.wallpaper.type == "video"
+       && cfg.wallpaper.fallback != null
+     ) [
+       "${cfg.wallpaper.fallback}"
      ];
 
      # The Phase B unit. Registered ONLY in initramfs systemd; the
@@ -1063,7 +1075,7 @@ in
        } // lib.optionalAttrs (cfg.greeterCommand != null) {
          # Greeter binary halmasuit fork+execs post-pivot.
          HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
-       };
+       } // wallpaperEnv;
      };
 
      # halmasuit-luks: the systemd password-agent Wayland client.

@@ -77,6 +77,9 @@ test-vm:
     echo "── luks-unlock ──"
     nix build .#checks.x86_64-linux.luks-unlock -L --print-build-logs --no-link
     echo
+    echo "── visual-initrd-pixmap ──"
+    nix build .#checks.x86_64-linux.visual-initrd-pixmap -L --print-build-logs --no-link
+    echo
     echo "── run-pam-auth ──"
     nix build .#checks.x86_64-linux.run-pam-auth -L --print-build-logs --no-link
     echo
@@ -252,6 +255,14 @@ test-vm-full-boot-flash:
 # on a virtual-keyboard substrate for the Wayland UI path.
 test-vm-luks-unlock:
     nix build .#checks.x86_64-linux.luks-unlock -L --print-build-logs --no-link
+
+# Phase B kernel-handoff-to-session pixmap continuity gate. Extends
+# the rootfs visual-* family's exact-stream no-flash mechanism
+# (frame_audit + assert_no_flash_stream) to the boot-from-initrd
+# timeline. The strongest empirical statement that halmasuit owns
+# the pixel pipeline continuously — the Plymouth-removability proof.
+test-vm-visual-initrd-pixmap:
+    nix build .#checks.x86_64-linux.visual-initrd-pixmap -L --print-build-logs --no-link
 
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.
