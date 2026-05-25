@@ -234,6 +234,11 @@ test-drm-probe-phase4:
 test-vm-initrd-survival:
     nix build .#checks.x86_64-linux.initrd-survival -L --print-build-logs --no-link
 
+# Phase B hard gate: full LUKS-backed boot + survival + chroot +
+# greeter spawn + PAM auth → SessionOpened end-to-end.
+test-vm-full-boot-flash:
+    nix build .#checks.x86_64-linux.full-boot-flash -L --print-build-logs --no-link
+
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.
 # Useful for `machine.screenshot("name")`, `machine.send_chars(...)`, and

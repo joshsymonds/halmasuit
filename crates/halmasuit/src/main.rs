@@ -2204,22 +2204,6 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
 
     // (2) Spawn greeter while still root (child setresuids in pre_exec).
     if let Some(cmd) = greeter_command_from_env() {
-        // DIAG: dump halmasuit's view post-chroot
-        if let Ok(root_dir) = std::fs::read_dir("/") {
-            let entries: Vec<String> = root_dir
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .take(20)
-                .collect();
-            tracing::info!(?entries, "DIAG: halmasuit / contents post-chroot");
-        }
-        let nix_store_exists = std::path::Path::new("/nix/store").exists();
-        tracing::info!(
-            nix_store_exists,
-            cmd_exists = cmd.exists(),
-            cmd = ?cmd,
-            "DIAG: pre-spawn greeter path check"
-        );
         match spawn_greeter(state.greeter_uid, &cmd) {
             Ok(handle) => {
                 tracing::info!(
@@ -2315,20 +2299,18 @@ fn migrate_to_broker_root(broker_socket: &Path) -> io::Result<()> {
     // backoff for up to 5s.
     let recv_deadline = std::time::Instant::now() + Duration::from_secs(5);
     let (_frame, root_fd) = loop {
-        match chan
+        if let Some(v) = chan
             .recv_with_fd()
             .map_err(|e| io::Error::other(format!("recv RootFd: {e:?}")))?
         {
-            Some(v) => break v,
-            None => {
-                if std::time::Instant::now() >= recv_deadline {
-                    return Err(io::Error::other(
-                        "recv RootFd timed out (5s); broker never responded",
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            break v;
         }
+        if std::time::Instant::now() >= recv_deadline {
+            return Err(io::Error::other(
+                "recv RootFd timed out (5s); broker never responded",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
     };
     let root_fd = root_fd
         .ok_or_else(|| io::Error::other("broker sent RootFd without SCM_RIGHTS fd attachment"))?;

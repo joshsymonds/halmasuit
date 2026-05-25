@@ -464,16 +464,6 @@ in
       '')
     ];
 
-    # Default PAM service file — gives us unixAuth-backed pam_unix +
-    # pam_env + pam_limits, the stack the privileged halmasuit-session
-    # broker authenticates against and the conventional starting stack
-    # for greeters. Operators wanting custom modules disable
-    # installPamConfig and declare security.pam.services.<name>
-    # themselves.
-    security.pam.services = lib.mkIf cfg.installPamConfig {
-      ${cfg.pamService} = {};
-    };
-
     # No setuid wrapper: the compositor execs no privilege-drop helper.
     # Session launch is the privileged halmasuit-session broker
     # forking-then-dropping a non-setuid child (Epic #1 R7/R15) — see
@@ -725,6 +715,18 @@ in
    # compositor's only auth path is relaying to this broker (Epic #1
    # R3/A4), so it is mandatory infrastructure, not an opt-in add-on.
    (lib.mkIf (cfg.enable || cfg.fromInitrd.enable || cfg.session.enable) {
+     # Default PAM service file — unixAuth-backed pam_unix + pam_env +
+     # pam_limits, the stack the privileged halmasuit-session broker
+     # authenticates against. Provisioned wherever the broker is — the
+     # rootfs `enable` deployment, the boot-from-initrd deployment, and
+     # the standalone `session.enable` shape all reach this PAM service
+     # through `cfg.pamService`. Operators wanting custom modules
+     # disable `installPamConfig` and declare
+     # `security.pam.services.<name>` themselves.
+     security.pam.services = lib.mkIf cfg.installPamConfig {
+       ${cfg.pamService} = {};
+     };
+
      systemd.sockets."halmasuit-session" = {
        description = "halmasuit-session privileged PAM-lifecycle broker socket";
        wantedBy    = [ "sockets.target" ];
