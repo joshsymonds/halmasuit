@@ -226,26 +226,28 @@ pkgs.testers.runNixOSTest {
         )
     print("PASS: Wayland socket present at /run/halmasuit/wayland-0 post-pivot")
 
-    # ASSERTION 7: post-pivot greetd listener bound. The phase event
+    # ASSERTION 7: post-pivot greetd listener bound. Phase event
     # proves `run_post_pivot_setup` ran and the bind succeeded —
-    # halmasuit's kernel-side listening FD references
-    # `/run/halmasuit/greetd.sock` (visible in `/proc/<pid>/net/unix`).
+    # halmasuit's kernel-side listening FD references the socket
+    # path (visible in /proc/<pid>/net/unix).
     #
-    # NOTE: This test does NOT assert the bound socket FILE is visible
-    # on disk. Rootfs systemd's `initrd-cleanup.service` issues a
-    # routine `Stop halmasuit.service` shortly after the pivot, and the
-    # ensuing unit-lifecycle sweep unlinks the just-bound socket file
-    # while halmasuit's process + FD persist (the SIGTERM handler's
-    # `started_from_initramfs` gate from task #4 keeps the process
-    # alive across the Stop, but the runtime-dir contents bound AFTER
-    # that signal don't survive). The wayland-0 inode happens to
-    # persist because in-flight clients + smithay's lock-file anchor
-    # keep it referenced. Resolving the cross-pivot unit lifecycle so
-    # external clients can connect via the socket path is
-    # `tests/full-boot-flash.nix` territory — most likely by
-    # registering a parallel rootfs systemd unit that adopts the
-    # survived PID, so rootfs systemd doesn't see the unit as
-    # "stopping" at all post-pivot.
+    # KNOWN PHASE B GAP — see `nix/module.nix` ("Phase B integration
+    # gap" docstring above the initramfs halmasuit unit) and below.
+    # Briefly: rootfs systemd's `initrd-cleanup.service` issues a
+    # routine "Stop halmasuit.service" shortly after the pivot. The
+    # `started_from_initramfs` SIGTERM-ignore gate (task #4) keeps
+    # halmasuit's PROCESS alive, but the cgroup-tied cleanup that
+    # follows unlinks just-bound files from the unit's process —
+    # specifically halmasuit's own sockets (not halmasuit-session's,
+    # which is a separate unit). Multiple defenses tried, none
+    # worked: RuntimeDirectoryPreserve=yes, RefuseManualStop=yes,
+    # KillMode=none, binding outside /run/halmasuit/. The structural
+    # fix is most likely a parallel rootfs systemd unit that ADOPTS
+    # the survived PID via PIDFile= so rootfs systemd doesn't see the
+    # unit as "stopping" at all post-pivot. Resolving this is on
+    # `tests/full-boot-flash.nix`'s path, since full-boot-flash needs
+    # the greeter to actually connect to drive the post-pivot auth
+    # arc.
     assert "greetd_ready" in phases_seen, (
         "halmasuit did NOT emit `phase: greetd_ready` post-pivot — "
         "`run_post_pivot_setup` either didn't run or failed to bind "

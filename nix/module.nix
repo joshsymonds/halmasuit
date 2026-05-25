@@ -935,24 +935,38 @@ in
          Restart        = "no";
          StandardOutput = "journal";
          StandardError  = "journal";
-         # `/run/halmasuit` is created via `mkdir -p` in ExecStartPre
-         # rather than `RuntimeDirectory=`. `RuntimeDirectory=` (even
-         # with `RuntimeDirectoryPreserve=yes`) interacts badly with
-         # the cross-pivot unit lifecycle: rootfs systemd's
-         # `initrd-cleanup.service` issues a routine `Stop
-         # halmasuit.service` after switch_root, and the unit's
-         # runtime-dir paths bound after that `Stop` (like the
-         # `greetd.sock` from `run_post_pivot_setup`) end up unlinked
-         # while halmasuit's process + listening FDs persist (the
-         # SIGTERM handler's `started_from_initramfs` gate keeps the
-         # process alive across the Stop). The `wayland-0` inode
+         # ## Phase B integration gap (cross-pivot socket-file
+         # visibility)
+         #
+         # `/run/halmasuit` is created here via `mkdir -p` rather than
+         # via `RuntimeDirectory=`. Neither shape resolves a deeper
+         # cross-pivot issue: rootfs systemd's `initrd-cleanup.service`
+         # issues a routine `Stop halmasuit.service` shortly after
+         # switch_root, and the cgroup-tied cleanup that follows
+         # unlinks halmasuit-bound socket files (the `greetd.sock`
+         # bound by `run_post_pivot_setup` in particular). halmasuit's
+         # process + listening FDs persist (the SIGTERM handler's
+         # `started_from_initramfs` gate keeps it alive across the
+         # Stop), but the dirent for the new bind is removed —
+         # external greeters can't connect by path. `wayland-0`
          # happens to outlast the sweep because in-flight clients +
-         # smithay's `.lock` keep it anchored, but freshly-bound
-         # `greetd.sock` does not. This is a known Phase B integration
-         # finding to be resolved by `tests/full-boot-flash.nix` —
-         # likely by registering a parallel rootfs unit that adopts
-         # the survived PID, so rootfs systemd doesn't see the unit
-         # as "stopping" at all post-pivot.
+         # smithay's `.lock` keep it anchored, but a freshly-bound
+         # `greetd.sock` does not.
+         #
+         # Tried defenses (none worked):
+         #   - `RuntimeDirectory=halmasuit` ± `RuntimeDirectoryPreserve=yes`
+         #   - `RefuseManualStop=yes` in [Unit]
+         #   - `KillMode=none` in [Service]
+         #   - Binding the greetd socket OUTSIDE /run/halmasuit/
+         #
+         # The structural fix is most likely a parallel ROOTFS unit
+         # that adopts the survived PID via `PIDFile=` so rootfs
+         # systemd doesn't see the initramfs unit as "stopping" at
+         # all post-pivot. Resolving this is on `tests/full-boot-flash.nix`'s
+         # path (Phase B task #7), since full-boot-flash needs the
+         # greeter to actually connect to drive the post-pivot auth
+         # arc. Documented here rather than left as a silent surprise
+         # for whoever picks up task #7.
        };
        environment = {
          RUST_LOG        = cfg.logLevel;
