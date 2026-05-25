@@ -2834,6 +2834,113 @@ const fn should_log_degraded(n: u32) -> bool {
     n <= 5 || n.is_power_of_two()
 }
 
+/// DRM vblank / error handler invoked by the calloop source registered
+/// inside `drm::setup_drm_backend` and `drm::setup_drm_direct`. Lifted
+/// to a free function so both DRM-bootstrap paths share the exact same
+/// per-frame logic (R5 popup cleanup, R2 frame callbacks, R9
+/// `wp_presentation_feedback`) — the libseat and direct-open paths
+/// differ only in fd acquisition.
+fn handle_drm_event(
+    event: smithay::backend::drm::DrmEvent,
+    _meta: &mut Option<smithay::backend::drm::DrmEventMetadata>,
+    state: &mut HalmasuitState,
+) {
+    match event {
+        smithay::backend::drm::DrmEvent::VBlank(_crtc) => {
+            // R5 (convergence epic): release dead popups before any
+            // per-frame work — once per VBlank is the smithay-
+            // recommended cadence and keeps the popup tree from
+            // accumulating zombies between commits.
+            state.popups.cleanup();
+            if let Some(backend) = state.drm_backend.as_mut()
+                && let Err(e) = backend.frame_submitted()
+            {
+                tracing::warn!(error = %e, "DRM frame_submitted failed");
+            }
+            // R2 (convergence epic): post-present frame-callback
+            // emission. Wayland spec Appendix A `wl_surface::frame`
+            // requires the server to notify clients when it's a good
+            // time to draw the next frame; Mesa's
+            // `dri2_wl_surface_throttle` (in `libEGL_mesa`) blocks
+            // `eglSwapBuffers` until that callback arrives, so a
+            // server that never fires wedges every EGL client on its
+            // second swap. Walk the surfaces visible on the just-
+            // presented output and send via smithay's canonical
+            // helpers; explicit clones drop the `LayerMap` guard
+            // before send_frame iterates.
+            let time = state.start_time.elapsed();
+            // P2 (review-round-3): the per-VBlank allocations below
+            // are bounded by design:
+            //  - `Vec<LayerSurface>::collect()` size ≤ 4 (Layer enum
+            //    cardinality: Background / Bottom / Top / Overlay).
+            //    One heap alloc / 16 ms.
+            //  - `output.clone()` is an Arc bump (~50 ns). Per-surface
+            //    invocations inside the closures below are bounded by
+            //    the foreground tree size; smithay's `Output` is
+            //    internally Arc-counted.
+            // Explicit collect-then-iter drops the LayerMap guard
+            // before `send_frame` runs (re-entering the LayerMap
+            // inside send_frame would deadlock).
+            let output = state.output.clone();
+            let layers: Vec<smithay::desktop::LayerSurface> =
+                smithay::desktop::layer_map_for_output(&output)
+                    .layers()
+                    .cloned()
+                    .collect();
+            for layer in &layers {
+                layer.send_frame(&output, time, None, |_, _| Some(output.clone()));
+            }
+            if let Some(toplevel) = state.foreground_toplevel.as_ref() {
+                smithay::desktop::utils::send_frames_surface_tree(
+                    toplevel.wl_surface(),
+                    &output,
+                    time,
+                    None,
+                    |_, _| Some(output.clone()),
+                );
+            }
+
+            // R9 (convergence): emit wp_presentation_feedback.presented
+            // for any surface that requested it on its last commit.
+            // smithay's `take_presentation_feedback_surface_tree` walks
+            // the cached feedback per surface; we drive it for the
+            // foreground tree + each layer. The
+            // primary-scanout-output closure unconditionally returns
+            // the single output (halmasuit hosts one output and every
+            // visible surface is on it).
+            let kind = smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync;
+            let mut feedback = smithay::desktop::utils::OutputPresentationFeedback::new(&output);
+            if let Some(toplevel) = state.foreground_toplevel.as_ref() {
+                smithay::desktop::utils::take_presentation_feedback_surface_tree(
+                    toplevel.wl_surface(),
+                    &mut feedback,
+                    |_, _| Some(output.clone()),
+                    |_, _| kind,
+                );
+            }
+            for layer in &layers {
+                smithay::desktop::utils::take_presentation_feedback_surface_tree(
+                    layer.wl_surface(),
+                    &mut feedback,
+                    |_, _| Some(output.clone()),
+                    |_, _| kind,
+                );
+            }
+            let refresh = smithay::wayland::presentation::Refresh::fixed(state.refresh_period);
+            state.presentation_seq = state.presentation_seq.wrapping_add(1);
+            feedback.presented::<_, smithay::utils::Monotonic>(
+                time,
+                refresh,
+                state.presentation_seq,
+                smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync,
+            );
+        }
+        smithay::backend::drm::DrmEvent::Error(e) => {
+            tracing::warn!(error = %e, "DRM device error");
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "main() is the wiring point — splitting smithay+greetd+calloop \
@@ -2852,6 +2959,36 @@ fn main() -> io::Result<()> {
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION"),
     });
+
+    // Phase B (boot-from-initrd) runtime detection. `/etc/initrd-release`
+    // is the systemd-canonical signal that we're in the initramfs
+    // (INITRD_INTERFACE spec); the rootfs filesystem doesn't ship the
+    // file. `initrd-switch-root.service` removes it during the pivot.
+    //
+    // When this is true, halmasuit:
+    //   - sets `argv[0][0] = '@'` (defense-in-depth alongside the
+    //     unit's `SurviveFinalKillSignal=yes`, per RESEARCH.md
+    //     Phase 2);
+    //   - opens DRM directly and issues SET_MASTER (no libseat — there
+    //     is no seatd in the initramfs);
+    //   - skips libinput, greetd, and the greeter (no users yet);
+    //   - stays root for its initramfs lifetime; the privilege drop
+    //     lands in a follow-up Phase B task that wires the post-pivot
+    //     transition. `HALMASUIT_COMPOSITOR_UID` is intentionally not
+    //     consulted on this path.
+    //   - inserts a calloop poll for `/etc/initrd-release` disappearance
+    //     and emits `Phase::RootfsReady` once observed.
+    //
+    // When this is false, the existing rootfs-only deployment path
+    // is unchanged: libseat-brokered DRM, greetd listener, greeter,
+    // privilege drop.
+    let in_initramfs = context::is_initramfs();
+    if in_initramfs {
+        context::set_argv0_marker();
+        emit(&Event::PhaseEntered {
+            phase: Phase::InitramfsInit,
+        });
+    }
 
     // Resolve the DRM device path before anything else (the path may
     // be `None` for the dev/test SKIP path). The actual DRM/GBM/EGL/GLES
@@ -2904,157 +3041,80 @@ fn main() -> io::Result<()> {
         EventLoop::try_new().map_err(io::Error::other)?;
     let loop_handle = event_loop.handle();
 
-    // Build the DRM backend if a device path was resolved. The real
-    // case (production) goes through `drm::setup_drm_backend` and
-    // returns the smithay `Output` backed by the actual connector
-    // mode. The SKIP case (dev/test, non-root) synthesizes a 1920x1080
-    // placeholder so wl_clients can still discover an output global.
+    // Build the DRM backend if a device path was resolved. Three paths:
+    //
+    // 1. `Some(path)` + `in_initramfs`: open `/dev/dri/card0` directly
+    //    and issue SET_MASTER ourselves (no libseat, no libinput).
+    //    drm-master-probe Phases 1+2 validated the survival semantics.
+    // 2. `Some(path)` + !`in_initramfs`: production rootfs deployment —
+    //    libseat brokers the DRM fd, seatd holds master, libinput
+    //    routes input through the same session.
+    // 3. `None`: the dev/test SKIP path — synthesized 1920x1080
+    //    placeholder so wl_clients can still discover an output global.
     let (drm_backend, drm_token, output, libseat_session) = if let Some(path) = &drm_device_path {
-        // Open the libseat session (seatd backend) while still root,
-        // BEFORE the privilege drop below. seatd brokers the DRM +
-        // input fds and owns DRM master; halmasuit never SET_MASTERs.
-        // drm-master-probe Phase 4 validated this session survives
-        // the subsequent setresuid.
-        let (mut session, libseat_notifier) = LibSeatSession::new().map_err(|e| {
-            io::Error::other(format!("LibSeatSession::new (is seatd reachable?): {e}"))
-        })?;
-        // Service libseat session (activate/pause) events. v1 in-VM:
-        // no VT switching (epic out-of-scope) — log only, but the
-        // source MUST be registered so libseat's event fd is drained.
-        loop_handle
-            .insert_source(
-                libseat_notifier,
-                |event, (), _state: &mut HalmasuitState| {
-                    tracing::info!(?event, "libseat session event");
-                },
-            )
-            .map_err(|e| io::Error::other(format!("insert libseat notifier: {e}")))?;
-        let (backend, token, real_output) = drm::setup_drm_backend(
-            &mut session,
-            path,
-            &loop_handle,
-            |event, _meta, state: &mut HalmasuitState| match event {
-                smithay::backend::drm::DrmEvent::VBlank(_crtc) => {
-                    // R5 (convergence epic): release dead popups
-                    // before any per-frame work — once per VBlank is
-                    // the smithay-recommended cadence and keeps the
-                    // popup tree from accumulating zombies between
-                    // commits.
-                    state.popups.cleanup();
-                    if let Some(backend) = state.drm_backend.as_mut()
-                        && let Err(e) = backend.frame_submitted()
-                    {
-                        tracing::warn!(error = %e, "DRM frame_submitted failed");
-                    }
-                    // R2 (convergence epic): post-present frame-callback
-                    // emission. Wayland spec Appendix A `wl_surface::frame`
-                    // requires the server to notify clients when it's a
-                    // good time to draw the next frame; Mesa's
-                    // `dri2_wl_surface_throttle` (in `libEGL_mesa`) blocks
-                    // `eglSwapBuffers` until that callback arrives, so a
-                    // server that never fires wedges every EGL client on
-                    // its second swap. Walk the surfaces visible on the
-                    // just-presented output and send via smithay's
-                    // canonical helpers; explicit clones drop the
-                    // `LayerMap` guard before send_frame iterates.
-                    let time = state.start_time.elapsed();
-                    // P2 (review-round-3): the per-VBlank allocations
-                    // below are bounded by design:
-                    //  - `Vec<LayerSurface>::collect()` size ≤ 4
-                    //    (Layer enum cardinality: Background / Bottom
-                    //    / Top / Overlay). One heap alloc / 16 ms.
-                    //  - `output.clone()` is an Arc bump (~50 ns).
-                    //    Per-surface invocations inside the closures
-                    //    below are bounded by the foreground tree
-                    //    size; smithay's `Output` is internally
-                    //    Arc-counted.
-                    // Explicit collect-then-iter drops the LayerMap
-                    // guard before `send_frame` runs (re-entering the
-                    // LayerMap inside send_frame would deadlock).
-                    let output = state.output.clone();
-                    let layers: Vec<smithay::desktop::LayerSurface> =
-                        smithay::desktop::layer_map_for_output(&output)
-                            .layers()
-                            .cloned()
-                            .collect();
-                    for layer in &layers {
-                        layer.send_frame(&output, time, None, |_, _| Some(output.clone()));
-                    }
-                    if let Some(toplevel) = state.foreground_toplevel.as_ref() {
-                        smithay::desktop::utils::send_frames_surface_tree(
-                            toplevel.wl_surface(),
-                            &output,
-                            time,
-                            None,
-                            |_, _| Some(output.clone()),
-                        );
-                    }
+        if in_initramfs {
+            // Direct-DRM path (Phase B). No libseat (no seatd in the
+            // initramfs); no libinput (no input is needed before
+            // halmasuit-luks lands in a follow-up task).
+            let (backend, token, real_output) =
+                drm::setup_drm_direct(path, &loop_handle, handle_drm_event, wallpaper_config)?;
+            real_output.create_global::<HalmasuitState>(&display_handle);
+            emit(&Event::PhaseEntered {
+                phase: Phase::DrmMasterAcquired,
+            });
+            (Some(backend), Some(token), real_output, None)
+        } else {
+            // Open the libseat session (seatd backend) while still
+            // root, BEFORE the privilege drop below. seatd brokers
+            // the DRM + input fds and owns DRM master; halmasuit
+            // never SET_MASTERs. drm-master-probe Phase 4 validated
+            // this session survives the subsequent setresuid.
+            let (mut session, libseat_notifier) = LibSeatSession::new().map_err(|e| {
+                io::Error::other(format!("LibSeatSession::new (is seatd reachable?): {e}"))
+            })?;
+            // Service libseat session (activate/pause) events. v1
+            // in-VM: no VT switching (epic out-of-scope) — log only,
+            // but the source MUST be registered so libseat's event
+            // fd is drained.
+            loop_handle
+                .insert_source(
+                    libseat_notifier,
+                    |event, (), _state: &mut HalmasuitState| {
+                        tracing::info!(?event, "libseat session event");
+                    },
+                )
+                .map_err(|e| io::Error::other(format!("insert libseat notifier: {e}")))?;
+            let (backend, token, real_output) = drm::setup_drm_backend(
+                &mut session,
+                path,
+                &loop_handle,
+                handle_drm_event,
+                wallpaper_config,
+            )?;
 
-                    // R9 (convergence): emit wp_presentation_feedback.presented
-                    // for any surface that requested it on its last commit.
-                    // smithay's `take_presentation_feedback_surface_tree` walks
-                    // the cached feedback per surface; we drive it for the
-                    // foreground tree + each layer. The
-                    // primary-scanout-output closure unconditionally returns
-                    // the single output (halmasuit hosts one output and
-                    // every visible surface is on it).
-                    let kind = smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync;
-                    let mut feedback =
-                        smithay::desktop::utils::OutputPresentationFeedback::new(&output);
-                    if let Some(toplevel) = state.foreground_toplevel.as_ref() {
-                        smithay::desktop::utils::take_presentation_feedback_surface_tree(
-                            toplevel.wl_surface(),
-                            &mut feedback,
-                            |_, _| Some(output.clone()),
-                            |_, _| kind,
-                        );
-                    }
-                    for layer in &layers {
-                        smithay::desktop::utils::take_presentation_feedback_surface_tree(
-                            layer.wl_surface(),
-                            &mut feedback,
-                            |_, _| Some(output.clone()),
-                            |_, _| kind,
-                        );
-                    }
-                    let refresh =
-                        smithay::wayland::presentation::Refresh::fixed(state.refresh_period);
-                    state.presentation_seq = state.presentation_seq.wrapping_add(1);
-                    feedback.presented::<_, smithay::utils::Monotonic>(
-                        time,
-                        refresh,
-                        state.presentation_seq,
-                        smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync,
-                    );
-                }
-                smithay::backend::drm::DrmEvent::Error(e) => {
-                    tracing::warn!(error = %e, "DRM device error");
-                }
-            },
-            wallpaper_config,
-        )?;
+            // libinput, fed device fds through the SAME seatd session
+            // (validated surviving setresuid by drm-master-probe
+            // Phase 4). Events are routed to the keyboard-focused
+            // client.
+            let mut libinput = smithay::reexports::input::Libinput::new_with_udev(
+                LibinputSessionInterface::from(session.clone()),
+            );
+            libinput.udev_assign_seat(&session.seat()).map_err(|()| {
+                io::Error::other(format!("libinput udev_assign_seat({})", session.seat()))
+            })?;
+            loop_handle
+                .insert_source(
+                    LibinputInputBackend::new(libinput),
+                    |event, (), state: &mut HalmasuitState| state.dispatch_libinput(event),
+                )
+                .map_err(|e| io::Error::other(format!("insert libinput backend: {e}")))?;
 
-        // libinput, fed device fds through the SAME seatd session
-        // (validated surviving setresuid by drm-master-probe Phase 4).
-        // Events are routed to the keyboard-focused client.
-        let mut libinput = smithay::reexports::input::Libinput::new_with_udev(
-            LibinputSessionInterface::from(session.clone()),
-        );
-        libinput.udev_assign_seat(&session.seat()).map_err(|()| {
-            io::Error::other(format!("libinput udev_assign_seat({})", session.seat()))
-        })?;
-        loop_handle
-            .insert_source(
-                LibinputInputBackend::new(libinput),
-                |event, (), state: &mut HalmasuitState| state.dispatch_libinput(event),
-            )
-            .map_err(|e| io::Error::other(format!("insert libinput backend: {e}")))?;
-
-        real_output.create_global::<HalmasuitState>(&display_handle);
-        emit(&Event::PhaseEntered {
-            phase: Phase::DrmMasterAcquired,
-        });
-        (Some(backend), Some(token), real_output, Some(session))
+            real_output.create_global::<HalmasuitState>(&display_handle);
+            emit(&Event::PhaseEntered {
+                phase: Phase::DrmMasterAcquired,
+            });
+            (Some(backend), Some(token), real_output, Some(session))
+        }
     } else {
         // SKIP path: synthesized placeholder. Geometry is invented;
         // the advertisement exists so clients can discover an output
@@ -3339,19 +3399,34 @@ fn main() -> io::Result<()> {
     // HALMASUIT_GREETER_UID to the greeter system user's uid.
     // Defaults are test-friendly: socket lives in XDG_RUNTIME_DIR,
     // greeter is the running user.
-    let (greetd_listener_token, greeter_uid, pam_service) = setup_greetd_listener(&loop_handle)?;
+    //
+    // Skipped in the initramfs path — greetd has no role pre-rootfs
+    // (no `/etc/passwd`, no PAM stack, no broker yet). The values
+    // returned by `setup_greetd_listener` (the listener token,
+    // greeter uid, PAM service name) feed `HalmasuitState` fields
+    // that are reachable only from greetd-connection callbacks, so
+    // populating sentinel placeholders is sound when the listener
+    // isn't registered.
+    let (greetd_listener_token, greeter_uid, pam_service) = if in_initramfs {
+        (None, 0_u32, String::new())
+    } else {
+        let (token, uid, svc) = setup_greetd_listener(&loop_handle)?;
+        (Some(token), uid, svc)
+    };
 
     // Spawn the configured greeter while halmasuit is still root.
     // The child uses `pre_exec` to setresuid into the greeter user
-    // before execve, so the greeter never sees root. After the
-    // fork, the parent (halmasuit) proceeds into its own privilege
-    // drop below. Greeter failure logs but doesn't abort halmasuit:
+    // before execve, so the greeter never sees root. After the fork,
+    // the parent (halmasuit) proceeds into its own privilege drop
+    // below. Greeter failure logs but doesn't abort halmasuit:
     // operators may run halmasuit without a greeter during dev.
-    #[expect(
-        clippy::option_if_let_else,
-        reason = "if/else is easier to read than nested map_or_else closures here"
-    )]
-    let greeter = if let Some(cmd) = greeter_command_from_env() {
+    //
+    // Skipped in the initramfs path: the greeter is the rootfs
+    // login UI; an analogous "halmasuit-luks" prompt for the
+    // initramfs path lands as its own task.
+    let greeter = if in_initramfs {
+        None
+    } else if let Some(cmd) = greeter_command_from_env() {
         match spawn_greeter(greeter_uid, &cmd) {
             Ok(handle) => {
                 tracing::info!(greeter_pid = handle.pid, greeter_cmd = %cmd.display(), "greeter spawned");
@@ -3433,7 +3508,7 @@ fn main() -> io::Result<()> {
         pam_service,
         broker_socket: broker_socket_path_from_env(),
         greeter_uid,
-        _greetd_listener_token: Some(greetd_listener_token),
+        _greetd_listener_token: greetd_listener_token,
         drm_backend,
         _drm_token: drm_token,
         greeter,
@@ -3567,26 +3642,71 @@ fn main() -> io::Result<()> {
     // lifetime, silently inverting the architecture's whole point.
     // Ad-hoc dev launches (non-root euid) keep the warn-and-continue
     // shape so they can run without the env at all.
-    match compositor_uid_from_env()? {
-        Some(uid) => {
-            drop_privileges(uid)?;
-            emit(&Event::PhaseEntered {
-                phase: Phase::Deprivileged,
-            });
+    //
+    // In the initramfs path the drop is deferred: halmasuit-luks (a
+    // follow-up Phase B task) writes to `/run/systemd/ask-password/`,
+    // which is root-only; the compositor user doesn't yet exist in
+    // `/etc/passwd` (we're pre-pivot — there is no rootfs `/etc`).
+    // The post-pivot drop wiring is the task that lands alongside
+    // halmasuit-luks.
+    if in_initramfs {
+        tracing::info!(
+            "in_initramfs: skipping privilege drop. Post-pivot drop is wired by a follow-up Phase B task."
+        );
+    } else {
+        match compositor_uid_from_env()? {
+            Some(uid) => {
+                drop_privileges(uid)?;
+                emit(&Event::PhaseEntered {
+                    phase: Phase::Deprivileged,
+                });
+            }
+            None if nix::unistd::geteuid().is_root() => {
+                return Err(io::Error::other(
+                    "refusing to run as root without HALMASUIT_COMPOSITOR_UID; \
+                     set services.halmasuit.compositorUid in production",
+                ));
+            }
+            None => {
+                tracing::warn!(
+                    "HALMASUIT_COMPOSITOR_UID unset; staying as current user. \
+                     This is expected in dev launches; production deployments \
+                     set it via services.halmasuit.compositorUid."
+                );
+            }
         }
-        None if nix::unistd::geteuid().is_root() => {
-            return Err(io::Error::other(
-                "refusing to run as root without HALMASUIT_COMPOSITOR_UID; \
-                 set services.halmasuit.compositorUid in production",
-            ));
-        }
-        None => {
-            tracing::warn!(
-                "HALMASUIT_COMPOSITOR_UID unset; staying as current user. \
-                 This is expected in dev launches; production deployments \
-                 set it via services.halmasuit.compositorUid."
-            );
-        }
+    }
+
+    // Phase B (boot-from-initrd) pivot-poll. Calloop timer that
+    // checks `/etc/initrd-release` every second; when it disappears,
+    // `initrd-switch-root.service` has completed the pivot —
+    // halmasuit emits `Phase::RootfsReady` and `TimeoutAction::Drop`
+    // unregisters the source on that same tick.
+    //
+    // Identical mechanism to drm-master-probe Phase 1, which
+    // validated that the same process can span the
+    // initramfs→rootfs boundary unmodified. Same PID, same DRM
+    // master fd, same Wayland socket — only the filesystem view
+    // flipped underneath us.
+    //
+    // Inserted only when we started in initramfs; the rootfs-only
+    // deployment never registers it.
+    if in_initramfs {
+        loop_handle
+            .insert_source(
+                Timer::from_duration(Duration::from_secs(1)),
+                |_deadline, (), _state: &mut HalmasuitState| {
+                    if context::is_initramfs() {
+                        TimeoutAction::ToDuration(Duration::from_secs(1))
+                    } else {
+                        emit(&Event::PhaseEntered {
+                            phase: Phase::RootfsReady,
+                        });
+                        TimeoutAction::Drop
+                    }
+                },
+            )
+            .map_err(|e| io::Error::other(format!("insert pivot-poll timer: {e}")))?;
     }
 
     // Main loop: wait briefly for any source to fire, then flush any

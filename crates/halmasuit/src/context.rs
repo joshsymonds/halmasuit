@@ -35,13 +35,6 @@ use std::path::Path;
 /// `/etc/initrd-release` will cause halmasuit to attempt the direct
 /// DRM-master path, which fails with `EBUSY` if seatd or another
 /// master holds it — surfacing the misconfiguration immediately.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into main.rs in task #3 (DRM direct-open path + initramfs branching)"
-    )
-)]
 pub fn is_initramfs() -> bool {
     is_initramfs_at(Path::new("/etc/initrd-release"))
 }
@@ -74,13 +67,6 @@ pub fn is_initramfs_at(marker: &Path) -> bool {
 #[expect(
     unsafe_code,
     reason = "argv[0] mutation is the systemd @-survival convention per ROOT_STORAGE_DAEMONS; no safe API exposes this"
-)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into main.rs in task #3 (DRM direct-open path + initramfs branching)"
-    )
 )]
 pub fn set_argv0_marker() {
     // glibc exports `__progname_full` as a public data symbol pointing
