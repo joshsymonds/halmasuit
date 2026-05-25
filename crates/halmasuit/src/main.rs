@@ -31,6 +31,7 @@
 
 mod broker_relay;
 mod broker_session;
+mod context;
 mod cursor;
 #[cfg(feature = "frame_audit")]
 mod dbus;
