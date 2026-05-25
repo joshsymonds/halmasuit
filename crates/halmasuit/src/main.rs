@@ -3805,13 +3805,9 @@ fn main() -> io::Result<()> {
                 Timer::from_duration(Duration::from_secs(1)),
                 move |_deadline, (), state: &mut HalmasuitState| match phase {
                     PivotPhase::Awaiting => {
-                        // Both arms of the `is_initramfs()` check
-                        // re-arm the timer at the same 1s cadence
-                        // (the second arm waits an additional second
-                        // before the post-pivot setup, giving
-                        // halmasuit-luks's exit + cleanup time to
-                        // land before the greeter race). Lifted out
-                        // for clippy::branches_sharing_code.
+                        // Both arms re-arm the timer at the same 1s
+                        // cadence. Lifted out for
+                        // clippy::branches_sharing_code.
                         if !context::is_initramfs() {
                             emit(&Event::PhaseEntered {
                                 phase: Phase::RootfsReady,
