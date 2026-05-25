@@ -124,6 +124,19 @@ pub enum CompositorToBroker {
     /// Abort the in-flight auth. The broker SIGKILLs its auth fork and
     /// `pam_end`s the transaction (Epic R4/R5).
     Cancel,
+    /// Phase B v2: request the broker's process-root file descriptor
+    /// for cross-pivot filesystem-view migration. The broker's
+    /// response carries `/proc/self/root` as an SCM_RIGHTS ancillary
+    /// fd attached to a [`BrokerToCompositor::RootFd`] frame.
+    /// Halmasuit then `fchdir(fd) + chroot(".")` to enter the
+    /// broker's process root (= rootfs's view), which makes
+    /// `/etc/passwd`, `/nix/store`, `/run/systemd` reachable.
+    ///
+    /// MUST be sent as the FIRST frame on a fresh broker connection,
+    /// before any `BeginAuth`. The broker recognizes it and responds
+    /// with the root fd then closes the connection — this connection
+    /// is dedicated to the root-fd transfer.
+    RequestRootFd,
 }
 
 /// How a launched user session ended (Amendment A5.2).
@@ -184,6 +197,11 @@ pub enum BrokerToCompositor {
     /// reverts to the greeter on this OR on the session client's
     /// Wayland disconnect, whichever is first.
     SessionEnded { outcome: SessionOutcome },
+    /// Phase B v2: response to [`CompositorToBroker::RequestRootFd`].
+    /// The broker's `/proc/self/root` fd is attached as SCM_RIGHTS
+    /// ancillary data on the same frame; the compositor extracts it
+    /// via `recvmsg` with a cmsg buffer.
+    RootFd,
 }
 
 /// Hard ceiling on a single framed message. Mirrors `halmasuit-greetd`'s

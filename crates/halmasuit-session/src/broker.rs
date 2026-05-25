@@ -408,6 +408,29 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
     };
     let begin = match greeter.recv::<CompositorToBroker>() {
         Ok(CompositorToBroker::BeginAuth { service, username }) => (service, username),
+        Ok(CompositorToBroker::RequestRootFd) => {
+            // Phase B v2: cross-pivot per-process-root migration.
+            // Respond with /proc/self/root attached as SCM_RIGHTS;
+            // halmasuit will `fchdir` + `chroot` to enter our view.
+            // This connection is dedicated to the root-fd transfer —
+            // close after responding.
+            match std::fs::File::open("/proc/self/root") {
+                Ok(root) => {
+                    use std::os::fd::AsFd;
+                    if let Err(e) = send_frame_with_fd(
+                        &greeter,
+                        &BrokerToCompositor::RootFd,
+                        Some(root.as_fd()),
+                    ) {
+                        tracing_log(&format!("send RootFd failed: {e:?}"));
+                    }
+                }
+                Err(e) => {
+                    tracing_log(&format!("open /proc/self/root failed: {e}"));
+                }
+            }
+            return Ok(true);
+        }
         Ok(_) => {
             tracing_log("first frame was not BeginAuth; dropping connection");
             return Ok(true);

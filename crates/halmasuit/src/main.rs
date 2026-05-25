@@ -2176,6 +2176,20 @@ fn record_session_started(spawn: &SpawnRequest, session_uid: &mut Option<u32>) {
 /// halmasuit would die mid-boot leaving the rootfs without its
 /// compositor.
 fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
+    // (0) Phase B v2 process-root migration. Halmasuit's surviving
+    // process-root references the initramfs's filesystem, leaving
+    // /etc/passwd, /nix/store, /run/systemd unreachable. The broker
+    // (rootfs systemd unit, rootfs process-root) sends its
+    // /proc/self/root fd via SCM_RIGHTS on receipt of
+    // CompositorToBroker::RequestRootFd. We fchdir + chroot to it,
+    // entering the rootfs view, while still root pre-drop (chroot
+    // requires CAP_SYS_CHROOT).
+    if let Err(e) = migrate_to_broker_root(&state.broker_socket) {
+        tracing::error!(error = %e, "post-pivot: broker root-fd migration failed");
+    } else {
+        tracing::info!("post-pivot: chrooted into broker's root (rootfs view)");
+    }
+
     // (1) Bind greetd listener while still root.
     match setup_greetd_listener(&state.loop_handle) {
         Ok((token, greeter_uid, pam_service)) => {
@@ -2190,6 +2204,22 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
 
     // (2) Spawn greeter while still root (child setresuids in pre_exec).
     if let Some(cmd) = greeter_command_from_env() {
+        // DIAG: dump halmasuit's view post-chroot
+        if let Ok(root_dir) = std::fs::read_dir("/") {
+            let entries: Vec<String> = root_dir
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .take(20)
+                .collect();
+            tracing::info!(?entries, "DIAG: halmasuit / contents post-chroot");
+        }
+        let nix_store_exists = std::path::Path::new("/nix/store").exists();
+        tracing::info!(
+            nix_store_exists,
+            cmd_exists = cmd.exists(),
+            cmd = ?cmd,
+            "DIAG: pre-spawn greeter path check"
+        );
         match spawn_greeter(state.greeter_uid, &cmd) {
             Ok(handle) => {
                 tracing::info!(
@@ -2231,6 +2261,90 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Phase B v2 process-root migration. Connects to the broker (which
+/// runs in rootfs systemd's process root), sends `RequestRootFd`,
+/// receives the broker's `/proc/self/root` fd via SCM_RIGHTS, then
+/// `fchdir + chroot` to enter rootfs's filesystem view.
+///
+/// After this, halmasuit can resolve rootfs paths: /etc/passwd
+/// (for getpwuid), /nix/store (for greeter binaries), /run/systemd
+/// (for ask-password requests).
+///
+/// Requires CAP_SYS_CHROOT (halmasuit has it as root pre-drop).
+/// The broker connection is dedicated to this transfer and closed
+/// immediately after; subsequent broker connections are normal auth
+/// flows.
+fn migrate_to_broker_root(broker_socket: &Path) -> io::Result<()> {
+    use crate::broker_session::connect_broker;
+    use halmasuit_session_ipc::CompositorToBroker;
+    use std::os::fd::AsRawFd;
+
+    // The broker is socket-activated by rootfs systemd, which may not
+    // have bound the listener yet when this fires (we run ~1s after
+    // pivot detection; rootfs systemd takes a few seconds to bring up
+    // its sockets). Retry with 200ms backoff for up to 10s.
+    let mut chan = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut last_err: Option<crate::broker_session::WireError> = None;
+    while std::time::Instant::now() < deadline {
+        match connect_broker(broker_socket) {
+            Ok(c) => {
+                chan = Some(c);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+    let chan = chan.ok_or_else(|| {
+        io::Error::other(format!(
+            "connect_broker({}) timed out after 10s; last error: {:?}",
+            broker_socket.display(),
+            last_err,
+        ))
+    })?;
+    chan.send(&CompositorToBroker::RequestRootFd)
+        .map_err(|e| io::Error::other(format!("send RequestRootFd: {e:?}")))?;
+    // recv_with_fd is non-blocking (MSG_DONTWAIT); the broker takes
+    // a few ms to spawn (socket-activation) and respond. Loop with
+    // backoff for up to 5s.
+    let recv_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let (_frame, root_fd) = loop {
+        match chan
+            .recv_with_fd()
+            .map_err(|e| io::Error::other(format!("recv RootFd: {e:?}")))?
+        {
+            Some(v) => break v,
+            None => {
+                if std::time::Instant::now() >= recv_deadline {
+                    return Err(io::Error::other(
+                        "recv RootFd timed out (5s); broker never responded",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    let root_fd = root_fd
+        .ok_or_else(|| io::Error::other("broker sent RootFd without SCM_RIGHTS fd attachment"))?;
+    // fchdir + chroot to the broker's root.
+    #[expect(
+        unsafe_code,
+        reason = "libc::fchdir and chroot lack safe Rust wrappers"
+    )]
+    unsafe {
+        if libc::fchdir(root_fd.as_raw_fd()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::chroot(c".".as_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     Ok(())
 }
 

@@ -947,45 +947,56 @@ in
          Restart        = "no";
          StandardOutput = "journal";
          StandardError  = "journal";
-         # ## Phase B v1 → v2 cross-pivot mount-namespace gap
+         # ## Phase B v1 → v2 cross-pivot per-process-root divergence
          #
-         # `/run/halmasuit` is created here via `mkdir -p` rather
-         # than `RuntimeDirectory=`. The deeper issue: at
-         # switch_root, halmasuit's mount namespace diverges from
+         # The deeper structural issue (investigated extensively):
+         # at switch_root, halmasuit's PROCESS-ROOT diverges from
          # rootfs systemd's, despite `/proc/<pid>/ns/mnt` reporting
-         # the same `mnt:[NNN]` ID for both. Empirically, halmasuit's
-         # view of `/run/halmasuit/` contains its own bound
-         # `greetd.sock` (device 2) while rootfs's view contains an
-         # orphan `wayland-0` socket file (device 25). External
-         # greeters launched by rootfs systemd see the rootfs view
-         # and can't connect to halmasuit's listener.
+         # the same `mnt:[NNN]` ID for both. Empirically halmasuit's
+         # `/` after pivot is essentially empty — no `/etc/passwd`,
+         # no `/nix/store` (so it can't exec the greeter binary), no
+         # `/run/systemd/ask-password/` (so halmasuit-luks can't
+         # receive LUKS prompts). `/dev`, `/sys`, and halmasuit's own
+         # bound `/run/halmasuit/` are visible (separate
+         # filesystems / persisted mount points).
          #
-         # Tried defenses (all failed to make the bind visible
-         # cross-namespace): `RuntimeDirectoryPreserve=yes`,
-         # `RefuseManualStop=yes`, `KillMode=none`, binding outside
-         # /run/halmasuit/, 10s deferred binds, setns(/proc/1/ns/mnt)
-         # (halmasuit can't access /proc — its view has no procfs
-         # mount), and a rebind-watchdog (halmasuit's stat sees the
-         # file in its own view; the rebind never triggers).
+         # Attempted fixes (Phase B v2 partials shipped):
          #
-         # The structural Phase B v1 → v2 fix is one of:
-         #   (a) Two-process design with SCM_RIGHTS DRM-fd handoff
-         #       at the pivot boundary — initramfs halmasuit dies
-         #       at switch_root, rootfs halmasuit adopts the master
-         #       fd and continues. Loses Phase B's
-         #       "single-process-from-boot-to-shutdown" property but
-         #       preserves no-flash (same fd, same scanout state).
-         #   (b) Broker-mediated namespace transfer — the broker is
-         #       in rootfs's mount namespace and can pass its
-         #       /proc/self/ns/mnt fd to halmasuit via SCM_RIGHTS.
-         #       halmasuit setns into rootfs's ns, re-binds its
-         #       sockets in the new view. Preserves single-process
-         #       but adds a new privileged surface to the broker.
+         #  - Abstract Linux sockets for greetd + broker (commits
+         #    51219e7, 8e54357). Bypasses the filesystem-path layer
+         #    for cross-namespace SOCKET reach. The greetd handshake
+         #    + broker auth wire is now reachable cross-namespace.
+         #  - Env-fallback greeter identity (commit 54ec894). Bypasses
+         #    `getpwuid` when /etc/passwd is invisible.
          #
-         # Phase B v1 ships the survival mechanic + module +
-         # post-pivot drop end-to-end. The greeter-connect arc that
-         # closes full-boot-flash.nix is the Phase B v2 boundary,
-         # gated on resolving the namespace divergence.
+         # Still required for full SessionOpened:
+         #
+         #  - Greeter BINARY must be exec'd from a path halmasuit
+         #    can resolve — /nix/store is invisible to its view.
+         #  - halmasuit-luks must read /run/systemd/ask-password/
+         #    request files — invisible to halmasuit's view.
+         #
+         # The remaining architectural fix is one of:
+         #
+         #  (a) Two-process design with `SCM_RIGHTS` DRM-fd handoff.
+         #      Initramfs halmasuit dies at switch_root; rootfs
+         #      halmasuit adopts the master fd. Loses the
+         #      "single-process-boot-to-shutdown" property but
+         #      preserves no-flash (same fd, same scanout state).
+         #      drm-master-probe Phase 3 mechanically validated DRM
+         #      master surviving via execve; cross-process SCM_RIGHTS
+         #      is the same kernel operation.
+         #
+         #  (b) Broker-mediated chroot fd handoff. The broker (in
+         #      rootfs's process root) opens `/proc/self/root` and
+         #      sends the fd via SCM_RIGHTS. Halmasuit, while still
+         #      root pre-drop, calls `fchdir(fd) + chroot(".")` to
+         #      enter rootfs's process root. New IPC variants
+         #      (RequestRootFd / RootFd) needed; broker needs
+         #      pre-handshake SCM_RIGHTS attach.
+         #
+         # `tests/full-boot-flash.nix` is the gate for the
+         # end-to-end SessionOpened arc once either fix lands.
        };
        environment = {
          RUST_LOG        = cfg.logLevel;

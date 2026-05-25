@@ -51,6 +51,11 @@ pkgs.testers.runNixOSTest {
 
   nodes.machine =
     { config, lib, pkgs, ... }:
+    let
+      testGreeter = pkgs.writeShellScript "halmasuit-test-greeter" ''
+        exec ${pkgs.coreutils}/bin/sleep infinity
+      '';
+    in
     {
       imports = [
         ../nix/module.nix
@@ -71,10 +76,15 @@ pkgs.testers.runNixOSTest {
         # get out-of-the-box, so the test exercises that surface too.
         # Sleep-forever greeter — the test asserts greeter SPAWN, not
         # greeter UI fidelity (that's the rootfs visual tests' job).
-        greeterCommand = "${pkgs.writeShellScript "halmasuit-test-greeter" ''
-          exec ${pkgs.coreutils}/bin/sleep infinity
-        ''}";
+        # The let-binding pins the same derivation in
+        # `system.extraDependencies` below, ensuring it lands in
+        # ROOTFS's nix store (otherwise the script would only be in
+        # initramfs's closure and halmasuit, after chrooting to
+        # rootfs's view, couldn't find it).
+        greeterCommand = "${testGreeter}";
       };
+
+      system.extraDependencies = [ testGreeter ];
 
       virtualisation = {
         memorySize = 1024;
@@ -92,6 +102,12 @@ pkgs.testers.runNixOSTest {
 
     machine.start()
     machine.wait_for_unit("multi-user.target")
+
+    # Confirm the test-greeter script is in rootfs's nix store.
+    test_greeter_check = machine.execute(
+        "ls /nix/store/*halmasuit-test-greeter 2>&1 | head -3"
+    )
+    print(f"rootfs nix store sees test-greeter: {test_greeter_check[1]}")
 
 
     # Wait for post-pivot setup to complete: halmasuit's pivot-poll
@@ -274,6 +290,44 @@ pkgs.testers.runNixOSTest {
         "The deprivileged event fired but setresuid didn't take."
     )
     print(f"PASS: phase=deprivileged emitted; PID {started_pid} runs as compositor uid 998")
+
+    # ASSERTION 9: post-pivot greeter spawn succeeded. Proves
+    # halmasuit's process-root migration via the broker-mediated
+    # SCM_RIGHTS fd transfer worked end-to-end: halmasuit can now see
+    # rootfs's /etc/passwd (getpwuid), /nix/store (greeter binary),
+    # and exec'd the greeter as a child.
+    raw_greeter = machine.succeed("journalctl -b --output=cat --no-pager")
+    greeter_pid = None
+    for line in raw_greeter.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            outer = json.loads(line)
+        except Exception:
+            continue
+        if outer.get("target") != "halmasuit::event":
+            continue
+        inner_str = outer.get("fields", {}).get("json")
+        if not inner_str:
+            continue
+        try:
+            inner = json.loads(inner_str)
+        except Exception:
+            continue
+        if inner.get("event") == "greeter_spawned":
+            greeter_pid = inner.get("pid")
+            break
+    assert greeter_pid is not None, (
+        "halmasuit did NOT emit `greeter_spawned` post-pivot. "
+        "Either run_post_pivot_setup's spawn_greeter failed (check "
+        "broker root-fd migration + chroot), or the greeter binary "
+        "isn't in rootfs's /nix/store closure."
+    )
+    # Greeter must be alive at test time.
+    alive = machine.execute(f"kill -0 {greeter_pid}")[0]
+    assert alive == 0, f"greeter PID {greeter_pid} not alive"
+    print(f"PASS: post-pivot greeter spawned (PID {greeter_pid}); chroot to rootfs view succeeded")
 
     print(
         f"initrd-survival: halmasuit PID {started_pid} survived switch_root, "
