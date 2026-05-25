@@ -71,6 +71,12 @@ test-vm:
     echo "── initrd-survival ──"
     nix build .#checks.x86_64-linux.initrd-survival -L --print-build-logs --no-link
     echo
+    echo "── full-boot-flash ──"
+    nix build .#checks.x86_64-linux.full-boot-flash -L --print-build-logs --no-link
+    echo
+    echo "── luks-unlock ──"
+    nix build .#checks.x86_64-linux.luks-unlock -L --print-build-logs --no-link
+    echo
     echo "── run-pam-auth ──"
     nix build .#checks.x86_64-linux.run-pam-auth -L --print-build-logs --no-link
     echo
@@ -238,6 +244,14 @@ test-vm-initrd-survival:
 # greeter spawn + PAM auth → SessionOpened end-to-end.
 test-vm-full-boot-flash:
     nix build .#checks.x86_64-linux.full-boot-flash -L --print-build-logs --no-link
+
+# Phase B LUKS unlock gate: real cryptsetup + real
+# systemd-cryptsetup ask-password producer + halmasuit-luks in
+# non-interactive responder mode actually unlocks a real LUKS
+# volume. Isolates the wire contract end-to-end without depending
+# on a virtual-keyboard substrate for the Wayland UI path.
+test-vm-luks-unlock:
+    nix build .#checks.x86_64-linux.luks-unlock -L --print-build-logs --no-link
 
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.

@@ -741,6 +741,18 @@
           halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
         };
+        # Phase B LUKS unlock gate: real cryptsetup, real
+        # systemd-cryptsetup ask-password producer, real
+        # systemd password-agent wire. halmasuit-luks runs in
+        # non-interactive responder mode (--passphrase-from PATH)
+        # and answers the ask-file; the LUKS volume actually
+        # unlocks. Isolates the wire contract from the Wayland UI
+        # path (which is exercised by the full deployment shape).
+        luks-unlock = import ./tests/luks-unlock.nix {
+          system         = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit-luks = self.packages.x86_64-linux.halmasuit-luks;
+        };
         # Visual gates consume `halmasuit-debug` (frame_audit on): the
         # capture path is the in-process `Snapshot()` D-Bus method,
         # not QMP screendump. Structural tests above stay on the

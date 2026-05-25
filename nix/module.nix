@@ -401,6 +401,27 @@ in
           deployments use rootfs systemd's password-agent stack).
         '';
       };
+
+      passphraseFile = lib.mkOption {
+        type        = lib.types.nullOr lib.types.path;
+        default     = null;
+        description = ''
+          Optional unattended-unlock passphrase source. When non-null,
+          halmasuit-luks runs in non-interactive mode — no Wayland UI,
+          no keyboard input — and responds to every ask-password
+          request in initramfs with the contents of this file. The
+          file is baked into the initramfs closure via
+          `boot.initrd.systemd.contents` and read once at startup
+          into a zeroizing buffer.
+
+          Intended for headless/server deployments where the
+          passphrase is materialised by an earlier boot step
+          (TPM-derived, USB key, network-provisioned), and for the
+          LUKS unlock VM gate (`tests/luks-unlock.nix`). For
+          interactive workstation use, leave this `null` and let the
+          Wayland UI prompt.
+        '';
+      };
     };
   };
 
@@ -1054,19 +1075,40 @@ in
      # rootfs LUKS volumes). Conceptually replaceable by any other
      # systemd password-agent implementation; the user can override
      # `services.halmasuit.luks.package`.
+     # When passphraseFile is set, halmasuit-luks runs in
+     # non-interactive responder mode (--passphrase-from PATH).
+     # halmasuit's Wayland socket is not used, so the Wayland-readiness
+     # ordering relaxes to a no-op (the agent ignores WAYLAND_DISPLAY
+     # and reads the passphrase file directly).
+     boot.initrd.systemd.contents = lib.mkIf (cfg.luks.passphraseFile != null) {
+       "/etc/halmasuit-luks-passphrase".source = cfg.luks.passphraseFile;
+     };
+
      boot.initrd.systemd.services.halmasuit-luks = {
        description = "halmasuit-luks (Phase B: LUKS prompt Wayland client)";
        wantedBy    = [ "initrd.target" ];
-       after       = [ "halmasuit.service" ];
-       requires    = [ "halmasuit.service" ];
+       after       = if cfg.luks.passphraseFile != null then [] else [ "halmasuit.service" ];
+       requires    = if cfg.luks.passphraseFile != null then [] else [ "halmasuit.service" ];
        before      = [ "initrd-switch-root.service" ];
+       # NOT before=cryptsetup.target: halmasuit-luks is a
+       # long-running agent that loops until /etc/initrd-release
+       # disappears. Ordering it before cryptsetup.target would
+       # block cryptsetup units from starting (the target can't be
+       # reached until its `before`-orderers exit), wedging boot.
+       # The agent + cryptsetup races are race-FREE: systemd-cryptsetup
+       # writes the ask-file then waits on a socket response; the
+       # agent polls the dir at 200ms cadence. Whichever started
+       # first, the response arrives.
        unitConfig = {
          DefaultDependencies = false;
          IgnoreOnIsolate     = true;
        };
        serviceConfig = {
          Type           = "simple";
-         ExecStart      = lib.getExe cfg.luks.package;
+         ExecStart =
+           if cfg.luks.passphraseFile != null
+           then "${lib.getExe cfg.luks.package} --passphrase-from /etc/halmasuit-luks-passphrase"
+           else lib.getExe cfg.luks.package;
          # The agent is allowed to die and respawn — Restart=on-failure
          # lets a wedged xkbcommon load or transient Wayland connect
          # error recover. The boot succeeds anyway if no LUKS volume
@@ -1079,7 +1121,8 @@ in
        environment = {
          RUST_LOG          = cfg.logLevel;
          # Connect to halmasuit's Wayland socket. halmasuit binds at
-         # /run/halmasuit/wayland-0 under XDG_RUNTIME_DIR.
+         # /run/halmasuit/wayland-0 under XDG_RUNTIME_DIR. Ignored in
+         # non-interactive mode.
          XDG_RUNTIME_DIR   = "/run/halmasuit";
          WAYLAND_DISPLAY   = "wayland-0";
        };

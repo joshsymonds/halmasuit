@@ -26,7 +26,7 @@
 // create_buffer API; our sizes are bounded well below i32::MAX.
 #![allow(clippy::cast_possible_wrap)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -91,6 +91,37 @@ const ASK_DIR: &str = "/run/systemd/ask-password";
 /// `switch_root` complete.
 const INITRD_RELEASE: &str = "/etc/initrd-release";
 
+/// Argv shape: at most one optional flag, `--passphrase-from PATH`.
+/// Anything else is rejected loudly.
+struct Args {
+    /// If `Some`, run in non-interactive mode: skip Wayland connect
+    /// entirely, read the passphrase from this file once at startup,
+    /// and respond to every ask-password request with that passphrase
+    /// until `/etc/initrd-release` disappears. Real production use is
+    /// unattended-boot setups where the passphrase is materialised by
+    /// an earlier initramfs step (TPM-derived, USB key, etc.); the
+    /// LUKS VM gate uses it as well. The file is read once and the
+    /// in-memory copy is zeroized after each submit.
+    passphrase_from: Option<PathBuf>,
+}
+
+fn parse_args() -> anyhow::Result<Args> {
+    let mut argv = std::env::args().skip(1);
+    let mut passphrase_from: Option<PathBuf> = None;
+    while let Some(arg) = argv.next() {
+        match arg.as_str() {
+            "--passphrase-from" => {
+                let path = argv
+                    .next()
+                    .context("--passphrase-from requires a PATH argument")?;
+                passphrase_from = Some(PathBuf::from(path));
+            }
+            other => anyhow::bail!("unknown argument: {other}"),
+        }
+    }
+    Ok(Args { passphrase_from })
+}
+
 fn main() -> anyhow::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -99,10 +130,21 @@ fn main() -> anyhow::Result<()> {
         .with_env_filter(env_filter)
         .init();
 
+    let args = parse_args()?;
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
+        non_interactive = args.passphrase_from.is_some(),
         "halmasuit-luks starting"
     );
+
+    if let Some(path) = args.passphrase_from {
+        return run_noninteractive(
+            &path,
+            &PathBuf::from(ASK_DIR),
+            &PathBuf::from(INITRD_RELEASE),
+        );
+    }
 
     let conn =
         Connection::connect_to_env().context("connect to wayland (is WAYLAND_DISPLAY set?)")?;
@@ -177,6 +219,64 @@ fn main() -> anyhow::Result<()> {
 
     tracing::info!("halmasuit-luks exiting (pivot complete)");
     Ok(())
+}
+
+/// Non-interactive mode: no Wayland UI. Poll `ask_dir` for outstanding
+/// ask-password requests, respond to each with the contents of
+/// `passphrase_path`, exit when `initrd_release` disappears. The
+/// passphrase file is read once at startup into a `Zeroizing` buffer
+/// that's reused for every request; the buffer is zeroed on drop. The
+/// file on disk is not touched (the caller's job is to wipe it if
+/// needed — typically a tmpfs-backed file consumed once).
+fn run_noninteractive(
+    passphrase_path: &Path,
+    ask_dir: &Path,
+    initrd_release: &Path,
+) -> anyhow::Result<()> {
+    let passphrase: Zeroizing<Vec<u8>> = Zeroizing::new(
+        std::fs::read(passphrase_path)
+            .with_context(|| format!("read passphrase file {}", passphrase_path.display()))?,
+    );
+    tracing::info!(
+        passphrase_bytes = passphrase.len(),
+        ask_dir = %ask_dir.display(),
+        "non-interactive responder ready"
+    );
+
+    loop {
+        if !initrd_release.exists() {
+            tracing::info!("pivot complete (/etc/initrd-release gone); exiting");
+            return Ok(());
+        }
+        match outstanding_requests(ask_dir) {
+            Ok(requests) => {
+                for path in requests {
+                    match AskFile::read(&path) {
+                        Ok(ask) => match ask.send_passphrase(&passphrase) {
+                            Ok(()) => tracing::info!(
+                                request = %path.display(),
+                                socket = %ask.response_socket.display(),
+                                "responded to ask-password request ({} bytes)",
+                                passphrase.len()
+                            ),
+                            Err(e) => tracing::warn!(
+                                request = %path.display(),
+                                error = %e,
+                                "send_passphrase failed"
+                            ),
+                        },
+                        Err(e) => tracing::warn!(
+                            request = %path.display(),
+                            error = %e,
+                            "parse ask-password file"
+                        ),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "scan ask-password dir"),
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 struct State {
