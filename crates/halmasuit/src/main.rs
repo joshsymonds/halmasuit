@@ -2423,13 +2423,35 @@ fn spawn_greeter(greeter_uid: u32, command: &Path) -> io::Result<GreeterHandle> 
     use nix::unistd::{Gid, Uid, User};
     use std::os::unix::process::CommandExt;
 
-    let user = User::from_uid(Uid::from_raw(greeter_uid))
-        .map_err(|e| io::Error::other(format!("getpwuid({greeter_uid}): {e}")))?
-        .ok_or_else(|| io::Error::other(format!("no passwd entry for uid {greeter_uid}")))?;
-
-    let gid_raw = user.gid.as_raw();
-    let greeter_name = user.name.clone();
-    let greeter_home = user.dir;
+    // Phase B v2: in the fromInitrd deployment, halmasuit's retained
+    // initramfs root has no /etc/passwd visible to its process root
+    // (cross-pivot per-process root divergence — see nix/module.nix's
+    // "Phase B v1 → v2" docstring). `User::from_uid` would fail with
+    // ENOENT in that case. Fall back to env-provided identity fields
+    // (HALMASUIT_GREETER_GID/NAME/HOME) when the passwd lookup fails.
+    // The rootfs `enable` deployment hits the Ok branch as before.
+    let (gid_raw, greeter_name, greeter_home) =
+        if let Ok(Some(u)) = User::from_uid(Uid::from_raw(greeter_uid)) {
+            (u.gid.as_raw(), u.name.clone(), u.dir)
+        } else {
+            let env_gid: u32 = std::env::var("HALMASUIT_GREETER_GID")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(greeter_uid);
+            let env_name = std::env::var("HALMASUIT_GREETER_NAME")
+                .unwrap_or_else(|_| format!("halmasuit-greeter-{greeter_uid}"));
+            let env_home = PathBuf::from(
+                std::env::var("HALMASUIT_GREETER_HOME").unwrap_or_else(|_| "/var/empty".to_owned()),
+            );
+            tracing::warn!(
+                uid = greeter_uid,
+                gid = env_gid,
+                name = %env_name,
+                home = ?env_home,
+                "getpwuid failed; using env-provided greeter identity fallback"
+            );
+            (env_gid, env_name, env_home)
+        };
 
     let mut cmd = Command::new(command);
     cmd.env_clear()

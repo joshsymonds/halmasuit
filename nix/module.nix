@@ -1001,6 +1001,13 @@ in
          # systemd's `halmasuit-session.socket` unit.
          HALMASUIT_GREETD_SOCKET  = "@halmasuit-greetd";
          HALMASUIT_BROKER_SOCKET  = "@halmasuit-session";
+         # Phase B v2: greeter-identity fields halmasuit consults when
+         # `User::from_uid` fails because /etc/passwd isn't visible in
+         # the surviving initramfs process-root. The values must match
+         # the system users the module auto-creates above.
+         HALMASUIT_GREETER_GID    = toString cfg.greeterUid;
+         HALMASUIT_GREETER_NAME   = cfg.greeterUser;
+         HALMASUIT_GREETER_HOME   = "/var/empty";
 
          # PAM/auth surface for the post-pivot greeter. The initramfs
          # phase skips greetd + greeter spawn + privilege drop (no

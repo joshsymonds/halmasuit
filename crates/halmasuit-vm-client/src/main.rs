@@ -225,6 +225,21 @@ fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<(), ClientError> 
     }
 }
 
+/// Connect to a Unix-socket path or an abstract Linux socket. Paths
+/// beginning with `@` are bound in the kernel's net-ns-scoped
+/// abstract namespace (Phase B fromInitrd deployment).
+fn connect_socket(socket: &Path) -> Result<UnixStream, ClientError> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::SocketAddr;
+
+    let path_str = socket.to_string_lossy();
+    if let Some(abstract_name) = path_str.strip_prefix('@') {
+        let addr = SocketAddr::from_abstract_name(abstract_name.as_bytes())?;
+        return UnixStream::connect_addr(&addr).map_err(ClientError::Io);
+    }
+    UnixStream::connect(socket).map_err(ClientError::Io)
+}
+
 fn full_auth(
     socket: &Path,
     user: &str,
@@ -233,7 +248,7 @@ fn full_auth(
     env: Vec<String>,
     timeout: Duration,
 ) -> Result<(), ClientError> {
-    let stream = UnixStream::connect(socket)?;
+    let stream = connect_socket(socket)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 
