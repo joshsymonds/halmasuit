@@ -290,6 +290,37 @@
             };
           };
 
+          # halmasuit-luks — Phase B systemd password-agent Wayland
+          # client. Spawned by initramfs systemd alongside halmasuit
+          # in the `services.halmasuit.fromInitrd.enable` deployment;
+          # watches /run/systemd/ask-password/ for LUKS unlock
+          # requests, prompts the user via a fullscreen xdg_toplevel
+          # over halmasuit's wayland socket, writes responses to the
+          # agent socket. Replaceable by any other implementation of
+          # the systemd password-agent protocol.
+          #
+          # nativeBuildInputs/buildInputs: smithay-client-toolkit's
+          # xkbcommon-sys build script probes pkg-config for
+          # libxkbcommon (same as halmasuit's own build).
+          halmasuit-luks = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-luks";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags   = [ "-p" "halmasuit-luks" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [ pkgs.libxkbcommon ];
+            doCheck = false;
+            meta = {
+              description = "Phase B systemd password-agent Wayland client for halmasuit";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-luks";
+            };
+          };
+
           # halmasuit-session — the socket-activated privileged
           # PAM-lifecycle broker (Epic #1 R6). The sole libpam-linking
           # crate in the workspace (R14), now via the hand-rolled
@@ -693,9 +724,10 @@
         # asserts PID + DRM-master + Wayland-socket continuity across
         # switch_root, single NDJSON stream observable post-pivot.
         initrd-survival = import ./tests/initrd-survival.nix {
-          system    = "x86_64-linux";
+          system         = "x86_64-linux";
           inherit nixpkgs;
-          halmasuit = self.packages.x86_64-linux.halmasuit;
+          halmasuit      = self.packages.x86_64-linux.halmasuit;
+          halmasuit-luks = self.packages.x86_64-linux.halmasuit-luks;
         };
         # Visual gates consume `halmasuit-debug` (frame_audit on): the
         # capture path is the in-process `Snapshot()` D-Bus method,

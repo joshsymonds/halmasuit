@@ -923,6 +923,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "halmasuit-luks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "calloop",
+ "calloop-wayland-source",
+ "smithay-client-toolkit",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
 name = "halmasuit-popup-test-client"
 version = "0.1.0"
 dependencies = [

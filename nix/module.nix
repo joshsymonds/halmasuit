@@ -356,6 +356,27 @@ in
         '';
       };
     };
+
+    luks = {
+      package = lib.mkOption {
+        type        = lib.types.package;
+        default     = pkgs.halmasuit-luks;
+        defaultText = lib.literalExpression "pkgs.halmasuit-luks";
+        description = ''
+          The `halmasuit-luks` systemd password-agent Wayland client
+          (Phase B). Registered as a `boot.initrd.systemd.services`
+          unit alongside halmasuit when
+          `services.halmasuit.fromInitrd.enable = true`; watches
+          `/run/systemd/ask-password/` for LUKS unlock requests and
+          renders a passphrase prompt over halmasuit's Wayland socket.
+          Replaceable by any other implementation of the systemd
+          password-agent protocol — substitute the package and the
+          new binary will be wired into the same unit slot.
+          Ignored when `fromInitrd.enable` is false (rootfs-only
+          deployments use rootfs systemd's password-agent stack).
+        '';
+      };
+    };
   };
 
   config = lib.mkMerge [
@@ -797,9 +818,10 @@ in
      boot.initrd.availableKernelModules = [ "virtio_gpu" ];
      boot.initrd.kernelModules = [ "virtio_gpu" ];
 
-     # Ship halmasuit + its full GLES runtime closure into the
-     # initramfs. `boot.initrd.systemd.storePaths` follows each entry's
-     # transitive closure, so naming the package roots is enough.
+     # Ship halmasuit + halmasuit-luks + the full GLES runtime closure
+     # into the initramfs. `boot.initrd.systemd.storePaths` follows
+     # each entry's transitive closure, so naming the package roots
+     # is enough.
      #
      # xkeyboard-config is a dlopen target xkbcommon resolves through a
      # compile-time baked-in path; it's not a regular link dep, so the
@@ -810,6 +832,7 @@ in
      # its data files reachable before any post-pivot Wayland client.
      boot.initrd.systemd.storePaths = [
        "${cfg.package}/bin/halmasuit"
+       "${cfg.luks.package}/bin/halmasuit-luks"
        "${pkgs.mesa}"
        "${pkgs.libglvnd}"
        "${pkgs.xkeyboard-config}"
@@ -884,6 +907,46 @@ in
          # (matches the rootfs unit's LIBGL_ALWAYS_SOFTWARE=1).
          LIBGL_ALWAYS_SOFTWARE = "1";
          LD_LIBRARY_PATH       = "${pkgs.libglvnd}/lib:${pkgs.mesa}/lib";
+       };
+     };
+
+     # halmasuit-luks: the systemd password-agent Wayland client.
+     # Registered as a separate initramfs unit ordered AFTER halmasuit
+     # (so the Wayland socket exists by the time halmasuit-luks tries
+     # to connect). NOT SurviveFinalKillSignal — halmasuit-luks exits
+     # cleanly when /etc/initrd-release disappears (= pivot done; the
+     # rootfs systemd-cryptsetup agent takes over from here for any
+     # rootfs LUKS volumes). Conceptually replaceable by any other
+     # systemd password-agent implementation; the user can override
+     # `services.halmasuit.luks.package`.
+     boot.initrd.systemd.services.halmasuit-luks = {
+       description = "halmasuit-luks (Phase B: LUKS prompt Wayland client)";
+       wantedBy    = [ "initrd.target" ];
+       after       = [ "halmasuit.service" ];
+       requires    = [ "halmasuit.service" ];
+       before      = [ "initrd-switch-root.service" ];
+       unitConfig = {
+         DefaultDependencies = false;
+         IgnoreOnIsolate     = true;
+       };
+       serviceConfig = {
+         Type           = "simple";
+         ExecStart      = lib.getExe cfg.luks.package;
+         # The agent is allowed to die and respawn — Restart=on-failure
+         # lets a wedged xkbcommon load or transient Wayland connect
+         # error recover. The boot succeeds anyway if no LUKS volume
+         # needs unlocking (the agent watches an empty directory).
+         Restart        = "on-failure";
+         RestartSec     = "1s";
+         StandardOutput = "journal";
+         StandardError  = "journal";
+       };
+       environment = {
+         RUST_LOG          = cfg.logLevel;
+         # Connect to halmasuit's Wayland socket. halmasuit binds at
+         # /run/halmasuit/wayland-0 under XDG_RUNTIME_DIR.
+         XDG_RUNTIME_DIR   = "/run/halmasuit";
+         WAYLAND_DISPLAY   = "wayland-0";
        };
      };
    })

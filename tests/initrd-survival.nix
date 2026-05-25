@@ -35,6 +35,7 @@
   system,
   nixpkgs,
   halmasuit,
+  halmasuit-luks,
 }:
 
 let
@@ -54,6 +55,7 @@ pkgs.testers.runNixOSTest {
       services.halmasuit = {
         fromInitrd.enable = true;
         package           = halmasuit;
+        luks.package      = halmasuit-luks;
       };
 
       virtualisation = {
