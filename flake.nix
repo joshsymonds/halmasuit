@@ -724,10 +724,11 @@
         # asserts PID + DRM-master + Wayland-socket continuity across
         # switch_root, single NDJSON stream observable post-pivot.
         initrd-survival = import ./tests/initrd-survival.nix {
-          system         = "x86_64-linux";
+          system            = "x86_64-linux";
           inherit nixpkgs;
-          halmasuit      = self.packages.x86_64-linux.halmasuit;
-          halmasuit-luks = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-luks    = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
         };
         # Visual gates consume `halmasuit-debug` (frame_audit on): the
         # capture path is the in-process `Snapshot()` D-Bus method,

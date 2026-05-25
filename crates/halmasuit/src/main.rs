@@ -333,7 +333,7 @@ struct HalmasuitState {
     greeter_uid: u32,
     /// Held so the registered listener token survives for the lifetime
     /// of the compositor; calloop drops the source on shutdown.
-    _greetd_listener_token: Option<RegistrationToken>,
+    greetd_listener_token: Option<RegistrationToken>,
 
     /// The GLES + GBM + DrmCompositor stack. Constructed in `main()`
     /// while still root via [`drm::setup_drm_backend`]; the underlying
@@ -2157,6 +2157,83 @@ fn record_session_started(spawn: &SpawnRequest, session_uid: &mut Option<u32>) {
     *session_uid = Some(spawn.uid);
 }
 
+/// Phase B post-pivot setup. Runs once, ~1s after the pivot-poll
+/// timer observes `/etc/initrd-release` disappear.
+///
+/// Sequence (mirrors the rootfs-only deployment's startup):
+///   1. Bind the greetd listener while still root (binds the socket
+///      with the configured ownership / permissions).
+///   2. Spawn the greeter while still root (child uses `pre_exec` to
+///      `setresuid` to the greeter user before `execve`).
+///   3. Drop privileges to the compositor uid (in-process
+///      `setresgid`/`setresuid`). After this, the rest of halmasuit's
+///      lifetime is unprivileged.
+///
+/// Per-step failures log + continue; halmasuit stays alive in a
+/// degraded state (no greeter / still root) so the pivot itself is
+/// observably complete via `Phase::RootfsReady`, and the operator
+/// can diagnose via journald. A panic here would be much worse —
+/// halmasuit would die mid-boot leaving the rootfs without its
+/// compositor.
+fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
+    // (1) Bind greetd listener while still root.
+    match setup_greetd_listener(&state.loop_handle) {
+        Ok((token, greeter_uid, pam_service)) => {
+            state.greetd_listener_token = Some(token);
+            state.greeter_uid = greeter_uid;
+            state.pam_service = pam_service;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "post-pivot: setup_greetd_listener failed");
+        }
+    }
+
+    // (2) Spawn greeter while still root (child setresuids in pre_exec).
+    if let Some(cmd) = greeter_command_from_env() {
+        match spawn_greeter(state.greeter_uid, &cmd) {
+            Ok(handle) => {
+                tracing::info!(
+                    greeter_pid = handle.pid,
+                    greeter_cmd = %cmd.display(),
+                    "post-pivot greeter spawned"
+                );
+                emit(&Event::GreeterSpawned { pid: handle.pid });
+                emit(&Event::ForegroundChanged {
+                    to: halmasuit_introspect::Foreground::Greeter,
+                });
+                state.greeter = Some(handle);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, greeter_cmd = %cmd.display(), "post-pivot greeter spawn failed");
+            }
+        }
+    } else {
+        tracing::warn!("HALMASUIT_GREETER_COMMAND unset post-pivot; running without a greeter");
+    }
+
+    // (3) Drop privileges. Compositor uid is now resolvable against
+    // the rootfs /etc/passwd (the pivot completed).
+    match compositor_uid_from_env()? {
+        Some(uid) => {
+            drop_privileges(uid)?;
+            emit(&Event::PhaseEntered {
+                phase: Phase::Deprivileged,
+            });
+        }
+        None if nix::unistd::geteuid().is_root() => {
+            return Err(io::Error::other(
+                "post-pivot: refusing to stay as root without HALMASUIT_COMPOSITOR_UID; \
+                 set services.halmasuit.compositorUid in the fromInitrd deployment",
+            ));
+        }
+        None => {
+            tracing::warn!("HALMASUIT_COMPOSITOR_UID unset post-pivot; staying as current user");
+        }
+    }
+
+    Ok(())
+}
+
 /// Bind the greetd socket, register it as a calloop source, and emit
 /// `Phase::GreetdReady`. Returns the registration token (held by
 /// `HalmasuitState` so the source lives for the compositor's lifetime)
@@ -3526,7 +3603,7 @@ fn main() -> io::Result<()> {
         pam_service,
         broker_socket: broker_socket_path_from_env(),
         greeter_uid,
-        _greetd_listener_token: greetd_listener_token,
+        greetd_listener_token,
         drm_backend,
         _drm_token: drm_token,
         greeter,
@@ -3697,12 +3774,19 @@ fn main() -> io::Result<()> {
 
     // Phase B (boot-from-initrd) pivot-poll. Calloop timer that
     // checks `/etc/initrd-release` every second; when it disappears,
-    // `initrd-switch-root.service` has completed the pivot —
-    // halmasuit emits `Phase::RootfsReady` and `TimeoutAction::Drop`
-    // unregisters the source on that same tick.
+    // `initrd-switch-root.service` has completed the pivot.
+    // halmasuit emits `Phase::RootfsReady`, then a follow-up tick
+    // (PivotPhase::AwaitingPostPivot) performs the post-pivot
+    // sequence: bind the greetd listener, spawn the greeter, drop
+    // privileges to the compositor uid. The ordering is identical to
+    // the rootfs-only deployment: bind+spawn while root, then drop.
     //
-    // Identical mechanism to drm-master-probe Phase 1, which
-    // validated that the same process can span the
+    // `PostPivotInProgress` is the "next tick will run the post-pivot
+    // setup" marker; carries an extra 1s delay after `RootfsReady`
+    // for halmasuit-luks to wrap up any in-flight prompt and exit.
+    //
+    // Identical underlying mechanism to drm-master-probe Phase 1,
+    // which validated that the same process can span the
     // initramfs→rootfs boundary unmodified. Same PID, same DRM
     // master fd, same Wayland socket — only the filesystem view
     // flipped underneath us.
@@ -3710,16 +3794,39 @@ fn main() -> io::Result<()> {
     // Inserted only when we started in initramfs; the rootfs-only
     // deployment never registers it.
     if in_initramfs {
+        #[derive(Clone, Copy)]
+        enum PivotPhase {
+            Awaiting,
+            PostPivotInProgress,
+        }
+        let mut phase = PivotPhase::Awaiting;
         loop_handle
             .insert_source(
                 Timer::from_duration(Duration::from_secs(1)),
-                |_deadline, (), _state: &mut HalmasuitState| {
-                    if context::is_initramfs() {
+                move |_deadline, (), state: &mut HalmasuitState| match phase {
+                    PivotPhase::Awaiting => {
+                        // Both arms of the `is_initramfs()` check
+                        // re-arm the timer at the same 1s cadence
+                        // (the second arm waits an additional second
+                        // before the post-pivot setup, giving
+                        // halmasuit-luks's exit + cleanup time to
+                        // land before the greeter race). Lifted out
+                        // for clippy::branches_sharing_code.
+                        if !context::is_initramfs() {
+                            emit(&Event::PhaseEntered {
+                                phase: Phase::RootfsReady,
+                            });
+                            phase = PivotPhase::PostPivotInProgress;
+                        }
                         TimeoutAction::ToDuration(Duration::from_secs(1))
-                    } else {
-                        emit(&Event::PhaseEntered {
-                            phase: Phase::RootfsReady,
-                        });
+                    }
+                    PivotPhase::PostPivotInProgress => {
+                        if let Err(e) = run_post_pivot_setup(state) {
+                            tracing::error!(
+                                error = %e,
+                                "post-pivot setup failed; halmasuit will stay in pre-greeter state"
+                            );
+                        }
                         TimeoutAction::Drop
                     }
                 },

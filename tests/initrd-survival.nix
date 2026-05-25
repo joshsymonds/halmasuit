@@ -20,22 +20,27 @@
 #      calloop source fired.
 #   6. The Wayland socket is bound at /run/halmasuit/wayland-0 and
 #      survived the pivot.
+#   7. Post-pivot, halmasuit emitted `phase: greetd_ready` (the
+#      `run_post_pivot_setup` greetd-listener bind succeeded).
+#   8. Post-pivot, halmasuit emitted `phase: deprivileged` (the
+#      `run_post_pivot_setup` privilege drop to the compositor uid
+#      succeeded).
 #
-# This is the Phase 2 mechanism (RESEARCH.md L86-87) wrapped around the
-# real halmasuit binary — drm-master-probe-phase2.nix proved the
-# mechanic on a minimal probe; this proves halmasuit-the-whole-binary
-# behaves the same way.
+# This composes the Phase 2 survival mechanism (RESEARCH.md L86-87)
+# with the post-pivot transition: same PID across switch_root, drops
+# to the unprivileged compositor uid only after the rootfs is alive
+# and `/etc/passwd` resolves.
 #
-# Out of scope here (later Phase B tasks):
-# - Greeter / halmasuit-luks foreground client
+# Out of scope here (Phase B follow-up):
+# - LUKS volume actually unlocked (full-boot-flash.nix)
 # - Frame-capture continuity (full-boot-flash.nix)
-# - Post-pivot privilege drop
 
 {
   system,
   nixpkgs,
   halmasuit,
   halmasuit-luks,
+  halmasuit-session,
 }:
 
 let
@@ -56,6 +61,19 @@ pkgs.testers.runNixOSTest {
         fromInitrd.enable = true;
         package           = halmasuit;
         luks.package      = halmasuit-luks;
+        # Broker shipped alongside the compositor; the
+        # `fromInitrd.enable` deployment auto-provisions the broker
+        # unit via the same module block the rootfs `enable` path uses.
+        session.package   = halmasuit-session;
+        # No greeterUid / compositorUid / greeterGroup overrides:
+        # the module's defaults (999/998/"halmasuit-greeter") and the
+        # auto-created system users are what production deployments
+        # get out-of-the-box, so the test exercises that surface too.
+        # Sleep-forever greeter — the test asserts greeter SPAWN, not
+        # greeter UI fidelity (that's the rootfs visual tests' job).
+        greeterCommand = "${pkgs.writeShellScript "halmasuit-test-greeter" ''
+          exec ${pkgs.coreutils}/bin/sleep infinity
+        ''}";
       };
 
       virtualisation = {
@@ -71,14 +89,24 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     import json
-    import time
 
     machine.start()
     machine.wait_for_unit("multi-user.target")
 
-    # Give the pivot-poll timer at least one cycle to fire post-rootfs.
-    # halmasuit's calloop timer is 1s; 5s here is generous headroom.
-    time.sleep(5)
+    # Wait for post-pivot setup to complete: halmasuit's pivot-poll
+    # fires once /etc/initrd-release is gone, then run_post_pivot_setup
+    # binds greetd, spawns the greeter, and drops privileges. Total
+    # window ~3-5s post-pivot; 15s is generous headroom.
+    #
+    # The journalctl `MESSAGE` field carries the outer
+    # tracing-subscriber JSON envelope; the halmasuit-introspect inner
+    # event JSON appears with backslash-escaped quotes there. Pattern-
+    # match the escaped form via grep -F.
+    machine.wait_until_succeeds(
+        "journalctl -b --output=cat --no-pager "
+        "| grep -F '\\\"phase\\\":\\\"deprivileged\\\"'",
+        timeout=15,
+    )
 
     # ASSERTION 1: SurviveFinalKillSignal=yes was parsed by systemd, not
     # silently dropped as an "Unknown key". A misplaced directive
@@ -97,16 +125,15 @@ pkgs.testers.runNixOSTest {
         )
     print("PASS: systemd parsed SurviveFinalKillSignal=yes")
 
-    # Pull halmasuit's PID from the `Started` event. The unit lived in
-    # initramfs systemd, so by the time rootfs is up the unit is no
-    # longer registered with rootfs systemd — `journalctl -u` won't
-    # find it. But the JSON log lines persist in journald (cross-pivot
-    # journald continuity is the whole point of structured logging).
-    # Filter by SYSLOG_IDENTIFIER or via `-o cat` + manual grep.
+    # Walk the NDJSON event stream once, collect every event we care
+    # about. The unit lived in initramfs systemd, so by the time
+    # rootfs is up the unit is no longer registered with rootfs
+    # systemd — `journalctl -u` won't find it. But the JSON log
+    # lines persist in journald (cross-pivot journald continuity is
+    # the whole point of structured logging).
     raw = machine.succeed("journalctl -b --output=cat --no-pager")
     started_pid = None
-    initramfs_init_seen = False
-    rootfs_ready_seen = False
+    phases_seen = set()
     for line in raw.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -127,10 +154,7 @@ pkgs.testers.runNixOSTest {
         if inner.get("event") == "started":
             started_pid = inner.get("pid")
         elif inner.get("event") == "phase_entered":
-            if inner.get("phase") == "initramfs_init":
-                initramfs_init_seen = True
-            elif inner.get("phase") == "rootfs_ready":
-                rootfs_ready_seen = True
+            phases_seen.add(inner.get("phase"))
 
     if started_pid is None:
         raise AssertionError(
@@ -140,22 +164,17 @@ pkgs.testers.runNixOSTest {
             + machine.succeed("journalctl -b --output=cat --no-pager | tail -50")
         )
     print(f"halmasuit PID = {started_pid}")
+    print(f"phases observed: {sorted(phases_seen)}")
 
     # ASSERTION 2: InitramfsInit was emitted (proves the
     # `is_initramfs()` branch fired).
-    if not initramfs_init_seen:
-        raise AssertionError(
-            "halmasuit did NOT emit `phase: initramfs_init` — the "
-            "runtime-detection branch in main.rs may not have fired. "
-            "Check that /etc/initrd-release was present when halmasuit "
-            "started.\n"
-            "Phase events in journal:\n"
-            + machine.execute("journalctl -b --output=cat --no-pager | grep -F 'phase_entered' || echo 'no phase_entered events found'")[1]
-        )
+    assert "initramfs_init" in phases_seen, (
+        "halmasuit did NOT emit `phase: initramfs_init` — the "
+        "runtime-detection branch in main.rs may not have fired."
+    )
     print("PASS: phase=initramfs_init emitted")
 
-    # ASSERTION 3: PID survived the pivot. `kill -0` returns 0 iff the
-    # process exists and signaling is permitted.
+    # ASSERTION 3: PID survived the pivot.
     alive = machine.execute(f"kill -0 {started_pid}")[0]
     if alive != 0:
         raise AssertionError(
@@ -186,20 +205,17 @@ pkgs.testers.runNixOSTest {
     # ASSERTION 5: RootfsReady was emitted (proves the pivot-poll
     # calloop source fired — `/etc/initrd-release` was observed
     # disappearing).
-    if not rootfs_ready_seen:
-        raise AssertionError(
-            "halmasuit did NOT emit `phase: rootfs_ready` — the pivot-"
-            "poll calloop source may not have fired, or /etc/initrd-"
-            "release did not disappear as expected.\n"
-            "Phase events in journal:\n"
-            + machine.execute("journalctl -b --output=cat --no-pager | grep -F 'phase_entered' || echo 'no phase_entered events found'")[1]
-        )
+    assert "rootfs_ready" in phases_seen, (
+        "halmasuit did NOT emit `phase: rootfs_ready` — the pivot-"
+        "poll calloop source may not have fired, or /etc/initrd-"
+        "release did not disappear as expected.\n"
+        f"phases: {sorted(phases_seen)}"
+    )
     print("PASS: phase=rootfs_ready emitted (pivot detected post-switch_root)")
 
     # ASSERTION 6: Wayland socket bound and present at the expected
-    # path. /run/halmasuit/ is a tmpfs created by the unit's
-    # RuntimeDirectory directive in initramfs; /run is `mount --move`d
-    # during switch_root, so the directory and the socket persist.
+    # path. /run is a tmpfs `mount --move`d during switch_root, so
+    # the directory and the socket persist.
     socket_check = machine.execute("test -S /run/halmasuit/wayland-0")[0]
     if socket_check != 0:
         raise AssertionError(
@@ -210,10 +226,57 @@ pkgs.testers.runNixOSTest {
         )
     print("PASS: Wayland socket present at /run/halmasuit/wayland-0 post-pivot")
 
+    # ASSERTION 7: post-pivot greetd listener bound. Proves
+    # `run_post_pivot_setup` ran and reached the
+    # `setup_greetd_listener` step — the bind succeeded (an `Err`
+    # would have aborted before `phase: greetd_ready` could fire) and
+    # the calloop source registration succeeded.
+    #
+    # NOTE: this test does NOT assert the socket FILE exists on disk
+    # post-bind. The rootfs systemd's `initrd-cleanup.service` issues a
+    # routine `Stop halmasuit.service` shortly after the pivot, which
+    # halmasuit's SIGTERM handler ignores (`started_from_initramfs`
+    # gate) but which appears to trigger a unit-cleanup pass that
+    # unlinks the bound socket file (the kernel's listening socket FD
+    # remains valid; `/proc/<pid>/net/unix` still references it).
+    # Resolving the cross-pivot unit lifecycle so external clients can
+    # connect via the socket path is `tests/full-boot-flash.nix`
+    # territory — it requires either making halmasuit re-bind from
+    # rootfs systemd's perspective or registering a parallel rootfs
+    # unit that adopts the survived PID. Documented as a Phase B
+    # follow-up rather than gated here.
+    assert "greetd_ready" in phases_seen, (
+        "halmasuit did NOT emit `phase: greetd_ready` post-pivot — "
+        "`run_post_pivot_setup` either didn't run or failed to bind "
+        "the greetd socket.\n"
+        f"phases: {sorted(phases_seen)}"
+    )
+    print("PASS: phase=greetd_ready emitted (post-pivot bind succeeded)")
+
+    # ASSERTION 8: post-pivot privilege drop completed. Proves
+    # `drop_privileges(compositorUid)` ran successfully — halmasuit
+    # is no longer root. The /proc/<pid>/status check is the load-
+    # bearing security assertion: the compositor MUST run as the
+    # configured compositor uid post-pivot (default 998, auto-created
+    # by the module).
+    assert "deprivileged" in phases_seen, (
+        "halmasuit did NOT emit `phase: deprivileged` post-pivot — "
+        "the drop to the compositor uid either didn't run or failed.\n"
+        f"phases: {sorted(phases_seen)}"
+    )
+    status_uid = machine.succeed(f"grep '^Uid:' /proc/{started_pid}/status").strip()
+    uid_fields = status_uid.split()
+    assert all(f == "998" for f in uid_fields[1:5]), (
+        f"halmasuit PID {started_pid} has Uid fields {uid_fields[1:5]}; "
+        "expected all 998 (the compositor uid default from the module). "
+        "The deprivileged event fired but setresuid didn't take."
+    )
+    print(f"PASS: phase=deprivileged emitted; PID {started_pid} runs as compositor uid 998")
+
     print(
         f"initrd-survival: halmasuit PID {started_pid} survived switch_root, "
-        "holds DRM master direct, emitted single NDJSON event stream "
-        "spanning both phases, Wayland socket bound post-pivot"
+        "holds DRM master direct, completed post-pivot setup (greetd_ready, "
+        "deprivileged), Wayland socket bound post-pivot"
     )
   '';
 }

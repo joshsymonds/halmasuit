@@ -27,7 +27,8 @@ let
   # →[broker's relay-peer gate]→ broker. When the broker is deployed
   # standalone (no compositor), whatever drives it directly (the
   # greeter uid, as the direct-broker VM gates do) is the peer.
-  brokerPeerUid = if cfg.enable then cfg.compositorUid else cfg.greeterUid;
+  brokerPeerUid =
+    if cfg.enable || cfg.fromInitrd.enable then cfg.compositorUid else cfg.greeterUid;
 in
 {
   imports = [
@@ -86,48 +87,72 @@ in
       # `crates/halmasuit/src/main.rs` and POSIX uid_t. A plain `int`
       # would accept negative values that then fail silently at
       # runtime when the env var doesn't parse as u32.
-      type        = lib.types.nullOr lib.types.ints.unsigned;
-      default     = null;
-      example     = 999;
+      type        = lib.types.ints.unsigned;
+      default     = 999;
       description = ''
         UID of the greeter system user. halmasuit's greetd listener
-        rejects connections whose SO_PEERCRED uid does not match — this
-        is the load-bearing authorization on the auth socket.
+        rejects connections whose SO_PEERCRED uid does not match —
+        this is the load-bearing authorization on the auth socket.
 
-        Must be set when `services.halmasuit.enable = true`. The matching
-        system user is the responsibility of the operator: declare it
-        elsewhere in your NixOS config (`users.users.<name> = { uid = …;
-        … }`) and pass its uid here.
+        Defaults to 999 with a matching `halmasuit-greeter` system
+        user created automatically by this module. Override to point
+        at an existing system user with a different uid; if you do,
+        also override `greeterUser` so the module names match.
+      '';
+    };
+
+    greeterUser = lib.mkOption {
+      type        = lib.types.str;
+      default     = "halmasuit-greeter";
+      description = ''
+        Name of the greeter system user. Created automatically by this
+        module with uid = `greeterUid` and primary group =
+        `greeterGroup`. Override if you have an existing system user
+        you want halmasuit to authenticate via SO_PEERCRED; the module
+        won't create a second user with the same name when overridden
+        to point at an existing one — define your own
+        `users.users.<name> = { uid = …; group = …; };` in that case.
       '';
     };
 
     greeterGroup = lib.mkOption {
-      type        = lib.types.nullOr lib.types.str;
-      default     = null;
-      example     = "halmasuit-greeter";
+      type        = lib.types.str;
+      default     = "halmasuit-greeter";
       description = ''
-        If set, becomes the systemd unit's `Group=`. Files bound by
+        Primary group for the greeter + compositor system users, and
+        the `Group=` on halmasuit's systemd unit. Files bound by
         halmasuit (greetd.sock, wayland-0) inherit this group, so a
-        greeter whose primary or supplementary group matches can connect
-        through the 0660 socket mode without further wiring.
+        greeter whose primary or supplementary group matches can
+        connect through the 0660 socket mode without further wiring.
 
-        Leave `null` only for the root-only test deployment; production
-        deployments must set this so a non-root greeter can connect.
+        Defaults to `halmasuit-greeter`, created automatically with
+        gid = `greeterUid`.
       '';
     };
 
     compositorUid = lib.mkOption {
-      type        = lib.types.nullOr lib.types.ints.unsigned;
-      default     = null;
-      example     = 998;
+      type        = lib.types.ints.unsigned;
+      default     = 998;
       description = ''
         UID halmasuit `setresuid`s to in-process after binding its
-        sockets. The compositor system user is the responsibility of
-        the operator: declare it in `users.users.<name>` and pass the
-        uid here. UID 0 is rejected by the assertion below: the whole
-        point of the privilege drop is to NOT run as root.
+        sockets. Defaults to 998 with a matching `halmasuit-compositor`
+        system user created automatically by this module.
 
-        Must be set when `services.halmasuit.enable = true`.
+        UID 0 is rejected by the assertion below: the whole point of
+        the privilege drop is to NOT run as root. Override to point at
+        an existing system user with a different uid; also override
+        `compositorUser` so names match.
+      '';
+    };
+
+    compositorUser = lib.mkOption {
+      type        = lib.types.str;
+      default     = "halmasuit-compositor";
+      description = ''
+        Name of the compositor system user. Created automatically by
+        this module with uid = `compositorUid` and primary group =
+        `greeterGroup`. Override if you have an existing system user
+        with the post-drop identity halmasuit should adopt.
       '';
     };
 
@@ -384,23 +409,7 @@ in
    (lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = cfg.greeterUid != null;
-        message   = ''
-          services.halmasuit.greeterUid must be set when
-          services.halmasuit.enable = true. halmasuit's greetd listener
-          rejects connections whose peer uid does not match.
-        '';
-      }
-      {
-        assertion = cfg.compositorUid != null;
-        message   = ''
-          services.halmasuit.compositorUid must be set when
-          services.halmasuit.enable = true. halmasuit drops privileges
-          to this uid after binding its sockets.
-        '';
-      }
-      {
-        assertion = (cfg.compositorUid or 0) != 0;
+        assertion = cfg.compositorUid != 0;
         message   = ''
           services.halmasuit.compositorUid must not be 0 (root). The
           privilege drop is load-bearing per the ARCHITECTURE.md threat
@@ -533,10 +542,12 @@ in
         # apply unconditionally. Blocks dmesg access from the
         # compositor process.
         ProtectKernelLogs      = true;
-      } // lib.optionalAttrs (cfg.greeterGroup != null) {
         # Process egid → inherited by Unix sockets bound under
         # RuntimeDirectory. Members of this group can connect through
-        # halmasuit's 0660 sockets without further wiring.
+        # halmasuit's 0660 sockets without further wiring. The default
+        # `halmasuit-greeter` group is auto-created by this module
+        # (see the shared `cfg.enable || cfg.fromInitrd.enable` block
+        # below); overriding `greeterGroup` is honored here too.
         Group = cfg.greeterGroup;
       };
 
@@ -675,11 +686,45 @@ in
    # broker is already root and forks-then-drops the session leader in
    # a non-setuid child (Epic R7/R15).
    #
+   # System users + group, created automatically for any halmasuit
+   # deployment (`enable` OR `fromInitrd.enable`). Defaults keep the
+   # operator off the "uid trap" path — `services.halmasuit.enable =
+   # true` is sufficient out-of-the-box; identities can be overridden
+   # via `compositorUid`/`compositorUser`/`greeterUid`/`greeterUser`
+   # for sites that already have system accounts to reuse.
+   #
+   # Each attr wraps in `lib.mkDefault` so a test or operator can
+   # redeclare any individual field (description, shell, home, …)
+   # without colliding with the module's defaults at the same priority.
+   #
+   # The compositor user gets the greeter group as its primary group
+   # so the post-drop process retains the gid the wayland-0 and
+   # greetd.sock files are bound with — without it, halmasuit can't
+   # accept() on the sockets it bound while still root.
+   (lib.mkIf (cfg.enable || cfg.fromInitrd.enable) {
+     users.users.${cfg.compositorUser} = {
+       isSystemUser = lib.mkDefault true;
+       uid          = lib.mkDefault cfg.compositorUid;
+       group        = lib.mkDefault cfg.greeterGroup;
+       description  = lib.mkDefault "halmasuit compositor process identity";
+     };
+     users.users.${cfg.greeterUser} = {
+       isSystemUser = lib.mkDefault true;
+       uid          = lib.mkDefault cfg.greeterUid;
+       group        = lib.mkDefault cfg.greeterGroup;
+       description  = lib.mkDefault "halmasuit greeter peer (SO_PEERCRED-authorized greetd client)";
+     };
+     users.groups.${cfg.greeterGroup}.gid = lib.mkDefault cfg.greeterUid;
+   })
+
+   # Epic #1 R6 / Amendment A2: the socket-activated privileged broker.
+   # See block-level comment below for full context.
+   #
    # Provisioned whenever the compositor is enabled (`cfg.enable`) OR
    # the broker is requested on its own (`cfg.session.enable`): the
    # compositor's only auth path is relaying to this broker (Epic #1
    # R3/A4), so it is mandatory infrastructure, not an opt-in add-on.
-   (lib.mkIf (cfg.enable || cfg.session.enable) {
+   (lib.mkIf (cfg.enable || cfg.fromInitrd.enable || cfg.session.enable) {
      systemd.sockets."halmasuit-session" = {
        description = "halmasuit-session privileged PAM-lifecycle broker socket";
        wantedBy    = [ "sockets.target" ];
@@ -759,18 +804,9 @@ in
        };
      };
 
-     assertions = [
-       {
-         assertion = cfg.greeterUid != null;
-         message   = ''
-           services.halmasuit.session.enable requires
-           services.halmasuit.greeterUid to be set: the broker's
-           SO_PEERCRED relay-peer gate rejects every connection whose
-           peer uid is not the authorized relay peer (the compositor
-           when services.halmasuit.enable, else the greeter uid).
-         '';
-       }
-     ];
+     # No assertions: `greeterUid` and `compositorUid` are
+     # always non-null now (typed `ints.unsigned`, with defaults
+     # 999/998 created by the shared user-creation block above).
    })
 
    # Phase B: boot-from-initrd deployment. halmasuit registered as an
@@ -793,6 +829,15 @@ in
            mutually exclusive deployment shapes:
              - enable = true       → rootfs-only, libseat-brokered DRM
              - fromInitrd.enable   → boot-from-initrd, direct DRM
+         '';
+       }
+       {
+         assertion = cfg.compositorUid != 0;
+         message   = ''
+           services.halmasuit.compositorUid must not be 0 (root). The
+           post-pivot privilege drop is load-bearing per the
+           ARCHITECTURE.md threat model; setting it to 0 would defeat
+           the split.
          '';
        }
      ];
@@ -894,11 +939,16 @@ in
        environment = {
          RUST_LOG        = cfg.logLevel;
          XDG_RUNTIME_DIR = "/run/halmasuit";
-         # No HALMASUIT_GREETER_UID / HALMASUIT_COMPOSITOR_UID /
-         # HALMASUIT_GREETER_COMMAND: the initramfs path skips
-         # greetd + greeter spawn + privilege drop entirely (see
-         # `crates/halmasuit/src/main.rs` initramfs branching). The
-         # PAM/auth surface lands when halmasuit-luks does.
+
+         # PAM/auth surface for the post-pivot greeter. The initramfs
+         # phase skips greetd + greeter spawn + privilege drop (no
+         # users / no /etc/passwd before the pivot); these env vars
+         # become live when `run_post_pivot_setup` runs in
+         # `crates/halmasuit/src/main.rs` shortly after the pivot-poll
+         # timer detects `/etc/initrd-release` disappearing.
+         HALMASUIT_GREETER_UID    = toString cfg.greeterUid;
+         HALMASUIT_COMPOSITOR_UID = toString cfg.compositorUid;
+         HALMASUIT_PAM_SERVICE    = cfg.pamService;
 
          # Mesa runtime. /run/opengl-driver symlink is created by the
          # ExecStartPre above; LD_LIBRARY_PATH carries libglvnd's
@@ -907,6 +957,9 @@ in
          # (matches the rootfs unit's LIBGL_ALWAYS_SOFTWARE=1).
          LIBGL_ALWAYS_SOFTWARE = "1";
          LD_LIBRARY_PATH       = "${pkgs.libglvnd}/lib:${pkgs.mesa}/lib";
+       } // lib.optionalAttrs (cfg.greeterCommand != null) {
+         # Greeter binary halmasuit fork+execs post-pivot.
+         HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
        };
      };
 
