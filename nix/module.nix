@@ -978,6 +978,14 @@ in
        environment = {
          RUST_LOG        = cfg.logLevel;
          XDG_RUNTIME_DIR = "/run/halmasuit";
+         # Phase B v2 workaround: bind the greetd socket as an
+         # ABSTRACT Linux socket (kernel-namespace-scoped, no
+         # filesystem inode). Filesystem-bound sockets aren't visible
+         # cross-mount-namespace at the switch_root boundary (see the
+         # "v1 → v2 gap" docstring above). Abstract sockets live in
+         # the NETWORK namespace which halmasuit + rootfs share —
+         # so rootfs greeters CAN connect via the abstract name.
+         HALMASUIT_GREETD_SOCKET = "@halmasuit-greetd";
 
          # PAM/auth surface for the post-pivot greeter. The initramfs
          # phase skips greetd + greeter spawn + privilege drop (no

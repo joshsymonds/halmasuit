@@ -227,45 +227,33 @@ pkgs.testers.runNixOSTest {
         )
     print("PASS: Wayland socket present at /run/halmasuit/wayland-0 post-pivot")
 
-    # ASSERTION 7: post-pivot greetd listener bound. Phase event
-    # proves `run_post_pivot_setup` ran and the bind succeeded —
-    # halmasuit's kernel-side listening FD references the socket
-    # path (visible in /proc/<pid>/net/unix).
-    #
-    # KNOWN PHASE B v1 GAP — the bound socket FILE is only visible
-    # in halmasuit's mount namespace, NOT in the rootfs's mount
-    # namespace where greeters would connect. Despite identical
-    # `mnt:[NNN]` namespace IDs reported by `/proc/<pid>/ns/mnt` for
-    # halmasuit and PID 1, empirical testing shows halmasuit's view
-    # of `/run/halmasuit/` contains greetd.sock (where it bound)
-    # while the rootfs view contains wayland-0 (an orphan file at
-    # the same path on a different device). The mount-namespace
-    # divergence likely happens at switch_root via systemd's
-    # specific transition mechanics that aren't documented in the
-    # Linux mnt-ns docs.
-    #
-    # Tried defenses (all failed): RuntimeDirectoryPreserve=yes,
-    # RefuseManualStop=yes, KillMode=none, binding outside
-    # /run/halmasuit/, 10s deferred bind, setns(/proc/1/ns/mnt)
-    # (failed — halmasuit's view has no /proc), and a rebind-on-
-    # disappearance watchdog (halmasuit's stat() always sees the
-    # file in its own view, so the watchdog never triggers).
-    #
-    # The structural fix needs either a two-process design with
-    # SCM_RIGHTS FD handoff at the pivot boundary, or a
-    # broker-mediated namespace fd transfer (the broker is in
-    # rootfs's mount namespace and could pass its
-    # /proc/self/ns/mnt fd to halmasuit via SCM_RIGHTS, after which
-    # halmasuit could setns into rootfs's ns and re-bind its
-    # sockets). Both are substantial follow-up work. Documented as
-    # the Phase B v1 → v2 transition path.
+    # ASSERTION 7: post-pivot greetd listener bound AND reachable
+    # from the rootfs view. The Phase B v1 → v2 fix uses an ABSTRACT
+    # Linux socket (`@halmasuit-greetd`) instead of a filesystem
+    # path — abstract sockets live in the NETWORK namespace which
+    # halmasuit + rootfs share, so cross-mount-namespace visibility
+    # of the listener is no longer a problem.
     assert "greetd_ready" in phases_seen, (
         "halmasuit did NOT emit `phase: greetd_ready` post-pivot — "
         "`run_post_pivot_setup` either didn't run or failed to bind "
         "the greetd socket.\n"
         f"phases: {sorted(phases_seen)}"
     )
-    print("PASS: phase=greetd_ready emitted (post-pivot bind succeeded)")
+    # Check the kernel's listening Unix sockets from the rootfs net
+    # namespace (which halmasuit + rootfs share). If the abstract
+    # name appears as a LISTEN socket, halmasuit's bind is visible
+    # cross-mount-ns. /proc/net/unix lists abstract sockets with `@`
+    # prefix in the Path column.
+    abstract_check = machine.execute(
+        "grep -E '@halmasuit-greetd' /proc/net/unix || echo 'not-found'"
+    )
+    assert "not-found" not in abstract_check[1], (
+        f"abstract @halmasuit-greetd socket NOT visible from rootfs view.\n"
+        f"output: {abstract_check[1]}\n"
+        "Mismatch suggests the bind happened in halmasuit's own net "
+        "ns or didn't happen at all."
+    )
+    print("PASS: abstract @halmasuit-greetd socket reachable from rootfs view")
 
     # ASSERTION 8: post-pivot privilege drop completed. Proves
     # `drop_privileges(compositorUid)` ran successfully — halmasuit

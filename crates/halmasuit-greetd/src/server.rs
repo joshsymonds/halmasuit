@@ -191,16 +191,42 @@ impl Listener {
 /// calloop) use this; tests use [`Listener::bind`] to get the
 /// auto-unlink-on-drop guard.
 ///
+/// `path` accepts two shapes:
+/// - A filesystem path (e.g., `/run/halmasuit/greetd.sock`). The
+///   socket file is created at that path; `mode` chmod's it.
+/// - An abstract Linux socket name prefixed by `@` (e.g.,
+///   `@halmasuit-greetd`). The socket is bound in the kernel's
+///   abstract namespace — no filesystem inode is created, so `mode`
+///   is irrelevant and silently ignored. Abstract sockets live in
+///   the NETWORK namespace, NOT the mount namespace; they're
+///   visible cross-mount-namespace as long as the connecting process
+///   is in the same net ns. This is the Phase B boot-from-initrd
+///   workaround for the cross-pivot mount-namespace divergence
+///   (rootfs greeters can't see halmasuit's filesystem-bound
+///   sockets, but they can see abstract ones).
+///
 /// The caller is responsible for the bound path's lifecycle —
-/// typically, production runs under systemd's
-/// `RuntimeDirectory=halmasuit` which handles cleanup on unit stop.
+/// typically, production runs under systemd's `RuntimeDirectory=`
+/// (filesystem path case) or has nothing to clean up (abstract case).
 ///
 /// # Errors
 ///
-/// `io::ErrorKind::InvalidInput` if `mode` grants world access
-/// (`mode & 0o007 != 0`). Otherwise any `io::Error` from
-/// `UnixListener::bind` or `set_permissions`.
+/// `io::ErrorKind::InvalidInput` if `mode` grants world access on a
+/// filesystem path (`mode & 0o007 != 0`). Otherwise any `io::Error`
+/// from the underlying bind or `set_permissions`.
 pub fn bind_socket(path: &Path, mode: u32) -> std::io::Result<UnixListener> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::SocketAddr;
+
+    let path_str = path.to_string_lossy();
+    if let Some(abstract_name) = path_str.strip_prefix('@') {
+        // Abstract Linux socket — no filesystem inode, lives in the
+        // kernel's net-namespace-scoped abstract namespace.
+        let addr = SocketAddr::from_abstract_name(abstract_name.as_bytes())?;
+        let sock = UnixListener::bind_addr(&addr)?;
+        return Ok(sock);
+    }
+
     if mode & 0o007 != 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
