@@ -93,6 +93,7 @@ pkgs.testers.runNixOSTest {
     machine.start()
     machine.wait_for_unit("multi-user.target")
 
+
     # Wait for post-pivot setup to complete: halmasuit's pivot-poll
     # fires once /etc/initrd-release is gone, then `run_post_pivot_setup`
     # binds greetd, spawns the greeter, and drops privileges. Total
@@ -231,16 +232,33 @@ pkgs.testers.runNixOSTest {
     # halmasuit's kernel-side listening FD references the socket
     # path (visible in /proc/<pid>/net/unix).
     #
-    # KNOWN PHASE B GAP — see `nix/module.nix`'s "Phase B integration
-    # gap" docstring for the full investigation. Briefly: the bound
-    # socket FILE on disk gets unlinked by a cgroup-tied unit-cleanup
-    # that follows rootfs systemd's "Stop halmasuit.service" (which
-    # halmasuit's PROCESS survives via the SIGTERM-ignore gate).
-    # Multiple defenses tried, none worked. Structural fix (parallel
-    # rootfs unit adopting the survived PID via PIDFile=) is on
-    # `tests/full-boot-flash.nix`'s path, where it's a hard
-    # prerequisite for the greeter actually connecting and the
-    # post-pivot auth arc reaching SessionOpened.
+    # KNOWN PHASE B v1 GAP — the bound socket FILE is only visible
+    # in halmasuit's mount namespace, NOT in the rootfs's mount
+    # namespace where greeters would connect. Despite identical
+    # `mnt:[NNN]` namespace IDs reported by `/proc/<pid>/ns/mnt` for
+    # halmasuit and PID 1, empirical testing shows halmasuit's view
+    # of `/run/halmasuit/` contains greetd.sock (where it bound)
+    # while the rootfs view contains wayland-0 (an orphan file at
+    # the same path on a different device). The mount-namespace
+    # divergence likely happens at switch_root via systemd's
+    # specific transition mechanics that aren't documented in the
+    # Linux mnt-ns docs.
+    #
+    # Tried defenses (all failed): RuntimeDirectoryPreserve=yes,
+    # RefuseManualStop=yes, KillMode=none, binding outside
+    # /run/halmasuit/, 10s deferred bind, setns(/proc/1/ns/mnt)
+    # (failed — halmasuit's view has no /proc), and a rebind-on-
+    # disappearance watchdog (halmasuit's stat() always sees the
+    # file in its own view, so the watchdog never triggers).
+    #
+    # The structural fix needs either a two-process design with
+    # SCM_RIGHTS FD handoff at the pivot boundary, or a
+    # broker-mediated namespace fd transfer (the broker is in
+    # rootfs's mount namespace and could pass its
+    # /proc/self/ns/mnt fd to halmasuit via SCM_RIGHTS, after which
+    # halmasuit could setns into rootfs's ns and re-bind its
+    # sockets). Both are substantial follow-up work. Documented as
+    # the Phase B v1 → v2 transition path.
     assert "greetd_ready" in phases_seen, (
         "halmasuit did NOT emit `phase: greetd_ready` post-pivot — "
         "`run_post_pivot_setup` either didn't run or failed to bind "

@@ -935,38 +935,45 @@ in
          Restart        = "no";
          StandardOutput = "journal";
          StandardError  = "journal";
-         # ## Phase B integration gap (cross-pivot socket-file
-         # visibility)
+         # ## Phase B v1 → v2 cross-pivot mount-namespace gap
          #
-         # `/run/halmasuit` is created here via `mkdir -p` rather than
-         # via `RuntimeDirectory=`. Neither shape resolves a deeper
-         # cross-pivot issue: rootfs systemd's `initrd-cleanup.service`
-         # issues a routine `Stop halmasuit.service` shortly after
-         # switch_root, and the cgroup-tied cleanup that follows
-         # unlinks halmasuit-bound socket files (the `greetd.sock`
-         # bound by `run_post_pivot_setup` in particular). halmasuit's
-         # process + listening FDs persist (the SIGTERM handler's
-         # `started_from_initramfs` gate keeps it alive across the
-         # Stop), but the dirent for the new bind is removed —
-         # external greeters can't connect by path. `wayland-0`
-         # happens to outlast the sweep because in-flight clients +
-         # smithay's `.lock` keep it anchored, but a freshly-bound
-         # `greetd.sock` does not.
+         # `/run/halmasuit` is created here via `mkdir -p` rather
+         # than `RuntimeDirectory=`. The deeper issue: at
+         # switch_root, halmasuit's mount namespace diverges from
+         # rootfs systemd's, despite `/proc/<pid>/ns/mnt` reporting
+         # the same `mnt:[NNN]` ID for both. Empirically, halmasuit's
+         # view of `/run/halmasuit/` contains its own bound
+         # `greetd.sock` (device 2) while rootfs's view contains an
+         # orphan `wayland-0` socket file (device 25). External
+         # greeters launched by rootfs systemd see the rootfs view
+         # and can't connect to halmasuit's listener.
          #
-         # Tried defenses (none worked):
-         #   - `RuntimeDirectory=halmasuit` ± `RuntimeDirectoryPreserve=yes`
-         #   - `RefuseManualStop=yes` in [Unit]
-         #   - `KillMode=none` in [Service]
-         #   - Binding the greetd socket OUTSIDE /run/halmasuit/
+         # Tried defenses (all failed to make the bind visible
+         # cross-namespace): `RuntimeDirectoryPreserve=yes`,
+         # `RefuseManualStop=yes`, `KillMode=none`, binding outside
+         # /run/halmasuit/, 10s deferred binds, setns(/proc/1/ns/mnt)
+         # (halmasuit can't access /proc — its view has no procfs
+         # mount), and a rebind-watchdog (halmasuit's stat sees the
+         # file in its own view; the rebind never triggers).
          #
-         # The structural fix is most likely a parallel ROOTFS unit
-         # that adopts the survived PID via `PIDFile=` so rootfs
-         # systemd doesn't see the initramfs unit as "stopping" at
-         # all post-pivot. Resolving this is on `tests/full-boot-flash.nix`'s
-         # path (Phase B task #7), since full-boot-flash needs the
-         # greeter to actually connect to drive the post-pivot auth
-         # arc. Documented here rather than left as a silent surprise
-         # for whoever picks up task #7.
+         # The structural Phase B v1 → v2 fix is one of:
+         #   (a) Two-process design with SCM_RIGHTS DRM-fd handoff
+         #       at the pivot boundary — initramfs halmasuit dies
+         #       at switch_root, rootfs halmasuit adopts the master
+         #       fd and continues. Loses Phase B's
+         #       "single-process-from-boot-to-shutdown" property but
+         #       preserves no-flash (same fd, same scanout state).
+         #   (b) Broker-mediated namespace transfer — the broker is
+         #       in rootfs's mount namespace and can pass its
+         #       /proc/self/ns/mnt fd to halmasuit via SCM_RIGHTS.
+         #       halmasuit setns into rootfs's ns, re-binds its
+         #       sockets in the new view. Preserves single-process
+         #       but adds a new privileged surface to the broker.
+         #
+         # Phase B v1 ships the survival mechanic + module +
+         # post-pivot drop end-to-end. The greeter-connect arc that
+         # closes full-boot-flash.nix is the Phase B v2 boundary,
+         # gated on resolving the namespace divergence.
        };
        environment = {
          RUST_LOG        = cfg.logLevel;
