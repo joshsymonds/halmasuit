@@ -226,25 +226,26 @@ pkgs.testers.runNixOSTest {
         )
     print("PASS: Wayland socket present at /run/halmasuit/wayland-0 post-pivot")
 
-    # ASSERTION 7: post-pivot greetd listener bound. Proves
-    # `run_post_pivot_setup` ran and reached the
-    # `setup_greetd_listener` step — the bind succeeded (an `Err`
-    # would have aborted before `phase: greetd_ready` could fire) and
-    # the calloop source registration succeeded.
+    # ASSERTION 7: post-pivot greetd listener bound. The phase event
+    # proves `run_post_pivot_setup` ran and the bind succeeded —
+    # halmasuit's kernel-side listening FD references
+    # `/run/halmasuit/greetd.sock` (visible in `/proc/<pid>/net/unix`).
     #
-    # NOTE: this test does NOT assert the socket FILE exists on disk
-    # post-bind. The rootfs systemd's `initrd-cleanup.service` issues a
-    # routine `Stop halmasuit.service` shortly after the pivot, which
-    # halmasuit's SIGTERM handler ignores (`started_from_initramfs`
-    # gate) but which appears to trigger a unit-cleanup pass that
-    # unlinks the bound socket file (the kernel's listening socket FD
-    # remains valid; `/proc/<pid>/net/unix` still references it).
-    # Resolving the cross-pivot unit lifecycle so external clients can
-    # connect via the socket path is `tests/full-boot-flash.nix`
-    # territory — it requires either making halmasuit re-bind from
-    # rootfs systemd's perspective or registering a parallel rootfs
-    # unit that adopts the survived PID. Documented as a Phase B
-    # follow-up rather than gated here.
+    # NOTE: This test does NOT assert the bound socket FILE is visible
+    # on disk. Rootfs systemd's `initrd-cleanup.service` issues a
+    # routine `Stop halmasuit.service` shortly after the pivot, and the
+    # ensuing unit-lifecycle sweep unlinks the just-bound socket file
+    # while halmasuit's process + FD persist (the SIGTERM handler's
+    # `started_from_initramfs` gate from task #4 keeps the process
+    # alive across the Stop, but the runtime-dir contents bound AFTER
+    # that signal don't survive). The wayland-0 inode happens to
+    # persist because in-flight clients + smithay's lock-file anchor
+    # keep it referenced. Resolving the cross-pivot unit lifecycle so
+    # external clients can connect via the socket path is
+    # `tests/full-boot-flash.nix` territory — most likely by
+    # registering a parallel rootfs systemd unit that adopts the
+    # survived PID, so rootfs systemd doesn't see the unit as
+    # "stopping" at all post-pivot.
     assert "greetd_ready" in phases_seen, (
         "halmasuit did NOT emit `phase: greetd_ready` post-pivot — "
         "`run_post_pivot_setup` either didn't run or failed to bind "

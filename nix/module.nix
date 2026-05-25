@@ -935,6 +935,24 @@ in
          Restart        = "no";
          StandardOutput = "journal";
          StandardError  = "journal";
+         # `/run/halmasuit` is created via `mkdir -p` in ExecStartPre
+         # rather than `RuntimeDirectory=`. `RuntimeDirectory=` (even
+         # with `RuntimeDirectoryPreserve=yes`) interacts badly with
+         # the cross-pivot unit lifecycle: rootfs systemd's
+         # `initrd-cleanup.service` issues a routine `Stop
+         # halmasuit.service` after switch_root, and the unit's
+         # runtime-dir paths bound after that `Stop` (like the
+         # `greetd.sock` from `run_post_pivot_setup`) end up unlinked
+         # while halmasuit's process + listening FDs persist (the
+         # SIGTERM handler's `started_from_initramfs` gate keeps the
+         # process alive across the Stop). The `wayland-0` inode
+         # happens to outlast the sweep because in-flight clients +
+         # smithay's `.lock` keep it anchored, but freshly-bound
+         # `greetd.sock` does not. This is a known Phase B integration
+         # finding to be resolved by `tests/full-boot-flash.nix` —
+         # likely by registering a parallel rootfs unit that adopts
+         # the survived PID, so rootfs systemd doesn't see the unit
+         # as "stopping" at all post-pivot.
        };
        environment = {
          RUST_LOG        = cfg.logLevel;
