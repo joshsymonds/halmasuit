@@ -731,7 +731,19 @@ in
        socketConfig = {
          # SOCK_SEQPACKET: the broker's wire codec is one logical
          # message per datagram (matches halmasuit-greetd's framing).
-         ListenSequentialPacket = "/run/halmasuit-session.sock";
+         #
+         # Path-vs-abstract: the rootfs `enable` deployment uses a
+         # filesystem path under /run; the fromInitrd deployment uses
+         # an abstract Linux socket name (kernel net-ns-scoped, no
+         # filesystem inode) so halmasuit — stuck in initramfs's
+         # mount namespace post-pivot — can still reach the broker.
+         # The `HALMASUIT_BROKER_SOCKET` env on halmasuit's unit
+         # selects the matching connect side; both sides agree on
+         # the path via that env.
+         ListenSequentialPacket =
+           if cfg.fromInitrd.enable
+           then "@halmasuit-session"
+           else "/run/halmasuit-session.sock";
          # The binary owns the accept loop and the global single slot
          # (Epic R5 / Amendment A2.1) — NOT one instance per
          # connection.
@@ -978,14 +990,17 @@ in
        environment = {
          RUST_LOG        = cfg.logLevel;
          XDG_RUNTIME_DIR = "/run/halmasuit";
-         # Phase B v2 workaround: bind the greetd socket as an
-         # ABSTRACT Linux socket (kernel-namespace-scoped, no
-         # filesystem inode). Filesystem-bound sockets aren't visible
+         # Phase B v2 workaround: bind sockets as ABSTRACT Linux
+         # sockets (kernel-namespace-scoped, no filesystem inode).
+         # Filesystem-bound sockets aren't visible
          # cross-mount-namespace at the switch_root boundary (see the
          # "v1 → v2 gap" docstring above). Abstract sockets live in
          # the NETWORK namespace which halmasuit + rootfs share —
-         # so rootfs greeters CAN connect via the abstract name.
-         HALMASUIT_GREETD_SOCKET = "@halmasuit-greetd";
+         # so rootfs greeters CAN connect via the abstract name AND
+         # halmasuit CAN reach the broker socket bound by rootfs
+         # systemd's `halmasuit-session.socket` unit.
+         HALMASUIT_GREETD_SOCKET  = "@halmasuit-greetd";
+         HALMASUIT_BROKER_SOCKET  = "@halmasuit-session";
 
          # PAM/auth surface for the post-pivot greeter. The initramfs
          # phase skips greetd + greeter spawn + privilege drop (no

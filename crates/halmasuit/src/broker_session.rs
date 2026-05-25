@@ -323,7 +323,16 @@ pub fn connect_broker(sock_path: &Path) -> Result<SeqpacketChannel, WireError> {
         SockFlag::empty(),
         None,
     )?;
-    let addr = UnixAddr::new(sock_path).map_err(WireError::Io)?;
+    // Path-or-abstract: `@name` selects the kernel's net-namespace-
+    // scoped abstract socket. Used in the Phase B fromInitrd
+    // deployment to bypass the cross-pivot mount-namespace
+    // divergence.
+    let path_str = sock_path.to_string_lossy();
+    let addr = if let Some(abstract_name) = path_str.strip_prefix('@') {
+        UnixAddr::new_abstract(abstract_name.as_bytes()).map_err(WireError::Io)?
+    } else {
+        UnixAddr::new(sock_path).map_err(WireError::Io)?
+    };
     connect(fd.as_raw_fd(), &addr)?;
     Ok(SeqpacketChannel::new(fd))
 }
