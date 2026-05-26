@@ -83,6 +83,9 @@ test-vm:
     echo "── visual-phase-b-side-image ──"
     nix build .#checks.x86_64-linux.visual-phase-b-side-image -L --print-build-logs --no-link
     echo
+    echo "── visual-phase-b-side-shader ──"
+    nix build .#checks.x86_64-linux.visual-phase-b-side-shader -L --print-build-logs --no-link
+    echo
     echo "── run-pam-auth ──"
     nix build .#checks.x86_64-linux.run-pam-auth -L --print-build-logs --no-link
     echo
@@ -276,6 +279,12 @@ test-vm-visual-initrd-pixmap:
 # whole timeline.
 test-vm-visual-phase-b-side-image:
     nix build .#checks.x86_64-linux.visual-phase-b-side-image -L --print-build-logs --no-link
+
+# Phase B cell — LUKS side-volume × shader wallpaper. Same end-to-end
+# arc; animated GLSL fragment shader (iTime-driven sine hue cycle, 60s
+# period for SSIMULACRA2 golden stability) replaces the image plane.
+test-vm-visual-phase-b-side-shader:
+    nix build .#checks.x86_64-linux.visual-phase-b-side-shader -L --print-build-logs --no-link
 
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.

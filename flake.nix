@@ -781,6 +781,17 @@
           halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Epic #35 cell (side, shader): same shape, animated GLSL
+        # fragment-shader wallpaper (tests/fixtures/wallpaper-shader.glsl).
+        visual-phase-b-side-shader = import ./tests/visual-phase-b-side-shader.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # Visual gates consume `halmasuit-debug` (frame_audit on): the
         # capture path is the in-process `Snapshot()` D-Bus method,
         # not QMP screendump. Structural tests above stay on the
