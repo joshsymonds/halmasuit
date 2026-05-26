@@ -80,6 +80,9 @@ test-vm:
     echo "── visual-initrd-pixmap ──"
     nix build .#checks.x86_64-linux.visual-initrd-pixmap -L --print-build-logs --no-link
     echo
+    echo "── visual-phase-b-side-image ──"
+    nix build .#checks.x86_64-linux.visual-phase-b-side-image -L --print-build-logs --no-link
+    echo
     echo "── run-pam-auth ──"
     nix build .#checks.x86_64-linux.run-pam-auth -L --print-build-logs --no-link
     echo
@@ -263,6 +266,16 @@ test-vm-luks-unlock:
 # the pixel pipeline continuously — the Plymouth-removability proof.
 test-vm-visual-initrd-pixmap:
     nix build .#checks.x86_64-linux.visual-initrd-pixmap -L --print-build-logs --no-link
+
+# Phase B golden-boot, side-volume LUKS × image wallpaper (Epic #35,
+# first cell of the matrix). Full composition: initramfs halmasuit +
+# halmasuit-luks → LUKS side-volume unlocks via the production wire →
+# switch_root → DankGreeter (real keyboard via machine.send_chars) →
+# alice's real pam_unix auth → niri spawned by broker → goldens at
+# greeter scene + session scene + no-flash invariant across the
+# whole timeline.
+test-vm-visual-phase-b-side-image:
+    nix build .#checks.x86_64-linux.visual-phase-b-side-image -L --print-build-logs --no-link
 
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.

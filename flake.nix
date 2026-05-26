@@ -768,6 +768,19 @@
           halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Epic #35 Phase B golden-boot — first cell of the matrix:
+        # LUKS side-volume × image wallpaper. Real DankGreeter
+        # driven by machine.send_chars; real niri as the
+        # broker-launched session; per-variant per-scene goldens.
+        visual-phase-b-side-image = import ./tests/visual-phase-b-side-image.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # Visual gates consume `halmasuit-debug` (frame_audit on): the
         # capture path is the in-process `Snapshot()` D-Bus method,
         # not QMP screendump. Structural tests above stay on the
