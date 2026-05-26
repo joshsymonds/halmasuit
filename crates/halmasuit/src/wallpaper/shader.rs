@@ -413,4 +413,85 @@ mod tests {
         assert!(SHADERTOY_PREAMBLE.contains("uniform int iFrame"));
         assert!(SHADERTOY_PREAMBLE.contains("uniform vec4 iMouse"));
     }
+
+    /// The Phase B shader-variant VM tests consume
+    /// `tests/fixtures/wallpaper-shader.glsl` as the
+    /// `services.halmasuit.wallpaper.source`. This unit test pins the
+    /// fixture's shape so a regression (wrong entry point, missing
+    /// uniform reference, accidental `#version` directive) fails
+    /// `just check` before the slow VM sweep runs. The actual GPU
+    /// compile via `ShaderBackend::new` requires a real `GlesRenderer`
+    /// and is exercised end-to-end by the VM tests.
+    const PHASE_B_SHADER_FIXTURE: &str =
+        include_str!("../../../../tests/fixtures/wallpaper-shader.glsl");
+
+    #[test]
+    fn phase_b_shader_fixture_is_shadertoy_shape() {
+        assert!(
+            is_shadertoy_shape(PHASE_B_SHADER_FIXTURE),
+            "fixture must use the `void mainImage(...)` Shadertoy entry \
+             so shader.rs injects the preamble that declares iTime / \
+             iResolution"
+        );
+    }
+
+    #[test]
+    fn phase_b_shader_fixture_uses_itime_and_iresolution() {
+        assert!(
+            PHASE_B_SHADER_FIXTURE.contains("iTime"),
+            "fixture must reference iTime so the time-varying golden \
+             actually animates (the no-flash gate would still pass on \
+             a static shader, but the VM test's whole point is to \
+             exercise the time-uniform code path)"
+        );
+        assert!(
+            PHASE_B_SHADER_FIXTURE.contains("iResolution"),
+            "fixture must reference iResolution so the per-frame \
+             uniform bind for the resolution vec3 runs"
+        );
+    }
+
+    #[test]
+    fn phase_b_shader_fixture_assembles_to_a_complete_glsl_es_100_program() {
+        // Wrap-and-stitch via the production assembler. Asserts the
+        // final source has both the user's `mainImage` AND the
+        // generated `void main()` entry. A regression where the
+        // assembler drops the user source would surface here.
+        let assembled = assemble_source(PHASE_B_SHADER_FIXTURE);
+        assert!(
+            assembled.contains("mainImage(out vec4 fragColor"),
+            "assembled source must contain the user's mainImage \
+             signature verbatim"
+        );
+        assert!(
+            assembled.contains("void main()"),
+            "assembled source must contain smithay's expected \
+             void main() entry (added by the Shadertoy wrapper)"
+        );
+        assert!(
+            !assembled.contains("#version"),
+            "assembled source must not declare #version; smithay \
+             prepends it during compile"
+        );
+    }
+
+    #[test]
+    fn phase_b_shader_fixture_does_not_declare_event_uniforms() {
+        // Phase A: EventTime / EventValue parse but the bus-event
+        // delivery isn't wired (shader.rs:184-205 warns + writes 0.0).
+        // The fixture must stick to fully-implemented uniforms so the
+        // VM test exercises a path that actually fires non-zero
+        // values. A future fixture that wants event uniforms lands
+        // alongside the bus-event epic.
+        assert!(
+            !PHASE_B_SHADER_FIXTURE.contains("EventTime"),
+            "fixture must not declare EventTime — Phase A leaves it \
+             at sentinel 0.0; use iTime"
+        );
+        assert!(
+            !PHASE_B_SHADER_FIXTURE.contains("EventValue"),
+            "fixture must not declare EventValue — Phase A leaves it \
+             at sentinel 0.0"
+        );
+    }
 }
