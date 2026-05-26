@@ -747,6 +747,14 @@
           system = "x86_64-linux";
           inherit nixpkgs;
         };
+        # Epic #47 R2 Phase 1 probe: same-PID survival across
+        # systemd-shutdown's pivot to /run/initramfs. Adds
+        # boot.initrd.systemd.shutdownRamfs.storePaths so the probe
+        # binary lives in the post-pivot tmpfs view.
+        halmasuit-shutdown-probe-phase1 = import ./tests/halmasuit-shutdown-probe-phase1.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+        };
         # Phase B (initramfs survival): real halmasuit binary in
         # boot.initrd.systemd.services with SurviveFinalKillSignal=yes,
         # asserts PID + DRM-master + Wayland-socket continuity across

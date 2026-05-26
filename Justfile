@@ -74,6 +74,9 @@ test-vm:
     echo "── halmasuit-shutdown-probe-phase0 ──"
     nix build .#checks.x86_64-linux.halmasuit-shutdown-probe-phase0 -L --print-build-logs --no-link
     echo
+    echo "── halmasuit-shutdown-probe-phase1 ──"
+    nix build .#checks.x86_64-linux.halmasuit-shutdown-probe-phase1 -L --print-build-logs --no-link
+    echo
     echo "── full-boot-flash ──"
     nix build .#checks.x86_64-linux.full-boot-flash -L --print-build-logs --no-link
     echo
@@ -265,6 +268,17 @@ test-drm-probe-phase4:
 # tasks of Epic #47.
 test-shutdown-probe-phase0:
     nix build .#checks.x86_64-linux.halmasuit-shutdown-probe-phase0 -L --print-build-logs --no-link
+
+# Epic #47 R2 Phase 1 probe: same-PID survival across
+# systemd-shutdown's pivot from rootfs to /run/initramfs. Adds
+# `boot.initrd.systemd.shutdownRamfs.storePaths` to include the
+# probe binary + closure so its executable + libs are backed by the
+# shutdownRamfs tmpfs (not the about-to-unmount rootfs). Asserts
+# heartbeats appear after the first `shutdown[1]:` log line (the
+# post-pivot systemd-shutdown binary), proving the pivot didn't
+# kill the probe.
+test-shutdown-probe-phase1:
+    nix build .#checks.x86_64-linux.halmasuit-shutdown-probe-phase1 -L --print-build-logs --no-link
 
 # Phase B initrd-survival gate: the production halmasuit binary
 # registered via `services.halmasuit.fromInitrd.enable`. Composes

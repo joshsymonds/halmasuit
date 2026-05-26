@@ -7,7 +7,7 @@
 // not by `just check`'s unit-test sweep, and its assertions answer
 // architectural questions rather than implement the production contract.
 //
-// Phase 0 (THIS file): the probe runs as a rootfs systemd unit with
+// Phase 0: the probe runs as a rootfs systemd unit with
 // `SurviveFinalKillSignal=yes`. It writes timestamped heartbeats to
 // `/dev/kmsg` every 100ms and ignores SIGTERM / SIGINT / SIGHUP. The
 // VM test triggers `systemctl poweroff`, waits for the VM to halt, then
@@ -16,15 +16,18 @@
 // remaining processes" marker. That marker is the last-line-of-defense
 // kill before halt; heartbeats past it prove the directive worked on
 // the SHUTDOWN-direction kill spree (drm-master-probe Phase 2 already
-// proved it for the BOOT-direction one).
+// proved it for the BOOT-direction one). STATUS: GREEN.
 //
-// Future sub-phases (separate tasks in Epic #47):
-//   * Phase 1: + `boot.initrd.systemd.shutdownRamfs.storePaths` includes
-//     this binary so the rootfs unmount doesn't pull mmap'd code out.
-//     Asserts the SAME pid keeps emitting heartbeats post-pivot.
-//   * Phase 2: + opens `/dev/dri/card0`, takes DRM master, paints a
-//     solid color via dumb buffer. Asserts the SAME DRM master fd
-//     remains valid post-pivot and a paint after pivot lands on screen.
+// Phase 1: same probe with `boot.initrd.systemd.shutdownRamfs.storePaths`
+// configured to materialize the probe binary into the shutdown ramfs.
+// Validates that the same PID survives systemd-shutdown's actual pivot
+// from rootfs to `/run/initramfs` — heartbeats appear AFTER the first
+// `shutdown[1]:` log line (which is the post-pivot systemd-shutdown
+// binary executing from the shutdown ramfs).
+//
+// Phase 2 (future): + opens `/dev/dri/card0`, takes DRM master, paints
+// a solid color via dumb buffer. Asserts the SAME DRM master fd
+// remains valid post-pivot and a paint after pivot lands on screen.
 //
 // The probe uses /dev/kmsg because it bypasses journald (journald itself
 // is shutting down during the kill spree). /dev/kmsg writes go to the
@@ -53,36 +56,42 @@ use nix::sys::signalfd::{SfdFlags, SignalFd};
 /// past the kill marker (not a new process re-entering after a respawn).
 static HEARTBEAT_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Run subcommand router. Phase 0 is the only sub-phase implemented;
-/// `phase1` / `phase2` panic until those sub-tasks land. Keeping the
-/// router in place documents the planned shape.
+/// Run subcommand router. Sub-phases compose: each one adds something
+/// (shutdownRamfs.storePaths config in Phase 1, DRM in Phase 2) but
+/// the probe loop is the same shape every time.
 fn main() {
     let mut args = std::env::args().skip(1);
     let phase = args.next();
     match phase.as_deref() {
-        Some("phase0") => phase0(),
+        Some("phase0") => heartbeat_loop("phase0"),
+        Some("phase1") => heartbeat_loop("phase1"),
         Some(other) => {
             eprintln!(
                 "halmasuit-shutdown-probe: unknown phase {other:?}; \
-                 only `phase0` is implemented in this build"
+                 supported: phase0, phase1"
             );
             process::exit(2);
         }
         None => {
-            eprintln!("halmasuit-shutdown-probe: usage: halmasuit-shutdown-probe <phase0>");
+            eprintln!("halmasuit-shutdown-probe: usage: halmasuit-shutdown-probe <phase0|phase1>");
             process::exit(2);
         }
     }
 }
 
-/// Phase 0: heartbeat to `/dev/kmsg` + ignore SIGTERM/SIGINT/SIGHUP.
+/// Heartbeat loop shared by every phase. Each phase tags its kmsg
+/// lines with its phase name so the VM test can disambiguate.
+///
+/// Behavior: heartbeat every 100ms via signalfd-polled loop. SIGTERM,
+/// SIGINT, SIGHUP are blocked + drained via signalfd, logged, ignored.
 /// Only SIGKILL exits this process.
-fn phase0() {
+fn heartbeat_loop(phase: &'static str) {
     let pid = process::id();
     let mut kmsg = open_kmsg();
     write_kmsg(
         &mut kmsg,
-        &format!("started pid={pid} (phase=phase0, ignoring SIGTERM/INT/HUP)"),
+        phase,
+        &format!("started pid={pid} (ignoring SIGTERM/INT/HUP)"),
     );
 
     // Block the signals we want to observe via signalfd. The block must
@@ -117,7 +126,7 @@ fn phase0() {
             Ok(0) => {
                 // Timeout: emit heartbeat and advance tick.
                 let seq = HEARTBEAT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-                write_kmsg(&mut kmsg, &format!("heartbeat seq={seq} pid={pid}"));
+                write_kmsg(&mut kmsg, phase, &format!("heartbeat seq={seq} pid={pid}"));
                 next_tick += tick;
                 // If we've fallen behind by more than one tick (slow
                 // I/O during shutdown), resync to "now + tick" so we
@@ -134,6 +143,7 @@ fn phase0() {
                         let signo = siginfo.ssi_signo;
                         write_kmsg(
                             &mut kmsg,
+                            phase,
                             &format!("caught signal={signo} pid={pid} (ignored)"),
                         );
                     }
@@ -143,6 +153,7 @@ fn phase0() {
                     Err(e) => {
                         write_kmsg(
                             &mut kmsg,
+                            phase,
                             &format!("signalfd read err={e} pid={pid} (continuing)"),
                         );
                     }
@@ -154,7 +165,11 @@ fn phase0() {
                 // SIGCHLD / other signals can fire). Just loop.
             }
             Err(e) => {
-                write_kmsg(&mut kmsg, &format!("poll err={e} pid={pid} (continuing)"));
+                write_kmsg(
+                    &mut kmsg,
+                    phase,
+                    &format!("poll err={e} pid={pid} (continuing)"),
+                );
             }
         }
     }
@@ -184,8 +199,8 @@ fn open_kmsg() -> KmsgWriter {
 /// prefix; `<6>` is INFO which surfaces on the kernel serial console
 /// at typical loglevel settings. The tag prefix matches what the VM
 /// test regexes for.
-fn write_kmsg(w: &mut KmsgWriter, msg: &str) {
-    let line = format!("<6>halmasuit-shutdown-probe[phase0]: {msg}\n");
+fn write_kmsg(w: &mut KmsgWriter, phase: &str, msg: &str) {
+    let line = format!("<6>halmasuit-shutdown-probe[{phase}]: {msg}\n");
     if let Some(f) = w.file.as_mut() {
         // Best-effort: write failures during shutdown are expected as
         // the system unwinds. Don't escalate.
