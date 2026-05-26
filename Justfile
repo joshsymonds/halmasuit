@@ -150,6 +150,9 @@ test-vm:
     echo "── visual-niri-session ──"
     nix build .#checks.x86_64-linux.visual-niri-session -L --print-build-logs --no-link
     echo
+    echo "── visual-logout-respawn ──"
+    nix build .#checks.x86_64-linux.visual-logout-respawn -L --print-build-logs --no-link
+    echo
     # R13 forcing function: real DMS DankGreeter (Quickshell+Qt6) as
     # halmasuit's greeter over the wallpaper, no-flash invariant intact.
     echo "── visual-dankgreeter ──"

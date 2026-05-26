@@ -955,6 +955,20 @@
           halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Epic #47 R1 hard gate: login → SIGKILL niri → broker-respawn
+        # greeter (NEW pid) → second login. Uses the same direct-niri
+        # session command pattern as visual-niri-session (bypassing
+        # niri-session's dbus dep) so the two-key swap_gate actually
+        # reaches Swapped under headless rendering.
+        visual-logout-respawn = import ./tests/visual-logout-respawn.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # R13 forcing function (the reason this epic exists): the
         # real DMS DankGreeter (Quickshell/Qt6 + greeter-niri) as
         # halmasuit's greeter. Scaffolded at epic #2 close (8925ca5);
