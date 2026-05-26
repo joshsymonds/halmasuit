@@ -969,6 +969,22 @@
           halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Epic #47 R2.1 hard gate: SIGTERM-arming + graceful tear-down.
+        # halmasuit ignores SIGTERM during the boot pivot (shutdown_armed
+        # = false in fromInitrd mode until Phase::RootfsReady), then
+        # honors it as the real shutdown signal post-arming. This test
+        # exercises the rootfs-only path (shutdown_armed=true at start)
+        # and asserts wallpaper-only recomposite + clean exit + no
+        # flash across the tear-down.
+        visual-shutdown-tear-down = import ./tests/visual-shutdown-tear-down.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # R13 forcing function (the reason this epic exists): the
         # real DMS DankGreeter (Quickshell/Qt6 + greeter-niri) as
         # halmasuit's greeter. Scaffolded at epic #2 close (8925ca5);

@@ -105,6 +105,15 @@ const MAX_GREETD_CONNECTIONS: usize = 4;
 /// Compositor state passed to calloop callbacks. Holds the smithay
 /// per-protocol state structs and the greetd-connection map; each new
 /// protocol adds its `*State` here as it lands.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "running / frame_pending / shutdown_armed / \
+              session_first_frame_emitted are semantically distinct \
+              lifecycle bits (main-loop run flag / per-tick render \
+              coalesce / shutdown gating / swap-gate key signaling). \
+              Folding them into a bitflag enum would obscure call-site \
+              intent without removing the per-flag cost."
+)]
 struct HalmasuitState {
     running: bool,
     display_handle: DisplayHandle,
@@ -330,6 +339,26 @@ struct HalmasuitState {
     /// Authorised greeter UID; connections from any other uid are
     /// dropped by `handle_listener_ready`.
     greeter_uid: u32,
+    /// Epic #47 R2.1: gates the SIGTERM handler's response.
+    ///
+    /// In the fromInitrd deployment, SIGTERM is sent twice in a
+    /// single boot: once during the boot pivot's
+    /// `systemd-shutdown --switch-root` kill spree (which we ignore
+    /// — survival is the whole point of the fromInitrd shape), and
+    /// again during the rootfs→shutdownRamfs pivot at actual system
+    /// shutdown (which SHOULD drive graceful tear-down).
+    /// Distinguishing them needs state: this flag flips true when
+    /// `Phase::RootfsReady` is emitted, which only happens AFTER the
+    /// boot pivot is complete.
+    /// A SIGTERM with this flag false in fromInitrd mode is the boot
+    /// pivot's kill spree (ignored, deferred to the
+    /// SurviveFinalKillSignal directive and the broker root-fd
+    /// handoff); with this flag true, it is the real shutdown signal.
+    ///
+    /// In rootfs-only mode (`services.halmasuit.enable=true` with no
+    /// fromInitrd), the flag flips true at startup completion — there's
+    /// no boot pivot to ignore.
+    shutdown_armed: bool,
     /// Held so the registered listener token survives for the lifetime
     /// of the compositor; calloop drops the source on shutdown.
     greetd_listener_token: Option<RegistrationToken>,
@@ -2854,6 +2883,52 @@ fn classify_reaped_child(
     }
 }
 
+/// Epic #47 R2.1: graceful shutdown. SIGKILL the greeter (if alive),
+/// composite wallpaper-only (no greeter, no session toplevel), emit
+/// `Event::Shutdown`, set `state.running = false` so the main loop
+/// exits on the next dispatch.
+///
+/// The wallpaper plane is composited from frame 0 by the existing
+/// `render_layer_elements` path; setting `state.greeter = None` and
+/// `state.foreground_toplevel = None` means the next render has no
+/// non-wallpaper elements, so the screen is wallpaper-only from this
+/// point until process exit. R2.2 will extend this so the wallpaper
+/// keeps painting THROUGH the rootfs→shutdownRamfs pivot until the
+/// kernel halts; for now the wallpaper holds until systemd-shutdown
+/// SIGKILLs halmasuit (the partial-scope alternative).
+fn graceful_shutdown(state: &mut HalmasuitState, reason: ShutdownReason) {
+    if let Some(g) = state.greeter.take() {
+        let pid = g.pid;
+        match pidfd_send_signal(&g.pidfd, libc::SIGKILL) {
+            Ok(()) => emit(&Event::GreeterTerminated { pid }),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    greeter_pid = pid,
+                    "graceful_shutdown: pidfd_send_signal greeter SIGKILL failed"
+                );
+            }
+        }
+    }
+    // Drop the foreground toplevel reference so the wallpaper plane
+    // composites alone. The session leader's lifecycle is the broker's
+    // problem (it's the sole reaper); we just stop showing the
+    // surface.
+    state.foreground_toplevel = None;
+    state.foreground = halmasuit_introspect::Foreground::Greeter;
+
+    // Recomposite once so the wallpaper-only state is visible this
+    // frame, not via a stale intermediate.
+    if let Some(backend) = state.drm_backend.as_mut()
+        && let Err(e) = backend.render_layer_elements(&state.output, None, HALMASUIT_BRAND_CLEAR)
+    {
+        tracing::warn!(error = %e, "graceful_shutdown: render_layer_elements failed");
+    }
+
+    emit(&Event::Shutdown { reason });
+    state.running = false;
+}
+
 /// Reap zombie children (coalesced SIGCHLD: one signal may cover
 /// several deaths — loop until `waitpid` drains). Beyond reaping,
 /// attribute each death: a greeter exit *before* authentication (R4)
@@ -3694,28 +3769,32 @@ fn main() -> io::Result<()> {
     // Signal source. Register BEFORE the first dispatch so a SIGTERM
     // racing startup is still caught.
     //
-    // Initramfs gating (Phase B): when halmasuit was started from the
-    // initramfs (`in_initramfs == true`), `initrd-cleanup.service`
-    // sends SIGTERM to every initramfs unit during the pivot to rootfs
-    // (`IgnoreOnIsolate=yes` doesn't prevent this — systemd 256+
-    // explicitly stops the unit, not just removes its watch). The
-    // boot-from-initrd deployment needs halmasuit to outlast that
-    // signal, mirroring drm-master-probe-phase2's
-    // `diagnostic_signal_handler` which logs SIGTERM and continues.
-    // The post-pivot graceful-shutdown path lands alongside the
-    // post-pivot privilege drop in a follow-up task.
+    // SIGTERM has two distinct meanings in the fromInitrd deployment:
+    //   1. During the boot pivot, `initrd-cleanup.service` sends
+    //      SIGTERM to every initramfs unit as systemd-shutdown tears
+    //      down the initramfs and switches root. halmasuit MUST
+    //      survive this (the whole point of the fromInitrd shape) —
+    //      its `SurviveFinalKillSignal=yes` directive prevents the
+    //      kill spree's SIGKILL from landing, and we ignore the
+    //      preceding SIGTERM here.
+    //   2. At actual system shutdown, systemd-shutdown sends SIGTERM
+    //      to halmasuit again BEFORE pivoting to /run/initramfs/
+    //      shutdown. This one drives graceful tear-down: SIGKILL the
+    //      greeter (if alive), composite wallpaper-only, exit cleanly.
+    //
+    // `state.shutdown_armed` distinguishes them: false during the
+    // boot pivot window (until `Phase::RootfsReady` fires the flip),
+    // true thereafter. In rootfs-only (`services.halmasuit.enable=
+    // true`) mode the flag starts true at construction — no boot
+    // pivot to survive.
     let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT, Signal::SIGCHLD])?;
-    let started_from_initramfs = in_initramfs;
     loop_handle
         .insert_source(
             signals,
             move |event, (), state: &mut HalmasuitState| match event.signal() {
                 Signal::SIGCHLD => reap_zombie_children(state),
-                Signal::SIGTERM if started_from_initramfs => {
-                    tracing::info!(
-                        "SIGTERM ignored (started_from_initramfs=true). \
-                         Post-pivot graceful shutdown lands in a follow-up Phase B task."
-                    );
+                Signal::SIGTERM if !state.shutdown_armed => {
+                    tracing::info!("SIGTERM ignored (shutdown_armed=false, boot pivot in flight)");
                 }
                 sig => {
                     let reason = match sig {
@@ -3723,8 +3802,7 @@ fn main() -> io::Result<()> {
                         Signal::SIGINT => ShutdownReason::SignalInt,
                         _ => ShutdownReason::Internal,
                     };
-                    emit(&Event::Shutdown { reason });
-                    state.running = false;
+                    graceful_shutdown(state, reason);
                 }
             },
         )
@@ -3875,6 +3953,12 @@ fn main() -> io::Result<()> {
         pam_service,
         broker_socket: broker_socket_path_from_env(),
         greeter_uid,
+        // Epic #47 R2.1: in rootfs-only mode no boot-pivot kill spree
+        // exists, so SIGTERM should drive graceful shutdown from the
+        // start. In fromInitrd mode the pivot-poll calloop source flips
+        // this true on `Phase::RootfsReady` — before that, SIGTERM is
+        // the boot kill spree and stays ignored.
+        shutdown_armed: !in_initramfs,
         greetd_listener_token,
         drm_backend,
         _drm_token: drm_token,
@@ -4111,6 +4195,10 @@ fn main() -> io::Result<()> {
                             emit(&Event::PhaseEntered {
                                 phase: Phase::RootfsReady,
                             });
+                            // Epic #47 R2.1: the boot pivot is complete.
+                            // A SIGTERM from this point is the real
+                            // shutdown signal, not the boot kill spree.
+                            state.shutdown_armed = true;
                             phase = PivotPhase::Connecting {
                                 deadline: Instant::now() + Duration::from_secs(10),
                                 next_delay: Duration::from_millis(20),
