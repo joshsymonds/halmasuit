@@ -92,6 +92,9 @@ test-vm:
     echo "── visual-phase-b-enc-image ──"
     nix build .#checks.x86_64-linux.visual-phase-b-enc-image -L --print-build-logs --no-link
     echo
+    echo "── visual-phase-b-enc-shader ──"
+    nix build .#checks.x86_64-linux.visual-phase-b-enc-shader -L --print-build-logs --no-link
+    echo
     echo "── run-pam-auth ──"
     nix build .#checks.x86_64-linux.run-pam-auth -L --print-build-logs --no-link
     echo
@@ -305,6 +308,10 @@ test-vm-visual-phase-b-side-video:
 # halmasuit-luks ask-password responder.
 test-vm-visual-phase-b-enc-image:
     nix build .#checks.x86_64-linux.visual-phase-b-enc-image -L --print-build-logs --no-link
+
+# Phase B cell — LUKS-encrypted ROOT × shader wallpaper.
+test-vm-visual-phase-b-enc-shader:
+    nix build .#checks.x86_64-linux.visual-phase-b-enc-shader -L --print-build-logs --no-link
 
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.
