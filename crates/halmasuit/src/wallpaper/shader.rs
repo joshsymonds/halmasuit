@@ -159,7 +159,27 @@ impl ShaderBackend {
         let raw = std::fs::read_to_string(source).map_err(|e| {
             io::Error::other(format!("read wallpaper shader {}: {e}", source.display()))
         })?;
+        let shadertoy = is_shadertoy_shape(&raw);
         let final_src = assemble_source(&raw);
+
+        // Shadertoy shape couples its injected preamble + wrapper to
+        // a fixed set of uniforms (iResolution, iTime, …). The
+        // wrapper passes `gl_FragCoord.xy` into `mainImage` and the
+        // user shader divides by `iResolution`; if that uniform is
+        // unbound it defaults to vec3(0) and every fragment computes
+        // `fragCoord/0 = Inf`, clamped to a solid color. Merge the
+        // canonical Shadertoy bindings in for Shadertoy-shape
+        // shaders so the JSON-config path (whose Nix option defaults
+        // `uniforms` to `{}`) is no worse than the env-var path's
+        // `infer_from_path`. User-supplied entries win on key
+        // collisions — a user that wants a Static iResolution still
+        // gets one.
+        let mut uniforms = uniforms;
+        if shadertoy {
+            for (k, v) in super::config::default_shadertoy_bindings() {
+                uniforms.entry(k).or_insert(v);
+            }
+        }
 
         // Stable order: sort by name so the binding list is
         // deterministic across runs (the HashMap iteration order is
@@ -473,6 +493,91 @@ mod tests {
             "assembled source must not declare #version; smithay \
              prepends it during compile"
         );
+    }
+
+    /// Mirror of the merge logic in `ShaderBackend::new` — the
+    /// constructor needs a live `GlesRenderer` so we can't drive it
+    /// directly here, but the merge itself is a pure HashMap
+    /// operation and pinning its behavior in a unit test catches the
+    /// regression class that produced solid-color shader goldens
+    /// (Shadertoy-shape shader + empty `uniforms` map → unbound
+    /// `iResolution` → `fragCoord/0 = Inf` → constant fragment).
+    fn merge_shadertoy_defaults(
+        src: &str,
+        user: HashMap<String, UniformBinding>,
+    ) -> HashMap<String, UniformBinding> {
+        let mut out = user;
+        if is_shadertoy_shape(src) {
+            for (k, v) in super::super::config::default_shadertoy_bindings() {
+                out.entry(k).or_insert(v);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn shadertoy_shape_with_empty_user_map_auto_binds_canonical_uniforms() {
+        // Reproduces the JSON-config-path bug: the Nix module's
+        // `uniforms` option defaults to `{}`, so a Shadertoy-shape
+        // shader configured via `services.halmasuit.wallpaper`
+        // arrived at ShaderBackend with an empty bindings map. The
+        // injected preamble + wrapper still reference iResolution /
+        // iTime / etc., so without a merge they end up unbound.
+        let merged = merge_shadertoy_defaults(PHASE_B_SHADER_FIXTURE, HashMap::new());
+        assert!(matches!(
+            merged.get("iResolution"),
+            Some(UniformBinding::AutoResolution)
+        ));
+        assert!(matches!(
+            merged.get("iTime"),
+            Some(UniformBinding::AutoTime)
+        ));
+        assert!(matches!(
+            merged.get("iFrame"),
+            Some(UniformBinding::AutoFrame)
+        ));
+    }
+
+    #[test]
+    fn shadertoy_shape_user_provided_uniform_wins_over_default() {
+        // A user that ships a Shadertoy shader and explicitly binds
+        // iTime to a Static value must NOT have the merge overwrite
+        // it. Defaults fill MISSING keys only — `HashMap::entry`'s
+        // `or_insert` semantics.
+        let mut user = HashMap::new();
+        user.insert(
+            "iTime".to_owned(),
+            UniformBinding::Static {
+                value: StaticValue::Float(42.0),
+            },
+        );
+        let merged = merge_shadertoy_defaults(PHASE_B_SHADER_FIXTURE, user);
+        assert!(
+            matches!(
+                merged.get("iTime"),
+                Some(UniformBinding::Static { value: StaticValue::Float(v) }) if (*v - 42.0).abs() < f32::EPSILON
+            ),
+            "user-provided Static iTime must survive the merge"
+        );
+        // The OTHER defaults still land — only the colliding key is
+        // preserved as the user provided.
+        assert!(matches!(
+            merged.get("iResolution"),
+            Some(UniformBinding::AutoResolution)
+        ));
+    }
+
+    #[test]
+    fn declared_uniform_shape_does_not_auto_bind_shadertoy_defaults() {
+        // Non-Shadertoy shape: the assembler passes the source
+        // through untouched, so the wrapper never gets injected and
+        // the user shader doesn't reference iResolution / iTime by
+        // name. Auto-binding them here would inject phantom uniforms
+        // that GetUniformLocation reports as -1 (silent no-op), but
+        // it'd also confuse the audit log + the binding count.
+        let user = "uniform float t;\nvoid main() { gl_FragColor = vec4(t); }";
+        let merged = merge_shadertoy_defaults(user, HashMap::new());
+        assert!(merged.is_empty());
     }
 
     #[test]

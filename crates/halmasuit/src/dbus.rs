@@ -319,6 +319,25 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_scene_empty_string_routes_to_current_slot() {
+        // The `match scene` arm at snapshot_impl pairs `""` with
+        // `"current"`. Pin that mapping so an accidental split into
+        // two separate arms (with the empty-string variant dropped)
+        // is caught — busctl callers occasionally pass `""` from
+        // shell scripts where the variable expanded to nothing, and
+        // the contract is "treat as current", not "reject".
+        let bufs = empty_handles();
+        *bufs.current.lock().unwrap() = Some(solid(2, 2, [11, 22, 33, 255]));
+        let iface = Introspect { bufs };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("empty.png");
+        iface
+            .snapshot_impl(path.to_str().unwrap(), "")
+            .expect("empty scene must route to current");
+        assert!(path.exists());
+    }
+
+    #[test]
     fn snapshot_scene_unknown_value_errors() {
         let iface = Introspect {
             bufs: empty_handles(),

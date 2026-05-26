@@ -887,19 +887,21 @@ impl DrmBackend {
         self.render_with_elements_inner(output, &elements, clear_color)
     }
 
-    fn render_with_elements_inner<E>(
+    fn render_with_elements_inner(
         &mut self,
         output: &smithay::output::Output,
-        elements: &[E],
+        elements: &[SceneElement],
         clear_color: [u8; 4],
-    ) -> io::Result<bool>
-    where
-        E: smithay::backend::renderer::element::RenderElement<GlesRenderer>,
-    {
+    ) -> io::Result<bool> {
         let color = xrgb_le_to_color32f(clear_color);
         let render_res = self
             .compositor
-            .render_frame::<_, E>(&mut self.renderer, elements, color, FrameFlags::DEFAULT)
+            .render_frame::<_, SceneElement>(
+                &mut self.renderer,
+                elements,
+                color,
+                FrameFlags::DEFAULT,
+            )
             .map_err(|e| io::Error::other(format!("render_frame: {e}")))?;
 
         if render_res.is_empty {
@@ -941,15 +943,12 @@ impl DrmBackend {
     /// the same element set and clear. The cost (an extra render +
     /// GPU→CPU sync) is exactly why this is feature-gated.
     #[cfg(feature = "frame_audit")]
-    fn audit_frame<E>(
+    fn audit_frame(
         &mut self,
         output: &smithay::output::Output,
-        elements: &[E],
+        elements: &[SceneElement],
         clear_color: [u8; 4],
-    ) -> io::Result<()>
-    where
-        E: smithay::backend::renderer::element::RenderElement<GlesRenderer>,
-    {
+    ) -> io::Result<()> {
         let (rgba, wu, hu) = self.read_frame_rgba(output, elements, clear_color)?;
         let stats = crate::frame_audit::analyze(&rgba, wu, hu);
         // Publish the frame for the D-Bus `Snapshot()` reader. A
@@ -975,45 +974,55 @@ impl DrmBackend {
         // covering the wallpaper plane, so all six matrix cells'
         // session goldens otherwise end up byte-identical). Re-render
         // ONLY the wallpaper element to an offscreen texture and
-        // publish it to a separate slot the D-Bus `Snapshot(path,
-        // "wallpaper-only")` call can read. Variant-distinct without
-        // racing the test driver against Quickshell's QML startup.
+        // publish it to a separate slot the D-Bus
+        // `SnapshotScene(path, "wallpaper-only")` call can read.
         //
-        // Best-effort: a failure here logs and skips the publish so
-        // the main snapshot path continues working. The render is
-        // gated on `wallpaper.has_backend()` so the legacy-clear path
-        // never burns the cost.
-        if self.wallpaper.has_backend()
-            && let Err(e) = self.audit_wallpaper_only(output, clear_color)
-        {
+        // We REUSE the wallpaper element the live render already
+        // built — do NOT call `self.wallpaper.render_element` again.
+        // Re-calling would advance per-frame state in
+        // `ShaderBackend` / `VideoBackend` (frame_counter, last_frame,
+        // texture upload), so the live render's NEXT frame would see
+        // mid-frame state drift. Best-effort: a failure logs and
+        // skips the publish so the main snapshot path keeps working.
+        if let Err(e) = self.audit_wallpaper_only(output, elements, clear_color) {
             tracing::warn!(error = %e, "frame_audit wallpaper-only readback failed");
         }
         Ok(())
     }
 
-    /// Re-render JUST the wallpaper element (no cursor / no layers /
-    /// no foreground toplevel) into an offscreen texture and publish
-    /// the bytes to `wallpaper_only_buf`. Companion to `audit_frame`;
-    /// invoked from the same code site so both slots track the same
-    /// wallpaper tick (matters for the shader/video backends whose
-    /// content advances per frame).
+    /// Render JUST the wallpaper element from `elements` (no cursor /
+    /// no layers / no foreground toplevel) into an offscreen texture
+    /// and publish the bytes to `wallpaper_only_buf`.
+    ///
+    /// Reuses the already-built wallpaper element from the live
+    /// composition's `elements` slice rather than calling
+    /// `WallpaperBackend::render_element` again — the shader + video
+    /// backends mutate per-frame timing state on every call and a
+    /// second call would corrupt the live render's next frame. If no
+    /// wallpaper element is in the list (legacy-clear path), returns
+    /// Ok without publishing.
     #[cfg(feature = "frame_audit")]
     fn audit_wallpaper_only(
         &mut self,
         output: &smithay::output::Output,
+        elements: &[SceneElement],
         clear_color: [u8; 4],
     ) -> io::Result<()> {
-        let osize = output.current_mode().map(|m| m.size).unwrap_or_default();
-        let dst = smithay::utils::Size::<i32, smithay::utils::Logical>::from((osize.w, osize.h));
-        let Some(element) = self.wallpaper.render_element(&mut self.renderer, dst)? else {
-            // Wallpaper backend declined to produce an element this
-            // tick (e.g., video pre-decode). Leave the slot at its
-            // last good value — variant-distinct goldens captured
-            // earlier in the boot remain valid.
+        // Wallpaper variants live in the SceneElement enum; match on
+        // the enum so we don't have to depend on scene_elements' z-
+        // order convention staying constant. `Wallpaper` covers
+        // image + video (both produce `TextureRenderElement`);
+        // `WallpaperShader` covers the shader backend.
+        let Some(wallpaper_elem) = elements.iter().find(|e| {
+            matches!(
+                e,
+                SceneElement::Wallpaper(_) | SceneElement::WallpaperShader(_)
+            )
+        }) else {
             return Ok(());
         };
-        let elements = [element];
-        let (rgba, wu, hu) = self.read_frame_rgba(output, &elements, clear_color)?;
+        let one = std::slice::from_ref(wallpaper_elem);
+        let (rgba, wu, hu) = self.read_frame_rgba(output, one, clear_color)?;
         if let Ok(mut slot) = self.wallpaper_only_buf.lock() {
             *slot = Some(crate::dbus::FrameBuf {
                 rgba,
@@ -1034,15 +1043,12 @@ impl DrmBackend {
     /// offscreen GLES render-target mechanism lives in its own cohesive
     /// `frame_audit`-gated module so production never compiles it.
     #[cfg(feature = "frame_audit")]
-    fn read_frame_rgba<E>(
+    fn read_frame_rgba(
         &mut self,
         output: &smithay::output::Output,
-        elements: &[E],
+        elements: &[SceneElement],
         clear_color: [u8; 4],
-    ) -> io::Result<(Vec<u8>, usize, usize)>
-    where
-        E: smithay::backend::renderer::element::RenderElement<GlesRenderer>,
-    {
+    ) -> io::Result<(Vec<u8>, usize, usize)> {
         let color = xrgb_le_to_color32f(clear_color);
         crate::offscreen::read_frame_rgba(&mut self.renderer, output, elements, color)
     }

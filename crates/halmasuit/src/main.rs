@@ -2265,17 +2265,18 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
     // is invoked only from the fromInitrd pivot-poll timer); the
     // single main()-time connect is sufficient there.
     //
-    // Sync `serve` — even though we're inside the calloop dispatcher
-    // and zbus' SASL handshake can burn ~tens of ms, the spawned
-    // thread's `connect(2)` would race against `drop_privileges` below
-    // and authenticate as the post-drop compositor uid instead of
-    // root, breaking the org.halmasuit `<allow own user="root"/>`
-    // policy (dbus-broker authenticates the connecting peer via
-    // SO_PEERCRED at connect time, which reads the *current* effective
-    // uid). The previous `serve_async` shape lost the pre-drop euid
-    // guarantee here for that reason. Accept the one-time post-pivot
-    // jitter; no frames are racing against it yet (the greeter is
-    // still loading QML when this fires).
+    // Sync `serve` is the only correct shape here, even though we're
+    // inside the calloop dispatcher and zbus' SASL handshake can burn
+    // ~tens of ms. The connect MUST run on the caller thread with
+    // root euid: `drop_privileges` below is the next thing this
+    // function does, dbus-broker authenticates the connecting peer
+    // via SO_PEERCRED at `connect(2)` time, and that reads the
+    // *current* effective uid. Any thread-internal connect would
+    // race the drop and authenticate as the post-drop compositor uid,
+    // refused by the `<allow own user="root"/>` policy on
+    // org.halmasuit. The one-time post-pivot jitter is harmless: no
+    // frames are racing against it yet (the greeter is still loading
+    // QML when this fires).
     #[cfg(feature = "frame_audit")]
     if let Some(backend) = state.drm_backend.as_ref() {
         dbus::serve(backend.snapshot_handle());
