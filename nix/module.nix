@@ -1047,8 +1047,11 @@ in
          #    sends `/proc/self/root` via SCM_RIGHTS; halmasuit
          #    `fchdir + chroot`s into rootfs's process-root before
          #    binding the post-pivot listener, spawning the greeter,
-         #    and dropping privileges. See `migrate_to_broker_root`
-         #    in crates/halmasuit/src/main.rs and the
+         #    and dropping privileges. See the `PivotPhase` state
+         #    machine in crates/halmasuit/src/main.rs (the
+         #    `try_connect_and_request_root_fd` / `try_recv_root_fd`
+         #    / `apply_chroot_to_root_fd` helpers drive one
+         #    non-blocking step per tick) and the
          #    `serve_root_fd_request` SO_PEERCRED gate in
          #    crates/halmasuit-session/src/broker.rs.
          #

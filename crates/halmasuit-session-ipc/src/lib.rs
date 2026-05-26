@@ -544,14 +544,27 @@ mod tests {
     }
 
     #[test]
-    fn session_lifecycle_is_broker_to_compositor_only() {
-        // A5.1 one-way invariant: a session_opened / session_ended /
-        // root_fd datagram MUST NOT decode as any CompositorToBroker
-        // variant (the compositor never *emits* lifecycle or root-fd
-        // grants; the type only deserializes broker→compositor).
-        // Structural anti-forge guarantee — there is no frame the
-        // unprivileged compositor can send that asserts session
-        // lifecycle or the broker-mediated process-root migration.
+    fn broker_to_compositor_only_frames_do_not_cross_decode_as_compositor_to_broker() {
+        // Structural anti-forge guarantee: frames the unprivileged
+        // compositor must NEVER be able to forge MUST NOT decode as
+        // any `CompositorToBroker` variant. Covers two distinct
+        // invariants in one structural check, both held by the
+        // tagged-enum discriminator:
+        //
+        //   - Session lifecycle (A5.1): `session_opened` /
+        //     `session_ended{outcome=...}` are emitted by the broker
+        //     ONLY; the compositor is a pure lifecycle sink. There
+        //     is no `CompositorToBroker::Session*` variant.
+        //
+        //   - Cross-pivot process-root migration (Phase B v2):
+        //     `root_fd` is the broker's SCM_RIGHTS-attached grant
+        //     of its `/proc/self/root` fd. Only the broker emits
+        //     it; the compositor receives + chroots. There is no
+        //     `CompositorToBroker::RootFd*` variant.
+        //
+        // The two are different protocol concerns (session
+        // lifecycle vs. fd grant) but the same anti-forge defense
+        // (tag-disjointness), tested together.
         for frame in [
             BrokerToCompositor::SessionOpened,
             BrokerToCompositor::SessionEnded {
@@ -566,7 +579,8 @@ mod tests {
             let as_c2b: Result<Option<(CompositorToBroker, usize)>, _> = try_decode(&bytes);
             assert!(
                 matches!(as_c2b, Err(CodecError::Json(_))),
-                "lifecycle frame must not decode as CompositorToBroker, got {as_c2b:?}"
+                "broker-to-compositor-only frame must not decode as \
+                 CompositorToBroker, got {as_c2b:?}"
             );
         }
     }

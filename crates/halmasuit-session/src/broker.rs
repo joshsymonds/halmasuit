@@ -322,6 +322,77 @@ struct BrokerLoop {
     loop_handle: calloop::LoopHandle<'static, Self>,
     loop_signal: LoopSignal,
     running: bool,
+    /// Rate-limiter for the `RequestRootFd` refusal log. An
+    /// unprivileged peer can spam the SO_PEERCRED gate by repeatedly
+    /// connecting and sending the frame; without a limiter every
+    /// refused attempt would emit a journal line. See
+    /// [`RefusalLog::record_refusal`].
+    refusal_log: RefusalLog,
+}
+
+/// Token-bucket-ish suppressor for the `RequestRootFd` refusal log.
+/// Keyed by peer uid (the uid the SO_PEERCRED check refused), it
+/// records one log line per peer per `SUPPRESS_WINDOW`, including a
+/// suppressed-count summary when the window rolls over. Bounds
+/// journald spam from a peer in a tight `connect + RequestRootFd +
+/// disconnect` loop while still surfacing first-occurrence and
+/// periodic re-occurrence.
+#[derive(Default)]
+struct RefusalLog {
+    per_puid: std::collections::HashMap<u32, RefusalState>,
+}
+
+struct RefusalState {
+    last_logged: Instant,
+    suppressed: u32,
+}
+
+impl RefusalLog {
+    /// 1-minute log-suppression window per peer uid. Long enough to
+    /// dampen a serious spam attempt; short enough that occasional
+    /// "is the gate still refusing?" debugging finds a line.
+    const SUPPRESS_WINDOW: Duration = Duration::from_mins(1);
+
+    /// Record a refused `RequestRootFd` attempt from `puid`; emit the
+    /// log line iff this peer hasn't logged within the suppression
+    /// window. On window roll-over the line carries a
+    /// `(+N suppressed in last <window>s)` summary.
+    fn record_refusal(&mut self, puid: u32, relay_peer_uid: u32) {
+        let now = Instant::now();
+        let entry = self.per_puid.entry(puid).or_insert_with(|| RefusalState {
+            // Initialise as if the last log were one window ago, so
+            // the very first refusal from this peer logs immediately.
+            // `checked_sub` defends against the (theoretically
+            // possible but vanishingly unlikely) case where `now`
+            // is less than the suppression window since process
+            // start — in that case fall back to `now`, which
+            // suppresses the first refusal-log line (harmless).
+            last_logged: now
+                .checked_sub(Self::SUPPRESS_WINDOW + Duration::from_secs(1))
+                .unwrap_or(now),
+            suppressed: 0,
+        });
+        if now.duration_since(entry.last_logged) >= Self::SUPPRESS_WINDOW {
+            if entry.suppressed > 0 {
+                tracing_log(&format!(
+                    "RequestRootFd refused: peer uid {puid} is neither root \
+                     nor relay_peer_uid {relay_peer_uid} (+{} suppressed in \
+                     last {}s)",
+                    entry.suppressed,
+                    Self::SUPPRESS_WINDOW.as_secs()
+                ));
+            } else {
+                tracing_log(&format!(
+                    "RequestRootFd refused: peer uid {puid} is neither root \
+                     nor relay_peer_uid {relay_peer_uid}"
+                ));
+            }
+            entry.last_logged = now;
+            entry.suppressed = 0;
+        } else {
+            entry.suppressed = entry.suppressed.saturating_add(1);
+        }
+    }
 }
 
 impl BrokerLoop {
@@ -418,12 +489,14 @@ fn tracing_log(msg: &str) {
 /// The connection is dedicated to the root-fd transfer; the caller
 /// closes it after this returns (either we sent the fd, or we
 /// refused — no further frames are expected on this channel).
-fn serve_root_fd_request(greeter: &SeqpacketChannel, puid: u32, relay_peer_uid: u32) {
+fn serve_root_fd_request(
+    greeter: &SeqpacketChannel,
+    puid: u32,
+    relay_peer_uid: u32,
+    refusal_log: &mut RefusalLog,
+) {
     if puid != 0 && puid != relay_peer_uid {
-        tracing_log(&format!(
-            "RequestRootFd refused: peer uid {puid} is neither root \
-             nor relay_peer_uid {relay_peer_uid}"
-        ));
+        refusal_log.record_refusal(puid, relay_peer_uid);
         return;
     }
     match std::fs::File::open("/proc/self/root") {
@@ -456,6 +529,26 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
         Err(e) => return Err(e),
     };
+    // Slow-loris guard: cap the first-frame recv at 5s via
+    // SO_RCVTIMEO so an unprivileged peer that connects without
+    // sending cannot wedge the broker calloop for an unbounded
+    // window. Legitimate clients (the compositor + the VM test
+    // client) send their first frame within ms of connect — 5s is
+    // huge headroom. setsockopt failures are logged but don't abort
+    // the admission: the per-uid refusal-log rate-limiter still
+    // bounds attacker-driven log spam, the broker idle-exit still
+    // bounds total uptime, and a failed setsockopt is a defense
+    // weakness, not a correctness break.
+    if let Err(e) = nix::sys::socket::setsockopt(
+        &greeter,
+        nix::sys::socket::sockopt::ReceiveTimeout,
+        &nix::sys::time::TimeVal::new(5, 0),
+    ) {
+        tracing_log(&format!(
+            "setsockopt(SO_RCVTIMEO) failed: {e}; \
+             accepted connection without slow-loris timeout"
+        ));
+    }
     let puid = match peer_uid(&greeter) {
         Ok(u) => u,
         Err(e) => {
@@ -466,7 +559,12 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
     let begin = match greeter.recv::<CompositorToBroker>() {
         Ok(CompositorToBroker::BeginAuth { service, username }) => (service, username),
         Ok(CompositorToBroker::RequestRootFd) => {
-            serve_root_fd_request(&greeter, puid, bl.slot.relay_peer_uid());
+            serve_root_fd_request(
+                &greeter,
+                puid,
+                bl.slot.relay_peer_uid(),
+                &mut bl.refusal_log,
+            );
             return Ok(true);
         }
         Ok(_) => {
@@ -606,6 +704,7 @@ pub fn run_broker(listener_fd: RawFd, relay_peer_uid: u32) -> io::Result<()> {
         loop_handle,
         loop_signal,
         running: true,
+        refusal_log: RefusalLog::default(),
     };
 
     while bl.running {
@@ -1139,7 +1238,8 @@ mod tests {
         // 1001 is also non-zero — root is allowed by a separate clause
         // (see the root test below), and this case checks the
         // non-root non-peer path is refused.
-        serve_root_fd_request(&broker_end, GREETER + 1, GREETER);
+        let mut refusal_log = RefusalLog::default();
+        serve_root_fd_request(&broker_end, GREETER + 1, GREETER, &mut refusal_log);
         // The unauthorized peer must NOT have received a frame — the
         // broker dropped the connection without sending. Reading from
         // the compositor end of the closed channel yields EOF, not a
@@ -1163,7 +1263,8 @@ mod tests {
     fn root_fd_request_sends_fd_to_authorized_relay_peer() {
         use std::os::fd::OwnedFd;
         let (compositor, broker_end) = pair();
-        serve_root_fd_request(&broker_end, GREETER, GREETER);
+        let mut refusal_log = RefusalLog::default();
+        serve_root_fd_request(&broker_end, GREETER, GREETER, &mut refusal_log);
         drop(broker_end);
         let (frame, fd): (BrokerToCompositor, Option<OwnedFd>) =
             recv_frame_with_fd(&compositor).expect("authorized peer receives the RootFd frame");
@@ -1192,7 +1293,8 @@ mod tests {
         let (compositor, broker_end) = pair();
         // puid = 0 (root); relay_peer_uid = 1000 (something else
         // entirely). Must still send the fd.
-        serve_root_fd_request(&broker_end, 0, GREETER);
+        let mut refusal_log = RefusalLog::default();
+        serve_root_fd_request(&broker_end, 0, GREETER, &mut refusal_log);
         drop(broker_end);
         let (frame, fd): (BrokerToCompositor, Option<OwnedFd>) =
             recv_frame_with_fd(&compositor).expect("root peer receives the RootFd frame");
@@ -1203,6 +1305,89 @@ mod tests {
         assert!(
             fd.is_some(),
             "RootFd frame must carry an SCM_RIGHTS fd attachment"
+        );
+    }
+
+    /// `RefusalLog` suppresses repeat-refusal log lines from the same
+    /// peer uid within a window. Verifies the suppression itself
+    /// (state mutation: a non-zero suppressed count is recorded), not
+    /// the log output (`tracing_log` writes to stderr — the test
+    /// would race against journald). One refused attempt logs; the
+    /// next 99 record into `suppressed`.
+    #[test]
+    fn refusal_log_suppresses_repeat_refusals_within_window() {
+        let mut log = RefusalLog::default();
+        // First refusal: logs immediately, suppressed remains 0.
+        log.record_refusal(1001, GREETER);
+        let entry = log
+            .per_puid
+            .get(&1001)
+            .expect("first refusal recorded an entry");
+        assert_eq!(
+            entry.suppressed, 0,
+            "first refusal must log; suppressed should be 0"
+        );
+        // 99 more refusals within the suppression window: all should
+        // bump the suppressed counter without logging.
+        for _ in 0..99 {
+            log.record_refusal(1001, GREETER);
+        }
+        let entry = log.per_puid.get(&1001).expect("entry still present");
+        assert_eq!(
+            entry.suppressed, 99,
+            "99 follow-up refusals should be suppressed, not logged"
+        );
+    }
+
+    /// Slow-loris guard: the SO_RCVTIMEO that admit_one sets on the
+    /// accepted greeter fd MUST cause `recv` to return EAGAIN/
+    /// ETIMEDOUT (TransportError::Io kind WouldBlock or TimedOut) if
+    /// no first-frame arrives within the timeout window. Without
+    /// this, an attacker can connect-and-stall to wedge the broker.
+    /// Test uses a 100ms timeout (vs the 5s production value) so it
+    /// can complete promptly.
+    #[test]
+    fn accepted_fd_recv_times_out_when_peer_stalls() {
+        use std::time::Instant;
+        let (a, b) = pair();
+        // Set 100ms recv timeout on `a`.
+        nix::sys::socket::setsockopt(
+            &a,
+            nix::sys::socket::sockopt::ReceiveTimeout,
+            &nix::sys::time::TimeVal::new(0, 100_000),
+        )
+        .expect("setsockopt SO_RCVTIMEO");
+        // `b` never sends. `a.recv` must return Err within ~100ms.
+        let start = Instant::now();
+        let r: Result<CompositorToBroker, _> = a.recv();
+        let elapsed = start.elapsed();
+        assert!(
+            r.is_err(),
+            "recv must error after SO_RCVTIMEO elapses, got {r:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(80) && elapsed < Duration::from_millis(500),
+            "recv should have blocked ~100ms, actually {elapsed:?}"
+        );
+        drop(b);
+    }
+
+    /// Suppression is per-peer-uid: a refusal from a different uid
+    /// should NOT inherit the prior peer's suppression state.
+    #[test]
+    fn refusal_log_suppression_is_per_peer_uid() {
+        let mut log = RefusalLog::default();
+        log.record_refusal(1001, GREETER);
+        log.record_refusal(1001, GREETER);
+        log.record_refusal(1001, GREETER);
+        let entry_a = log.per_puid.get(&1001).expect("entry a");
+        assert_eq!(entry_a.suppressed, 2, "two refusals suppressed for 1001");
+        // Different uid: starts fresh.
+        log.record_refusal(1002, GREETER);
+        let entry_b = log.per_puid.get(&1002).expect("entry b");
+        assert_eq!(
+            entry_b.suppressed, 0,
+            "first refusal from a different uid must log, not inherit"
         );
     }
 }

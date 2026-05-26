@@ -660,8 +660,17 @@ mod tests {
         // filesystem paths.
         let listener = bind_socket(&abstract_path, 0o600).expect("bind_socket abstract");
 
-        // No filesystem entry was created — the abstract namespace
-        // does not touch any path on disk.
+        // Regression detector for "bind_socket fell through to the
+        // filesystem-path branch on @-prefixed input": if the
+        // strip_prefix("@") arm somehow didn't fire, `UnixListener::bind`
+        // would create a filesystem inode in CWD literally named
+        // `@<name>` (Linux permits `@` in filenames). The assertion
+        // catches that — it is NOT tautological. The /proc/net/unix
+        // check below also catches the same regression because the
+        // fs-fallthrough socket would carry an absolute path in its
+        // Path column rather than the `@<name>` abstract-namespace
+        // marker; the two checks compose to pin both halves of the
+        // contract (no inode + abstract entry present).
         assert!(
             !std::path::Path::new(&format!("@{name}")).exists(),
             "abstract bind must not create a filesystem inode"

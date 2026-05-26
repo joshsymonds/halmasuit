@@ -2180,6 +2180,20 @@ fn record_session_started(spawn: &SpawnRequest, session_uid: &mut Option<u32>) {
 /// halmasuit would die mid-boot leaving the rootfs without its
 /// compositor.
 fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
+    // Accumulate per-step errors so the function reports them in
+    // aggregate at the end (or as context on a hard failure).
+    // Steps 1 + 2 are degraded-state recoverable: a greetd bind
+    // failure or greeter spawn failure means "no auth surface
+    // right now," but halmasuit can stay alive as the unprivileged
+    // compositor and the operator can fix forward without
+    // restarting the boot. Step 3 (drop_privileges) is NOT
+    // recoverable in place: if drop fails and we're still root,
+    // halmasuit must die so the unit's `Restart=on-failure` cycles
+    // the boot. The "die rather than continue as root" floor
+    // applies symmetrically to the "no HALMASUIT_COMPOSITOR_UID
+    // env" path below.
+    let mut step_errors: Vec<String> = Vec::new();
+
     // (1) Bind greetd listener while still root.
     match setup_greetd_listener(&state.loop_handle) {
         Ok((token, greeter_uid, pam_service)) => {
@@ -2189,6 +2203,7 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
         }
         Err(e) => {
             tracing::error!(error = %e, "post-pivot: setup_greetd_listener failed");
+            step_errors.push(format!("setup_greetd_listener: {e}"));
         }
     }
 
@@ -2209,6 +2224,7 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
             }
             Err(e) => {
                 tracing::error!(error = %e, greeter_cmd = %cmd.display(), "post-pivot greeter spawn failed");
+                step_errors.push(format!("spawn_greeter: {e}"));
             }
         }
     } else {
@@ -2216,23 +2232,44 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
     }
 
     // (3) Drop privileges. Compositor uid is now resolvable against
-    // the rootfs /etc/passwd (the pivot completed).
+    // the rootfs /etc/passwd (the pivot completed). If drop fails
+    // OR the env is missing while still root, return Err — the
+    // unit's Restart=on-failure cycles the boot, which is strictly
+    // preferable to continuing as root with no greeter.
     match compositor_uid_from_env()? {
         Some(uid) => {
-            drop_privileges(uid)?;
+            if let Err(e) = drop_privileges(uid) {
+                return Err(io::Error::other(format!(
+                    "drop_privileges({uid}): {e}; \
+                     prior step errors: {step_errors:?}"
+                )));
+            }
             emit(&Event::PhaseEntered {
                 phase: Phase::Deprivileged,
             });
         }
         None if nix::unistd::geteuid().is_root() => {
-            return Err(io::Error::other(
-                "post-pivot: refusing to stay as root without HALMASUIT_COMPOSITOR_UID; \
-                 set services.halmasuit.compositorUid in the fromInitrd deployment",
-            ));
+            return Err(io::Error::other(format!(
+                "post-pivot: refusing to stay as root without \
+                 HALMASUIT_COMPOSITOR_UID; set \
+                 services.halmasuit.compositorUid in the fromInitrd \
+                 deployment. Prior step errors: {step_errors:?}"
+            )));
         }
         None => {
             tracing::warn!("HALMASUIT_COMPOSITOR_UID unset post-pivot; staying as current user");
         }
+    }
+
+    if !step_errors.is_empty() {
+        // We dropped successfully but with prior step failures.
+        // Surface the aggregate so the journal carries a single
+        // grep-able "degraded" marker; halmasuit stays alive.
+        tracing::error!(
+            errors = ?step_errors,
+            "post-pivot setup completed in DEGRADED state \
+             (privilege drop succeeded; auth-surface setup failed)"
+        );
     }
 
     Ok(())
@@ -2834,6 +2871,23 @@ fn drop_privileges(uid: u32) -> io::Result<()> {
     // the gid half of the privilege drop would silently regress.
     let target_gid = match std::env::var("HALMASUIT_COMPOSITOR_GID") {
         Ok(s) => match s.parse::<u32>() {
+            Ok(0) => {
+                // Defense-in-depth gid floor mirroring the existing
+                // Nix-side `cfg.compositorUid != 0` assertion. The
+                // module sources HALMASUIT_COMPOSITOR_GID from the
+                // greeter group's gid (non-zero by default), but an
+                // env-override misconfig — or a hostile reuse of the
+                // unit's environment — could otherwise land the
+                // compositor at gid 0 (root group) after the drop.
+                // The CLAUDE.md hard rule about UID_MIN ≥1000 is
+                // scoped to the broker's session-leader child; this
+                // is the symmetric in-binary floor for the
+                // compositor process itself.
+                return Err(io::Error::other(
+                    "HALMASUIT_COMPOSITOR_GID=0 refused: \
+                     the compositor must not run with the root group",
+                ));
+            }
             Ok(g) => Gid::from_raw(g),
             Err(e) => {
                 return Err(io::Error::other(format!(
@@ -3990,6 +4044,14 @@ fn main() -> io::Result<()> {
                                     "post-pivot: broker connect timed out (10s); skipping migration"
                                 );
                                 phase = PivotPhase::Setup;
+                                // ToDuration(0): calloop schedules the
+                                // timer for the NEXT dispatch tick — not
+                                // a busy spin. Used at phase-transition
+                                // boundaries so the next phase runs
+                                // promptly without sleeping. There is no
+                                // `TimeoutAction::Immediate` variant in
+                                // calloop 0.14; this is the canonical
+                                // "fire-next-tick" idiom for this loop.
                                 TimeoutAction::ToDuration(Duration::from_millis(0))
                             } else {
                                 // Exponential backoff capped at 200ms.
