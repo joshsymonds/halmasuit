@@ -86,6 +86,9 @@ test-vm:
     echo "── visual-phase-b-side-shader ──"
     nix build .#checks.x86_64-linux.visual-phase-b-side-shader -L --print-build-logs --no-link
     echo
+    echo "── visual-phase-b-side-video ──"
+    nix build .#checks.x86_64-linux.visual-phase-b-side-video -L --print-build-logs --no-link
+    echo
     echo "── run-pam-auth ──"
     nix build .#checks.x86_64-linux.run-pam-auth -L --print-build-logs --no-link
     echo
@@ -285,6 +288,13 @@ test-vm-visual-phase-b-side-image:
 # period for SSIMULACRA2 golden stability) replaces the image plane.
 test-vm-visual-phase-b-side-shader:
     nix build .#checks.x86_64-linux.visual-phase-b-side-shader -L --print-build-logs --no-link
+
+# Phase B cell — LUKS side-volume × video wallpaper. Real h264 (built
+# with ffmpeg's testsrc) looped through halmasuit-decoder's sandbox +
+# DecoderRelay; PNG fallback armed (a fallback swap during the run is
+# itself caught by assert_no_flash_stream).
+test-vm-visual-phase-b-side-video:
+    nix build .#checks.x86_64-linux.visual-phase-b-side-video -L --print-build-logs --no-link
 
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.

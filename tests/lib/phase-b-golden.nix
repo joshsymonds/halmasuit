@@ -39,6 +39,11 @@
   halmasuit-luks,
   halmasuit-session,
   halmasuit-vm-client,
+  # Only the video-wallpaper cell consumes this; the other cells pass
+  # null and the option default is left untouched. Optional so the
+  # image/shader cells aren't forced to build a decoder closure they
+  # never exercise.
+  halmasuit-decoder ? null,
   nix-config,
   wallpaperStorePaths ? [ ],
 }:
@@ -233,6 +238,11 @@ in
     session.package = halmasuit-session;
     inherit wallpaper;
     greeterCommand = "${greeterCmd}";
+    # Only the video cell ships a decoder package; the option default
+    # would try to resolve `pkgs.halmasuit-decoder` (not in pkgs in
+    # this test eval) on the image/shader paths, so we ONLY set this
+    # when the test cell wires a decoder closure.
+    decoder = lib.mkIf (halmasuit-decoder != null) { package = halmasuit-decoder; };
     # Default uids: greeter=999, compositor=998.
   };
 

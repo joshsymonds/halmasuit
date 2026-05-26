@@ -792,6 +792,20 @@
           halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Epic #35 cell (side, video): same shape, real h264 (ffmpeg-built
+        # testsrc), looping, with a PNG fallback. Exercises the
+        # halmasuit-decoder sandbox + DecoderRelay through the fromInitrd
+        # path on top of the rest of the Phase B end-to-end arc.
+        visual-phase-b-side-video = import ./tests/visual-phase-b-side-video.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-decoder   = self.packages.x86_64-linux.halmasuit-decoder;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # Visual gates consume `halmasuit-debug` (frame_audit on): the
         # capture path is the in-process `Snapshot()` D-Bus method,
         # not QMP screendump. Structural tests above stay on the
