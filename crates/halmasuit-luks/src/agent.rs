@@ -35,6 +35,14 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 /// A parsed ask-password request file.
+///
+/// Only `response_socket` is used by the production agent today; the
+/// other fields are parsed for wire-format completeness against the
+/// systemd ask-password schema (and exercised by the parser unit
+/// tests). The agent does not render `message` (the prompt surface is
+/// the LUKS-fixed color sentinel — there is no in-UI prompt text) and
+/// does not branch on `echo` (LUKS prompts are always non-echoing —
+/// the keystroke filter masks input regardless of the field's value).
 #[derive(Debug)]
 pub struct AskFile {
     /// Path to the response socket (`Socket=` field).
@@ -44,18 +52,16 @@ pub struct AskFile {
         not(test),
         expect(
             dead_code,
-            reason = "consumed by the future text-rendering follow-up (MVP shows solid-color surface, no rendered prompt text)"
+            reason = "parsed for wire-format completeness; production agent does not render prompt text (see struct doc)"
         )
     )]
     pub message: String,
-    /// Whether to echo characters as typed (`Echo=` field). Always
-    /// `false` for LUKS; tracked so future non-secret prompts (e.g.,
-    /// confirmation) display correctly.
+    /// Whether to echo characters as typed (`Echo=` field).
     #[cfg_attr(
         not(test),
         expect(
             dead_code,
-            reason = "consumed by the future text-rendering follow-up (LUKS path is always non-echo)"
+            reason = "parsed for wire-format completeness; production agent always masks input (see struct doc)"
         )
     )]
     pub echo: bool,
@@ -139,6 +145,15 @@ fn send_datagram(socket_path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// guarantees the dir exists when the agent system is in use; we
 /// tolerate ENOENT as "no requests pending" since the dir may not
 /// exist before the first request lands.
+///
+/// The per-call `Vec<PathBuf>` allocation is intentional: this runs
+/// at 5Hz on a typically-empty directory; the empty `Vec::new()` does
+/// not allocate at all (Rust's `Vec` is zero-alloc until first push),
+/// and the rare populated case allocates a single entry. Returning an
+/// iterator would let callers compose without the Vec, but the
+/// callers currently iterate-then-drop, so the alloc is a wash; the
+/// `Vec` return shape keeps the API straightforward. Profile-confirm
+/// before optimising further.
 pub fn outstanding_requests(ask_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let read_dir = match std::fs::read_dir(ask_dir) {

@@ -212,13 +212,28 @@ fn parse_timeout(s: &str) -> Result<Duration, ClientError> {
 
 fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<(), ClientError> {
     let deadline = Instant::now() + timeout;
+    let path_str = socket.to_string_lossy();
+    let is_abstract = path_str.starts_with('@');
     loop {
-        if socket.exists() {
+        let ready = if is_abstract {
+            // Abstract sockets have no filesystem inode — `exists()`
+            // is always false. Probe by attempting a connect; success
+            // means the listener is up. Closing the probe stream
+            // immediately leaves the listener untouched.
+            connect_socket(socket).is_ok()
+        } else {
+            socket.exists()
+        };
+        if ready {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(ClientError::Timeout {
-                what: "socket file existence",
+                what: if is_abstract {
+                    "abstract socket reachable"
+                } else {
+                    "socket file existence"
+                },
             });
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -480,6 +495,42 @@ mod tests {
         assert!(matches!(err, ClientError::Usage(_)));
     }
 
+    /// `connect_socket` accepts `@<name>` paths and connects via the
+    /// kernel abstract namespace. Pins the Phase B cross-mount-ns
+    /// connect path (the rootfs full-boot-flash test exercises this
+    /// end-to-end against halmasuit's abstract greetd listener; this
+    /// unit test pins the parsing + connect call so a regression
+    /// fails `just check` before the VM sweep runs).
+    #[test]
+    fn connect_socket_abstract_round_trip() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::SocketAddr;
+
+        // Unique-per-run abstract name to avoid collisions.
+        let name = format!(
+            "halmasuit-vm-client-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let addr = SocketAddr::from_abstract_name(name.as_bytes()).expect("abstract addr");
+        let listener = UnixListener::bind_addr(&addr).expect("bind abstract listener");
+
+        let abstract_path = PathBuf::from(format!("@{name}"));
+        let (accept_tx, accept_rx) = channel();
+        thread::spawn(move || {
+            let (_stream, _peer) = listener.accept().expect("server accept");
+            accept_tx.send(()).unwrap();
+        });
+
+        let _client = connect_socket(&abstract_path).expect("connect to @-prefixed path");
+        accept_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server received the connection");
+    }
+
     // ── mock-server round trip ──────────────────────────────────────────
 
     /// Spawn a one-shot mock greetd server on the given tempdir
@@ -646,6 +697,51 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("never.sock");
         let r = wait_for_socket(&sock, Duration::from_millis(100));
+        assert!(matches!(r, Err(ClientError::Timeout { .. })));
+    }
+
+    /// `wait_for_socket` on an `@`-prefixed abstract path probes by
+    /// connect rather than `Path::exists()` (abstract sockets have
+    /// no filesystem inode). Pins the Phase B cross-mount-ns
+    /// readiness path.
+    #[test]
+    fn wait_for_socket_abstract_returns_when_listener_appears() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::SocketAddr;
+
+        let name = format!(
+            "halmasuit-wait-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let abstract_path = PathBuf::from(format!("@{name}"));
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            let addr = SocketAddr::from_abstract_name(name.as_bytes()).expect("addr");
+            let _l = UnixListener::bind_addr(&addr).expect("bind abstract");
+            // Keep the listener alive past the wait deadline so
+            // wait_for_socket's connect probe finds it.
+            thread::sleep(Duration::from_secs(2));
+        });
+        wait_for_socket(&abstract_path, Duration::from_secs(2))
+            .expect("wait_for_socket should reach the abstract listener");
+    }
+
+    #[test]
+    fn wait_for_socket_abstract_times_out_when_listener_never_appears() {
+        let abstract_path = PathBuf::from(format!(
+            "@halmasuit-never-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let r = wait_for_socket(&abstract_path, Duration::from_millis(100));
         assert!(matches!(r, Err(ClientError::Timeout { .. })));
     }
 }

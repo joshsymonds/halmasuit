@@ -384,6 +384,63 @@ fn tracing_log(msg: &str) {
     eprintln!("halmasuit-session: {msg}");
 }
 
+/// Serve a `CompositorToBroker::RequestRootFd` frame: SO_PEERCRED-
+/// gate the request, then attach `/proc/self/root` to a
+/// `BrokerToCompositor::RootFd` reply via SCM_RIGHTS.
+///
+/// Phase B v2 cross-pivot per-process-root migration: halmasuit
+/// inherits the initramfs's process-root through `switch_root`; the
+/// broker (in rootfs's process-root) hands its `/proc/self/root` over
+/// so halmasuit can `fchdir(fd) + chroot(".")` into rootfs's view
+/// before binding the post-pivot greetd listener / spawning the
+/// greeter / dropping privileges.
+///
+/// SO_PEERCRED-authorized: only `root` or the trusted relay peer
+/// (compositor uid in the live topology) may obtain a fd to the
+/// broker's `/proc/self/root`. Both are accepted because the cross-
+/// pivot call site runs PRE-drop: halmasuit calls `RequestRootFd`
+/// from the still-root post-pivot setup window, BEFORE it executes
+/// `drop_privileges` (which would clear `CAP_SYS_CHROOT` and make
+/// the subsequent `fchdir` + `chroot` impossible). After the drop
+/// the relay-peer uid path applies for steady-state operation.
+///
+/// Without any gate, any local process in the broker's net-namespace
+/// could request the broker's mount-namespace view via a single
+/// unauthenticated frame (the broker is root + host-mount-namespace;
+/// the fd lets the holder fchdir into root's process-root). The
+/// effective threat model the check defends against is "unprivileged
+/// local process in the broker's net-ns" — accepting root is fine
+/// because any root process already trivially holds equivalent
+/// authority through other paths. Mirrors the `peer_uid !=
+/// relay_peer_uid` gate inside `AuthSlot::create` for the non-root
+/// case so every privileged op is authorized identically.
+///
+/// The connection is dedicated to the root-fd transfer; the caller
+/// closes it after this returns (either we sent the fd, or we
+/// refused — no further frames are expected on this channel).
+fn serve_root_fd_request(greeter: &SeqpacketChannel, puid: u32, relay_peer_uid: u32) {
+    if puid != 0 && puid != relay_peer_uid {
+        tracing_log(&format!(
+            "RequestRootFd refused: peer uid {puid} is neither root \
+             nor relay_peer_uid {relay_peer_uid}"
+        ));
+        return;
+    }
+    match std::fs::File::open("/proc/self/root") {
+        Ok(root) => {
+            use std::os::fd::AsFd;
+            if let Err(e) =
+                send_frame_with_fd(greeter, &BrokerToCompositor::RootFd, Some(root.as_fd()))
+            {
+                tracing_log(&format!("send RootFd failed: {e:?}"));
+            }
+        }
+        Err(e) => {
+            tracing_log(&format!("open /proc/self/root failed: {e}"));
+        }
+    }
+}
+
 /// Accept and admit ONE pending connection on `listener_fd`.
 ///
 /// `listener_fd` is already O_NONBLOCK. `Ok(true)` = a connection was
@@ -409,26 +466,7 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
     let begin = match greeter.recv::<CompositorToBroker>() {
         Ok(CompositorToBroker::BeginAuth { service, username }) => (service, username),
         Ok(CompositorToBroker::RequestRootFd) => {
-            // Phase B v2: cross-pivot per-process-root migration.
-            // Respond with /proc/self/root attached as SCM_RIGHTS;
-            // halmasuit will `fchdir` + `chroot` to enter our view.
-            // This connection is dedicated to the root-fd transfer —
-            // close after responding.
-            match std::fs::File::open("/proc/self/root") {
-                Ok(root) => {
-                    use std::os::fd::AsFd;
-                    if let Err(e) = send_frame_with_fd(
-                        &greeter,
-                        &BrokerToCompositor::RootFd,
-                        Some(root.as_fd()),
-                    ) {
-                        tracing_log(&format!("send RootFd failed: {e:?}"));
-                    }
-                }
-                Err(e) => {
-                    tracing_log(&format!("open /proc/self/root failed: {e}"));
-                }
-            }
+            serve_root_fd_request(&greeter, puid, bl.slot.relay_peer_uid());
             return Ok(true);
         }
         Ok(_) => {
@@ -1083,6 +1121,88 @@ mod tests {
         assert!(
             slot.current().is_none(),
             "out-of-phase frame fails closed: worker cancelled + reaped"
+        );
+    }
+
+    /// Phase B v2 cross-pivot per-process-root migration: the
+    /// `RequestRootFd` arm of `admit_one` is SO_PEERCRED-gated like
+    /// every other privileged op (Epic R5/R8). A non-root peer whose
+    /// uid does not match `relay_peer_uid` MUST NOT receive a fd to
+    /// the broker's `/proc/self/root` — the fd would let the holder
+    /// `fchdir` into root's process-root, defeating the privilege
+    /// split.
+    #[test]
+    fn root_fd_request_refuses_when_peer_uid_mismatches_relay_peer_uid() {
+        let (compositor, broker_end) = pair();
+        // Broker authorizes uid GREETER (1000) as its relay peer; the
+        // connecting peer is GREETER + 1 (some other local uid). Note:
+        // 1001 is also non-zero — root is allowed by a separate clause
+        // (see the root test below), and this case checks the
+        // non-root non-peer path is refused.
+        serve_root_fd_request(&broker_end, GREETER + 1, GREETER);
+        // The unauthorized peer must NOT have received a frame — the
+        // broker dropped the connection without sending. Reading from
+        // the compositor end of the closed channel yields EOF, not a
+        // RootFd frame.
+        drop(broker_end);
+        let result: Result<(BrokerToCompositor, Option<std::os::fd::OwnedFd>), _> =
+            recv_frame_with_fd(&compositor);
+        if let Ok((frame, fd)) = result {
+            panic!(
+                "broker leaked frame {frame:?} (fd={:?}) to an unauthorized peer",
+                fd.is_some()
+            );
+        }
+        // Otherwise: EOF / closed — the desired outcome.
+    }
+
+    /// The authorized relay peer DOES receive a `RootFd` frame with
+    /// an SCM_RIGHTS-attached fd. Validates the happy path of
+    /// `serve_root_fd_request` for the post-drop steady-state path.
+    #[test]
+    fn root_fd_request_sends_fd_to_authorized_relay_peer() {
+        use std::os::fd::OwnedFd;
+        let (compositor, broker_end) = pair();
+        serve_root_fd_request(&broker_end, GREETER, GREETER);
+        drop(broker_end);
+        let (frame, fd): (BrokerToCompositor, Option<OwnedFd>) =
+            recv_frame_with_fd(&compositor).expect("authorized peer receives the RootFd frame");
+        assert!(
+            matches!(frame, BrokerToCompositor::RootFd),
+            "expected BrokerToCompositor::RootFd, got {frame:?}"
+        );
+        assert!(
+            fd.is_some(),
+            "RootFd frame must carry an SCM_RIGHTS fd attachment"
+        );
+    }
+
+    /// Root is allowed regardless of `relay_peer_uid`. This is the
+    /// LIVE cross-pivot call site: halmasuit invokes
+    /// `RequestRootFd` from `run_post_pivot_setup` PRE-drop, while
+    /// still uid 0 (the chroot needs `CAP_SYS_CHROOT` which the
+    /// subsequent `drop_privileges` clears). The relay-peer uid
+    /// constraint is meaningless against a uid-0 attacker (root
+    /// already holds equivalent authority through other paths), so
+    /// the gate's effective threat model is "unprivileged local
+    /// process in the broker's net-ns."
+    #[test]
+    fn root_fd_request_allows_root_peer_regardless_of_relay_peer_uid() {
+        use std::os::fd::OwnedFd;
+        let (compositor, broker_end) = pair();
+        // puid = 0 (root); relay_peer_uid = 1000 (something else
+        // entirely). Must still send the fd.
+        serve_root_fd_request(&broker_end, 0, GREETER);
+        drop(broker_end);
+        let (frame, fd): (BrokerToCompositor, Option<OwnedFd>) =
+            recv_frame_with_fd(&compositor).expect("root peer receives the RootFd frame");
+        assert!(
+            matches!(frame, BrokerToCompositor::RootFd),
+            "expected BrokerToCompositor::RootFd, got {frame:?}"
+        );
+        assert!(
+            fd.is_some(),
+            "RootFd frame must carry an SCM_RIGHTS fd attachment"
         );
     }
 }

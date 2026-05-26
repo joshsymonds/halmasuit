@@ -453,12 +453,28 @@ in
           `boot.initrd.systemd.contents` and read once at startup
           into a zeroizing buffer.
 
-          Intended for headless/server deployments where the
-          passphrase is materialised by an earlier boot step
-          (TPM-derived, USB key, network-provisioned), and for the
-          LUKS unlock VM gate (`tests/luks-unlock.nix`). For
-          interactive workstation use, leave this `null` and let the
-          Wayland UI prompt.
+          ⚠️ SECURITY: `lib.types.path` imports the file into
+          `/nix/store/<hash>-<name>` at evaluation time. The Nix
+          store is world-readable on the running system, so passing
+          a literal Nix path here publishes the LUKS passphrase to
+          every local user. The materialised initramfs copy at
+          `/etc/halmasuit-luks-passphrase` inherits the source
+          file's mode and is similarly readable.
+
+          Safe usage patterns:
+
+          * The LUKS VM gate (`tests/luks-unlock.nix`) — the
+            passphrase isn't a secret because the volume is created
+            at test time.
+          * Out-of-band passphrase materialised by an earlier
+            initramfs step (e.g. TPM-derived, USB-key-loaded). In
+            that flow pass a runtime path string (`lib.types.str`,
+            not via this option), or write the file from a
+            preceding `boot.initrd.systemd.services` unit with
+            `chmod 0400`.
+
+          For interactive workstation use, leave this `null` and
+          let the Wayland UI prompt.
         '';
       };
     };
@@ -673,7 +689,9 @@ in
    #
    # but the decoder will then EMSGSIZE on first send and the
    # wallpaper will fall back to the placeholder.
-   (lib.mkIf (cfg.enable && cfg.wallpaper != null && cfg.wallpaper.type == "video"
+   (lib.mkIf ((cfg.enable || cfg.fromInitrd.enable)
+              && cfg.wallpaper != null
+              && cfg.wallpaper.type == "video"
               && cfg.wallpaper.raiseSocketBuffers) {
      boot.kernel.sysctl."net.core.wmem_max" = lib.mkDefault 16777216;
      boot.kernel.sysctl."net.core.rmem_max" = lib.mkDefault 16777216;
@@ -768,12 +786,31 @@ in
          Accept = false;
          # SO_PEERCRED in the broker is the load-bearing authorization
          # (only the HALMASUIT_BROKER_PEER_UID relay peer may drive
-         # auth). The socket mode
-         # is defence-in-depth only; the compositor will broker greeter
+         # auth — AuthSlot::create gate, plus the `RequestRootFd`
+         # gate in serve_root_fd_request). The socket mode is
+         # defence-in-depth ONLY; the compositor will broker greeter
          # connections through a tighter SocketUser/SocketGroup once
          # the G-layer lands. Until then a permissive mode lets the
-         # gated VM client connect; the SO_PEERCRED check still refuses
-         # any non-greeter peer.
+         # gated VM client connect; the SO_PEERCRED check still
+         # refuses any non-greeter peer.
+         #
+         # For the abstract-socket fromInitrd shape the socket-mode
+         # gate doesn't apply at all (abstract sockets have no
+         # filesystem inode to chmod), making SO_PEERCRED the SOLE
+         # authorization. Network-namespace isolation
+         # (`PrivateNetwork=true` on this unit) would hide the
+         # abstract name from the host net-ns, but it would also
+         # hide it from halmasuit, which lives in initramfs PID1's
+         # (host) net-ns — cross-systemd JoinsNamespaceOf isn't
+         # practical between rootfs systemd's broker and the
+         # initramfs-systemd-spawned halmasuit. Further isolation
+         # is a deployment-shape change (shared net-ns via
+         # boot.specialFileSystems or a privileged broker spawned
+         # by initramfs systemd), tracked as a follow-up. For now
+         # the SO_PEERCRED gate is sufficient against
+         # non-root-non-relay-peer attackers; a root attacker in
+         # the broker's net-ns already holds equivalent authority
+         # by other paths.
          SocketMode = "0666";
        };
      };
@@ -955,6 +992,15 @@ in
        };
        serviceConfig = {
          Type           = "simple";
+         # No `Group=`: the rootfs `enable` unit pins the egid via
+         # `Group = cfg.greeterGroup` (line ~601) because rootfs NSS
+         # resolves the name to a gid. The initramfs systemd has no
+         # NSS / no /etc/group (the user-database auto-creation runs
+         # in stage 2 activation, long after this unit starts), so
+         # both name- and numeric-form `Group=` fail 216/GROUP. The
+         # gid half of `drop_privileges` is instead pinned by
+         # halmasuit consulting `HALMASUIT_COMPOSITOR_GID` and
+         # calling `setresgid(target_gid, …)` directly — set below.
          # ExecStartPre sets up two paths halmasuit needs before its
          # main() reaches them, in the initramfs context:
          #
@@ -982,76 +1028,58 @@ in
          Restart        = "no";
          StandardOutput = "journal";
          StandardError  = "journal";
-         # ## Phase B v1 → v2 cross-pivot per-process-root divergence
+         # Cross-pivot per-process-root divergence: at switch_root
+         # halmasuit's process-root diverges from rootfs systemd's
+         # despite sharing a mount-namespace ID — halmasuit's `/`
+         # post-pivot is essentially empty (no /etc/passwd, no
+         # /nix/store, no /run/systemd/ask-password/). Two design
+         # choices follow from this and are visible elsewhere in
+         # this file + crates/halmasuit/src/main.rs:
          #
-         # The deeper structural issue (investigated extensively):
-         # at switch_root, halmasuit's PROCESS-ROOT diverges from
-         # rootfs systemd's, despite `/proc/<pid>/ns/mnt` reporting
-         # the same `mnt:[NNN]` ID for both. Empirically halmasuit's
-         # `/` after pivot is essentially empty — no `/etc/passwd`,
-         # no `/nix/store` (so it can't exec the greeter binary), no
-         # `/run/systemd/ask-password/` (so halmasuit-luks can't
-         # receive LUKS prompts). `/dev`, `/sys`, and halmasuit's own
-         # bound `/run/halmasuit/` are visible (separate
-         # filesystems / persisted mount points).
+         #  - Sockets that must be reachable cross-mount-ns (greetd
+         #    listener + broker connect) bind/connect via ABSTRACT
+         #    Linux socket names (`@halmasuit-greetd`,
+         #    `@halmasuit-session`) — abstract sockets live in the
+         #    NETWORK namespace which halmasuit + rootfs share.
+         #  - To exec the greeter, read /run/systemd/ask-password/,
+         #    and consult /etc/passwd, halmasuit calls
+         #    `RequestRootFd` on the broker pre-drop; the broker
+         #    sends `/proc/self/root` via SCM_RIGHTS; halmasuit
+         #    `fchdir + chroot`s into rootfs's process-root before
+         #    binding the post-pivot listener, spawning the greeter,
+         #    and dropping privileges. See `migrate_to_broker_root`
+         #    in crates/halmasuit/src/main.rs and the
+         #    `serve_root_fd_request` SO_PEERCRED gate in
+         #    crates/halmasuit-session/src/broker.rs.
          #
-         # Attempted fixes (Phase B v2 partials shipped):
-         #
-         #  - Abstract Linux sockets for greetd + broker (commits
-         #    51219e7, 8e54357). Bypasses the filesystem-path layer
-         #    for cross-namespace SOCKET reach. The greetd handshake
-         #    + broker auth wire is now reachable cross-namespace.
-         #  - Env-fallback greeter identity (commit 54ec894). Bypasses
-         #    `getpwuid` when /etc/passwd is invisible.
-         #
-         # Still required for full SessionOpened:
-         #
-         #  - Greeter BINARY must be exec'd from a path halmasuit
-         #    can resolve — /nix/store is invisible to its view.
-         #  - halmasuit-luks must read /run/systemd/ask-password/
-         #    request files — invisible to halmasuit's view.
-         #
-         # The remaining architectural fix is one of:
-         #
-         #  (a) Two-process design with `SCM_RIGHTS` DRM-fd handoff.
-         #      Initramfs halmasuit dies at switch_root; rootfs
-         #      halmasuit adopts the master fd. Loses the
-         #      "single-process-boot-to-shutdown" property but
-         #      preserves no-flash (same fd, same scanout state).
-         #      drm-master-probe Phase 3 mechanically validated DRM
-         #      master surviving via execve; cross-process SCM_RIGHTS
-         #      is the same kernel operation.
-         #
-         #  (b) Broker-mediated chroot fd handoff. The broker (in
-         #      rootfs's process root) opens `/proc/self/root` and
-         #      sends the fd via SCM_RIGHTS. Halmasuit, while still
-         #      root pre-drop, calls `fchdir(fd) + chroot(".")` to
-         #      enter rootfs's process root. New IPC variants
-         #      (RequestRootFd / RootFd) needed; broker needs
-         #      pre-handshake SCM_RIGHTS attach.
-         #
-         # `tests/full-boot-flash.nix` is the gate for the
-         # end-to-end SessionOpened arc once either fix lands.
+         # `tests/full-boot-flash.nix` is the end-to-end gate.
        };
        environment = {
          RUST_LOG        = cfg.logLevel;
          XDG_RUNTIME_DIR = "/run/halmasuit";
-         # Phase B v2 workaround: bind sockets as ABSTRACT Linux
-         # sockets (kernel-namespace-scoped, no filesystem inode).
-         # Filesystem-bound sockets aren't visible
-         # cross-mount-namespace at the switch_root boundary (see the
-         # "v1 → v2 gap" docstring above). Abstract sockets live in
-         # the NETWORK namespace which halmasuit + rootfs share —
-         # so rootfs greeters CAN connect via the abstract name AND
-         # halmasuit CAN reach the broker socket bound by rootfs
-         # systemd's `halmasuit-session.socket` unit.
+         # Bind sockets as ABSTRACT Linux sockets (kernel-namespace-
+         # scoped, no filesystem inode) because filesystem-bound
+         # sockets aren't visible cross-mount-namespace at the
+         # switch_root boundary. Abstract sockets live in the NETWORK
+         # namespace which halmasuit + rootfs share — so rootfs
+         # greeters CAN connect via the abstract name AND halmasuit
+         # CAN reach the broker socket bound by rootfs systemd's
+         # `halmasuit-session.socket` unit. See the cross-pivot
+         # docstring on the unit's serviceConfig above.
          HALMASUIT_GREETD_SOCKET  = "@halmasuit-greetd";
          HALMASUIT_BROKER_SOCKET  = "@halmasuit-session";
          # Phase B v2: greeter-identity fields halmasuit consults when
          # `User::from_uid` fails because /etc/passwd isn't visible in
          # the surviving initramfs process-root. The values must match
-         # the system users the module auto-creates above.
-         HALMASUIT_GREETER_GID    = toString cfg.greeterUid;
+         # the system users the module auto-creates above. The gid is
+         # sourced from the GREETER GROUP's actual gid (resolved
+         # through the module config), NOT `cfg.greeterUid` — those
+         # happen to share a value via the auto-created group's
+         # `gid = lib.mkDefault cfg.greeterUid` default, but an
+         # operator who overrides `greeterGroup` to a pre-existing
+         # group with a different gid would otherwise ship the wrong
+         # bytes to halmasuit's setresgid call.
+         HALMASUIT_GREETER_GID    = toString config.users.groups.${cfg.greeterGroup}.gid;
          HALMASUIT_GREETER_NAME   = cfg.greeterUser;
          HALMASUIT_GREETER_HOME   = "/var/empty";
 
@@ -1063,6 +1091,16 @@ in
          # timer detects `/etc/initrd-release` disappearing.
          HALMASUIT_GREETER_UID    = toString cfg.greeterUid;
          HALMASUIT_COMPOSITOR_UID = toString cfg.compositorUid;
+         # Pin the post-drop gid explicitly. Without this halmasuit
+         # falls back to `getegid()` which inherits PID1's gid 0 in
+         # initramfs (Group= can't be set on initramfs units — no
+         # NSS pre-pivot). The compositor user's primary group is
+         # `cfg.greeterGroup`; the actual gid comes from the module
+         # config (not `cfg.greeterUid`, which is a uid that happens
+         # to share its numeric value with the auto-created group's
+         # gid by default — an operator overriding `greeterGroup` to
+         # a pre-existing group breaks that coincidence).
+         HALMASUIT_COMPOSITOR_GID = toString config.users.groups.${cfg.greeterGroup}.gid;
          HALMASUIT_PAM_SERVICE    = cfg.pamService;
 
          # Mesa runtime. /run/opengl-driver symlink is created by the

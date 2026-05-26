@@ -662,6 +662,51 @@ mod tests {
         );
     }
 
+    /// `connect_broker` accepts `@<name>` paths and connects via the
+    /// kernel abstract namespace. Pins the Phase B fromInitrd
+    /// cross-mount-ns connect path: halmasuit reaches the broker
+    /// socket bound by rootfs systemd's `halmasuit-session.socket`
+    /// via the abstract namespace, since the filesystem inode under
+    /// /run/ isn't visible from initramfs's surviving process-root.
+    #[test]
+    fn connect_broker_abstract_round_trip() {
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, listen};
+        use std::os::fd::AsRawFd;
+
+        let name = format!(
+            "halmasuit-broker-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        // Bind an abstract SEQPACKET listener and accept on a worker
+        // thread; assert connect_broker reaches us.
+        let server = nix::sys::socket::socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::empty(),
+            None,
+        )
+        .expect("server socket");
+        let addr = UnixAddr::new_abstract(name.as_bytes()).expect("abstract addr");
+        bind(server.as_raw_fd(), &addr).expect("bind abstract");
+        listen(&server, nix::sys::socket::Backlog::new(1).unwrap()).expect("listen");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let accepted = nix::sys::socket::accept(server.as_raw_fd()).expect("accept");
+            tx.send(accepted).unwrap();
+        });
+
+        let abstract_path = std::path::PathBuf::from(format!("@{name}"));
+        let _client = connect_broker(&abstract_path).expect("connect to @-prefixed broker");
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("server accepted abstract connection");
+    }
+
     /// (compositor channel, broker end) connected SEQPACKET pair. The
     /// tests act as the broker SYNCHRONOUSLY on the broker end —
     /// single-threaded, deterministic (socketpair buffers; the episode

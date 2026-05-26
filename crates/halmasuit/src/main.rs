@@ -49,7 +49,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use calloop::generic::Generic;
 use calloop::signals::{Signal, Signals};
@@ -2157,8 +2157,12 @@ fn record_session_started(spawn: &SpawnRequest, session_uid: &mut Option<u32>) {
     *session_uid = Some(spawn.uid);
 }
 
-/// Phase B post-pivot setup. Runs once, ~1s after the pivot-poll
-/// timer observes `/etc/initrd-release` disappear.
+/// Phase B post-pivot setup AFTER the process-root migration has
+/// already chrooted halmasuit into rootfs's filesystem view. The
+/// migration runs as its own calloop-driven phase (see
+/// `PivotPhase::Connecting` / `AwaitingReply` in the pivot-poll timer
+/// in `main` below); this function is invoked from the final
+/// `PivotPhase::Setup` tick once the chroot is in place.
 ///
 /// Sequence (mirrors the rootfs-only deployment's startup):
 ///   1. Bind the greetd listener while still root (binds the socket
@@ -2176,20 +2180,6 @@ fn record_session_started(spawn: &SpawnRequest, session_uid: &mut Option<u32>) {
 /// halmasuit would die mid-boot leaving the rootfs without its
 /// compositor.
 fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
-    // (0) Phase B v2 process-root migration. Halmasuit's surviving
-    // process-root references the initramfs's filesystem, leaving
-    // /etc/passwd, /nix/store, /run/systemd unreachable. The broker
-    // (rootfs systemd unit, rootfs process-root) sends its
-    // /proc/self/root fd via SCM_RIGHTS on receipt of
-    // CompositorToBroker::RequestRootFd. We fchdir + chroot to it,
-    // entering the rootfs view, while still root pre-drop (chroot
-    // requires CAP_SYS_CHROOT).
-    if let Err(e) = migrate_to_broker_root(&state.broker_socket) {
-        tracing::error!(error = %e, "post-pivot: broker root-fd migration failed");
-    } else {
-        tracing::info!("post-pivot: chrooted into broker's root (rootfs view)");
-    }
-
     // (1) Bind greetd listener while still root.
     match setup_greetd_listener(&state.loop_handle) {
         Ok((token, greeter_uid, pam_service)) => {
@@ -2248,85 +2238,69 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
     Ok(())
 }
 
-/// Phase B v2 process-root migration. Connects to the broker (which
-/// runs in rootfs systemd's process root), sends `RequestRootFd`,
-/// receives the broker's `/proc/self/root` fd via SCM_RIGHTS, then
-/// `fchdir + chroot` to enter rootfs's filesystem view.
+/// Phase B v2 process-root migration helpers — one non-blocking
+/// step each, driven from the pivot-poll calloop timer
+/// (`PivotPhase::Connecting` / `AwaitingReply` in `main` below).
 ///
-/// After this, halmasuit can resolve rootfs paths: /etc/passwd
-/// (for getpwuid), /nix/store (for greeter binaries), /run/systemd
-/// (for ask-password requests).
+/// The cross-pivot migration: halmasuit's surviving process-root
+/// references the initramfs's filesystem, leaving /etc/passwd,
+/// /nix/store, /run/systemd unreachable. The broker (rootfs systemd
+/// unit, rootfs process-root) sends its `/proc/self/root` fd via
+/// SCM_RIGHTS on receipt of `CompositorToBroker::RequestRootFd`;
+/// halmasuit `fchdir + chroot`s into it.
 ///
-/// Requires CAP_SYS_CHROOT (halmasuit has it as root pre-drop).
-/// The broker connection is dedicated to this transfer and closed
-/// immediately after; subsequent broker connections are normal auth
-/// flows.
-fn migrate_to_broker_root(broker_socket: &Path) -> io::Result<()> {
-    use crate::broker_session::connect_broker;
+/// Hard rule (CLAUDE.md): "The compositor never blocks the render/
+/// calloop thread on broker IPC. ... No blocking recv/send-then-recv,
+/// with or without a timeout." So this migration runs as a calloop
+/// state machine across multiple timer ticks: each tick performs at
+/// most one non-blocking syscall (connect attempt, recv attempt) and
+/// either transitions phase or re-arms the timer.
+///
+/// `try_connect_and_request_root_fd` — one non-blocking attempt at
+/// connecting to the broker socket and sending the `RequestRootFd`
+/// frame. Returns the channel on success so the caller can park it
+/// in the `AwaitingReply` phase state; returns the connect/send
+/// error otherwise so the caller can decide to retry or fail.
+fn try_connect_and_request_root_fd(
+    broker_socket: &Path,
+) -> Result<crate::broker_session::SeqpacketChannel, io::Error> {
     use halmasuit_session_ipc::CompositorToBroker;
-    use std::os::fd::AsRawFd;
 
-    // The broker is socket-activated by rootfs systemd, which may not
-    // have bound the listener yet when this fires (we run ~1s after
-    // pivot detection; rootfs systemd takes a few seconds to bring up
-    // its sockets). Retry with 200ms backoff for up to 10s.
-    let mut chan = None;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut last_err: Option<crate::broker_session::WireError> = None;
-    while std::time::Instant::now() < deadline {
-        match connect_broker(broker_socket) {
-            Ok(c) => {
-                chan = Some(c);
-                break;
-            }
-            Err(e) => {
-                last_err = Some(e);
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
-    }
-    let chan = chan.ok_or_else(|| {
-        io::Error::other(format!(
-            "connect_broker({}) timed out after 10s; last error: {:?}",
-            broker_socket.display(),
-            last_err,
-        ))
-    })?;
+    let chan = connect_broker(broker_socket)
+        .map_err(|e| io::Error::other(format!("connect_broker: {e:?}")))?;
     chan.send(&CompositorToBroker::RequestRootFd)
         .map_err(|e| io::Error::other(format!("send RequestRootFd: {e:?}")))?;
-    // recv_with_fd is non-blocking (MSG_DONTWAIT); the broker takes
-    // a few ms to spawn (socket-activation) and respond. Loop with
-    // backoff for up to 5s.
-    let recv_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let (_frame, root_fd) = loop {
-        if let Some(v) = chan
-            .recv_with_fd()
-            .map_err(|e| io::Error::other(format!("recv RootFd: {e:?}")))?
-        {
-            break v;
-        }
-        if std::time::Instant::now() >= recv_deadline {
-            return Err(io::Error::other(
-                "recv RootFd timed out (5s); broker never responded",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    Ok(chan)
+}
+
+/// `try_recv_root_fd` — one non-blocking attempt at receiving the
+/// broker's `RootFd` reply on an established channel. `Ok(Some(fd))`
+/// = broker has replied; `Ok(None)` = no datagram pending yet
+/// (caller re-arms the timer); `Err(e)` = transport error or the
+/// broker refused (e.g., SO_PEERCRED gate rejected the peer).
+fn try_recv_root_fd(
+    chan: &crate::broker_session::SeqpacketChannel,
+) -> io::Result<Option<std::os::fd::OwnedFd>> {
+    let Some((_frame, root_fd)) = chan
+        .recv_with_fd()
+        .map_err(|e| io::Error::other(format!("recv RootFd: {e:?}")))?
+    else {
+        return Ok(None);
     };
     let root_fd = root_fd
         .ok_or_else(|| io::Error::other("broker sent RootFd without SCM_RIGHTS fd attachment"))?;
-    // fchdir + chroot to the broker's root.
-    #[expect(
-        unsafe_code,
-        reason = "libc::fchdir and chroot lack safe Rust wrappers"
-    )]
-    unsafe {
-        if libc::fchdir(root_fd.as_raw_fd()) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::chroot(c".".as_ptr()) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
+    Ok(Some(root_fd))
+}
+
+/// `apply_chroot_to_root_fd` — fchdir + chroot to the broker's
+/// `/proc/self/root`. Both syscalls land via nix's safe wrappers
+/// (no unsafe block). Requires `CAP_SYS_CHROOT`; halmasuit has it
+/// as root pre-drop. After this returns Ok, halmasuit's
+/// process-root IS rootfs's process-root.
+fn apply_chroot_to_root_fd(root_fd: &std::os::fd::OwnedFd) -> io::Result<()> {
+    nix::unistd::fchdir(root_fd)
+        .map_err(|e| io::Error::other(format!("fchdir(broker root fd): {e}")))?;
+    nix::unistd::chroot(".").map_err(|e| io::Error::other(format!("chroot(\".\"): {e}")))?;
     Ok(())
 }
 
@@ -2556,7 +2530,17 @@ fn spawn_greeter(greeter_uid: u32, command: &Path) -> io::Result<GreeterHandle> 
         .env("HOME", greeter_home.as_os_str())
         .env("XDG_RUNTIME_DIR", "/run/halmasuit")
         .env("WAYLAND_DISPLAY", "wayland-0")
-        .env("GREETD_SOCK", "/run/halmasuit/greetd.sock")
+        // GREETD_SOCK MUST match the path/abstract-name halmasuit's
+        // own greetd listener bound to. The fromInitrd deployment
+        // uses an abstract socket (`@halmasuit-greetd`) to bridge
+        // the cross-pivot mount-namespace boundary; the rootfs
+        // deployment uses `/run/halmasuit/greetd.sock`. Reading
+        // through the same helper as `setup_greetd_listener` keeps
+        // the two ends in lockstep — hardcoding the filesystem path
+        // here would break the greeter's BeginAuth in the fromInitrd
+        // shape because the abstract socket is unreachable via
+        // `connect("/run/halmasuit/greetd.sock")`.
+        .env("GREETD_SOCK", greetd_socket_path_from_env())
         // PATH so the greeter can exec children (session command,
         // PAM helpers). Match systemd's default unit PATH.
         .env(
@@ -2818,7 +2802,7 @@ fn reap_zombie_children(state: &mut HalmasuitState) {
 /// see nix/module.nix).
 fn drop_privileges(uid: u32) -> io::Result<()> {
     use caps::CapSet;
-    use nix::unistd::{Uid, getegid, setresgid, setresuid};
+    use nix::unistd::{Gid, Uid, getegid, setresgid, setresuid};
 
     // Step 1: empty the bounding set ENTIRELY while we're still root
     // with CAP_SETPCAP in effective. Nothing is kept: the compositor
@@ -2839,8 +2823,28 @@ fn drop_privileges(uid: u32) -> io::Result<()> {
     caps::securebits::set_keepcaps(true)
         .map_err(|e| io::Error::other(format!("set_keepcaps(true): {e}")))?;
 
-    let egid = getegid();
-    setresgid(egid, egid, egid).map_err(|e| io::Error::other(format!("setresgid({egid}): {e}")))?;
+    // Pin the gid explicitly when HALMASUIT_COMPOSITOR_GID is set;
+    // fall back to getegid() otherwise. The env-pin is load-bearing
+    // for the fromInitrd deployment: initramfs systemd has no NSS
+    // (the user/group database auto-creation runs in stage 2
+    // activation, long after this unit starts), so `Group=` on the
+    // unit fails 216/GROUP for both name and numeric forms. Without
+    // this env-driven path the compositor inherits PID1's gid 0
+    // and would post-drop run as `compositorUid:0` (root group) —
+    // the gid half of the privilege drop would silently regress.
+    let target_gid = match std::env::var("HALMASUIT_COMPOSITOR_GID") {
+        Ok(s) => match s.parse::<u32>() {
+            Ok(g) => Gid::from_raw(g),
+            Err(e) => {
+                return Err(io::Error::other(format!(
+                    "HALMASUIT_COMPOSITOR_GID={s:?} is not a u32: {e}"
+                )));
+            }
+        },
+        Err(_) => getegid(),
+    };
+    setresgid(target_gid, target_gid, target_gid)
+        .map_err(|e| io::Error::other(format!("setresgid({target_gid}): {e}")))?;
 
     let u = Uid::from_raw(uid);
     setresuid(u, u, u).map_err(|e| io::Error::other(format!("setresuid({u}): {e}")))?;
@@ -3912,10 +3916,38 @@ fn main() -> io::Result<()> {
     // Inserted only when we started in initramfs; the rootfs-only
     // deployment never registers it.
     if in_initramfs {
-        #[derive(Clone, Copy)]
+        // Phase B state machine. Each tick advances at most ONE
+        // non-blocking step, then re-arms the timer at an
+        // appropriate cadence. Honors the CLAUDE.md hard rule "the
+        // compositor never blocks the render/calloop thread on
+        // broker IPC" — every prior synchronous send/recv is now
+        // driven from the timer callback. The cumulative window
+        // (10s connect + 5s recv) is unchanged; the difference is
+        // that DRM page-flip events, wallpaper-tick callbacks, and
+        // any other calloop source service NORMALLY during the
+        // migration. The longest single tick is one connect attempt
+        // + one send (both non-blocking on Unix-domain abstract
+        // sockets) — fits comfortably under the 16ms dispatch tick.
         enum PivotPhase {
+            /// Polling `/etc/initrd-release` for the pivot itself.
+            /// Cadence: 1s. Transitions to `Connecting` on disappear.
             Awaiting,
-            PostPivotInProgress,
+            /// Pivot happened; attempting to reach the broker.
+            /// Cadence: exponential backoff 20ms → 200ms cap, 10s
+            /// total deadline.
+            Connecting {
+                deadline: Instant,
+                next_delay: Duration,
+            },
+            /// Broker reached; `RequestRootFd` sent; waiting for the
+            /// SCM_RIGHTS reply. Cadence: 50ms, 5s deadline.
+            AwaitingReply {
+                chan: crate::broker_session::SeqpacketChannel,
+                deadline: Instant,
+            },
+            /// Chroot complete; ready to bind greetd, spawn greeter,
+            /// drop. One-shot then Drop.
+            Setup,
         }
         let mut phase = PivotPhase::Awaiting;
         loop_handle
@@ -3923,18 +3955,93 @@ fn main() -> io::Result<()> {
                 Timer::from_duration(Duration::from_secs(1)),
                 move |_deadline, (), state: &mut HalmasuitState| match phase {
                     PivotPhase::Awaiting => {
-                        // Both arms re-arm the timer at the same 1s
-                        // cadence. Lifted out for
-                        // clippy::branches_sharing_code.
-                        if !context::is_initramfs() {
+                        if context::is_initramfs() {
+                            TimeoutAction::ToDuration(Duration::from_secs(1))
+                        } else {
                             emit(&Event::PhaseEntered {
                                 phase: Phase::RootfsReady,
                             });
-                            phase = PivotPhase::PostPivotInProgress;
+                            phase = PivotPhase::Connecting {
+                                deadline: Instant::now() + Duration::from_secs(10),
+                                next_delay: Duration::from_millis(20),
+                            };
+                            // Re-arm immediately for the first
+                            // connect attempt.
+                            TimeoutAction::ToDuration(Duration::from_millis(20))
                         }
-                        TimeoutAction::ToDuration(Duration::from_secs(1))
                     }
-                    PivotPhase::PostPivotInProgress => {
+                    PivotPhase::Connecting {
+                        deadline,
+                        next_delay,
+                    } => match try_connect_and_request_root_fd(&state.broker_socket) {
+                        Ok(chan) => {
+                            phase = PivotPhase::AwaitingReply {
+                                chan,
+                                deadline: Instant::now() + Duration::from_secs(5),
+                            };
+                            // Poll for the reply at a constant 50ms.
+                            TimeoutAction::ToDuration(Duration::from_millis(50))
+                        }
+                        Err(e) => {
+                            if Instant::now() >= deadline {
+                                tracing::error!(
+                                    error = %e,
+                                    socket = ?state.broker_socket,
+                                    "post-pivot: broker connect timed out (10s); skipping migration"
+                                );
+                                phase = PivotPhase::Setup;
+                                TimeoutAction::ToDuration(Duration::from_millis(0))
+                            } else {
+                                // Exponential backoff capped at 200ms.
+                                let new_delay =
+                                    std::cmp::min(next_delay * 2, Duration::from_millis(200));
+                                phase = PivotPhase::Connecting {
+                                    deadline,
+                                    next_delay: new_delay,
+                                };
+                                TimeoutAction::ToDuration(next_delay)
+                            }
+                        }
+                    },
+                    PivotPhase::AwaitingReply { ref chan, deadline } => {
+                        match try_recv_root_fd(chan) {
+                            Ok(Some(root_fd)) => {
+                                if let Err(e) = apply_chroot_to_root_fd(&root_fd) {
+                                    tracing::error!(
+                                        error = %e,
+                                        "post-pivot: chroot failed; skipping migration"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "post-pivot: chrooted into broker's root (rootfs view)"
+                                    );
+                                }
+                                phase = PivotPhase::Setup;
+                                TimeoutAction::ToDuration(Duration::from_millis(0))
+                            }
+                            Ok(None) => {
+                                if Instant::now() >= deadline {
+                                    tracing::error!(
+                                        "post-pivot: broker root-fd reply timed out (5s); \
+                                         skipping migration"
+                                    );
+                                    phase = PivotPhase::Setup;
+                                    TimeoutAction::ToDuration(Duration::from_millis(0))
+                                } else {
+                                    TimeoutAction::ToDuration(Duration::from_millis(50))
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "post-pivot: broker root-fd migration failed"
+                                );
+                                phase = PivotPhase::Setup;
+                                TimeoutAction::ToDuration(Duration::from_millis(0))
+                            }
+                        }
+                    }
+                    PivotPhase::Setup => {
                         if let Err(e) = run_post_pivot_setup(state) {
                             tracing::error!(
                                 error = %e,

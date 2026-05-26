@@ -289,7 +289,25 @@ pkgs.testers.runNixOSTest {
         "expected all 998 (the compositor uid default from the module). "
         "The deprivileged event fired but setresuid didn't take."
     )
-    print(f"PASS: phase=deprivileged emitted; PID {started_pid} runs as compositor uid 998")
+    # Gid half of the drop: load-bearing — without `Group=` set on
+    # the fromInitrd unit, halmasuit's `drop_privileges` calls
+    # `setresgid(getegid(), …)` which inherits PID1's gid 0, leaving
+    # the post-drop compositor at `998:0` (root group). The module's
+    # `Group = cfg.greeterGroup` pins the egid so the drop lands on
+    # the greeter group's gid (default 999, matching greeterUid).
+    status_gid = machine.succeed(f"grep '^Gid:' /proc/{started_pid}/status").strip()
+    gid_fields = status_gid.split()
+    assert all(f == "999" for f in gid_fields[1:5]), (
+        f"halmasuit PID {started_pid} has Gid fields {gid_fields[1:5]}; "
+        "expected all 999 (the greeter group's gid). Most likely the "
+        "fromInitrd unit lost its `Group = cfg.greeterGroup` and is "
+        "inheriting PID1's gid 0 — the gid half of the privilege drop "
+        "regressed."
+    )
+    print(
+        f"PASS: phase=deprivileged emitted; PID {started_pid} runs as "
+        f"compositor uid 998, gid 999"
+    )
 
     # ASSERTION 9: post-pivot greeter spawn succeeded. Proves
     # halmasuit's process-root migration via the broker-mediated

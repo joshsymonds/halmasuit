@@ -635,6 +635,92 @@ mod tests {
         );
     }
 
+    /// Phase B v2 cross-mount-ns workaround: `bind_socket` accepts an
+    /// `@`-prefixed path and binds an ABSTRACT Linux socket (kernel
+    /// net-namespace-scoped, no filesystem inode). Asserts the listener
+    /// is visible in `/proc/net/unix` with the `@` prefix in its Path
+    /// column, and that no filesystem inode was created.
+    #[test]
+    fn bind_socket_abstract_binds_in_net_namespace_and_creates_no_inode() {
+        // Unique-per-run abstract name so concurrent test runs don't
+        // collide. Use the test PID + a high-entropy suffix.
+        let name = format!(
+            "halmasuit-test-bind-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let abstract_path = PathBuf::from(format!("@{name}"));
+
+        // `mode` is ignored on the abstract path (no inode to chmod);
+        // we still pass a permissive value to confirm the abstract
+        // branch doesn't trip the world-access gate that applies to
+        // filesystem paths.
+        let listener = bind_socket(&abstract_path, 0o600).expect("bind_socket abstract");
+
+        // No filesystem entry was created — the abstract namespace
+        // does not touch any path on disk.
+        assert!(
+            !std::path::Path::new(&format!("@{name}")).exists(),
+            "abstract bind must not create a filesystem inode"
+        );
+
+        // The kernel reports the listening abstract socket in
+        // /proc/net/unix with the Path column prefixed by `@`.
+        let proc_unix = std::fs::read_to_string("/proc/net/unix").expect("read /proc/net/unix");
+        let listening = proc_unix
+            .lines()
+            .any(|line| line.contains(&format!("@{name}")));
+        assert!(
+            listening,
+            "abstract @{name} not visible in /proc/net/unix:\n{proc_unix}"
+        );
+
+        drop(listener);
+    }
+
+    /// Round-trip on the abstract path: a client connecting to
+    /// `@<name>` reaches the listener we just bound, and `SO_PEERCRED`
+    /// reports the connecting peer's uid. Pins both the bind path and
+    /// the accept-with-creds path against drift.
+    #[test]
+    fn bind_socket_abstract_round_trip_via_peer_uid() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::SocketAddr;
+
+        let name = format!(
+            "halmasuit-test-rt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let abstract_path = PathBuf::from(format!("@{name}"));
+        let listener = bind_socket(&abstract_path, 0o600).expect("bind_socket abstract");
+
+        let client = std::thread::spawn(move || {
+            let addr = SocketAddr::from_abstract_name(name.as_bytes()).expect("client addr");
+            UnixStream::connect_addr(&addr).expect("client connect")
+        });
+
+        let (_server_side, creds) = {
+            let (stream, _peer_addr) = listener.accept().expect("accept abstract");
+            let creds = peer_credentials(&stream).expect("peer_credentials on accepted stream");
+            (stream, creds)
+        };
+        let _ = client.join().unwrap();
+
+        let self_uid = nix::unistd::getuid().as_raw();
+        assert_eq!(
+            creds.uid, self_uid,
+            "peer should be us, got {} self {}",
+            creds.uid, self_uid
+        );
+    }
+
     #[test]
     fn listener_accept_returns_peer_uid_matching_self() {
         let dir = TempDir::new().unwrap();

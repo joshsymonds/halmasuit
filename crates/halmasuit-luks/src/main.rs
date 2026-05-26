@@ -233,6 +233,27 @@ fn run_noninteractive(
     ask_dir: &Path,
     initrd_release: &Path,
 ) -> anyhow::Result<()> {
+    // Warn loudly when the on-disk passphrase file is readable by
+    // anyone other than the running user. The typical misuse pattern
+    // is passing a Nix-path-typed `services.halmasuit.luks.passphraseFile`
+    // — that imports the file into /nix/store world-readable, which
+    // the option doc now warns against but operators have a long
+    // history of trusting Nix's defaults. A runtime warning at the
+    // first ask-password response surfaces the misconfiguration in
+    // the boot journal before it becomes a quiet credential leak.
+    if let Ok(meta) = std::fs::metadata(passphrase_path) {
+        use std::os::unix::fs::MetadataExt;
+        let mode = meta.mode();
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                passphrase_path = %passphrase_path.display(),
+                mode = format!("{:#o}", mode & 0o777),
+                "passphrase file is group/world-readable; \
+                 anyone with shell access on this host can read the LUKS \
+                 passphrase. Recommended mode is 0400."
+            );
+        }
+    }
     let passphrase: Zeroizing<Vec<u8>> = Zeroizing::new(
         std::fs::read(passphrase_path)
             .with_context(|| format!("read passphrase file {}", passphrase_path.display()))?,
@@ -656,10 +677,7 @@ impl KeyboardHandler for State {
                 // through is correct.
                 if let Some(utf8) = event.utf8 {
                     for &b in utf8.as_bytes() {
-                        // Reject control chars (everything < 0x20 except
-                        // what we've handled above); accept printable
-                        // ASCII + UTF-8 continuation bytes.
-                        if b >= 0x20 || b >= 0x80 {
+                        if accept_passphrase_byte(b) {
                             self.type_char(b);
                         }
                     }
@@ -737,4 +755,55 @@ delegate_seat!(State);
 delegate_keyboard!(State);
 delegate_xdg_shell!(State);
 delegate_xdg_window!(State);
+
+/// Filter for keystroke bytes admitted into the passphrase buffer.
+///
+/// Accepts: printable ASCII (`0x20..=0x7E`) and any UTF-8
+/// continuation/lead byte (`>= 0x80`). xkbcommon has already
+/// translated key events into their UTF-8 byte sequence; passing the
+/// bytes through is correct because the LUKS keyfile is exactly the
+/// UTF-8 byte sequence.
+///
+/// Rejects: C0 control bytes (`< 0x20`) and DEL (`0x7F`). Tab,
+/// Backspace, Enter, ESC are handled by the `match` above this — by
+/// the time bytes reach this filter they're already the
+/// printable-character path.
+fn accept_passphrase_byte(b: u8) -> bool {
+    (0x20..=0x7E).contains(&b) || b >= 0x80
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accept_passphrase_byte;
+
+    /// The keystroke filter must accept printable ASCII, accept UTF-8
+    /// continuation/lead bytes (multi-byte chars pass through whole),
+    /// and reject C0 control bytes + DEL. The previous condition
+    /// `b >= 0x20 || b >= 0x80` had a dead second arm and accepted
+    /// DEL (0x7F) — a control char.
+    #[test]
+    fn accept_passphrase_byte_filter() {
+        // C0 controls (< 0x20): rejected. Sample a few corners.
+        assert!(!accept_passphrase_byte(0x00)); // NUL
+        assert!(!accept_passphrase_byte(0x07)); // BEL
+        assert!(!accept_passphrase_byte(0x19)); // EM
+        assert!(!accept_passphrase_byte(0x1F)); // US
+
+        // Printable ASCII: accepted.
+        assert!(accept_passphrase_byte(0x20)); // SP
+        assert!(accept_passphrase_byte(b'a'));
+        assert!(accept_passphrase_byte(b'~')); // 0x7E, the last printable
+
+        // DEL (0x7F): rejected — the bug-fix's whole point.
+        assert!(!accept_passphrase_byte(0x7F));
+
+        // UTF-8: every byte >= 0x80 is either a lead or a
+        // continuation. Both must be accepted so multi-byte
+        // characters arrive in the passphrase buffer intact.
+        assert!(accept_passphrase_byte(0x80)); // continuation
+        assert!(accept_passphrase_byte(0xC3)); // 2-byte lead (é = 0xC3 0xA9)
+        assert!(accept_passphrase_byte(0xA9));
+        assert!(accept_passphrase_byte(0xFF));
+    }
+}
 delegate_registry!(State);

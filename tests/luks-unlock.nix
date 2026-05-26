@@ -123,20 +123,35 @@ pkgs.testers.runNixOSTest {
     )
     print("PASS: systemd-ask-password ↔ halmasuit-luks wire round-trip")
 
-    # cryptsetup unlock via the SAME passphrase the agent holds. This
-    # proves the canonical passphrase the agent ships matches what
-    # the LUKS keyslot accepts — the end-to-end claim "halmasuit-luks
-    # is what unlocks a real LUKS volume" holds because:
-    #   (a) the wire test above shows halmasuit-luks's bytes match
-    #       what the canonical password agent (`systemd-ask-password`)
-    #       expects, AND
-    #   (b) the cryptsetup unlock below shows those same bytes do
-    #       unlock /dev/vdb.
-    # Together that's the wire claim. Driving systemd-cryptsetup
-    # through the ask-password path hangs when invoked outside a
-    # systemd-cryptsetup@.service unit (the agent loop only ticks
-    # inside that managed lifecycle); the cleaner gate is the wire
-    # test above + this independent unlock confirmation.
+    # cryptsetup unlock with the SAME passphrase the agent holds.
+    # This proves the bytes the agent ships are the bytes the LUKS
+    # keyslot accepts.
+    #
+    # Production deployments invoke the agent-driven unlock path
+    # via `systemd-cryptsetup@.service` (generated from /etc/crypttab
+    # by `systemd-cryptsetup-generator`), which is what runs in the
+    # full-boot-flash + initrd-survival fromInitrd shape. That path
+    # composes (wire) × (cryptsetup) end-to-end at boot. This test
+    # decomposes that production path into its two halves:
+    #
+    #   1. WIRE: systemd-ask-password (above) — the SAME tool
+    #      systemd-cryptsetup@.service invokes for the agent path.
+    #      Asserts halmasuit-luks's bytes match what systemd's
+    #      canonical ask-password producer expects.
+    #   2. KEYSLOT: cryptsetup open with --key-file=... using the
+    #      SAME bytes (this section). Asserts those bytes unlock
+    #      /dev/vdb.
+    #
+    # Composition (1)×(2) is what `systemd-cryptsetup@.service`
+    # exercises at boot. The bare-CLI `systemd-cryptsetup attach
+    # NAME DEV [KEY] [OPTS]` (which we initially tried for an in-test
+    # end-to-end check) does NOT tick the password-agent loop the
+    # same way — `ask_password_auto` inside the CLI binary follows
+    # a different fallback chain than the agent-monitored unit
+    # lifecycle, and reliably hangs in VM-test conditions. Until
+    # that path is fixed upstream or worked around with a proper
+    # systemd-managed harness, the decomposed proof is the
+    # strongest assertion of the production claim.
     machine.succeed(
         "cryptsetup open --key-file=/run/halmasuit-luks-key "
         "/dev/vdb test-luks-data"
@@ -146,7 +161,7 @@ pkgs.testers.runNixOSTest {
         f"/dev/mapper/test-luks-data not present.\n"
         f"/dev/mapper contents: {mapper}"
     )
-    print("PASS: /dev/mapper/test-luks-data unlocked with the same passphrase")
+    print("PASS: /dev/mapper/test-luks-data unlocked with the canonical passphrase (composition of wire + keyslot above)")
 
     sectors = machine.succeed(
         "blockdev --getsz /dev/mapper/test-luks-data"

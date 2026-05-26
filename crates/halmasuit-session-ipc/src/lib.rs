@@ -450,6 +450,7 @@ mod tests {
             "failure",
             "session_opened",
             "session_ended",
+            "root_fd",
             "worker_success",
             "worker_failure",
         ] {
@@ -463,6 +464,16 @@ mod tests {
                 "tag {tag:?} must not decode as CompositorToBroker, got {as_c2b:?}"
             );
         }
+
+        // Conversely: `request_root_fd` (the new C→B tag) must NOT
+        // decode as any BrokerToCompositor variant. The broker is
+        // the recipient of root-fd requests, not the emitter.
+        let req = encode(&CompositorToBroker::RequestRootFd).unwrap();
+        let as_b2c: Result<Option<(BrokerToCompositor, usize)>, _> = try_decode(&req);
+        assert!(
+            matches!(as_b2c, Err(CodecError::Json(_))),
+            "request_root_fd must not decode as BrokerToCompositor, got {as_b2c:?}"
+        );
     }
 
     // ── Amendment A5: broker→compositor session-lifecycle frames ─────
@@ -509,13 +520,38 @@ mod tests {
     }
 
     #[test]
+    fn wire_format_request_root_fd() {
+        // Phase B v2 cross-pivot per-process-root migration:
+        // C→B side of the broker RootFd handoff. Tagless body, same
+        // shape as Cancel.
+        let json = r#"{"type":"request_root_fd"}"#;
+        let parsed: CompositorToBroker = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, CompositorToBroker::RequestRootFd);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn wire_format_root_fd() {
+        // Phase B v2 cross-pivot per-process-root migration:
+        // B→C reply carrying the broker's `/proc/self/root` as an
+        // SCM_RIGHTS attachment. The frame body is empty (the fd
+        // travels out-of-band on the SCM_RIGHTS control message);
+        // the JSON shape is the discriminator only.
+        let json = r#"{"type":"root_fd"}"#;
+        let parsed: BrokerToCompositor = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, BrokerToCompositor::RootFd);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+
+    #[test]
     fn session_lifecycle_is_broker_to_compositor_only() {
-        // A5.1 one-way invariant: a session_opened / session_ended
-        // datagram MUST NOT decode as any CompositorToBroker variant
-        // (the compositor never *emits* lifecycle; the type only
-        // deserializes broker→compositor). This is the structural
-        // anti-forge guarantee — there is no frame the unprivileged
-        // compositor can send that asserts session lifecycle.
+        // A5.1 one-way invariant: a session_opened / session_ended /
+        // root_fd datagram MUST NOT decode as any CompositorToBroker
+        // variant (the compositor never *emits* lifecycle or root-fd
+        // grants; the type only deserializes broker→compositor).
+        // Structural anti-forge guarantee — there is no frame the
+        // unprivileged compositor can send that asserts session
+        // lifecycle or the broker-mediated process-root migration.
         for frame in [
             BrokerToCompositor::SessionOpened,
             BrokerToCompositor::SessionEnded {
@@ -524,6 +560,7 @@ mod tests {
             BrokerToCompositor::SessionEnded {
                 outcome: SessionOutcome::Signaled { signal: 15 },
             },
+            BrokerToCompositor::RootFd,
         ] {
             let bytes = encode(&frame).unwrap();
             let as_c2b: Result<Option<(CompositorToBroker, usize)>, _> = try_decode(&bytes);
@@ -551,6 +588,7 @@ mod tests {
                 env: vec![("HOME".into(), "/home/alice".into())],
             },
             CompositorToBroker::Cancel,
+            CompositorToBroker::RequestRootFd,
         ] {
             let bytes = encode(&msg).unwrap();
             let (decoded, consumed): (CompositorToBroker, usize) =
@@ -582,6 +620,7 @@ mod tests {
             BrokerToCompositor::SessionEnded {
                 outcome: SessionOutcome::Signaled { signal: 9 },
             },
+            BrokerToCompositor::RootFd,
         ] {
             let bytes = encode(&msg).unwrap();
             let (decoded, consumed): (BrokerToCompositor, usize) =
