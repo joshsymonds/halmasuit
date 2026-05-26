@@ -529,20 +529,25 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
         Err(e) => return Err(e),
     };
-    // Slow-loris guard: cap the first-frame recv at 5s via
+    // Slow-loris guard: cap the first-frame recv at 30s via
     // SO_RCVTIMEO so an unprivileged peer that connects without
     // sending cannot wedge the broker calloop for an unbounded
-    // window. Legitimate clients (the compositor + the VM test
-    // client) send their first frame within ms of connect — 5s is
-    // huge headroom. setsockopt failures are logged but don't abort
-    // the admission: the per-uid refusal-log rate-limiter still
-    // bounds attacker-driven log spam, the broker idle-exit still
-    // bounds total uptime, and a failed setsockopt is a defense
-    // weakness, not a correctness break.
+    // window. Originally 5s on the assumption that the compositor
+    // sends BeginAuth within ms of connect; Phase B's greetd flow
+    // changes that — halmasuit connects to the broker EAGERLY on
+    // greeter accept, but the actual BeginAuth payload requires the
+    // greeter's `CreateSession` (R8 hint username), which is gated
+    // on user input. Real users can take longer than 5s to type a
+    // username. 30s keeps the defense intact (single-slot serialisation
+    // + per-uid refusal-log rate-limiter + idle-exit still bound the
+    // broker's total exposure) while accommodating human-paced auth.
+    // setsockopt failures are logged but don't abort the admission:
+    // a failed setsockopt is a defense weakness, not a correctness
+    // break.
     if let Err(e) = nix::sys::socket::setsockopt(
         &greeter,
         nix::sys::socket::sockopt::ReceiveTimeout,
-        &nix::sys::time::TimeVal::new(5, 0),
+        &nix::sys::time::TimeVal::new(30, 0),
     ) {
         tracing_log(&format!(
             "setsockopt(SO_RCVTIMEO) failed: {e}; \

@@ -921,6 +921,37 @@ in
      # indirection in initramfs).
      hardware.graphics.enable = true;
 
+     # halmasuit needs seatd in rootfs too (post-pivot, when the broker
+     # session-leader child connects to negotiate device acquisition).
+     # Same shape as the rootfs `enable` deployment.
+     services.seatd.enable = true;
+
+     # System bus + halmasuit ownership policy for the post-pivot
+     # rootfs dbus-broker. halmasuit-debug's `Snapshot()` D-Bus thread
+     # connects to the rootfs system bus in `run_post_pivot_setup`
+     # (the initramfs system bus denied the name; this is the retry
+     # site that succeeds because the policy below grants it). The
+     # production `halmasuit` package never requests the name; this
+     # policy is inert there. Shipped from the fromInitrd block so the
+     # cfg.enable block above doesn't need to mkForce.
+     services.dbus.enable = true;
+     services.dbus.packages = [
+       (pkgs.writeTextDir "share/dbus-1/system.d/org.halmasuit.conf" ''
+         <!DOCTYPE busconfig PUBLIC
+           "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+           "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+         <busconfig>
+           <policy user="root">
+             <allow own="org.halmasuit"/>
+           </policy>
+           <policy context="default">
+             <allow send_destination="org.halmasuit"/>
+             <allow receive_sender="org.halmasuit"/>
+           </policy>
+         </busconfig>
+       '')
+     ];
+
      # `boot.initrd.systemd.enable = true` is required for
      # `boot.initrd.systemd.services.*` to take effect. NixOS's older
      # initramfs (without systemd) can't host a long-running unit.
@@ -1069,7 +1100,19 @@ in
          # CAN reach the broker socket bound by rootfs systemd's
          # `halmasuit-session.socket` unit. See the cross-pivot
          # docstring on the unit's serviceConfig above.
-         HALMASUIT_GREETD_SOCKET  = "@halmasuit-greetd";
+         # The greetd socket is bound POST-CHROOT (run_post_pivot_setup
+         # calls setup_greetd_listener after halmasuit chroots into
+         # rootfs's view), so a filesystem path works the same way it
+         # does in the rootfs `enable` deployment. We DON'T use an
+         # abstract socket here: greetd clients (Quickshell / DMS) call
+         # `connect(2)` with the env value verbatim and don't interpret
+         # a leading '@' as the abstract namespace — pointing them at
+         # `@halmasuit-greetd` silently fails the connect and the
+         # greeter never asks the broker to authenticate. The BROKER
+         # socket above stays abstract because halmasuit reaches it
+         # FROM the initramfs net-ns (PrivateNetwork=false; same
+         # net-ns) before the chroot happens.
+         HALMASUIT_GREETD_SOCKET  = "/run/halmasuit/greetd.sock";
          HALMASUIT_BROKER_SOCKET  = "@halmasuit-session";
          # Phase B v2: greeter-identity fields halmasuit consults when
          # `User::from_uid` fails because /etc/passwd isn't visible in
@@ -1085,6 +1128,17 @@ in
          HALMASUIT_GREETER_GID    = toString config.users.groups.${cfg.greeterGroup}.gid;
          HALMASUIT_GREETER_NAME   = cfg.greeterUser;
          HALMASUIT_GREETER_HOME   = "/var/empty";
+
+         # Group ownership for the bound `/run/halmasuit/wayland-0` socket
+         # (Phase B fromInitrd path). The rootfs `enable` unit pins this
+         # via systemd's `Group = cfg.greeterGroup` directive on the
+         # service (process egid at bind time → file gid). Initramfs
+         # systemd can't carry `Group=` (no NSS pre-pivot — `Group=` fails
+         # 216/GROUP), so halmasuit reads this env and `fchown`s the
+         # socket explicitly after bind. Without this the file ends up
+         # `root:root` and the greeter (running as the greeter uid in the
+         # greeter group, mode 0660) hits EACCES on `connect(2)`.
+         HALMASUIT_WAYLAND_GROUP_GID = toString config.users.groups.${cfg.greeterGroup}.gid;
 
          # PAM/auth surface for the post-pivot greeter. The initramfs
          # phase skips greetd + greeter spawn + privilege drop (no

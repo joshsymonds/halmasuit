@@ -309,7 +309,7 @@ struct HalmasuitState {
     /// revoked. `None` only on the SKIP (no-DRM/dev) path. Epic
     /// layer E; survival across the privilege drop validated by
     /// drm-master-probe Phase 4.
-    _libseat_session: Option<LibSeatSession>,
+    libseat_session: Option<LibSeatSession>,
 
     // ── greetd I/O ──────────────────────────────────────────────────────
     /// LoopHandle for inserting per-connection sources from inside
@@ -2231,6 +2231,44 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
         tracing::warn!("HALMASUIT_GREETER_COMMAND unset post-pivot; running without a greeter");
     }
 
+    // libinput / libseat — post-pivot wiring for input device fds.
+    // The Phase B initramfs phase deliberately skips libseat (no seatd
+    // pre-pivot — see the `in_initramfs` branch in `main`); DRM is
+    // direct-opened with SET_MASTER instead. seatd comes up post-pivot
+    // as a rootfs unit, and from this point libinput can broker the
+    // keyboard / pointer / touch fds through it. Without this branch
+    // the wl_seat capabilities advertise but never carry events —
+    // halmasuit ignores host keystrokes / pointer motion entirely and
+    // any Wayland greeter ends up unfocusable.
+    //
+    // The DRM side stays direct-opened from initramfs; libseat brokers
+    // ONLY the input subsystem here. drm-master-probe Phase 4
+    // validated that a libseat session survives the subsequent
+    // setresuid in `drop_privileges` below.
+    //
+    // Errors are degraded-state recoverable (same posture as
+    // setup_greetd_listener / spawn_greeter above): if seatd is
+    // unreachable or udev_assign_seat fails, log + continue without
+    // input. The visible surface still composites; only interactive
+    // greeters lose input.
+    if state.libseat_session.is_none() {
+        step_errors.extend(setup_post_pivot_input(state));
+    }
+
+    // frame_audit only: retry the D-Bus `Snapshot()` server connect
+    // post-chroot. The pre-pivot connect (in `main`) targets the
+    // initramfs system bus, which has no halmasuit ownership policy
+    // — it bounces with `AccessDenied`. The post-chroot bus is
+    // rootfs's dbus-broker, whose policy DOES grant `org.halmasuit`
+    // to halmasuit; a fresh connect here succeeds. In rootfs-only
+    // `enable` deployments this branch never runs (`post_pivot_setup`
+    // is invoked only from the fromInitrd pivot-poll timer); the
+    // single main()-time connect is sufficient there.
+    #[cfg(feature = "frame_audit")]
+    if let Some(backend) = state.drm_backend.as_ref() {
+        dbus::serve(backend.snapshot_handle());
+    }
+
     // (3) Drop privileges. Compositor uid is now resolvable against
     // the rootfs /etc/passwd (the pivot completed). If drop fails
     // OR the env is missing while still root, return Err — the
@@ -2341,6 +2379,78 @@ fn apply_chroot_to_root_fd(root_fd: &std::os::fd::OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Post-pivot libseat + libinput attach (Phase B fromInitrd path only).
+///
+/// The Phase B initramfs phase deliberately skips libseat — no seatd
+/// pre-pivot, DRM is direct-opened with SET_MASTER. seatd comes up
+/// post-pivot as a rootfs unit, after which libinput can broker the
+/// keyboard / pointer / touch fds through it. Without this branch the
+/// `wl_seat` capabilities advertise but never carry events; halmasuit
+/// ignores host keystrokes and any Wayland greeter is unfocusable.
+///
+/// DRM stays direct-opened from initramfs; libseat brokers ONLY the
+/// input subsystem here. drm-master-probe Phase 4 validated that the
+/// libseat session survives the subsequent `setresuid` in
+/// `drop_privileges`.
+///
+/// Each step is degraded-state recoverable (same posture as
+/// setup_greetd_listener / spawn_greeter in `run_post_pivot_setup`):
+/// errors are returned as strings for the caller's `step_errors`
+/// aggregate; the function never panics or returns Err.
+fn setup_post_pivot_input(state: &mut HalmasuitState) -> Vec<String> {
+    let mut errs: Vec<String> = Vec::new();
+    let session_and_notifier = match LibSeatSession::new() {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "post-pivot: LibSeatSession::new failed (is seatd reachable?)"
+            );
+            errs.push(format!("post-pivot LibSeatSession::new: {e}"));
+            return errs;
+        }
+    };
+    let (session, libseat_notifier) = session_and_notifier;
+    if let Err(e) = state.loop_handle.insert_source(
+        libseat_notifier,
+        |event, (), _state: &mut HalmasuitState| {
+            tracing::info!(?event, "libseat session event (post-pivot)");
+        },
+    ) {
+        tracing::error!(error = %e, "post-pivot: insert libseat notifier failed");
+        errs.push(format!("insert libseat notifier: {e}"));
+    }
+    let mut libinput = smithay::reexports::input::Libinput::new_with_udev(
+        LibinputSessionInterface::from(session.clone()),
+    );
+    if libinput.udev_assign_seat(&session.seat()).is_err() {
+        tracing::error!(
+            seat = %session.seat(),
+            "post-pivot: libinput udev_assign_seat failed"
+        );
+        errs.push(format!("libinput udev_assign_seat({})", session.seat()));
+        state.libseat_session = Some(session);
+        return errs;
+    }
+    match state.loop_handle.insert_source(
+        LibinputInputBackend::new(libinput),
+        |event, (), st: &mut HalmasuitState| st.dispatch_libinput(event),
+    ) {
+        Ok(_token) => {
+            tracing::info!(
+                seat = %session.seat(),
+                "post-pivot: libinput backend attached"
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "post-pivot: insert libinput backend failed");
+            errs.push(format!("insert libinput backend: {e}"));
+        }
+    }
+    state.libseat_session = Some(session);
+    errs
+}
+
 /// Bind the greetd socket, register it as a calloop source, and emit
 /// `Phase::GreetdReady`. Returns the registration token (held by
 /// `HalmasuitState` so the source lives for the compositor's lifetime)
@@ -2366,6 +2476,20 @@ fn setup_greetd_listener(
     let greetd_listener = bind_socket(&greetd_path, 0o660)
         .map_err(|e| io::Error::other(format!("bind greetd socket: {e}")))?;
     greetd_listener.set_nonblocking(true)?;
+    // Mirror the wayland-0 chgrp pattern: in fromInitrd the systemd
+    // unit can't set `Group=` (no NSS pre-pivot), so the bound socket
+    // inherits the process gid (root). Honour
+    // `HALMASUIT_WAYLAND_GROUP_GID` so the greeter (which is in the
+    // greeter group, mode 0o660) can `connect(2)` — without this the
+    // bind succeeds but Quickshell's greetd client hits EACCES and
+    // never speaks the greetd protocol.
+    if let Ok(gid_str) = std::env::var("HALMASUIT_WAYLAND_GROUP_GID")
+        && let Ok(gid) = gid_str.parse::<u32>()
+    {
+        nix::unistd::chown(&greetd_path, None, Some(nix::unistd::Gid::from_raw(gid))).map_err(
+            |e| io::Error::other(format!("chgrp {} -> {gid}: {e}", greetd_path.display())),
+        )?;
+    }
     tracing::info!(socket = ?greetd_path, "greetd socket bound");
 
     let greeter_uid = greeter_uid_from_env();
@@ -3542,6 +3666,15 @@ fn main() -> io::Result<()> {
     //
     // `socket.socket_name()` returns just the basename (e.g.
     // "wayland-0"); the actual file lives at $XDG_RUNTIME_DIR/<name>.
+    //
+    // Group ownership: the rootfs `enable` deployment lets systemd's
+    // `Group = cfg.greeterGroup` directive set the process's egid
+    // before this bind, so the file inherits the right gid. The
+    // initramfs Phase B unit can't use `Group=` (no NSS in initramfs;
+    // `Group=halmasuit-greeter` fails 216/GROUP). Honour an explicit
+    // `HALMASUIT_WAYLAND_GROUP_GID` so the same 0660 protections work
+    // cross-deployment: the gid is baked into the module from the
+    // greeter group's resolved gid in rootfs config.
     {
         use std::os::unix::fs::PermissionsExt;
         let xdg_runtime_dir =
@@ -3551,6 +3684,18 @@ fn main() -> io::Result<()> {
         std::fs::set_permissions(&abs_socket_path, perms).map_err(|e| {
             io::Error::other(format!("chmod 0660 {}: {e}", abs_socket_path.display()))
         })?;
+        if let Ok(gid_str) = std::env::var("HALMASUIT_WAYLAND_GROUP_GID")
+            && let Ok(gid) = gid_str.parse::<u32>()
+        {
+            nix::unistd::chown(
+                &abs_socket_path,
+                None,
+                Some(nix::unistd::Gid::from_raw(gid)),
+            )
+            .map_err(|e| {
+                io::Error::other(format!("chgrp {} -> {gid}: {e}", abs_socket_path.display()))
+            })?;
+        }
     }
 
     // New-client handler: SO_PEERCRED-gate every accepted stream
@@ -3772,7 +3917,7 @@ fn main() -> io::Result<()> {
         foreground_toplevel: None,
         popups: PopupManager::default(),
         foreground: halmasuit_introspect::Foreground::Greeter,
-        _libseat_session: libseat_session,
+        libseat_session,
         loop_handle: loop_handle.clone(),
         connections: HashMap::new(),
         next_conn_id: 0,

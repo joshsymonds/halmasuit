@@ -121,10 +121,12 @@ let
   greeterCmd = pkgs.writeShellScript "phase-b-dankgreeter" ''
     export XDG_RUNTIME_DIR=/run/halmasuit-greeter
     export WAYLAND_DISPLAY=/run/halmasuit/wayland-0
-    # halmasuit-greetd in the fromInitrd shape binds the abstract
-    # name `@halmasuit-greetd`. DMS's Quickshell.Services.Greetd
-    # passes GREETD_SOCK to connect to.
-    export GREETD_SOCK=@halmasuit-greetd
+    # halmasuit's spawn_greeter already exports GREETD_SOCK pointing
+    # at the path it bound — we don't need to override it. The
+    # production fromInitrd module pins this to
+    # `/run/halmasuit/greetd.sock` so Quickshell's greetd client
+    # (which doesn't interpret a leading '@' as the abstract namespace)
+    # connects via the standard filesystem path.
     # OUR test sessions dir FIRST so DMS picks phase-b-niri.desktop.
     export XDG_DATA_DIRS=${testSessions}/share:/run/current-system/sw/share:/usr/share
     export LIBGL_ALWAYS_SOFTWARE=1

@@ -288,7 +288,14 @@ def introspect_events(machine) -> list:
     (`{"timestamp":...,"fields":{"json":"<Event JSON string>"},...}`);
     the Event itself is the JSON-encoded `fields.json` string.
     """
-    raw = machine.succeed("journalctl -u halmasuit -o cat --no-pager")
+    # `-b` constrains to the CURRENT boot. The Phase B golden-boot
+    # tests run a deliberate dual-boot dance (first boot luksFormats
+    # `/dev/vdb`, crashes, then the real boot exercises the unlock
+    # path); without `-b` `assert_no_flash_stream` would see two
+    # `client_first_frame{role:wallpaper}` events (one per boot) and
+    # incorrectly flag the second-boot wallpaper plane as a recreation. Single-
+    # boot tests are unaffected — `-b` is a no-op there.
+    raw = machine.succeed("journalctl -b -u halmasuit -o cat --no-pager")
     events = []
     for line in raw.splitlines():
         line = line.strip()
