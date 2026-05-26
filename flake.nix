@@ -821,6 +821,18 @@
           halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Epic #35 cell (enc, video): LUKS rootfs + h264 video wallpaper.
+        # Final matrix cell.
+        visual-phase-b-enc-video = import ./tests/visual-phase-b-enc-video.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-decoder   = self.packages.x86_64-linux.halmasuit-decoder;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         visual-phase-b-side-video = import ./tests/visual-phase-b-side-video.nix {
           system              = "x86_64-linux";
           inherit nixpkgs nix-config;
