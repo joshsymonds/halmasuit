@@ -755,6 +755,15 @@
           system = "x86_64-linux";
           inherit nixpkgs;
         };
+        # Epic #47 R2 Phase 2 probe (THE risky one): DRM master fd
+        # survival across the shutdownRamfs pivot. No documented
+        # prior art for a graphics process doing this. If this
+        # passes, production wiring is unblocked. If it fails, fall
+        # back to the partial-scope alternative.
+        halmasuit-shutdown-probe-phase2 = import ./tests/halmasuit-shutdown-probe-phase2.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+        };
         # Phase B (initramfs survival): real halmasuit binary in
         # boot.initrd.systemd.services with SurviveFinalKillSignal=yes,
         # asserts PID + DRM-master + Wayland-socket continuity across

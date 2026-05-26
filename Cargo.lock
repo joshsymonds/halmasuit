@@ -986,6 +986,8 @@ dependencies = [
 name = "halmasuit-shutdown-probe"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "drm 0.15.0",
  "nix 0.30.1",
 ]
 

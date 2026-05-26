@@ -19,6 +19,14 @@ workspace = true
 [dependencies]
 # signalfd, sigprocmask, poll. `libc` would be needed for direct
 # syscall wrappers; we use nix's safe layer instead, so libc itself
-# isn't a direct dep. Add it back if a phase 1/2 sub-task needs a
-# raw libc::ioctl / libc::syscall.
+# isn't a direct dep.
 nix = { version = "0.30", features = ["signal", "poll"] }
+# Phase 2: DRM ioctls. Same crate + version as drm-master-probe.
+# Phase 0/1 don't link this; cargo's resolver only pulls it in
+# because Phase 2 is in the same binary, but the lean phase0/phase1
+# builds don't pay any runtime cost for it.
+drm = "0.15"
+# Error-context plumbing for the Phase 2 DRM setup chain (mirror of
+# drm-master-probe's pattern; the setup chain has eleven steps,
+# every one of which can fail in informative ways).
+anyhow = "1"

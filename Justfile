@@ -77,6 +77,9 @@ test-vm:
     echo "── halmasuit-shutdown-probe-phase1 ──"
     nix build .#checks.x86_64-linux.halmasuit-shutdown-probe-phase1 -L --print-build-logs --no-link
     echo
+    echo "── halmasuit-shutdown-probe-phase2 ──"
+    nix build .#checks.x86_64-linux.halmasuit-shutdown-probe-phase2 -L --print-build-logs --no-link
+    echo
     echo "── full-boot-flash ──"
     nix build .#checks.x86_64-linux.full-boot-flash -L --print-build-logs --no-link
     echo
@@ -279,6 +282,15 @@ test-shutdown-probe-phase0:
 # kill the probe.
 test-shutdown-probe-phase1:
     nix build .#checks.x86_64-linux.halmasuit-shutdown-probe-phase1 -L --print-build-logs --no-link
+
+# Epic #47 R2 Phase 2 probe (THE risky one): opens /dev/dri/card0,
+# takes DRM master, paints magenta, then per-heartbeat re-issues
+# set_crtc to assert both master + fd validity. Passing means the
+# whole Epic #47 R2 ("wallpaper through shutdown to kernel halt")
+# design is empirically grounded. Failing means we fall back to
+# the partial-scope alternative (paint until SIGKILL).
+test-shutdown-probe-phase2:
+    nix build .#checks.x86_64-linux.halmasuit-shutdown-probe-phase2 -L --print-build-logs --no-link
 
 # Phase B initrd-survival gate: the production halmasuit binary
 # registered via `services.halmasuit.fromInitrd.enable`. Composes
