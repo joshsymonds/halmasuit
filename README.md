@@ -8,8 +8,8 @@ greeter and the user desktop on every greetd-based Linux setup.
 
 ## Status
 
-**v2 Phase A: in-repo contract complete, privilege-separated. Not yet
-running on real hardware.**
+**v2 in-repo contract complete (Phase A + Phase B). Not yet running
+on real hardware.**
 
 The compositor exists and works in NixOS VM tests. The auth/session
 path is privilege-separated: a single privileged `halmasuit-session`
@@ -19,13 +19,27 @@ the session by forking once and dropping privileges in a non-setuid
 child. The compositor is an unprivileged sans-IO relay to it; there is
 exactly one libpam surface and **no setuid binary in the closure** (the
 old in-compositor `halmasuit-pam` and setuid `halmasuit-spawn` are
-deleted). `tests/login-flash.nix` — the test that empirically measured
-the flash — is GREEN **through the broker-launched session**: halmasuit
-holds its PID and frame continuity across the real greeter→session
-transition, the property that proves no restart and therefore no flash.
-`just check` is 244/244 + `r14-gate`; `just test-vm` is a 14-gate
-sweep including three real-PAM broker gates (`run-pam-auth`,
-`session-r5r6`, `session-onehandle`).
+deleted). `tests/login-flash.nix` is GREEN **through the broker-launched
+session**: halmasuit holds its PID and frame continuity across the real
+greeter→session transition, the property that proves no restart and
+therefore no flash.
+
+**Phase B (initramfs survival) shipped.** halmasuit runs from the
+initramfs systemd, survives `switch_root` via
+`SurviveFinalKillSignal=yes`, unlocks LUKS volumes via the
+`halmasuit-luks` password-agent Wayland client, and reaches paths
+in the rootfs view post-pivot via the broker's SCM_RIGHTS root-fd
+handoff (the rootfs `chroot` fd travels over the broker socket so
+the surviving initramfs process can `fchdir` + `chroot` into the
+rootfs mount-ns view). 6/6 visual matrix cells green
+(`tests/visual-phase-b-{side,enc}-{image,shader,video}.nix` — 2
+LUKS shapes × 3 wallpaper variants); `tests/full-boot-flash.nix`
+green; `tests/luks-unlock.nix` green.
+
+`just check` is 377/377; `just test-vm` is a 49-gate sweep.
+Empirical foundations for Phase B are in [RESEARCH.md](RESEARCH.md)
+(drm-master-probe Phases 0–3 on DRM master persistence across
+`setresuid`, fork, and `switch_root` + `execve`).
 
 **What's left before halmasuit boots a real machine** — all
 cross-repo, in [nix-config](https://github.com/joshsymonds/nix-config):
@@ -34,19 +48,13 @@ cross-repo, in [nix-config](https://github.com/joshsymonds/nix-config):
   `WAYLAND_DISPLAY=wayland-0` and skip the nested-niri spawn that
   exists for the greetd model.
 - dms-niri integration switchover: replace `services.greetd.enable`
-  with `services.halmasuit.enable` in gnomon's host config; declare
-  the halmasuit-greeter and halmasuit-compositor system users.
+  with `services.halmasuit.enable` +
+  `services.halmasuit.fromInitrd.enable` in gnomon's host config;
+  declare the halmasuit-greeter and halmasuit-compositor system
+  users; remove `boot.plymouth.enable`.
 - Real-hardware shakedown on gnomon. Likely to surface integration
   issues VM tests can't see (real KMS instead of virtio-gpu, real
   DankGreeter rendering, real niri-as-session-client).
-
-**Phase B (initramfs survival) hasn't started.** halmasuit running
-from initramfs, surviving `switch_root` with its DRM master fd
-intact, replacing Plymouth so the splash and the compositor are
-the same process from KMS init onward. The empirical foundations
-are validated (drm-master-probe Phases 0–3, documented in
-[RESEARCH.md](RESEARCH.md)); production wiring is the next major
-milestone.
 
 ## Architecture
 
@@ -54,7 +62,8 @@ milestone.
 
 | Crate | Role |
 |---|---|
-| `halmasuit` | The compositor binary. smithay-based Wayland server; drives the greetd protocol via calloop; spawns the greeter as a child; relays the auth/session lifecycle to the `halmasuit-session` broker (per-greeter `BrokerEpisode`, non-blocking broker calloop source). Holds no PAM, no credentials, no escalation capability post-drop (keeps only `CAP_KILL`). |
+| `halmasuit` | The compositor binary. smithay-based Wayland server; drives the greetd protocol via calloop; spawns the greeter as a child; relays the auth/session lifecycle to the `halmasuit-session` broker (per-greeter `BrokerEpisode`, non-blocking broker calloop source). Holds no PAM, no credentials, no escalation capability post-drop (keeps only `CAP_KILL`). Runs in both initramfs (via `services.halmasuit.fromInitrd.enable`) and rootfs. |
+| `halmasuit-luks` | systemd password-agent Wayland client. Registers with `/run/systemd/ask-password/`, prompts the user for LUKS passphrases via a layer-shell surface over halmasuit's wallpaper plane, returns the answer to systemd-cryptsetup. Runs as root in the initramfs (no userdb yet) — highest-risk Phase B surface because it sees passphrases. |
 | `halmasuit-session` | **The single privileged surface.** Host-ns PAM/session broker: one `pam_handle_t` whole-lifecycle, `pam_authenticate` in an ephemeral SIGKILL-able `setrlimit`-bounded fork, non-setuid fork-then-drop session leader, identity independently PAM-re-derived, UID floor in the leader child, socket-activated with idle-exit, relay-peer `SO_PEERCRED` gate. `unsafe` confined to its `pam_ffi`/`worker` modules. |
 | `halmasuit-session-ipc` | Pure wire contract (types + codec) for the compositor↔broker relay, incl. the one-way `BrokerToCompositor` session-lifecycle frames. `#![forbid(unsafe_code)]`. |
 | `halmasuit-introspect` | Schema-stable `Event` enum + `tracing-subscriber` JSON sink. Every state transition lands in journald as one JSON line. `#![forbid(unsafe_code)]`. |
@@ -62,9 +71,11 @@ milestone.
 | `halmasuit-vm-client` | Test-only greetd-protocol CLI driver. Used by the VM tests to exercise auth flows deterministically. |
 | `drm-master-probe` | Research crate, not v2 production. Validated the empirical foundations of Phase A + Phase B (`DRM_IOCTL_SET_MASTER` survival across `setresuid`, fork, and `switch_root` + exec). |
 
-The remaining workspace members (`halmasuit-protocols`, `halmasuit-kms`,
-`halmasuit-ipc`, `halmasuit-cli`, `halmasuit-test`) are placeholder
-stubs that will populate as the consuming tasks land.
+The remaining workspace members (`halmasuit-protocols`,
+`halmasuit-kms`, `halmasuit-ipc`, `halmasuit-cli`, `halmasuit-test`)
+are placeholder stubs that will populate as the consuming tasks land.
+`halmasuit-fsck` and `halmasuit-emergency` adapters are explicitly
+out of scope for v2 (edge-case UX — happy-path mandate).
 
 ### Runtime flow
 
@@ -116,10 +127,13 @@ Requires Nix with flakes enabled.
 ```bash
 nix develop          # rust + cargo tooling + qemu + lints
 just check           # rustfmt + clippy -D warnings + cargo-deny +
-                     # cargo-machete + typos + r14-gate + nextest (244)
-just test-vm         # NixOS VM gates (14): smoke-boot, halmasuit-vm,
-                     # run-pam-auth, session-r5r6, session-onehandle,
-                     # login-flash, halmasuit-input, visual-* — all hard
+                     # cargo-machete + typos + nextest (377)
+just test-vm         # NixOS VM gates (49): smoke-boot, halmasuit-vm,
+                     # initrd-survival, full-boot-flash, luks-unlock,
+                     # visual-initrd-pixmap, visual-phase-b-* (6-cell
+                     # matrix), run-pam-auth, session-r5r6,
+                     # session-onehandle, login-flash, halmasuit-input,
+                     # visual-* — all hard
 ```
 
 For interactive debugging of a VM test with an attached QEMU

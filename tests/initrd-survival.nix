@@ -244,32 +244,29 @@ pkgs.testers.runNixOSTest {
     print("PASS: Wayland socket present at /run/halmasuit/wayland-0 post-pivot")
 
     # ASSERTION 7: post-pivot greetd listener bound AND reachable
-    # from the rootfs view. The Phase B v1 → v2 fix uses an ABSTRACT
-    # Linux socket (`@halmasuit-greetd`) instead of a filesystem
-    # path — abstract sockets live in the NETWORK namespace which
-    # halmasuit + rootfs share, so cross-mount-namespace visibility
-    # of the listener is no longer a problem.
+    # from the rootfs view. Cross-mount-namespace visibility is
+    # solved by the broker SCM_RIGHTS root-fd handoff: halmasuit
+    # `fchdir` + `chroot`s into rootfs's process root post-pivot, so
+    # its `/run/halmasuit/` view matches the rootfs view. Production
+    # binds the greetd listener as a filesystem path (not abstract)
+    # because Quickshell/Qt greeter clients don't honor the `@`
+    # abstract-socket prefix — see HALMASUIT_GREETD_SOCKET in
+    # nix/module.nix.
     assert "greetd_ready" in phases_seen, (
         "halmasuit did NOT emit `phase: greetd_ready` post-pivot — "
         "`run_post_pivot_setup` either didn't run or failed to bind "
         "the greetd socket.\n"
         f"phases: {sorted(phases_seen)}"
     )
-    # Check the kernel's listening Unix sockets from the rootfs net
-    # namespace (which halmasuit + rootfs share). If the abstract
-    # name appears as a LISTEN socket, halmasuit's bind is visible
-    # cross-mount-ns. /proc/net/unix lists abstract sockets with `@`
-    # prefix in the Path column.
-    abstract_check = machine.execute(
-        "grep -E '@halmasuit-greetd' /proc/net/unix || echo 'not-found'"
-    )
-    assert "not-found" not in abstract_check[1], (
-        f"abstract @halmasuit-greetd socket NOT visible from rootfs view.\n"
-        f"output: {abstract_check[1]}\n"
-        "Mismatch suggests the bind happened in halmasuit's own net "
-        "ns or didn't happen at all."
-    )
-    print("PASS: abstract @halmasuit-greetd socket reachable from rootfs view")
+    greetd_sock_check = machine.execute("test -S /run/halmasuit/greetd.sock")[0]
+    if greetd_sock_check != 0:
+        raise AssertionError(
+            "halmasuit's greetd socket is missing at "
+            "/run/halmasuit/greetd.sock post-pivot.\n"
+            "Contents of /run/halmasuit/:\n"
+            + machine.execute("ls -la /run/halmasuit/ 2>&1 || echo 'directory missing'")[1]
+        )
+    print("PASS: greetd socket present at /run/halmasuit/greetd.sock post-pivot")
 
     # ASSERTION 8: post-pivot privilege drop completed. Proves
     # `drop_privileges(compositorUid)` ran successfully — halmasuit
