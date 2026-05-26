@@ -206,15 +206,27 @@ pub struct DrmBackend {
     /// `halmasuit-debug`.
     #[cfg(feature = "frame_audit")]
     snapshot_buf: crate::dbus::SnapshotBuffer,
+    /// Latest wallpaper-plane-only frame, captured by re-rendering just
+    /// the wallpaper element to an offscreen GLES texture. Published
+    /// alongside `snapshot_buf` so the test driver can request a
+    /// variant-distinct golden uncoupled from any layer-shell /
+    /// xdg-toplevel overlay. Only exists in `halmasuit-debug`.
+    #[cfg(feature = "frame_audit")]
+    wallpaper_only_buf: crate::dbus::SnapshotBuffer,
 }
 
 impl DrmBackend {
-    /// A clone of the shared snapshot slot, to hand to the D-Bus
-    /// server. The render loop publishes into it; `Snapshot()` reads.
+    /// Clones of the shared snapshot slots (current composition +
+    /// wallpaper-plane-only), to hand to the D-Bus server. The render
+    /// loop publishes into both; `Snapshot(path, scene)` reads from one
+    /// based on the `scene` arg.
     #[cfg(feature = "frame_audit")]
     #[must_use]
-    pub fn snapshot_handle(&self) -> crate::dbus::SnapshotBuffer {
-        self.snapshot_buf.clone()
+    pub fn snapshot_handle(&self) -> crate::dbus::SnapshotHandles {
+        crate::dbus::SnapshotHandles {
+            current: self.snapshot_buf.clone(),
+            wallpaper_only: self.wallpaper_only_buf.clone(),
+        }
     }
 
     /// Periodic tick that drives the wallpaper backend's
@@ -579,6 +591,8 @@ where
             frame_counter: 0,
             #[cfg(feature = "frame_audit")]
             snapshot_buf: crate::dbus::new_buffer(),
+            #[cfg(feature = "frame_audit")]
+            wallpaper_only_buf: crate::dbus::new_buffer(),
         },
         registration_token,
         output,
@@ -956,6 +970,57 @@ impl DrmBackend {
             phash: stats.phash,
         });
         self.frame_counter += 1;
+        // Wallpaper-plane-only auxiliary capture (closes C-G1: the
+        // session-scene golden has niri's opaque fullscreen toplevel
+        // covering the wallpaper plane, so all six matrix cells'
+        // session goldens otherwise end up byte-identical). Re-render
+        // ONLY the wallpaper element to an offscreen texture and
+        // publish it to a separate slot the D-Bus `Snapshot(path,
+        // "wallpaper-only")` call can read. Variant-distinct without
+        // racing the test driver against Quickshell's QML startup.
+        //
+        // Best-effort: a failure here logs and skips the publish so
+        // the main snapshot path continues working. The render is
+        // gated on `wallpaper.has_backend()` so the legacy-clear path
+        // never burns the cost.
+        if self.wallpaper.has_backend()
+            && let Err(e) = self.audit_wallpaper_only(output, clear_color)
+        {
+            tracing::warn!(error = %e, "frame_audit wallpaper-only readback failed");
+        }
+        Ok(())
+    }
+
+    /// Re-render JUST the wallpaper element (no cursor / no layers /
+    /// no foreground toplevel) into an offscreen texture and publish
+    /// the bytes to `wallpaper_only_buf`. Companion to `audit_frame`;
+    /// invoked from the same code site so both slots track the same
+    /// wallpaper tick (matters for the shader/video backends whose
+    /// content advances per frame).
+    #[cfg(feature = "frame_audit")]
+    fn audit_wallpaper_only(
+        &mut self,
+        output: &smithay::output::Output,
+        clear_color: [u8; 4],
+    ) -> io::Result<()> {
+        let osize = output.current_mode().map(|m| m.size).unwrap_or_default();
+        let dst = smithay::utils::Size::<i32, smithay::utils::Logical>::from((osize.w, osize.h));
+        let Some(element) = self.wallpaper.render_element(&mut self.renderer, dst)? else {
+            // Wallpaper backend declined to produce an element this
+            // tick (e.g., video pre-decode). Leave the slot at its
+            // last good value — variant-distinct goldens captured
+            // earlier in the boot remain valid.
+            return Ok(());
+        };
+        let elements = [element];
+        let (rgba, wu, hu) = self.read_frame_rgba(output, &elements, clear_color)?;
+        if let Ok(mut slot) = self.wallpaper_only_buf.lock() {
+            *slot = Some(crate::dbus::FrameBuf {
+                rgba,
+                width: wu,
+                height: hu,
+            });
+        }
         Ok(())
     }
 

@@ -137,30 +137,6 @@ def run(machine, visual, *, cell_name, lukshape, no_flash_mode):
         )
     print(f"PASS: Phase B phase_entered sequence ({sorted(phases_seen)})")
 
-    # Wallpaper-variant coverage: the session-scene golden below is
-    # INTENTIONALLY content-identical across the six cells — niri's
-    # xdg_toplevel maps as halmasuit's fullscreen foreground and the
-    # toplevel surface is opaque even with niri's `layout
-    # background-color "transparent"` (that setting only governs
-    # inter-window gaps inside niri, not the surface niri commits to
-    # halmasuit). So the session golden tests the niri-on-halmasuit
-    # render path (same per cell). The wallpaper variant is gated by
-    # `assert_no_flash_stream` further down: every frame_rendered event
-    # is checked for pixel_count constant + non-degenerate + zero
-    # clear-pixel-count from the wallpaper plane's first composite
-    # through session_opened. A broken shader would degrade pixels; a
-    # broken video would produce empty-fbo frames (caught by the
-    # suffix anchor); a broken image source would fail to mmap and
-    # halmasuit would emit a startup error.
-    #
-    # We considered a per-cell wallpaper-scene golden captured during
-    # the wallpaper-only window pre-DankGreeter, but DankGreeter's
-    # Quickshell QML loads fast enough (~3-5s after greeter_spawned)
-    # that the Snapshot call always races past it; even when the
-    # capture lands cleanly, DankGreeter's live HH:MM clock makes
-    # same-cell-different-run SSIMULACRA2 scores fall below any
-    # threshold that would still flag a wrong-variant regression.
-
     # DankGreeter (DMS Quickshell) is the greeter.
     machine.wait_until_succeeds(
         "journalctl -b --output=cat --no-pager "
@@ -243,10 +219,28 @@ def run(machine, visual, *, cell_name, lukshape, no_flash_mode):
     )
     print(f"PASS: halmasuit pid {halmasuit_pid} continuous")
 
-    # Session-scene golden AFTER niri maps.
+    # Session-scene golden AFTER niri maps. Two captures from the
+    # same settled scene:
+    #
+    # - `current`: live composition (wallpaper + niri's opaque
+    #   fullscreen xdg_toplevel + cursor). Same content per cell —
+    #   gates the niri-on-halmasuit render path.
+    # - `wallpaper-only`: variant-distinct, read from the auxiliary
+    #   slot halmasuit-debug publishes alongside every audited frame
+    #   (no cursor / no layer-shell / no toplevel). Closes review
+    #   finding C-G1; cell-distinguishing wallpaper coverage that the
+    #   `current` scene can't provide because niri's toplevel is
+    #   opaque. Skipped on video cells for the same reason the strict
+    #   no-flash anchor is — decoder startup may have produced an
+    #   empty fbo at the read moment.
     time.sleep(2)
     visual.assert_matches_golden(machine, f"{cell_name}-session")
     print("PASS: session-scene golden")
+    if no_flash_mode == "strict":
+        visual.assert_matches_golden(
+            machine, f"{cell_name}-wallpaper", scene="wallpaper-only"
+        )
+        print("PASS: wallpaper-only golden (variant-distinct)")
 
     # ── No-flash invariant over the full timeline ───────────────────
     if no_flash_mode == "strict":

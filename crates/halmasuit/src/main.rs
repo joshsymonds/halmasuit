@@ -2265,15 +2265,20 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
     // is invoked only from the fromInitrd pivot-poll timer); the
     // single main()-time connect is sufficient there.
     //
-    // `serve_async` (not `serve`) — the connect runs on the spawned
-    // holder thread instead of synchronously on this calloop
-    // dispatcher tick. zbus' SASL handshake against dbus-broker can
-    // burn through the 16ms render budget, so the sync variant (used
-    // in main() pre-loop where stalls are free) would jitter the
-    // post-pivot frame stream.
+    // Sync `serve` — even though we're inside the calloop dispatcher
+    // and zbus' SASL handshake can burn ~tens of ms, the spawned
+    // thread's `connect(2)` would race against `drop_privileges` below
+    // and authenticate as the post-drop compositor uid instead of
+    // root, breaking the org.halmasuit `<allow own user="root"/>`
+    // policy (dbus-broker authenticates the connecting peer via
+    // SO_PEERCRED at connect time, which reads the *current* effective
+    // uid). The previous `serve_async` shape lost the pre-drop euid
+    // guarantee here for that reason. Accept the one-time post-pivot
+    // jitter; no frames are racing against it yet (the greeter is
+    // still loading QML when this fires).
     #[cfg(feature = "frame_audit")]
     if let Some(backend) = state.drm_backend.as_ref() {
-        dbus::serve_async(backend.snapshot_handle());
+        dbus::serve(backend.snapshot_handle());
     }
 
     // (3) Drop privileges. Compositor uid is now resolvable against
