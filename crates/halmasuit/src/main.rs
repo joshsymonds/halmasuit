@@ -2264,9 +2264,16 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
     // `enable` deployments this branch never runs (`post_pivot_setup`
     // is invoked only from the fromInitrd pivot-poll timer); the
     // single main()-time connect is sufficient there.
+    //
+    // `serve_async` (not `serve`) — the connect runs on the spawned
+    // holder thread instead of synchronously on this calloop
+    // dispatcher tick. zbus' SASL handshake against dbus-broker can
+    // burn through the 16ms render budget, so the sync variant (used
+    // in main() pre-loop where stalls are free) would jitter the
+    // post-pivot frame stream.
     #[cfg(feature = "frame_audit")]
     if let Some(backend) = state.drm_backend.as_ref() {
-        dbus::serve(backend.snapshot_handle());
+        dbus::serve_async(backend.snapshot_handle());
     }
 
     // (3) Drop privileges. Compositor uid is now resolvable against
@@ -2399,7 +2406,19 @@ fn apply_chroot_to_root_fd(root_fd: &std::os::fd::OwnedFd) -> io::Result<()> {
 /// aggregate; the function never panics or returns Err.
 fn setup_post_pivot_input(state: &mut HalmasuitState) -> Vec<String> {
     let mut errs: Vec<String> = Vec::new();
-    let session_and_notifier = match LibSeatSession::new() {
+    // "Fail loud" marker: LibSeatSession::new ultimately calls
+    // libseat_open_seat → poll(-1) (unbounded; no upstream timeout),
+    // and the smithay types LibSeatSession + LibSeatSessionNotifier
+    // are !Send (hold an Rc), so we can't wrap the call on a watchdog
+    // thread without invasive smithay changes. The practical failure
+    // mode is "seatd not running" → connect EAGAIN → fast Err; the
+    // pathological "seatd accepted but never replies" hang shows up
+    // as halmasuit silently stuck inside this function. Emit a
+    // before/after pair so a missing "post-pivot: LibSeatSession::new
+    // returned" line in the journal pinpoints the hang to seatd
+    // rather than to compositor logic.
+    tracing::info!("post-pivot: calling LibSeatSession::new (blocks until seatd responds)");
+    let (session, libseat_notifier) = match LibSeatSession::new() {
         Ok(pair) => pair,
         Err(e) => {
             tracing::error!(
@@ -2410,7 +2429,7 @@ fn setup_post_pivot_input(state: &mut HalmasuitState) -> Vec<String> {
             return errs;
         }
     };
-    let (session, libseat_notifier) = session_and_notifier;
+    tracing::info!(seat = %session.seat(), "post-pivot: LibSeatSession::new returned");
     if let Err(e) = state.loop_handle.insert_source(
         libseat_notifier,
         |event, (), _state: &mut HalmasuitState| {
@@ -2420,35 +2439,63 @@ fn setup_post_pivot_input(state: &mut HalmasuitState) -> Vec<String> {
         tracing::error!(error = %e, "post-pivot: insert libseat notifier failed");
         errs.push(format!("insert libseat notifier: {e}"));
     }
-    let mut libinput = smithay::reexports::input::Libinput::new_with_udev(
-        LibinputSessionInterface::from(session.clone()),
-    );
-    if libinput.udev_assign_seat(&session.seat()).is_err() {
-        tracing::error!(
-            seat = %session.seat(),
-            "post-pivot: libinput udev_assign_seat failed"
-        );
-        errs.push(format!("libinput udev_assign_seat({})", session.seat()));
-        state.libseat_session = Some(session);
-        return errs;
-    }
-    match state.loop_handle.insert_source(
-        LibinputInputBackend::new(libinput),
-        |event, (), st: &mut HalmasuitState| st.dispatch_libinput(event),
-    ) {
-        Ok(_token) => {
-            tracing::info!(
-                seat = %session.seat(),
-                "post-pivot: libinput backend attached"
-            );
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "post-pivot: insert libinput backend failed");
-            errs.push(format!("insert libinput backend: {e}"));
-        }
+    if let Err(e) = attach_libinput(&state.loop_handle, &session) {
+        tracing::error!(error = %e, "post-pivot: attach_libinput failed");
+        errs.push(format!("post-pivot attach_libinput: {e}"));
+    } else {
+        tracing::info!(seat = %session.seat(), "post-pivot: libinput backend attached");
     }
     state.libseat_session = Some(session);
     errs
+}
+
+/// Build a libinput backend brokered through `session`, attach it to
+/// the calloop, and dispatch events to `HalmasuitState::dispatch_libinput`.
+/// Used by both the rootfs deployment (in `main`) and the Phase B
+/// post-pivot path (in `setup_post_pivot_input`); both walk the same
+/// four-stage sequence (Libinput::new_with_udev → udev_assign_seat →
+/// LibinputInputBackend::new → loop_handle.insert_source).
+fn attach_libinput(
+    loop_handle: &LoopHandle<'static, HalmasuitState>,
+    session: &LibSeatSession,
+) -> io::Result<()> {
+    let mut libinput = smithay::reexports::input::Libinput::new_with_udev(
+        LibinputSessionInterface::from(session.clone()),
+    );
+    libinput
+        .udev_assign_seat(&session.seat())
+        .map_err(|()| io::Error::other(format!("libinput udev_assign_seat({})", session.seat())))?;
+    loop_handle
+        .insert_source(
+            LibinputInputBackend::new(libinput),
+            |event, (), state: &mut HalmasuitState| state.dispatch_libinput(event),
+        )
+        .map(|_token| ())
+        .map_err(|e| io::Error::other(format!("insert libinput backend: {e}")))
+}
+
+/// Apply the Phase B initramfs group-ownership convention to a freshly
+/// bound socket inode.
+///
+/// The rootfs `enable` deployment lets systemd's
+/// `Group = cfg.greeterGroup` directive set the process's egid before
+/// each socket bind, so the bound file inherits the right gid. The
+/// initramfs Phase B unit can't use `Group=` (no NSS pre-pivot;
+/// `Group=halmasuit-greeter` fails 216/GROUP), so we read the
+/// operator-supplied `HALMASUIT_WAYLAND_GROUP_GID` and `fchown` the
+/// inode to that gid. Without this the bound file ends up `root:root`
+/// and any greeter-group member (the spawned greeter, niri-as-session)
+/// hits EACCES on `connect(2)`. No-op when the env is unset
+/// (rootfs path).
+fn apply_wayland_group_gid(path: &Path) -> io::Result<()> {
+    let Ok(gid_str) = std::env::var("HALMASUIT_WAYLAND_GROUP_GID") else {
+        return Ok(());
+    };
+    let Ok(gid) = gid_str.parse::<u32>() else {
+        return Ok(());
+    };
+    nix::unistd::chown(path, None, Some(nix::unistd::Gid::from_raw(gid)))
+        .map_err(|e| io::Error::other(format!("chgrp {} -> {gid}: {e}", path.display())))
 }
 
 /// Bind the greetd socket, register it as a calloop source, and emit
@@ -2476,20 +2523,7 @@ fn setup_greetd_listener(
     let greetd_listener = bind_socket(&greetd_path, 0o660)
         .map_err(|e| io::Error::other(format!("bind greetd socket: {e}")))?;
     greetd_listener.set_nonblocking(true)?;
-    // Mirror the wayland-0 chgrp pattern: in fromInitrd the systemd
-    // unit can't set `Group=` (no NSS pre-pivot), so the bound socket
-    // inherits the process gid (root). Honour
-    // `HALMASUIT_WAYLAND_GROUP_GID` so the greeter (which is in the
-    // greeter group, mode 0o660) can `connect(2)` — without this the
-    // bind succeeds but Quickshell's greetd client hits EACCES and
-    // never speaks the greetd protocol.
-    if let Ok(gid_str) = std::env::var("HALMASUIT_WAYLAND_GROUP_GID")
-        && let Ok(gid) = gid_str.parse::<u32>()
-    {
-        nix::unistd::chown(&greetd_path, None, Some(nix::unistd::Gid::from_raw(gid))).map_err(
-            |e| io::Error::other(format!("chgrp {} -> {gid}: {e}", greetd_path.display())),
-        )?;
-    }
+    apply_wayland_group_gid(&greetd_path)?;
     tracing::info!(socket = ?greetd_path, "greetd socket bound");
 
     let greeter_uid = greeter_uid_from_env();
@@ -2665,10 +2699,26 @@ fn spawn_greeter(greeter_uid: u32, command: &Path) -> io::Result<GreeterHandle> 
         if let Ok(Some(u)) = User::from_uid(Uid::from_raw(greeter_uid)) {
             (u.gid.as_raw(), u.name.clone(), u.dir)
         } else {
-            let env_gid: u32 = std::env::var("HALMASUIT_GREETER_GID")
+            // If HALMASUIT_GREETER_GID is unset (or unparsable) we fall
+            // back to using `greeter_uid` as the gid. That's the right
+            // default when greeter uid == gid (the auto-created system
+            // user shape the module ships out of the box), but breaks
+            // silently if an operator overrides ONE of greeterUid /
+            // greeterGroup without the other. Surface that case so
+            // misconfiguration is greppable rather than mysterious
+            // permission errors later.
+            let env_gid_raw = std::env::var("HALMASUIT_GREETER_GID")
                 .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(greeter_uid);
+                .and_then(|s| s.parse::<u32>().ok());
+            let env_gid: u32 = env_gid_raw.unwrap_or(greeter_uid);
+            if env_gid_raw.is_none() {
+                tracing::warn!(
+                    uid = greeter_uid,
+                    fallback_gid = env_gid,
+                    "HALMASUIT_GREETER_GID unset/unparsable on env-fallback path; \
+                     defaulting gid to greeter uid (correct only when uid == gid)"
+                );
+            }
             let env_name = std::env::var("HALMASUIT_GREETER_NAME")
                 .unwrap_or_else(|_| format!("halmasuit-greeter-{greeter_uid}"));
             let env_home = PathBuf::from(
@@ -3472,19 +3522,9 @@ fn main() -> io::Result<()> {
             // libinput, fed device fds through the SAME seatd session
             // (validated surviving setresuid by drm-master-probe
             // Phase 4). Events are routed to the keyboard-focused
-            // client.
-            let mut libinput = smithay::reexports::input::Libinput::new_with_udev(
-                LibinputSessionInterface::from(session.clone()),
-            );
-            libinput.udev_assign_seat(&session.seat()).map_err(|()| {
-                io::Error::other(format!("libinput udev_assign_seat({})", session.seat()))
-            })?;
-            loop_handle
-                .insert_source(
-                    LibinputInputBackend::new(libinput),
-                    |event, (), state: &mut HalmasuitState| state.dispatch_libinput(event),
-                )
-                .map_err(|e| io::Error::other(format!("insert libinput backend: {e}")))?;
+            // client. Same four-stage sequence as the Phase B post-pivot
+            // path; extracted to `attach_libinput`.
+            attach_libinput(&loop_handle, &session)?;
 
             real_output.create_global::<HalmasuitState>(&display_handle);
             emit(&Event::PhaseEntered {
@@ -3684,18 +3724,7 @@ fn main() -> io::Result<()> {
         std::fs::set_permissions(&abs_socket_path, perms).map_err(|e| {
             io::Error::other(format!("chmod 0660 {}: {e}", abs_socket_path.display()))
         })?;
-        if let Ok(gid_str) = std::env::var("HALMASUIT_WAYLAND_GROUP_GID")
-            && let Ok(gid) = gid_str.parse::<u32>()
-        {
-            nix::unistd::chown(
-                &abs_socket_path,
-                None,
-                Some(nix::unistd::Gid::from_raw(gid)),
-            )
-            .map_err(|e| {
-                io::Error::other(format!("chgrp {} -> {gid}: {e}", abs_socket_path.display()))
-            })?;
-        }
+        apply_wayland_group_gid(&abs_socket_path)?;
     }
 
     // New-client handler: SO_PEERCRED-gate every accepted stream

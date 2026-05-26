@@ -58,7 +58,22 @@ let
   dmsQuickshell = nix-config.inputs.dms.packages.${system}.quickshell;
 
   # Minimal niri config — empty workspace, no animations, no
-  # autostart. Same shape as tests/visual-niri-session.nix.
+  # autostart. Two settings are load-bearing for the matrix goldens:
+  #
+  #   - `hotkey-overlay skip-at-startup`: without this, niri's
+  #     first-run "Important Hotkeys" overlay covers the entire
+  #     workspace and every cell's session-scene golden ends up
+  #     byte-identical (the overlay obscures the wallpaper plane the
+  #     cell is supposed to be distinguishing). Skip it so the
+  #     session-scene reveals whatever the active wallpaper variant
+  #     actually composed.
+  #
+  #   - `layout { background-color "transparent" }`: niri renders its
+  #     own workspace background by default; transparent lets the
+  #     halmasuit wallpaper plane underneath show through when niri
+  #     has no toplevel mapped (the brief window between niri spawn
+  #     and the test's session-scene capture, before any startup app
+  #     gets a chance — we don't autospawn anything).
   niriConfig = pkgs.writeText "phase-b-niri-config.kdl" ''
     input {
         keyboard {
@@ -71,6 +86,11 @@ let
     }
 
     layout {
+        background-color "transparent"
+    }
+
+    hotkey-overlay {
+        skip-at-startup
     }
 
     animations {

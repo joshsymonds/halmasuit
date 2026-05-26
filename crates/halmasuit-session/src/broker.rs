@@ -561,6 +561,31 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
             return Ok(true);
         }
     };
+    // Pre-recv uid gate (slow-loris amplification fix). The socket is
+    // mode 0666 (defence-in-depth — SO_PEERCRED is the load-bearing
+    // gate) so any local uid can `connect(2)`. The slow-loris timeout
+    // (SO_RCVTIMEO 30s above) is the wedge cap, but a peer that
+    // connects-and-stalls still blocks the broker's single-threaded
+    // calloop for the full window. Reject unauthorized peers IMMEDIATELY
+    // — before the blocking recv — so an attacker connecting from a
+    // non-{root, relay_peer_uid} uid costs only an accept+getsockopt
+    // round-trip instead of 30 wall-clock seconds. Per-uid refusal-log
+    // bounds the matching log spam.
+    //
+    // Root is permitted because the pre-drop in-process compositor
+    // setup runs as root, and so does the relay_peer_uid configurator
+    // before its setresuid. Identical authorization shape to the
+    // serve_root_fd_request gate downstream.
+    let relay_uid = bl.slot.relay_peer_uid();
+    if puid != 0 && puid != relay_uid {
+        // Per-uid suppressed log emission — same rate-limit shape the
+        // RequestRootFd refusal path uses (existing RefusalLog state
+        // keyed by puid; the log line phrasing also covers pre-recv
+        // since RequestRootFd is the only OTHER path that fires
+        // record_refusal, and the refusal IS pre-handshake either way).
+        bl.refusal_log.record_refusal(puid, relay_uid);
+        return Ok(true);
+    }
     let begin = match greeter.recv::<CompositorToBroker>() {
         Ok(CompositorToBroker::BeginAuth { service, username }) => (service, username),
         Ok(CompositorToBroker::RequestRootFd) => {
@@ -1349,7 +1374,7 @@ mod tests {
     /// ETIMEDOUT (TransportError::Io kind WouldBlock or TimedOut) if
     /// no first-frame arrives within the timeout window. Without
     /// this, an attacker can connect-and-stall to wedge the broker.
-    /// Test uses a 100ms timeout (vs the 5s production value) so it
+    /// Test uses a 100ms timeout (vs the 30s production value) so it
     /// can complete promptly.
     #[test]
     fn accepted_fd_recv_times_out_when_peer_stalls() {

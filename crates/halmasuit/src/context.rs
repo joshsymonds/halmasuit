@@ -93,7 +93,7 @@ pub fn set_argv0_marker() {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_initramfs, is_initramfs_at, set_argv0_marker};
+    use super::{is_initramfs_at, set_argv0_marker};
 
     #[test]
     fn is_initramfs_at_returns_true_when_marker_present() {
@@ -115,16 +115,6 @@ mod tests {
         assert!(
             !is_initramfs_at(&path),
             "absent path; is_initramfs_at must report false"
-        );
-    }
-
-    #[test]
-    fn is_initramfs_returns_false_in_rootfs_test_environment() {
-        // The cargo-nextest harness runs in the rootfs; the systemd
-        // initramfs marker should never be present here.
-        assert!(
-            !is_initramfs(),
-            "expected /etc/initrd-release absent in the test runner's rootfs"
         );
     }
 

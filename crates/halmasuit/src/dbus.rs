@@ -145,18 +145,53 @@ pub fn serve(buf: SnapshotBuffer) {
     // in production deploys) deterministically — not racing the
     // setresuid the way a thread-internal connect would. The D-Bus
     // policy then only has to grant name ownership to root.
-    let conn = match zbus::blocking::connection::Builder::system()
+    let Some(conn) = build_connection(buf) else {
+        return;
+    };
+    park_with_connection(conn);
+}
+
+/// `serve_async` — same as [`serve`] but performs the bus-connect on
+/// the spawned holder thread rather than synchronously on the caller.
+/// Used by the Phase B post-pivot retry, which runs from inside the
+/// calloop dispatcher and would otherwise stall the render loop on
+/// zbus' SASL handshake. There's no privilege-drop race here because
+/// drop_privileges runs AFTER this call site in `run_post_pivot_setup`
+/// (still root throughout), and zbus inherits the caller process's
+/// euid via the spawned thread's `getuid()` syscall at connect time.
+pub fn serve_async(buf: SnapshotBuffer) {
+    std::thread::Builder::new()
+        .name("halmasuit-dbus".to_owned())
+        .spawn(move || {
+            let Some(conn) = build_connection(buf) else {
+                return;
+            };
+            let _conn = conn;
+            loop {
+                std::thread::park();
+            }
+        })
+        .expect("spawn halmasuit-dbus thread");
+}
+
+fn build_connection(buf: SnapshotBuffer) -> Option<zbus::blocking::Connection> {
+    match zbus::blocking::connection::Builder::system()
         .and_then(|b| b.name("org.halmasuit"))
         .and_then(|b| b.serve_at("/org/halmasuit/Debug/Introspect", Introspect { buf }))
         .and_then(zbus::blocking::connection::Builder::build)
     {
-        Ok(conn) => conn,
+        Ok(conn) => {
+            tracing::info!("frame_audit D-Bus Snapshot() ready on org.halmasuit.Debug.Introspect");
+            Some(conn)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "frame_audit D-Bus serve failed; Snapshot() unavailable");
-            return;
+            None
         }
-    };
-    tracing::info!("frame_audit D-Bus Snapshot() ready on org.halmasuit.Debug.Introspect");
+    }
+}
+
+fn park_with_connection(conn: zbus::blocking::Connection) {
     // Hand the established connection to a holder thread that parks to
     // keep it (and the served object) alive for the process lifetime.
     // zbus dispatches method calls on its own internal executor.
