@@ -71,6 +71,9 @@ test-vm:
     echo "── initrd-survival ──"
     nix build .#checks.x86_64-linux.initrd-survival -L --print-build-logs --no-link
     echo
+    echo "── halmasuit-shutdown-probe-phase0 ──"
+    nix build .#checks.x86_64-linux.halmasuit-shutdown-probe-phase0 -L --print-build-logs --no-link
+    echo
     echo "── full-boot-flash ──"
     nix build .#checks.x86_64-linux.full-boot-flash -L --print-build-logs --no-link
     echo
@@ -250,6 +253,18 @@ test-drm-probe-phase3:
 # privilege model; the conclusion is recorded in RESEARCH.md Phase 4.
 test-drm-probe-phase4:
     nix build .#checks.x86_64-linux.drm-master-probe-phase4 -L --print-build-logs --no-link
+
+# Epic #47 R2 Phase 0 probe: empirical validation that
+# SurviveFinalKillSignal=yes on a rootfs unit keeps the process alive
+# through systemd-shutdown's "Sending SIGKILL to remaining processes"
+# kill spree. Phase 2 of drm-master-probe proved the BOOT direction;
+# this proves the SHUTDOWN direction. Probe writes heartbeats to
+# /dev/kmsg, test inspects qemu's serial console capture post-halt
+# for heartbeats appearing after the SIGKILL marker. Sub-phases 1
+# and 2 (pivot survival + DRM master survival) land in follow-up
+# tasks of Epic #47.
+test-shutdown-probe-phase0:
+    nix build .#checks.x86_64-linux.halmasuit-shutdown-probe-phase0 -L --print-build-logs --no-link
 
 # Phase B initrd-survival gate: the production halmasuit binary
 # registered via `services.halmasuit.fromInitrd.enable`. Composes

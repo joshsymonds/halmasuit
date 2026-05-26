@@ -442,6 +442,27 @@
             };
           };
 
+          # halmasuit-shutdown-probe — research probe for Epic #47 R2
+          # (wallpaper continuity to kernel halt). Three-phase probe;
+          # Phase 0 only landed today. Lean closure (signalfd + libc),
+          # no smithay / no DRM. Phase 2 (when it lands) will need a
+          # DRM-aware build variant analogous to drm-master-probe-phase4.
+          halmasuit-shutdown-probe = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-shutdown-probe";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [ "-p" "halmasuit-shutdown-probe" ];
+            doCheck = false; # NixOS VM test is the actual test
+            meta = {
+              description = "Phase 0 research probe — SurviveFinalKillSignal=yes on rootfs shutdown kill spree (Epic #47 R2)";
+              license     = pkgs.lib.licenses.asl20;
+            };
+          };
+
           # drm-master-probe-phase4 — the SAME probe built with the
           # `phase4` cargo feature (libseat/seatd survival across
           # setresuid). Separate package so the phase-0–3 tests keep
@@ -716,6 +737,13 @@
           inherit nixpkgs;
         };
         drm-master-probe-phase4 = import ./tests/drm-master-probe-phase4.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+        };
+        # Epic #47 R2 Phase 0 probe: SurviveFinalKillSignal=yes on the
+        # rootfs side. drm-master-probe-phase2 already proved this for
+        # the boot pivot; this proves it for the shutdown pivot.
+        halmasuit-shutdown-probe-phase0 = import ./tests/halmasuit-shutdown-probe-phase0.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
         };
