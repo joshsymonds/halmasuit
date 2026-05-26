@@ -1008,12 +1008,17 @@ impl DrmBackend {
         elements: &[SceneElement],
         clear_color: [u8; 4],
     ) -> io::Result<()> {
-        // Wallpaper variants live in the SceneElement enum; match on
-        // the enum so we don't have to depend on scene_elements' z-
-        // order convention staying constant. `Wallpaper` covers
-        // image + video (both produce `TextureRenderElement`);
-        // `WallpaperShader` covers the shader backend.
-        let Some(wallpaper_elem) = elements.iter().find(|e| {
+        // Wallpaper variants live in the SceneElement enum.
+        // `scene_elements` pushes the wallpaper at the bottom of the
+        // front-to-back list (its `debug_assert_eq!(slot,
+        // elements.len(), "wallpaper is the bottom-most element")`
+        // pins this invariant), and the cursor is prepended AT THE
+        // FRONT — so after cursor prepend the wallpaper is at the
+        // back, i.e. `elements.last()`. `O(1)`; falls through to
+        // `Ok(())` on the legacy-clear path where no wallpaper
+        // element was pushed (the bottom element is then a layer or
+        // toplevel, which the variant filter rejects).
+        let Some(wallpaper_elem) = elements.last().filter(|e| {
             matches!(
                 e,
                 SceneElement::Wallpaper(_) | SceneElement::WallpaperShader(_)

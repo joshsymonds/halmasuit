@@ -205,7 +205,7 @@ pub fn infer_from_path(path: PathBuf) -> WallpaperConfig {
     match ext.as_deref() {
         Some("frag" | "glsl") => WallpaperConfig::Shader {
             source: path,
-            uniforms: default_shadertoy_bindings(),
+            uniforms: default_shadertoy_bindings().clone(),
         },
         Some("mp4" | "webm" | "mkv") => WallpaperConfig::Video {
             source: path,
@@ -228,14 +228,23 @@ pub fn infer_from_path(path: PathBuf) -> WallpaperConfig {
 /// preamble + wrapper reference these uniforms, so for that shape
 /// they MUST be bound regardless of whether the JSON config path
 /// (which defaults `uniforms` to `{}`) supplied them.
-pub fn default_shadertoy_bindings() -> HashMap<String, UniformBinding> {
-    let mut m = HashMap::new();
-    m.insert("iResolution".to_owned(), UniformBinding::AutoResolution);
-    m.insert("iTime".to_owned(), UniformBinding::AutoTime);
-    m.insert("iTimeDelta".to_owned(), UniformBinding::AutoDelta);
-    m.insert("iFrame".to_owned(), UniformBinding::AutoFrame);
-    m.insert("iMouse".to_owned(), UniformBinding::AutoMouse);
-    m
+///
+/// Returns a `&'static` reference; the 5-entry map is built once
+/// via `LazyLock` and shared across the (rare) callers. The owned
+/// `HashMap` ownership the env-var path needs is recovered with
+/// `.clone()` at that single site.
+pub fn default_shadertoy_bindings() -> &'static HashMap<String, UniformBinding> {
+    static MAP: std::sync::LazyLock<HashMap<String, UniformBinding>> =
+        std::sync::LazyLock::new(|| {
+            let mut m = HashMap::new();
+            m.insert("iResolution".to_owned(), UniformBinding::AutoResolution);
+            m.insert("iTime".to_owned(), UniformBinding::AutoTime);
+            m.insert("iTimeDelta".to_owned(), UniformBinding::AutoDelta);
+            m.insert("iFrame".to_owned(), UniformBinding::AutoFrame);
+            m.insert("iMouse".to_owned(), UniformBinding::AutoMouse);
+            m
+        });
+    &MAP
 }
 
 #[cfg(test)]

@@ -177,7 +177,7 @@ impl ShaderBackend {
         let mut uniforms = uniforms;
         if shadertoy {
             for (k, v) in super::config::default_shadertoy_bindings() {
-                uniforms.entry(k).or_insert(v);
+                uniforms.entry(k.clone()).or_insert_with(|| v.clone());
             }
         }
 
@@ -509,7 +509,7 @@ mod tests {
         let mut out = user;
         if is_shadertoy_shape(src) {
             for (k, v) in super::super::config::default_shadertoy_bindings() {
-                out.entry(k).or_insert(v);
+                out.entry(k.clone()).or_insert_with(|| v.clone());
             }
         }
         out
