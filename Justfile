@@ -89,6 +89,9 @@ test-vm:
     echo "── visual-phase-b-side-video ──"
     nix build .#checks.x86_64-linux.visual-phase-b-side-video -L --print-build-logs --no-link
     echo
+    echo "── visual-phase-b-enc-image ──"
+    nix build .#checks.x86_64-linux.visual-phase-b-enc-image -L --print-build-logs --no-link
+    echo
     echo "── run-pam-auth ──"
     nix build .#checks.x86_64-linux.run-pam-auth -L --print-build-logs --no-link
     echo
@@ -295,6 +298,13 @@ test-vm-visual-phase-b-side-shader:
 # itself caught by assert_no_flash_stream).
 test-vm-visual-phase-b-side-video:
     nix build .#checks.x86_64-linux.visual-phase-b-side-video -L --print-build-logs --no-link
+
+# Phase B cell — LUKS-encrypted ROOT × image wallpaper. Same arc but
+# the rootfs itself is on a LUKS volume; dual-boot specialisation
+# pattern unlocks /dev/mapper/cryptroot in initramfs via the
+# halmasuit-luks ask-password responder.
+test-vm-visual-phase-b-enc-image:
+    nix build .#checks.x86_64-linux.visual-phase-b-enc-image -L --print-build-logs --no-link
 
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.

@@ -796,6 +796,21 @@
         # testsrc), looping, with a PNG fallback. Exercises the
         # halmasuit-decoder sandbox + DecoderRelay through the fromInitrd
         # path on top of the rest of the Phase B end-to-end arc.
+        # Epic #35 cell (enc, image): LUKS rootfs (not a side volume).
+        # Same arc, dual-boot specialisation pattern (cf.
+        # nixos/tests/systemd-initrd-luks-password.nix): first boot
+        # luksFormats /dev/vdb + `bootctl set-default cryptroot`,
+        # second boot enters the specialisation; halmasuit-luks
+        # responds to the cryptroot-mount ask-password prompt.
+        visual-phase-b-enc-image = import ./tests/visual-phase-b-enc-image.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         visual-phase-b-side-video = import ./tests/visual-phase-b-side-video.nix {
           system              = "x86_64-linux";
           inherit nixpkgs nix-config;

@@ -230,8 +230,35 @@ in
 
   # halmasuit Phase B fromInitrd deployment. Wallpaper config is the
   # parametric input that distinguishes the six cells.
+  #
+  # ESP-fit gating: encrypted-root cells use a systemd-boot
+  # specialisation (the `cryptroot` entry), which means the ESP has
+  # to hold TWO initramfs entries — and the fromInitrd initramfs is
+  # large (~250 MiB; mesa + libglvnd + xkbcommon + halmasuit-debug +
+  # halmasuit-luks closure). NixOS pins the ESP at 256 MiB and the
+  # qemu-vm module doesn't expose `bootSize` to override that. So for
+  # encrypted-root we DISABLE fromInitrd in the BASE config (small
+  # initramfs — first boot just needs to luksFormat /dev/vdb and
+  # switch the bootloader default) and let the specialisation below
+  # `mkForce` it on (full Phase B initramfs).
+  # For encrypted-root we have fromInitrd off in BASE (see comment
+  # below), but the DMS greeter module asserts at eval time that the
+  # `halmasuit-greeter` user it references in
+  # `services.greetd.settings.default_session.user` exists. The
+  # halmasuit module auto-creates this user when enable / fromInitrd /
+  # session is on; with none of those set in BASE on encrypted-root,
+  # we need to wire the user manually so DMS's assertion passes.
+  users.users.halmasuit-greeter = lib.mkIf (lukshape == "encrypted-root") {
+    isSystemUser = true;
+    group = "halmasuit-greeter";
+    uid = 999;
+  };
+  users.groups.halmasuit-greeter = lib.mkIf (lukshape == "encrypted-root") {
+    gid = 999;
+  };
+
   services.halmasuit = {
-    fromInitrd.enable = true;
+    fromInitrd.enable = lukshape != "encrypted-root";
     package = halmasuit-debug;
     luks.package = halmasuit-luks;
     luks.passphraseFile = passphraseFile;
@@ -291,34 +318,57 @@ in
 
   environment.systemPackages = [ halmasuit-vm-client pkgs.cryptsetup ];
 
-  # ── LUKS (side-volume case) ──────────────────────────────────────
+  # ── LUKS wiring ───────────────────────────────────────────────────
   #
-  # SAME-CONFIG dual-boot pattern (avoids specialisation):
-  #   1. First boot — `/dev/vdb` exists but is not LUKS yet. The
-  #      initramfs systemd-cryptsetup generator creates a unit for
-  #      `test-luks-data` (because boot.initrd.luks.devices below
-  #      declares it); the unit fails because the device isn't a
-  #      LUKS header. multi-user.target reaches anyway because the
-  #      cryptsetup unit doesn't carry hard dependencies for
-  #      non-root volumes. testScript then luksFormats /dev/vdb and
-  #      reboots.
-  #   2. Second boot — SAME config. The device IS LUKS now;
-  #      systemd-cryptsetup issues the ask-password; halmasuit-luks
-  #      answers via the production wire; cryptsetup unlocks;
-  #      `/dev/mapper/test-luks-data` is present at multi-user.target.
+  # Two shapes; the wiring diverges by shape:
   #
-  # No specialisation = one initramfs in /boot = default 256 MB ESP
-  # fits the fromInitrd deployment's bundled mesa+libglvnd+xkbcommon
-  # closure.
-  # Side-volume LUKS unlock in initramfs (Epic #35 side-* tests).
+  # `side-volume` (current cells):
+  #   /dev/vdb is a non-root LUKS volume. Rootfs is the default
+  #   qcow2-backed /dev/vda. SAME-CONFIG dual-boot pattern (no
+  #   specialisation): first boot luksFormats /dev/vdb (no LUKS header
+  #   yet, the custom unit's `cryptsetup isLuks` guard skips), reboots;
+  #   second boot's custom unit ticks systemd-cryptsetup which asks
+  #   for a passphrase; halmasuit-luks responds.
   #
-  # We DON'T use `boot.initrd.luks.devices.<name>` — that module's
-  # systemd-stage1 wiring (nixos/modules/system/boot/luksroot.nix:1061)
-  # ships /etc/crypttab + the cryptsetup generator into the initramfs,
-  # but the generated systemd-cryptsetup@<name>.service isn't pulled
-  # into NixOS's initrd.target chain by default (cryptsetup.target is
-  # upstream-wantedBy=sysinit.target, which is the rootfs chain), so
-  # the unit never wakes up. We tried adding it via
+  # `encrypted-root` (enc-* cells):
+  #   The rootfs itself is on a LUKS volume (/dev/vdb formatted on
+  #   first boot, then specialisation `cryptroot` swaps
+  #   `virtualisation.rootDevice` to `/dev/mapper/cryptroot` and
+  #   `autoFormat`s it). systemd-cryptsetup is pulled into the
+  #   initramfs target chain automatically (cryptroot is REQUIRED for
+  #   /) so no custom unit is needed. halmasuit-luks's ask-password
+  #   responder still answers the prompt. Dual-boot dance: first boot
+  #   runs in the default (non-cryptroot) config, luksFormats /dev/vdb,
+  #   `bootctl set-default ...cryptroot.conf`, crashes; second boot
+  #   activates the specialisation and unlocks the rootfs.
+  #
+  # Force-load the LUKS cipher chain in initramfs. luksroot.nix adds
+  # dm_crypt et al. to availableKernelModules (initramfs CAN load
+  # them) but not to kernelModules (WILL load them). On the
+  # encrypted-root path the rootfs mount blocks until dm_crypt is
+  # available — without this the kernel-modules autoload race makes
+  # the unlock unit transiently fail. Declaring them in
+  # `boot.initrd.kernelModules` makes systemd-modules-load force-load
+  # them deterministically. Used in BOTH shapes for the same reason
+  # (the side-volume custom unit also relies on the modules being
+  # already-loaded; without this its modprobe calls fail).
+  boot.initrd.kernelModules = [
+    "dm_crypt"
+    "aes"
+    "xts"
+    "sha256"
+  ];
+
+  # Side-volume LUKS unlock — only when lukshape says so.
+  #
+  # We DON'T use `boot.initrd.luks.devices.<name>` for the unlock
+  # itself — that module's systemd-stage1 wiring
+  # (nixos/modules/system/boot/luksroot.nix:1061) ships /etc/crypttab
+  # + the cryptsetup generator into the initramfs, but the generated
+  # systemd-cryptsetup@<name>.service isn't pulled into NixOS's
+  # initrd.target chain by default for NON-ROOT volumes
+  # (cryptsetup.target is upstream-wantedBy=sysinit.target — the
+  # rootfs chain), so the unit never wakes up. We tried adding it via
   # `boot.initrd.systemd.targets.initrd.wants` but it still didn't
   # take effect (probably because the conditional crypttab placement
   # in luksroot.nix has its own internal gates that don't fire under
@@ -328,73 +378,89 @@ in
   # `systemd-cryptsetup attach test-luks-data /dev/vdb` as a oneshot,
   # ordered AFTER halmasuit-luks is ready and BEFORE
   # initrd-switch-root. systemd-cryptsetup inside a managed unit
-  # ticks the password-agent loop correctly (the systemd-cryptsetup@.
-  # service path; verified empirically — `tests/luks-unlock.nix`
-  # documents the contrast against the bare-CLI form that hangs).
-  # halmasuit-luks answers; the volume unlocks BEFORE pivot, so
-  # `/dev/mapper/test-luks-data` is present at multi-user.target.
-  boot.initrd.systemd.services."phase-b-cryptsetup-test-luks-data" = {
-    description = "Phase B side-volume LUKS unlock (driven by halmasuit-luks)";
-    wantedBy = [ "initrd.target" ];
-    # Order before initrd-switch-root so we unlock while still in
-    # initramfs (halmasuit-luks is alive then). Don't add After= on
-    # halmasuit-luks: simple-services-are-Active-on-fork semantics
-    # mean halmasuit-luks is "Active" as soon as the binary execs,
-    # before the polling loop even starts; we don't gain much by
-    # gating on it.
-    before = [ "initrd-switch-root.service" ];
-    requires = [ "halmasuit-luks.service" ];
-    after = [ "halmasuit-luks.service" "systemd-udev-settle.service" "dev-vdb.device" ];
-    wants = [ "dev-vdb.device" ];
-    unitConfig = {
-      DefaultDependencies = false;
-      IgnoreOnIsolate = true;
-    };
-    serviceConfig = {
-      Type = "oneshot";
-      RemainAfterExit = true;
-      StandardOutput = "journal";
-      StandardError = "journal";
-      ExecStart = "${cryptsetupAttachScript}";
+  # ticks the password-agent loop correctly. halmasuit-luks answers;
+  # the volume unlocks BEFORE pivot, so `/dev/mapper/test-luks-data`
+  # is present at multi-user.target.
+  boot.initrd.systemd.services = lib.optionalAttrs (lukshape == "side-volume") {
+    "phase-b-cryptsetup-test-luks-data" = {
+      description = "Phase B side-volume LUKS unlock (driven by halmasuit-luks)";
+      wantedBy = [ "initrd.target" ];
+      before = [ "initrd-switch-root.service" ];
+      requires = [ "halmasuit-luks.service" ];
+      after = [ "halmasuit-luks.service" "systemd-udev-settle.service" "dev-vdb.device" ];
+      wants = [ "dev-vdb.device" ];
+      unitConfig = {
+        DefaultDependencies = false;
+        IgnoreOnIsolate = true;
+      };
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        StandardOutput = "journal";
+        StandardError = "journal";
+        ExecStart = "${cryptsetupAttachScript}";
+      };
     };
   };
+
   # Bundle the attach script + cryptsetup binary + kmod (modprobe)
   # into the initramfs closure. systemd's ExecStart resolves paths
   # against the initramfs filesystem; without this the unit fails
-  # 203/EXEC. The script's modprobe calls need kmod present.
-  boot.initrd.systemd.storePaths = [
-    "${cryptsetupAttachScript}"
-    "${pkgs.cryptsetup}/bin/cryptsetup"
-    "${pkgs.systemd}/bin/systemd-cryptsetup"
-    "${pkgs.kmod}/bin/modprobe"
-  ];
+  # 203/EXEC. Side-volume only — the encrypted-root path uses the
+  # upstream systemd-cryptsetup generator (cryptroot is the rootfs,
+  # so the unit IS pulled into the initramfs target chain by the /
+  # mount dependency); cryptsetup + systemd-cryptsetup ship via the
+  # luksroot module's storePaths in that case.
+  boot.initrd.systemd.storePaths =
+    lib.optionals (lukshape == "side-volume") [
+      "${cryptsetupAttachScript}"
+      "${pkgs.cryptsetup}/bin/cryptsetup"
+      "${pkgs.systemd}/bin/systemd-cryptsetup"
+      "${pkgs.kmod}/bin/modprobe"
+    ];
 
-  # Declare boot.initrd.luks.devices to trigger NixOS's luksroot
-  # module's automatic module-pull (dm_crypt + cipher chain via
-  # `boot.initrd.kernelModules` it adds). We don't depend on the
-  # generator's unit running — our custom `phase-b-cryptsetup-...`
-  # unit above does the actual attach. The declaration is here
-  # purely for its side effect: the right modules end up in the
-  # initramfs availableKernelModules + kernelModules lists.
-  boot.initrd.luks.devices."test-luks-data" = {
-    device = "/dev/vdb";
-    allowDiscards = false;
+  # Side-volume only: declare boot.initrd.luks.devices to trigger
+  # NixOS's luksroot module's automatic module-pull. We don't depend
+  # on the generator's unit running — our custom unit above does the
+  # actual attach. The declaration is here purely for its side
+  # effect: the right modules end up in the initramfs
+  # availableKernelModules + kernelModules lists.
+  #
+  # Encrypted-root: the LUKS declaration lives in the specialisation
+  # block below, so the FIRST boot (default specialisation) has no
+  # LUKS to unlock; the testScript luksFormats /dev/vdb in that
+  # window and switches boot default to the cryptroot specialisation.
+  boot.initrd.luks.devices = lib.optionalAttrs (lukshape == "side-volume") {
+    "test-luks-data" = {
+      device = "/dev/vdb";
+      allowDiscards = false;
+    };
   };
 
-  # Force-load the LUKS cipher chain in initramfs. luksroot.nix adds
-  # dm_crypt et al. to availableKernelModules (initramfs CAN load
-  # them) but not to kernelModules (will load them). Our custom
-  # phase-b-cryptsetup unit calls modprobe but the modprobe path
-  # only sees modules that systemd-modules-load knows about. The
-  # cleanest fix: force-load explicitly via boot.initrd.kernelModules
-  # so they're INCLUDED in the initramfs storePath search AND auto-
-  # loaded at boot.
-  boot.initrd.kernelModules = [
-    "dm_crypt"
-    "aes"
-    "xts"
-    "sha256"
-  ];
+  # ── Encrypted-root specialisation ─────────────────────────────────
+  #
+  # Activated by the testScript via `bootctl set-default
+  # ...cryptroot.conf` after first-boot luksFormat. Inherits the
+  # base config (halmasuit + halmasuit-luks + Phase B wiring), adds
+  # only the LUKS-rootfs bits. autoFormat lets NixOS format the
+  # cryptroot device with ext4 on first activation, then mounts it
+  # at /. The systemd-cryptsetup unit for `cryptroot` IS in the
+  # initramfs target chain (cryptroot is required-for /) so the
+  # unlock fires automatically; halmasuit-luks answers the prompt.
+  specialisation = lib.optionalAttrs (lukshape == "encrypted-root") {
+    cryptroot.configuration = {
+      # `mkForce` the gate so the specialisation initramfs ships the
+      # Phase B halmasuit closure (base config has it off for ESP
+      # reasons — see the comment on `services.halmasuit.fromInitrd`
+      # above).
+      services.halmasuit.fromInitrd.enable = lib.mkForce true;
+      boot.initrd.luks.devices = lib.mkVMOverride {
+        cryptroot.device = "/dev/vdb";
+      };
+      virtualisation.rootDevice = "/dev/mapper/cryptroot";
+      virtualisation.fileSystems."/".autoFormat = true;
+    };
+  };
 
   virtualisation = {
     memorySize = 4096;
