@@ -87,19 +87,41 @@ fn write_png(frame: &FrameBuf, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Pair of snapshot slots the D-Bus server can read from. `current`
+/// holds the full composited frame (wallpaper + layers + foreground +
+/// cursor); `wallpaper_only` holds an auxiliary capture of just the
+/// wallpaper element (no cursor, no layer-shell, no xdg-toplevel) so
+/// the Phase B golden gates can distinguish wallpaper variants even
+/// when niri's fullscreen toplevel covers the wallpaper in the live
+/// composition.
+#[derive(Clone)]
+pub struct SnapshotHandles {
+    pub current: SnapshotBuffer,
+    pub wallpaper_only: SnapshotBuffer,
+}
+
 /// The `org.halmasuit.Debug.Introspect` D-Bus object.
 pub struct Introspect {
-    buf: SnapshotBuffer,
+    bufs: SnapshotHandles,
 }
 
 impl Introspect {
     /// Core of the `Snapshot` method, factored out so it is unit-
     /// testable without a live bus: copy the current frame out from
-    /// under the lock, then PNG-encode it to `path`.
-    fn snapshot_impl(&self, path: &str) -> io::Result<()> {
+    /// under the lock, then PNG-encode it to `path`. `scene` selects
+    /// the slot (`"current"` (default) or `"wallpaper-only"`).
+    fn snapshot_impl(&self, path: &str, scene: &str) -> io::Result<()> {
+        let buf = match scene {
+            "" | "current" => &self.bufs.current,
+            "wallpaper-only" => &self.bufs.wallpaper_only,
+            other => {
+                return Err(io::Error::other(format!(
+                    "snapshot: unknown scene {other:?} (expected `current` or `wallpaper-only`)"
+                )));
+            }
+        };
         let frame = {
-            let guard = self
-                .buf
+            let guard = buf
                 .lock()
                 .map_err(|_| io::Error::other("snapshot: buffer mutex poisoned"))?;
             guard
@@ -123,7 +145,23 @@ impl Introspect {
         reason = "zbus #[interface] method args must be owned (deserialized by value)"
     )]
     fn snapshot(&self, path: String) -> zbus::fdo::Result<()> {
-        self.snapshot_impl(&path)
+        self.snapshot_impl(&path, "current")
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+    }
+
+    /// Like `Snapshot` but selects a slot by name. `scene` is one of:
+    ///
+    /// - `"current"` — the full live composition (same as `Snapshot`)
+    /// - `"wallpaper-only"` — the auxiliary capture of just the
+    ///   wallpaper element, populated alongside every audited frame.
+    ///   Variant-distinct across the matrix cells even when niri's
+    ///   xdg_toplevel covers the wallpaper in the live composition.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "zbus #[interface] method args must be owned (deserialized by value)"
+    )]
+    fn snapshot_scene(&self, path: String, scene: String) -> zbus::fdo::Result<()> {
+        self.snapshot_impl(&path, &scene)
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
     }
 }
@@ -138,25 +176,37 @@ impl Introspect {
 /// Best-effort: a bus that is unreachable or a name that is policy-
 /// denied logs a warning and the thread exits — frame_audit's
 /// `FrameRendered` stream is unaffected, only `Snapshot()` is.
-pub fn serve(buf: SnapshotBuffer) {
+pub fn serve(bufs: SnapshotHandles) {
     // Build the connection on the CALLER's thread, synchronously,
     // before returning. main() calls this before the privilege drop,
     // so the bus connection authenticates as the pre-drop euid (root
     // in production deploys) deterministically — not racing the
     // setresuid the way a thread-internal connect would. The D-Bus
     // policy then only has to grant name ownership to root.
-    let conn = match zbus::blocking::connection::Builder::system()
+    let Some(conn) = build_connection(bufs) else {
+        return;
+    };
+    park_with_connection(conn);
+}
+
+fn build_connection(bufs: SnapshotHandles) -> Option<zbus::blocking::Connection> {
+    match zbus::blocking::connection::Builder::system()
         .and_then(|b| b.name("org.halmasuit"))
-        .and_then(|b| b.serve_at("/org/halmasuit/Debug/Introspect", Introspect { buf }))
+        .and_then(|b| b.serve_at("/org/halmasuit/Debug/Introspect", Introspect { bufs }))
         .and_then(zbus::blocking::connection::Builder::build)
     {
-        Ok(conn) => conn,
+        Ok(conn) => {
+            tracing::info!("frame_audit D-Bus Snapshot() ready on org.halmasuit.Debug.Introspect");
+            Some(conn)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "frame_audit D-Bus serve failed; Snapshot() unavailable");
-            return;
+            None
         }
-    };
-    tracing::info!("frame_audit D-Bus Snapshot() ready on org.halmasuit.Debug.Introspect");
+    }
+}
+
+fn park_with_connection(conn: zbus::blocking::Connection) {
     // Hand the established connection to a holder thread that parks to
     // keep it (and the served object) alive for the process lifetime.
     // zbus dispatches method calls on its own internal executor.
@@ -173,13 +223,20 @@ pub fn serve(buf: SnapshotBuffer) {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameBuf, Introspect, new_buffer, write_png};
+    use super::{FrameBuf, Introspect, SnapshotHandles, new_buffer, write_png};
 
     fn solid(w: usize, h: usize, rgba: [u8; 4]) -> FrameBuf {
         FrameBuf {
             rgba: rgba.iter().copied().cycle().take(w * h * 4).collect(),
             width: w,
             height: h,
+        }
+    }
+
+    fn empty_handles() -> SnapshotHandles {
+        SnapshotHandles {
+            current: new_buffer(),
+            wallpaper_only: new_buffer(),
         }
     }
 
@@ -220,11 +277,13 @@ mod tests {
 
     #[test]
     fn snapshot_without_frame_errors() {
-        let iface = Introspect { buf: new_buffer() };
+        let iface = Introspect {
+            bufs: empty_handles(),
+        };
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("none.png");
         let err = iface
-            .snapshot_impl(path.to_str().unwrap())
+            .snapshot_impl(path.to_str().unwrap(), "current")
             .expect_err("no frame yet must error");
         assert!(err.to_string().contains("no frame composited"), "{err}");
         assert!(!path.exists(), "no file should be written when empty");
@@ -232,14 +291,63 @@ mod tests {
 
     #[test]
     fn snapshot_writes_published_frame() {
-        let buf = new_buffer();
-        *buf.lock().unwrap() = Some(solid(4, 4, [10, 20, 30, 255]));
-        let iface = Introspect { buf };
+        let bufs = empty_handles();
+        *bufs.current.lock().unwrap() = Some(solid(4, 4, [10, 20, 30, 255]));
+        let iface = Introspect { bufs };
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("ok.png");
         iface
-            .snapshot_impl(path.to_str().unwrap())
+            .snapshot_impl(path.to_str().unwrap(), "current")
             .expect("snapshot of published frame");
         assert!(path.exists());
+    }
+
+    #[test]
+    fn snapshot_scene_routes_to_wallpaper_only_slot() {
+        let bufs = empty_handles();
+        // `current` is empty; `wallpaper_only` has a frame. A scene
+        // arg of "wallpaper-only" must read from the latter without
+        // erroring on the former.
+        *bufs.wallpaper_only.lock().unwrap() = Some(solid(3, 3, [55, 66, 77, 255]));
+        let iface = Introspect { bufs };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wp.png");
+        iface
+            .snapshot_impl(path.to_str().unwrap(), "wallpaper-only")
+            .expect("snapshot of wallpaper-only slot");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn snapshot_scene_empty_string_routes_to_current_slot() {
+        // The `match scene` arm at snapshot_impl pairs `""` with
+        // `"current"`. Pin that mapping so an accidental split into
+        // two separate arms (with the empty-string variant dropped)
+        // is caught — busctl callers occasionally pass `""` from
+        // shell scripts where the variable expanded to nothing, and
+        // the contract is "treat as current", not "reject".
+        let bufs = empty_handles();
+        *bufs.current.lock().unwrap() = Some(solid(2, 2, [11, 22, 33, 255]));
+        let iface = Introspect { bufs };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("empty.png");
+        iface
+            .snapshot_impl(path.to_str().unwrap(), "")
+            .expect("empty scene must route to current");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn snapshot_scene_unknown_value_errors() {
+        let iface = Introspect {
+            bufs: empty_handles(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("z.png");
+        let err = iface
+            .snapshot_impl(path.to_str().unwrap(), "made-up-scene")
+            .expect_err("unknown scene must error");
+        assert!(err.to_string().contains("unknown scene"), "{err}");
+        assert!(!path.exists());
     }
 }

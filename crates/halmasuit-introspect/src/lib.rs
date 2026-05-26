@@ -353,6 +353,22 @@ pub enum Phase {
     /// committed a buffer. Emitted exactly once per process lifetime,
     /// after `DrmMasterAcquired` and before any client connects.
     ScanoutActive,
+    /// halmasuit started inside the initramfs (Phase B). Emitted at
+    /// `main()` after `Started`, when `/etc/initrd-release` is
+    /// present. In this deployment halmasuit holds DRM master
+    /// directly (no libseat, no seatd) and survives `switch_root` via
+    /// `SurviveFinalKillSignal=yes` — drm-master-probe Phase 2
+    /// validated the mechanic. The rootfs-only deployment never emits
+    /// this phase.
+    InitramfsInit,
+    /// `switch_root` completed and halmasuit is now running in the
+    /// rootfs (Phase B). Emitted by the calloop poll source that
+    /// watches `/etc/initrd-release` for disappearance. The DRM
+    /// master fd, the Wayland socket, and the process PID are all
+    /// unchanged across this transition — only the filesystem view
+    /// has flipped. The rootfs-only deployment never emits this
+    /// phase.
+    RootfsReady,
 }
 
 /// Reason a clean shutdown was initiated.
@@ -456,6 +472,24 @@ mod tests {
         });
         assert_eq!(v["event"], "phase_entered");
         assert_eq!(v["phase"], "scanout_active");
+    }
+
+    #[test]
+    fn event_phase_entered_initramfs_init_serializes() {
+        let v = round_trip(&Event::PhaseEntered {
+            phase: Phase::InitramfsInit,
+        });
+        assert_eq!(v["event"], "phase_entered");
+        assert_eq!(v["phase"], "initramfs_init");
+    }
+
+    #[test]
+    fn event_phase_entered_rootfs_ready_serializes() {
+        let v = round_trip(&Event::PhaseEntered {
+            phase: Phase::RootfsReady,
+        });
+        assert_eq!(v["event"], "phase_entered");
+        assert_eq!(v["phase"], "rootfs_ready");
     }
 
     #[test]

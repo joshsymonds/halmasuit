@@ -1,0 +1,33 @@
+[package]
+name        = "halmasuit-luks"
+description = "Phase B systemd password-agent Wayland client. Watches /run/systemd/ask-password/ for LUKS unlock requests, prompts the user, writes the response back to the agent socket. Replaceable by any other implementation of the systemd password-agent protocol."
+
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+authors.workspace    = true
+
+# Throwaway-style boot-phase tool: built via nixpkgs's pinned rustc, so
+# a looser MSRV than the workspace pin is fine (matches the test-client
+# pattern).
+rust-version = "1.87"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow                 = "1"
+smithay-client-toolkit = { version = "0.20", features = ["calloop"] }
+calloop                = "0.14"
+calloop-wayland-source = "0.4"
+zeroize                = { workspace = true }
+tracing                = { workspace = true }
+tracing-subscriber     = { workspace = true, features = ["fmt", "env-filter", "json"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "halmasuit-luks"
+path = "src/main.rs"

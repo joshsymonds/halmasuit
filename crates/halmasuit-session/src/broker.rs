@@ -322,6 +322,77 @@ struct BrokerLoop {
     loop_handle: calloop::LoopHandle<'static, Self>,
     loop_signal: LoopSignal,
     running: bool,
+    /// Rate-limiter for the `RequestRootFd` refusal log. An
+    /// unprivileged peer can spam the SO_PEERCRED gate by repeatedly
+    /// connecting and sending the frame; without a limiter every
+    /// refused attempt would emit a journal line. See
+    /// [`RefusalLog::record_refusal`].
+    refusal_log: RefusalLog,
+}
+
+/// Token-bucket-ish suppressor for the `RequestRootFd` refusal log.
+/// Keyed by peer uid (the uid the SO_PEERCRED check refused), it
+/// records one log line per peer per `SUPPRESS_WINDOW`, including a
+/// suppressed-count summary when the window rolls over. Bounds
+/// journald spam from a peer in a tight `connect + RequestRootFd +
+/// disconnect` loop while still surfacing first-occurrence and
+/// periodic re-occurrence.
+#[derive(Default)]
+struct RefusalLog {
+    per_puid: std::collections::HashMap<u32, RefusalState>,
+}
+
+struct RefusalState {
+    last_logged: Instant,
+    suppressed: u32,
+}
+
+impl RefusalLog {
+    /// 1-minute log-suppression window per peer uid. Long enough to
+    /// dampen a serious spam attempt; short enough that occasional
+    /// "is the gate still refusing?" debugging finds a line.
+    const SUPPRESS_WINDOW: Duration = Duration::from_mins(1);
+
+    /// Record a refused `RequestRootFd` attempt from `puid`; emit the
+    /// log line iff this peer hasn't logged within the suppression
+    /// window. On window roll-over the line carries a
+    /// `(+N suppressed in last <window>s)` summary.
+    fn record_refusal(&mut self, puid: u32, relay_peer_uid: u32) {
+        let now = Instant::now();
+        let entry = self.per_puid.entry(puid).or_insert_with(|| RefusalState {
+            // Initialise as if the last log were one window ago, so
+            // the very first refusal from this peer logs immediately.
+            // `checked_sub` defends against the (theoretically
+            // possible but vanishingly unlikely) case where `now`
+            // is less than the suppression window since process
+            // start — in that case fall back to `now`, which
+            // suppresses the first refusal-log line (harmless).
+            last_logged: now
+                .checked_sub(Self::SUPPRESS_WINDOW + Duration::from_secs(1))
+                .unwrap_or(now),
+            suppressed: 0,
+        });
+        if now.duration_since(entry.last_logged) >= Self::SUPPRESS_WINDOW {
+            if entry.suppressed > 0 {
+                tracing_log(&format!(
+                    "RequestRootFd refused: peer uid {puid} is neither root \
+                     nor relay_peer_uid {relay_peer_uid} (+{} suppressed in \
+                     last {}s)",
+                    entry.suppressed,
+                    Self::SUPPRESS_WINDOW.as_secs()
+                ));
+            } else {
+                tracing_log(&format!(
+                    "RequestRootFd refused: peer uid {puid} is neither root \
+                     nor relay_peer_uid {relay_peer_uid}"
+                ));
+            }
+            entry.last_logged = now;
+            entry.suppressed = 0;
+        } else {
+            entry.suppressed = entry.suppressed.saturating_add(1);
+        }
+    }
 }
 
 impl BrokerLoop {
@@ -384,6 +455,65 @@ fn tracing_log(msg: &str) {
     eprintln!("halmasuit-session: {msg}");
 }
 
+/// Serve a `CompositorToBroker::RequestRootFd` frame: SO_PEERCRED-
+/// gate the request, then attach `/proc/self/root` to a
+/// `BrokerToCompositor::RootFd` reply via SCM_RIGHTS.
+///
+/// Phase B v2 cross-pivot per-process-root migration: halmasuit
+/// inherits the initramfs's process-root through `switch_root`; the
+/// broker (in rootfs's process-root) hands its `/proc/self/root` over
+/// so halmasuit can `fchdir(fd) + chroot(".")` into rootfs's view
+/// before binding the post-pivot greetd listener / spawning the
+/// greeter / dropping privileges.
+///
+/// SO_PEERCRED-authorized: only `root` or the trusted relay peer
+/// (compositor uid in the live topology) may obtain a fd to the
+/// broker's `/proc/self/root`. Both are accepted because the cross-
+/// pivot call site runs PRE-drop: halmasuit calls `RequestRootFd`
+/// from the still-root post-pivot setup window, BEFORE it executes
+/// `drop_privileges` (which would clear `CAP_SYS_CHROOT` and make
+/// the subsequent `fchdir` + `chroot` impossible). After the drop
+/// the relay-peer uid path applies for steady-state operation.
+///
+/// Without any gate, any local process in the broker's net-namespace
+/// could request the broker's mount-namespace view via a single
+/// unauthenticated frame (the broker is root + host-mount-namespace;
+/// the fd lets the holder fchdir into root's process-root). The
+/// effective threat model the check defends against is "unprivileged
+/// local process in the broker's net-ns" — accepting root is fine
+/// because any root process already trivially holds equivalent
+/// authority through other paths. Mirrors the `peer_uid !=
+/// relay_peer_uid` gate inside `AuthSlot::create` for the non-root
+/// case so every privileged op is authorized identically.
+///
+/// The connection is dedicated to the root-fd transfer; the caller
+/// closes it after this returns (either we sent the fd, or we
+/// refused — no further frames are expected on this channel).
+fn serve_root_fd_request(
+    greeter: &SeqpacketChannel,
+    puid: u32,
+    relay_peer_uid: u32,
+    refusal_log: &mut RefusalLog,
+) {
+    if puid != 0 && puid != relay_peer_uid {
+        refusal_log.record_refusal(puid, relay_peer_uid);
+        return;
+    }
+    match std::fs::File::open("/proc/self/root") {
+        Ok(root) => {
+            use std::os::fd::AsFd;
+            if let Err(e) =
+                send_frame_with_fd(greeter, &BrokerToCompositor::RootFd, Some(root.as_fd()))
+            {
+                tracing_log(&format!("send RootFd failed: {e:?}"));
+            }
+        }
+        Err(e) => {
+            tracing_log(&format!("open /proc/self/root failed: {e}"));
+        }
+    }
+}
+
 /// Accept and admit ONE pending connection on `listener_fd`.
 ///
 /// `listener_fd` is already O_NONBLOCK. `Ok(true)` = a connection was
@@ -399,6 +529,31 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
         Err(e) => return Err(e),
     };
+    // Slow-loris guard: cap the first-frame recv at 30s via
+    // SO_RCVTIMEO so an unprivileged peer that connects without
+    // sending cannot wedge the broker calloop for an unbounded
+    // window. Originally 5s on the assumption that the compositor
+    // sends BeginAuth within ms of connect; Phase B's greetd flow
+    // changes that — halmasuit connects to the broker EAGERLY on
+    // greeter accept, but the actual BeginAuth payload requires the
+    // greeter's `CreateSession` (R8 hint username), which is gated
+    // on user input. Real users can take longer than 5s to type a
+    // username. 30s keeps the defense intact (single-slot serialisation
+    // + per-uid refusal-log rate-limiter + idle-exit still bound the
+    // broker's total exposure) while accommodating human-paced auth.
+    // setsockopt failures are logged but don't abort the admission:
+    // a failed setsockopt is a defense weakness, not a correctness
+    // break.
+    if let Err(e) = nix::sys::socket::setsockopt(
+        &greeter,
+        nix::sys::socket::sockopt::ReceiveTimeout,
+        &nix::sys::time::TimeVal::new(30, 0),
+    ) {
+        tracing_log(&format!(
+            "setsockopt(SO_RCVTIMEO) failed: {e}; \
+             accepted connection without slow-loris timeout"
+        ));
+    }
     let puid = match peer_uid(&greeter) {
         Ok(u) => u,
         Err(e) => {
@@ -406,8 +561,42 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
             return Ok(true);
         }
     };
+    // Pre-recv uid gate (slow-loris amplification fix). The socket is
+    // mode 0666 (defence-in-depth — SO_PEERCRED is the load-bearing
+    // gate) so any local uid can `connect(2)`. The slow-loris timeout
+    // (SO_RCVTIMEO 30s above) is the wedge cap, but a peer that
+    // connects-and-stalls still blocks the broker's single-threaded
+    // calloop for the full window. Reject unauthorized peers IMMEDIATELY
+    // — before the blocking recv — so an attacker connecting from a
+    // non-{root, relay_peer_uid} uid costs only an accept+getsockopt
+    // round-trip instead of 30 wall-clock seconds. Per-uid refusal-log
+    // bounds the matching log spam.
+    //
+    // Root is permitted because the pre-drop in-process compositor
+    // setup runs as root, and so does the relay_peer_uid configurator
+    // before its setresuid. Identical authorization shape to the
+    // serve_root_fd_request gate downstream.
+    let relay_uid = bl.slot.relay_peer_uid();
+    if puid != 0 && puid != relay_uid {
+        // Per-uid suppressed log emission — same rate-limit shape the
+        // RequestRootFd refusal path uses (existing RefusalLog state
+        // keyed by puid; the log line phrasing also covers pre-recv
+        // since RequestRootFd is the only OTHER path that fires
+        // record_refusal, and the refusal IS pre-handshake either way).
+        bl.refusal_log.record_refusal(puid, relay_uid);
+        return Ok(true);
+    }
     let begin = match greeter.recv::<CompositorToBroker>() {
         Ok(CompositorToBroker::BeginAuth { service, username }) => (service, username),
+        Ok(CompositorToBroker::RequestRootFd) => {
+            serve_root_fd_request(
+                &greeter,
+                puid,
+                bl.slot.relay_peer_uid(),
+                &mut bl.refusal_log,
+            );
+            return Ok(true);
+        }
         Ok(_) => {
             tracing_log("first frame was not BeginAuth; dropping connection");
             return Ok(true);
@@ -545,6 +734,7 @@ pub fn run_broker(listener_fd: RawFd, relay_peer_uid: u32) -> io::Result<()> {
         loop_handle,
         loop_signal,
         running: true,
+        refusal_log: RefusalLog::default(),
     };
 
     while bl.running {
@@ -1060,6 +1250,174 @@ mod tests {
         assert!(
             slot.current().is_none(),
             "out-of-phase frame fails closed: worker cancelled + reaped"
+        );
+    }
+
+    /// Phase B v2 cross-pivot per-process-root migration: the
+    /// `RequestRootFd` arm of `admit_one` is SO_PEERCRED-gated like
+    /// every other privileged op (Epic R5/R8). A non-root peer whose
+    /// uid does not match `relay_peer_uid` MUST NOT receive a fd to
+    /// the broker's `/proc/self/root` — the fd would let the holder
+    /// `fchdir` into root's process-root, defeating the privilege
+    /// split.
+    #[test]
+    fn root_fd_request_refuses_when_peer_uid_mismatches_relay_peer_uid() {
+        let (compositor, broker_end) = pair();
+        // Broker authorizes uid GREETER (1000) as its relay peer; the
+        // connecting peer is GREETER + 1 (some other local uid). Note:
+        // 1001 is also non-zero — root is allowed by a separate clause
+        // (see the root test below), and this case checks the
+        // non-root non-peer path is refused.
+        let mut refusal_log = RefusalLog::default();
+        serve_root_fd_request(&broker_end, GREETER + 1, GREETER, &mut refusal_log);
+        // The unauthorized peer must NOT have received a frame — the
+        // broker dropped the connection without sending. Reading from
+        // the compositor end of the closed channel yields EOF, not a
+        // RootFd frame.
+        drop(broker_end);
+        let result: Result<(BrokerToCompositor, Option<std::os::fd::OwnedFd>), _> =
+            recv_frame_with_fd(&compositor);
+        if let Ok((frame, fd)) = result {
+            panic!(
+                "broker leaked frame {frame:?} (fd={:?}) to an unauthorized peer",
+                fd.is_some()
+            );
+        }
+        // Otherwise: EOF / closed — the desired outcome.
+    }
+
+    /// The authorized relay peer DOES receive a `RootFd` frame with
+    /// an SCM_RIGHTS-attached fd. Validates the happy path of
+    /// `serve_root_fd_request` for the post-drop steady-state path.
+    #[test]
+    fn root_fd_request_sends_fd_to_authorized_relay_peer() {
+        use std::os::fd::OwnedFd;
+        let (compositor, broker_end) = pair();
+        let mut refusal_log = RefusalLog::default();
+        serve_root_fd_request(&broker_end, GREETER, GREETER, &mut refusal_log);
+        drop(broker_end);
+        let (frame, fd): (BrokerToCompositor, Option<OwnedFd>) =
+            recv_frame_with_fd(&compositor).expect("authorized peer receives the RootFd frame");
+        assert!(
+            matches!(frame, BrokerToCompositor::RootFd),
+            "expected BrokerToCompositor::RootFd, got {frame:?}"
+        );
+        assert!(
+            fd.is_some(),
+            "RootFd frame must carry an SCM_RIGHTS fd attachment"
+        );
+    }
+
+    /// Root is allowed regardless of `relay_peer_uid`. This is the
+    /// LIVE cross-pivot call site: halmasuit invokes
+    /// `RequestRootFd` from `run_post_pivot_setup` PRE-drop, while
+    /// still uid 0 (the chroot needs `CAP_SYS_CHROOT` which the
+    /// subsequent `drop_privileges` clears). The relay-peer uid
+    /// constraint is meaningless against a uid-0 attacker (root
+    /// already holds equivalent authority through other paths), so
+    /// the gate's effective threat model is "unprivileged local
+    /// process in the broker's net-ns."
+    #[test]
+    fn root_fd_request_allows_root_peer_regardless_of_relay_peer_uid() {
+        use std::os::fd::OwnedFd;
+        let (compositor, broker_end) = pair();
+        // puid = 0 (root); relay_peer_uid = 1000 (something else
+        // entirely). Must still send the fd.
+        let mut refusal_log = RefusalLog::default();
+        serve_root_fd_request(&broker_end, 0, GREETER, &mut refusal_log);
+        drop(broker_end);
+        let (frame, fd): (BrokerToCompositor, Option<OwnedFd>) =
+            recv_frame_with_fd(&compositor).expect("root peer receives the RootFd frame");
+        assert!(
+            matches!(frame, BrokerToCompositor::RootFd),
+            "expected BrokerToCompositor::RootFd, got {frame:?}"
+        );
+        assert!(
+            fd.is_some(),
+            "RootFd frame must carry an SCM_RIGHTS fd attachment"
+        );
+    }
+
+    /// `RefusalLog` suppresses repeat-refusal log lines from the same
+    /// peer uid within a window. Verifies the suppression itself
+    /// (state mutation: a non-zero suppressed count is recorded), not
+    /// the log output (`tracing_log` writes to stderr — the test
+    /// would race against journald). One refused attempt logs; the
+    /// next 99 record into `suppressed`.
+    #[test]
+    fn refusal_log_suppresses_repeat_refusals_within_window() {
+        let mut log = RefusalLog::default();
+        // First refusal: logs immediately, suppressed remains 0.
+        log.record_refusal(1001, GREETER);
+        let entry = log
+            .per_puid
+            .get(&1001)
+            .expect("first refusal recorded an entry");
+        assert_eq!(
+            entry.suppressed, 0,
+            "first refusal must log; suppressed should be 0"
+        );
+        // 99 more refusals within the suppression window: all should
+        // bump the suppressed counter without logging.
+        for _ in 0..99 {
+            log.record_refusal(1001, GREETER);
+        }
+        let entry = log.per_puid.get(&1001).expect("entry still present");
+        assert_eq!(
+            entry.suppressed, 99,
+            "99 follow-up refusals should be suppressed, not logged"
+        );
+    }
+
+    /// Slow-loris guard: the SO_RCVTIMEO that admit_one sets on the
+    /// accepted greeter fd MUST cause `recv` to return EAGAIN/
+    /// ETIMEDOUT (TransportError::Io kind WouldBlock or TimedOut) if
+    /// no first-frame arrives within the timeout window. Without
+    /// this, an attacker can connect-and-stall to wedge the broker.
+    /// Test uses a 100ms timeout (vs the 30s production value) so it
+    /// can complete promptly.
+    #[test]
+    fn accepted_fd_recv_times_out_when_peer_stalls() {
+        use std::time::Instant;
+        let (a, b) = pair();
+        // Set 100ms recv timeout on `a`.
+        nix::sys::socket::setsockopt(
+            &a,
+            nix::sys::socket::sockopt::ReceiveTimeout,
+            &nix::sys::time::TimeVal::new(0, 100_000),
+        )
+        .expect("setsockopt SO_RCVTIMEO");
+        // `b` never sends. `a.recv` must return Err within ~100ms.
+        let start = Instant::now();
+        let r: Result<CompositorToBroker, _> = a.recv();
+        let elapsed = start.elapsed();
+        assert!(
+            r.is_err(),
+            "recv must error after SO_RCVTIMEO elapses, got {r:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(80) && elapsed < Duration::from_millis(500),
+            "recv should have blocked ~100ms, actually {elapsed:?}"
+        );
+        drop(b);
+    }
+
+    /// Suppression is per-peer-uid: a refusal from a different uid
+    /// should NOT inherit the prior peer's suppression state.
+    #[test]
+    fn refusal_log_suppression_is_per_peer_uid() {
+        let mut log = RefusalLog::default();
+        log.record_refusal(1001, GREETER);
+        log.record_refusal(1001, GREETER);
+        log.record_refusal(1001, GREETER);
+        let entry_a = log.per_puid.get(&1001).expect("entry a");
+        assert_eq!(entry_a.suppressed, 2, "two refusals suppressed for 1001");
+        // Different uid: starts fresh.
+        log.record_refusal(1002, GREETER);
+        let entry_b = log.per_puid.get(&1002).expect("entry b");
+        assert_eq!(
+            entry_b.suppressed, 0,
+            "first refusal from a different uid must log, not inherit"
         );
     }
 }

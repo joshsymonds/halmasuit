@@ -114,6 +114,16 @@ impl AuthSlot {
         Self::new(relay_peer_uid, DEFAULT_MAX_PER_WINDOW, DEFAULT_WINDOW)
     }
 
+    /// The uid the slot authorizes as the trusted relay peer
+    /// (Epic R5/R8). Exposed for sibling code paths in the broker
+    /// (e.g., the `RequestRootFd` cross-pivot fd handoff) that must
+    /// apply the same SO_PEERCRED gate without going through
+    /// `create` — every privileged op authorized identically.
+    #[must_use]
+    pub const fn relay_peer_uid(&self) -> u32 {
+        self.relay_peer_uid
+    }
+
     /// The in-flight worker, if any.
     #[must_use]
     pub const fn current(&self) -> Option<&InFlight> {

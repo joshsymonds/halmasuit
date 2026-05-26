@@ -124,6 +124,19 @@ pub enum CompositorToBroker {
     /// Abort the in-flight auth. The broker SIGKILLs its auth fork and
     /// `pam_end`s the transaction (Epic R4/R5).
     Cancel,
+    /// Phase B v2: request the broker's process-root file descriptor
+    /// for cross-pivot filesystem-view migration. The broker's
+    /// response carries `/proc/self/root` as an SCM_RIGHTS ancillary
+    /// fd attached to a [`BrokerToCompositor::RootFd`] frame.
+    /// Halmasuit then `fchdir(fd) + chroot(".")` to enter the
+    /// broker's process root (= rootfs's view), which makes
+    /// `/etc/passwd`, `/nix/store`, `/run/systemd` reachable.
+    ///
+    /// MUST be sent as the FIRST frame on a fresh broker connection,
+    /// before any `BeginAuth`. The broker recognizes it and responds
+    /// with the root fd then closes the connection — this connection
+    /// is dedicated to the root-fd transfer.
+    RequestRootFd,
 }
 
 /// How a launched user session ended (Amendment A5.2).
@@ -184,6 +197,11 @@ pub enum BrokerToCompositor {
     /// reverts to the greeter on this OR on the session client's
     /// Wayland disconnect, whichever is first.
     SessionEnded { outcome: SessionOutcome },
+    /// Phase B v2: response to [`CompositorToBroker::RequestRootFd`].
+    /// The broker's `/proc/self/root` fd is attached as SCM_RIGHTS
+    /// ancillary data on the same frame; the compositor extracts it
+    /// via `recvmsg` with a cmsg buffer.
+    RootFd,
 }
 
 /// Hard ceiling on a single framed message. Mirrors `halmasuit-greetd`'s
@@ -432,6 +450,7 @@ mod tests {
             "failure",
             "session_opened",
             "session_ended",
+            "root_fd",
             "worker_success",
             "worker_failure",
         ] {
@@ -445,6 +464,16 @@ mod tests {
                 "tag {tag:?} must not decode as CompositorToBroker, got {as_c2b:?}"
             );
         }
+
+        // Conversely: `request_root_fd` (the new C→B tag) must NOT
+        // decode as any BrokerToCompositor variant. The broker is
+        // the recipient of root-fd requests, not the emitter.
+        let req = encode(&CompositorToBroker::RequestRootFd).unwrap();
+        let as_b2c: Result<Option<(BrokerToCompositor, usize)>, _> = try_decode(&req);
+        assert!(
+            matches!(as_b2c, Err(CodecError::Json(_))),
+            "request_root_fd must not decode as BrokerToCompositor, got {as_b2c:?}"
+        );
     }
 
     // ── Amendment A5: broker→compositor session-lifecycle frames ─────
@@ -491,13 +520,51 @@ mod tests {
     }
 
     #[test]
-    fn session_lifecycle_is_broker_to_compositor_only() {
-        // A5.1 one-way invariant: a session_opened / session_ended
-        // datagram MUST NOT decode as any CompositorToBroker variant
-        // (the compositor never *emits* lifecycle; the type only
-        // deserializes broker→compositor). This is the structural
-        // anti-forge guarantee — there is no frame the unprivileged
-        // compositor can send that asserts session lifecycle.
+    fn wire_format_request_root_fd() {
+        // Phase B v2 cross-pivot per-process-root migration:
+        // C→B side of the broker RootFd handoff. Tagless body, same
+        // shape as Cancel.
+        let json = r#"{"type":"request_root_fd"}"#;
+        let parsed: CompositorToBroker = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, CompositorToBroker::RequestRootFd);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn wire_format_root_fd() {
+        // Phase B v2 cross-pivot per-process-root migration:
+        // B→C reply carrying the broker's `/proc/self/root` as an
+        // SCM_RIGHTS attachment. The frame body is empty (the fd
+        // travels out-of-band on the SCM_RIGHTS control message);
+        // the JSON shape is the discriminator only.
+        let json = r#"{"type":"root_fd"}"#;
+        let parsed: BrokerToCompositor = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, BrokerToCompositor::RootFd);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn broker_to_compositor_only_frames_do_not_cross_decode_as_compositor_to_broker() {
+        // Structural anti-forge guarantee: frames the unprivileged
+        // compositor must NEVER be able to forge MUST NOT decode as
+        // any `CompositorToBroker` variant. Covers two distinct
+        // invariants in one structural check, both held by the
+        // tagged-enum discriminator:
+        //
+        //   - Session lifecycle (A5.1): `session_opened` /
+        //     `session_ended{outcome=...}` are emitted by the broker
+        //     ONLY; the compositor is a pure lifecycle sink. There
+        //     is no `CompositorToBroker::Session*` variant.
+        //
+        //   - Cross-pivot process-root migration (Phase B v2):
+        //     `root_fd` is the broker's SCM_RIGHTS-attached grant
+        //     of its `/proc/self/root` fd. Only the broker emits
+        //     it; the compositor receives + chroots. There is no
+        //     `CompositorToBroker::RootFd*` variant.
+        //
+        // The two are different protocol concerns (session
+        // lifecycle vs. fd grant) but the same anti-forge defense
+        // (tag-disjointness), tested together.
         for frame in [
             BrokerToCompositor::SessionOpened,
             BrokerToCompositor::SessionEnded {
@@ -506,12 +573,14 @@ mod tests {
             BrokerToCompositor::SessionEnded {
                 outcome: SessionOutcome::Signaled { signal: 15 },
             },
+            BrokerToCompositor::RootFd,
         ] {
             let bytes = encode(&frame).unwrap();
             let as_c2b: Result<Option<(CompositorToBroker, usize)>, _> = try_decode(&bytes);
             assert!(
                 matches!(as_c2b, Err(CodecError::Json(_))),
-                "lifecycle frame must not decode as CompositorToBroker, got {as_c2b:?}"
+                "broker-to-compositor-only frame must not decode as \
+                 CompositorToBroker, got {as_c2b:?}"
             );
         }
     }
@@ -533,6 +602,7 @@ mod tests {
                 env: vec![("HOME".into(), "/home/alice".into())],
             },
             CompositorToBroker::Cancel,
+            CompositorToBroker::RequestRootFd,
         ] {
             let bytes = encode(&msg).unwrap();
             let (decoded, consumed): (CompositorToBroker, usize) =
@@ -564,6 +634,7 @@ mod tests {
             BrokerToCompositor::SessionEnded {
                 outcome: SessionOutcome::Signaled { signal: 9 },
             },
+            BrokerToCompositor::RootFd,
         ] {
             let bytes = encode(&msg).unwrap();
             let (decoded, consumed): (BrokerToCompositor, usize) =

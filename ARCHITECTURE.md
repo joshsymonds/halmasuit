@@ -1224,12 +1224,16 @@ solve nothing of the project's stated mission.
 
 Implementation is staged into **Phase A** (rootfs spine) and **Phase
 B** (initramfs survival). The split is execution sequencing only;
-the architectural commitment is unchanged. Phase A is complete and its
-auth/session model has since been rebuilt by the privilege-separation
-epic (the `halmasuit-session` broker; see "Authentication and session
-lifecycle" above and
+the architectural commitment is unchanged. Both phases are complete
+in-repo. Phase A's auth/session model has since been rebuilt by the
+privilege-separation epic (the `halmasuit-session` broker; see
+"Authentication and session lifecycle" above and
 [`PLAN.md`'s "Privilege-separation decision record"](PLAN.md#privilege-separation-decision-record)).
-See [`PLAN.md`](PLAN.md) for the in-scope status table.
+Phase B shipped under Epic #35 — `halmasuit-luks`,
+`services.halmasuit.fromInitrd.enable`, the broker SCM_RIGHTS
+root-fd handoff for cross-pivot mount-namespace visibility, the
+6-cell visual matrix, and the `full-boot-flash` hard gate. See
+[`PLAN.md`](PLAN.md) for the in-scope status table.
 
 Scope:
 

@@ -86,7 +86,7 @@ DEFAULT_THRESHOLD = 90.0
 GUEST_SNAPSHOT_DIR = "/run/hsnap"
 
 
-def capture(machine, name: str) -> Path:
+def capture(machine, name: str, scene: str = "current") -> Path:
     """Capture the real composited frame via halmasuit's `Snapshot()`
     D-Bus method and return the host-side PNG path.
 
@@ -100,17 +100,35 @@ def capture(machine, name: str) -> Path:
 
     The PNG is written guest-side into ``GUEST_SNAPSHOT_DIR`` then
     copied to the driver's output directory.
+
+    `scene` selects which snapshot slot to read:
+
+      - `"current"` (default) — the full live composition (wallpaper +
+        layer-shell + foreground toplevel + cursor). Calls the
+        no-arg `Snapshot(s)` D-Bus method.
+      - `"wallpaper-only"` — the auxiliary capture of just the
+        wallpaper element, populated alongside every audited frame.
+        Variant-distinct across Phase B matrix cells even when niri's
+        opaque xdg_toplevel covers the wallpaper in the live
+        composition. Calls the two-arg `SnapshotScene(s, s)` method.
     """
     guest_path = f"{GUEST_SNAPSHOT_DIR}/{name}.png"
-    # `busctl call ... Snapshot s <path>` — the `s` signature is the
-    # single string arg. machine.succeed raises with the guest stderr
-    # if the method returns a D-Bus error (no frame yet, unwritable
-    # path, name not owned).
-    machine.succeed(
-        "busctl --system call org.halmasuit "
-        "/org/halmasuit/Debug/Introspect "
-        f"org.halmasuit.Debug.Introspect Snapshot s {guest_path!r}"
-    )
+    # `busctl call ... Snapshot s <path>` — single-string for the
+    # default scene; `SnapshotScene ss <path> <scene>` for the
+    # auxiliary slots. machine.succeed raises with the guest stderr
+    # if the method returns a D-Bus error.
+    if scene == "current":
+        machine.succeed(
+            "busctl --system call org.halmasuit "
+            "/org/halmasuit/Debug/Introspect "
+            f"org.halmasuit.Debug.Introspect Snapshot s {guest_path!r}"
+        )
+    else:
+        machine.succeed(
+            "busctl --system call org.halmasuit "
+            "/org/halmasuit/Debug/Introspect "
+            f"org.halmasuit.Debug.Introspect SnapshotScene ss {guest_path!r} {scene!r}"
+        )
     # Pull the guest file into the test driver's output dir.
     machine.copy_from_vm(guest_path)
     out_dir = os.environ.get("out") or os.environ.get("TMPDIR") or "/tmp"
@@ -196,16 +214,23 @@ def assert_matches_golden(
     name: str,
     *,
     threshold: float = DEFAULT_THRESHOLD,
+    scene: str = "current",
 ) -> None:
     """Capture a screenshot named `name`, compare to
     `${GOLDENS_DIR}/{name}.png`, raise if `score < threshold`.
+
+    `scene` is forwarded to `capture()` — passes through to the
+    `org.halmasuit.Debug.Introspect.SnapshotScene` D-Bus method to
+    select which snapshot slot to read (`"current"` for the live
+    composition, `"wallpaper-only"` for the auxiliary wallpaper-plane
+    capture).
 
     If `HALMASUIT_GOLDEN_REGEN=1` is set in the environment, the
     captured screenshot is copied to the golden path instead and the
     function returns without asserting. The developer is expected to
     visually inspect the new golden before committing it.
     """
-    actual = capture(machine, name)
+    actual = capture(machine, name, scene=scene)
     goldens_dir = os.environ.get("GOLDENS_DIR")
     if not goldens_dir:
         raise RuntimeError(
@@ -288,7 +313,14 @@ def introspect_events(machine) -> list:
     (`{"timestamp":...,"fields":{"json":"<Event JSON string>"},...}`);
     the Event itself is the JSON-encoded `fields.json` string.
     """
-    raw = machine.succeed("journalctl -u halmasuit -o cat --no-pager")
+    # `-b` constrains to the CURRENT boot. The Phase B golden-boot
+    # tests run a deliberate dual-boot dance (first boot luksFormats
+    # `/dev/vdb`, crashes, then the real boot exercises the unlock
+    # path); without `-b` `assert_no_flash_stream` would see two
+    # `client_first_frame{role:wallpaper}` events (one per boot) and
+    # incorrectly flag the second-boot wallpaper plane as a recreation. Single-
+    # boot tests are unaffected — `-b` is a no-op there.
+    raw = machine.succeed("journalctl -b -u halmasuit -o cat --no-pager")
     events = []
     for line in raw.splitlines():
         line = line.strip()

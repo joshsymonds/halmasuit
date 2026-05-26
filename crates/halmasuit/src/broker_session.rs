@@ -323,7 +323,16 @@ pub fn connect_broker(sock_path: &Path) -> Result<SeqpacketChannel, WireError> {
         SockFlag::empty(),
         None,
     )?;
-    let addr = UnixAddr::new(sock_path).map_err(WireError::Io)?;
+    // Path-or-abstract: `@name` selects the kernel's net-namespace-
+    // scoped abstract socket. Used in the Phase B fromInitrd
+    // deployment to bypass the cross-pivot mount-namespace
+    // divergence.
+    let path_str = sock_path.to_string_lossy();
+    let addr = if let Some(abstract_name) = path_str.strip_prefix('@') {
+        UnixAddr::new_abstract(abstract_name.as_bytes()).map_err(WireError::Io)?
+    } else {
+        UnixAddr::new(sock_path).map_err(WireError::Io)?
+    };
     connect(fd.as_raw_fd(), &addr)?;
     Ok(SeqpacketChannel::new(fd))
 }
@@ -651,6 +660,51 @@ mod tests {
             resolve_command_path(vec!["a\0b".into(), "--session".into()]),
             None
         );
+    }
+
+    /// `connect_broker` accepts `@<name>` paths and connects via the
+    /// kernel abstract namespace. Pins the Phase B fromInitrd
+    /// cross-mount-ns connect path: halmasuit reaches the broker
+    /// socket bound by rootfs systemd's `halmasuit-session.socket`
+    /// via the abstract namespace, since the filesystem inode under
+    /// /run/ isn't visible from initramfs's surviving process-root.
+    #[test]
+    fn connect_broker_abstract_round_trip() {
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, listen};
+        use std::os::fd::AsRawFd;
+
+        let name = format!(
+            "halmasuit-broker-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        // Bind an abstract SEQPACKET listener and accept on a worker
+        // thread; assert connect_broker reaches us.
+        let server = nix::sys::socket::socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::empty(),
+            None,
+        )
+        .expect("server socket");
+        let addr = UnixAddr::new_abstract(name.as_bytes()).expect("abstract addr");
+        bind(server.as_raw_fd(), &addr).expect("bind abstract");
+        listen(&server, nix::sys::socket::Backlog::new(1).unwrap()).expect("listen");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let accepted = nix::sys::socket::accept(server.as_raw_fd()).expect("accept");
+            tx.send(accepted).unwrap();
+        });
+
+        let abstract_path = std::path::PathBuf::from(format!("@{name}"));
+        let _client = connect_broker(&abstract_path).expect("connect to @-prefixed broker");
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("server accepted abstract connection");
     }
 
     /// (compositor channel, broker end) connected SEQPACKET pair. The

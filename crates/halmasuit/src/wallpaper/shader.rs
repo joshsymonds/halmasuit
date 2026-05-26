@@ -159,7 +159,27 @@ impl ShaderBackend {
         let raw = std::fs::read_to_string(source).map_err(|e| {
             io::Error::other(format!("read wallpaper shader {}: {e}", source.display()))
         })?;
+        let shadertoy = is_shadertoy_shape(&raw);
         let final_src = assemble_source(&raw);
+
+        // Shadertoy shape couples its injected preamble + wrapper to
+        // a fixed set of uniforms (iResolution, iTime, …). The
+        // wrapper passes `gl_FragCoord.xy` into `mainImage` and the
+        // user shader divides by `iResolution`; if that uniform is
+        // unbound it defaults to vec3(0) and every fragment computes
+        // `fragCoord/0 = Inf`, clamped to a solid color. Merge the
+        // canonical Shadertoy bindings in for Shadertoy-shape
+        // shaders so the JSON-config path (whose Nix option defaults
+        // `uniforms` to `{}`) is no worse than the env-var path's
+        // `infer_from_path`. User-supplied entries win on key
+        // collisions — a user that wants a Static iResolution still
+        // gets one.
+        let mut uniforms = uniforms;
+        if shadertoy {
+            for (k, v) in super::config::default_shadertoy_bindings() {
+                uniforms.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
 
         // Stable order: sort by name so the binding list is
         // deterministic across runs (the HashMap iteration order is
@@ -412,5 +432,171 @@ mod tests {
         assert!(SHADERTOY_PREAMBLE.contains("uniform float iTimeDelta"));
         assert!(SHADERTOY_PREAMBLE.contains("uniform int iFrame"));
         assert!(SHADERTOY_PREAMBLE.contains("uniform vec4 iMouse"));
+    }
+
+    /// The Phase B shader-variant VM tests consume
+    /// `tests/fixtures/wallpaper-shader.glsl` as the
+    /// `services.halmasuit.wallpaper.source`. This unit test pins the
+    /// fixture's shape so a regression (wrong entry point, missing
+    /// uniform reference, accidental `#version` directive) fails
+    /// `just check` before the slow VM sweep runs. The actual GPU
+    /// compile via `ShaderBackend::new` requires a real `GlesRenderer`
+    /// and is exercised end-to-end by the VM tests.
+    const PHASE_B_SHADER_FIXTURE: &str =
+        include_str!("../../../../tests/fixtures/wallpaper-shader.glsl");
+
+    #[test]
+    fn phase_b_shader_fixture_is_shadertoy_shape() {
+        assert!(
+            is_shadertoy_shape(PHASE_B_SHADER_FIXTURE),
+            "fixture must use the `void mainImage(...)` Shadertoy entry \
+             so shader.rs injects the preamble that declares iTime / \
+             iResolution"
+        );
+    }
+
+    #[test]
+    fn phase_b_shader_fixture_uses_itime_and_iresolution() {
+        assert!(
+            PHASE_B_SHADER_FIXTURE.contains("iTime"),
+            "fixture must reference iTime so the time-varying golden \
+             actually animates (the no-flash gate would still pass on \
+             a static shader, but the VM test's whole point is to \
+             exercise the time-uniform code path)"
+        );
+        assert!(
+            PHASE_B_SHADER_FIXTURE.contains("iResolution"),
+            "fixture must reference iResolution so the per-frame \
+             uniform bind for the resolution vec3 runs"
+        );
+    }
+
+    #[test]
+    fn phase_b_shader_fixture_assembles_to_a_complete_glsl_es_100_program() {
+        // Wrap-and-stitch via the production assembler. Asserts the
+        // final source has both the user's `mainImage` AND the
+        // generated `void main()` entry. A regression where the
+        // assembler drops the user source would surface here.
+        let assembled = assemble_source(PHASE_B_SHADER_FIXTURE);
+        assert!(
+            assembled.contains("mainImage(out vec4 fragColor"),
+            "assembled source must contain the user's mainImage \
+             signature verbatim"
+        );
+        assert!(
+            assembled.contains("void main()"),
+            "assembled source must contain smithay's expected \
+             void main() entry (added by the Shadertoy wrapper)"
+        );
+        assert!(
+            !assembled.contains("#version"),
+            "assembled source must not declare #version; smithay \
+             prepends it during compile"
+        );
+    }
+
+    /// Mirror of the merge logic in `ShaderBackend::new` — the
+    /// constructor needs a live `GlesRenderer` so we can't drive it
+    /// directly here, but the merge itself is a pure HashMap
+    /// operation and pinning its behavior in a unit test catches the
+    /// regression class that produced solid-color shader goldens
+    /// (Shadertoy-shape shader + empty `uniforms` map → unbound
+    /// `iResolution` → `fragCoord/0 = Inf` → constant fragment).
+    fn merge_shadertoy_defaults(
+        src: &str,
+        user: HashMap<String, UniformBinding>,
+    ) -> HashMap<String, UniformBinding> {
+        let mut out = user;
+        if is_shadertoy_shape(src) {
+            for (k, v) in super::super::config::default_shadertoy_bindings() {
+                out.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn shadertoy_shape_with_empty_user_map_auto_binds_canonical_uniforms() {
+        // Reproduces the JSON-config-path bug: the Nix module's
+        // `uniforms` option defaults to `{}`, so a Shadertoy-shape
+        // shader configured via `services.halmasuit.wallpaper`
+        // arrived at ShaderBackend with an empty bindings map. The
+        // injected preamble + wrapper still reference iResolution /
+        // iTime / etc., so without a merge they end up unbound.
+        let merged = merge_shadertoy_defaults(PHASE_B_SHADER_FIXTURE, HashMap::new());
+        assert!(matches!(
+            merged.get("iResolution"),
+            Some(UniformBinding::AutoResolution)
+        ));
+        assert!(matches!(
+            merged.get("iTime"),
+            Some(UniformBinding::AutoTime)
+        ));
+        assert!(matches!(
+            merged.get("iFrame"),
+            Some(UniformBinding::AutoFrame)
+        ));
+    }
+
+    #[test]
+    fn shadertoy_shape_user_provided_uniform_wins_over_default() {
+        // A user that ships a Shadertoy shader and explicitly binds
+        // iTime to a Static value must NOT have the merge overwrite
+        // it. Defaults fill MISSING keys only — `HashMap::entry`'s
+        // `or_insert` semantics.
+        let mut user = HashMap::new();
+        user.insert(
+            "iTime".to_owned(),
+            UniformBinding::Static {
+                value: StaticValue::Float(42.0),
+            },
+        );
+        let merged = merge_shadertoy_defaults(PHASE_B_SHADER_FIXTURE, user);
+        assert!(
+            matches!(
+                merged.get("iTime"),
+                Some(UniformBinding::Static { value: StaticValue::Float(v) }) if (*v - 42.0).abs() < f32::EPSILON
+            ),
+            "user-provided Static iTime must survive the merge"
+        );
+        // The OTHER defaults still land — only the colliding key is
+        // preserved as the user provided.
+        assert!(matches!(
+            merged.get("iResolution"),
+            Some(UniformBinding::AutoResolution)
+        ));
+    }
+
+    #[test]
+    fn declared_uniform_shape_does_not_auto_bind_shadertoy_defaults() {
+        // Non-Shadertoy shape: the assembler passes the source
+        // through untouched, so the wrapper never gets injected and
+        // the user shader doesn't reference iResolution / iTime by
+        // name. Auto-binding them here would inject phantom uniforms
+        // that GetUniformLocation reports as -1 (silent no-op), but
+        // it'd also confuse the audit log + the binding count.
+        let user = "uniform float t;\nvoid main() { gl_FragColor = vec4(t); }";
+        let merged = merge_shadertoy_defaults(user, HashMap::new());
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn phase_b_shader_fixture_does_not_declare_event_uniforms() {
+        // Phase A: EventTime / EventValue parse but the bus-event
+        // delivery isn't wired (shader.rs:184-205 warns + writes 0.0).
+        // The fixture must stick to fully-implemented uniforms so the
+        // VM test exercises a path that actually fires non-zero
+        // values. A future fixture that wants event uniforms lands
+        // alongside the bus-event epic.
+        assert!(
+            !PHASE_B_SHADER_FIXTURE.contains("EventTime"),
+            "fixture must not declare EventTime — Phase A leaves it \
+             at sentinel 0.0; use iTime"
+        );
+        assert!(
+            !PHASE_B_SHADER_FIXTURE.contains("EventValue"),
+            "fixture must not declare EventValue — Phase A leaves it \
+             at sentinel 0.0"
+        );
     }
 }

@@ -43,6 +43,11 @@ members = [
     # compositor forwards on xdg_popup.configure (xdg-shell positioner
     # pipeline / PopupManager wiring contract).
     "crates/halmasuit-popup-test-client",
+    # Phase B: systemd password-agent Wayland client. Watches
+    # /run/systemd/ask-password/ for LUKS unlock requests, prompts the
+    # user via a fullscreen xdg_toplevel, writes the response to the
+    # agent socket. Spawned by halmasuit when started from initramfs.
+    "crates/halmasuit-luks",
     "xtask",
 ]
 

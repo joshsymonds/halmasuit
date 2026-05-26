@@ -68,6 +68,36 @@ test-vm:
     echo "── halmasuit-vm ──"
     nix build .#checks.x86_64-linux.halmasuit-vm -L --print-build-logs --no-link
     echo
+    echo "── initrd-survival ──"
+    nix build .#checks.x86_64-linux.initrd-survival -L --print-build-logs --no-link
+    echo
+    echo "── full-boot-flash ──"
+    nix build .#checks.x86_64-linux.full-boot-flash -L --print-build-logs --no-link
+    echo
+    echo "── luks-unlock ──"
+    nix build .#checks.x86_64-linux.luks-unlock -L --print-build-logs --no-link
+    echo
+    echo "── visual-initrd-pixmap ──"
+    nix build .#checks.x86_64-linux.visual-initrd-pixmap -L --print-build-logs --no-link
+    echo
+    echo "── visual-phase-b-side-image ──"
+    nix build .#checks.x86_64-linux.visual-phase-b-side-image -L --print-build-logs --no-link
+    echo
+    echo "── visual-phase-b-side-shader ──"
+    nix build .#checks.x86_64-linux.visual-phase-b-side-shader -L --print-build-logs --no-link
+    echo
+    echo "── visual-phase-b-side-video ──"
+    nix build .#checks.x86_64-linux.visual-phase-b-side-video -L --print-build-logs --no-link
+    echo
+    echo "── visual-phase-b-enc-image ──"
+    nix build .#checks.x86_64-linux.visual-phase-b-enc-image -L --print-build-logs --no-link
+    echo
+    echo "── visual-phase-b-enc-shader ──"
+    nix build .#checks.x86_64-linux.visual-phase-b-enc-shader -L --print-build-logs --no-link
+    echo
+    echo "── visual-phase-b-enc-video ──"
+    nix build .#checks.x86_64-linux.visual-phase-b-enc-video -L --print-build-logs --no-link
+    echo
     echo "── run-pam-auth ──"
     nix build .#checks.x86_64-linux.run-pam-auth -L --print-build-logs --no-link
     echo
@@ -220,6 +250,76 @@ test-drm-probe-phase3:
 # privilege model; the conclusion is recorded in RESEARCH.md Phase 4.
 test-drm-probe-phase4:
     nix build .#checks.x86_64-linux.drm-master-probe-phase4 -L --print-build-logs --no-link
+
+# Phase B initrd-survival gate: the production halmasuit binary
+# registered via `services.halmasuit.fromInitrd.enable`. Composes
+# RESEARCH.md Phase 2 mechanism (`SurviveFinalKillSignal=yes` in
+# unitConfig) with halmasuit's runtime initramfs detection. Asserts
+# PID + DRM-master + Wayland-socket continuity across switch_root,
+# and that the NDJSON event stream emits both `initramfs_init`
+# (pre-pivot) and `rootfs_ready` (post-pivot) from the SAME pid.
+test-vm-initrd-survival:
+    nix build .#checks.x86_64-linux.initrd-survival -L --print-build-logs --no-link
+
+# Phase B hard gate: full LUKS-backed boot + survival + chroot +
+# greeter spawn + PAM auth → SessionOpened end-to-end.
+test-vm-full-boot-flash:
+    nix build .#checks.x86_64-linux.full-boot-flash -L --print-build-logs --no-link
+
+# Phase B LUKS unlock gate: real cryptsetup + real
+# systemd-cryptsetup ask-password producer + halmasuit-luks in
+# non-interactive responder mode actually unlocks a real LUKS
+# volume. Isolates the wire contract end-to-end without depending
+# on a virtual-keyboard substrate for the Wayland UI path.
+test-vm-luks-unlock:
+    nix build .#checks.x86_64-linux.luks-unlock -L --print-build-logs --no-link
+
+# Phase B kernel-handoff-to-session pixmap continuity gate. Extends
+# the rootfs visual-* family's exact-stream no-flash mechanism
+# (frame_audit + assert_no_flash_stream) to the boot-from-initrd
+# timeline. The strongest empirical statement that halmasuit owns
+# the pixel pipeline continuously — the Plymouth-removability proof.
+test-vm-visual-initrd-pixmap:
+    nix build .#checks.x86_64-linux.visual-initrd-pixmap -L --print-build-logs --no-link
+
+# Phase B golden-boot, side-volume LUKS × image wallpaper (Epic #35,
+# first cell of the matrix). Full composition: initramfs halmasuit +
+# halmasuit-luks → LUKS side-volume unlocks via the production wire →
+# switch_root → DankGreeter (real keyboard via machine.send_chars) →
+# alice's real pam_unix auth → niri spawned by broker → goldens at
+# greeter scene + session scene + no-flash invariant across the
+# whole timeline.
+test-vm-visual-phase-b-side-image:
+    nix build .#checks.x86_64-linux.visual-phase-b-side-image -L --print-build-logs --no-link
+
+# Phase B cell — LUKS side-volume × shader wallpaper. Same end-to-end
+# arc; animated GLSL fragment shader (iTime-driven sine hue cycle, 60s
+# period for SSIMULACRA2 golden stability) replaces the image plane.
+test-vm-visual-phase-b-side-shader:
+    nix build .#checks.x86_64-linux.visual-phase-b-side-shader -L --print-build-logs --no-link
+
+# Phase B cell — LUKS side-volume × video wallpaper. Real h264 (built
+# with ffmpeg's testsrc) looped through halmasuit-decoder's sandbox +
+# DecoderRelay; PNG fallback armed (a fallback swap during the run is
+# itself caught by assert_no_flash_stream).
+test-vm-visual-phase-b-side-video:
+    nix build .#checks.x86_64-linux.visual-phase-b-side-video -L --print-build-logs --no-link
+
+# Phase B cell — LUKS-encrypted ROOT × image wallpaper. Same arc but
+# the rootfs itself is on a LUKS volume; dual-boot specialisation
+# pattern unlocks /dev/mapper/cryptroot in initramfs via the
+# halmasuit-luks ask-password responder.
+test-vm-visual-phase-b-enc-image:
+    nix build .#checks.x86_64-linux.visual-phase-b-enc-image -L --print-build-logs --no-link
+
+# Phase B cell — LUKS-encrypted ROOT × shader wallpaper.
+test-vm-visual-phase-b-enc-shader:
+    nix build .#checks.x86_64-linux.visual-phase-b-enc-shader -L --print-build-logs --no-link
+
+# Phase B cell — LUKS-encrypted ROOT × video wallpaper (final cell
+# of the 6-cell matrix).
+test-vm-visual-phase-b-enc-video:
+    nix build .#checks.x86_64-linux.visual-phase-b-enc-video -L --print-build-logs --no-link
 
 # Same VM test, but interactive: opens a QEMU window so you can watch the
 # guest boot, and drops you into a Python REPL inside the test driver.

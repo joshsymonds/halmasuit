@@ -205,7 +205,7 @@ pub fn infer_from_path(path: PathBuf) -> WallpaperConfig {
     match ext.as_deref() {
         Some("frag" | "glsl") => WallpaperConfig::Shader {
             source: path,
-            uniforms: default_shadertoy_bindings(),
+            uniforms: default_shadertoy_bindings().clone(),
         },
         Some("mp4" | "webm" | "mkv") => WallpaperConfig::Video {
             source: path,
@@ -220,18 +220,31 @@ pub fn infer_from_path(path: PathBuf) -> WallpaperConfig {
 }
 
 /// The canonical Shadertoy uniform-binding set, auto-bound by name
-/// to engine values. The shader backend ships these as the default
-/// when no `HALMASUIT_WALLPAPER_CONFIG` TOML is supplied — Shadertoy
-/// demos drop in unchanged. A future TOML config can override or
-/// extend the set with named declared uniforms.
-fn default_shadertoy_bindings() -> HashMap<String, UniformBinding> {
-    let mut m = HashMap::new();
-    m.insert("iResolution".to_owned(), UniformBinding::AutoResolution);
-    m.insert("iTime".to_owned(), UniformBinding::AutoTime);
-    m.insert("iTimeDelta".to_owned(), UniformBinding::AutoDelta);
-    m.insert("iFrame".to_owned(), UniformBinding::AutoFrame);
-    m.insert("iMouse".to_owned(), UniformBinding::AutoMouse);
-    m
+/// to engine values. Two callers: the env-var path's
+/// `infer_from_path` uses this as the initial set when a `.glsl`/
+/// `.frag` is given via `HALMASUIT_WALLPAPER_PATH`; the shader
+/// backend merges this in (user entries winning on collisions)
+/// whenever the user shader is Shadertoy-shape — the injected
+/// preamble + wrapper reference these uniforms, so for that shape
+/// they MUST be bound regardless of whether the JSON config path
+/// (which defaults `uniforms` to `{}`) supplied them.
+///
+/// Returns a `&'static` reference; the 5-entry map is built once
+/// via `LazyLock` and shared across the (rare) callers. The owned
+/// `HashMap` ownership the env-var path needs is recovered with
+/// `.clone()` at that single site.
+pub fn default_shadertoy_bindings() -> &'static HashMap<String, UniformBinding> {
+    static MAP: std::sync::LazyLock<HashMap<String, UniformBinding>> =
+        std::sync::LazyLock::new(|| {
+            let mut m = HashMap::new();
+            m.insert("iResolution".to_owned(), UniformBinding::AutoResolution);
+            m.insert("iTime".to_owned(), UniformBinding::AutoTime);
+            m.insert("iTimeDelta".to_owned(), UniformBinding::AutoDelta);
+            m.insert("iFrame".to_owned(), UniformBinding::AutoFrame);
+            m.insert("iMouse".to_owned(), UniformBinding::AutoMouse);
+            m
+        });
+    &MAP
 }
 
 #[cfg(test)]

@@ -46,6 +46,7 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::session::Session;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::output::{Mode as OutputMode, Output, OutputModeSource, PhysicalProperties, Subpixel};
+use smithay::reexports::drm::Device as BaseDrmDevice;
 use smithay::reexports::drm::control::Device as ControlDevice;
 use smithay::reexports::drm::control::connector;
 use smithay::reexports::rustix::fs::OFlags;
@@ -205,15 +206,27 @@ pub struct DrmBackend {
     /// `halmasuit-debug`.
     #[cfg(feature = "frame_audit")]
     snapshot_buf: crate::dbus::SnapshotBuffer,
+    /// Latest wallpaper-plane-only frame, captured by re-rendering just
+    /// the wallpaper element to an offscreen GLES texture. Published
+    /// alongside `snapshot_buf` so the test driver can request a
+    /// variant-distinct golden uncoupled from any layer-shell /
+    /// xdg-toplevel overlay. Only exists in `halmasuit-debug`.
+    #[cfg(feature = "frame_audit")]
+    wallpaper_only_buf: crate::dbus::SnapshotBuffer,
 }
 
 impl DrmBackend {
-    /// A clone of the shared snapshot slot, to hand to the D-Bus
-    /// server. The render loop publishes into it; `Snapshot()` reads.
+    /// Clones of the shared snapshot slots (current composition +
+    /// wallpaper-plane-only), to hand to the D-Bus server. The render
+    /// loop publishes into both; `Snapshot(path, scene)` reads from one
+    /// based on the `scene` arg.
     #[cfg(feature = "frame_audit")]
     #[must_use]
-    pub fn snapshot_handle(&self) -> crate::dbus::SnapshotBuffer {
-        self.snapshot_buf.clone()
+    pub fn snapshot_handle(&self) -> crate::dbus::SnapshotHandles {
+        crate::dbus::SnapshotHandles {
+            current: self.snapshot_buf.clone(),
+            wallpaper_only: self.wallpaper_only_buf.clone(),
+        }
     }
 
     /// Periodic tick that drives the wallpaper backend's
@@ -255,15 +268,6 @@ impl DrmBackend {
 ///
 /// Bubbles any DRM ioctl, GBM allocation, EGL initialization, or
 /// calloop registration failure with context.
-// reason: a single linear DRM→GBM→EGL→GLES→DrmCompositor→calloop
-// init sequence. The ordering is load-bearing (master before GBM,
-// EGL before GLES, surface before compositor); splitting it into
-// helpers scatters that ordering across the module for no
-// readability or testability gain.
-#[allow(
-    clippy::too_many_lines,
-    reason = "linear hardware-init sequence; ordering is load-bearing"
-)]
 pub fn setup_drm_backend<S, F>(
     session: &mut LibSeatSession,
     path: &Path,
@@ -285,11 +289,123 @@ where
         .open(path, OFlags::RDWR | OFlags::CLOEXEC | OFlags::NONBLOCK)
         .map_err(|e| io::Error::other(format!("libseat session.open({}): {e}", path.display())))?;
     let device_fd = DrmDeviceFd::new(DeviceFd::from(owned_fd));
+    build_drm_pipeline(
+        device_fd,
+        MasterAcquisition::FromSeatd,
+        loop_handle,
+        drm_event_handler,
+        wallpaper_config,
+    )
+}
 
+/// Set up the full DRM/GBM/EGL/GLES/DrmCompositor stack by opening the
+/// DRM device at `path` **directly** (no libseat brokerage) and
+/// issuing `DRM_IOCTL_SET_MASTER` ourselves. The Phase B boot-from-
+/// initrd deployment path: in initramfs there is no seatd to broker
+/// the fd and no other DRM consumer to contend with, so halmasuit
+/// owns master direct for its process lifetime. drm-master-probe
+/// Phase 1+2 validated that the master designation survives both
+/// `setresuid` and `switch_root` via `SurviveFinalKillSignal=yes`.
+///
+/// Same returned shape as [`setup_drm_backend`]; the caller registers
+/// the smithay `Output` global from its concrete-state context.
+///
+/// # Errors
+///
+/// Bubbles any open / SET_MASTER ioctl / DRM / GBM / EGL / GLES /
+/// calloop failure with context.
+pub fn setup_drm_direct<S, F>(
+    path: &Path,
+    loop_handle: &smithay::reexports::calloop::LoopHandle<'static, S>,
+    drm_event_handler: F,
+    wallpaper_config: Option<WallpaperConfig>,
+) -> io::Result<(
+    DrmBackend,
+    smithay::reexports::calloop::RegistrationToken,
+    Output,
+)>
+where
+    S: 'static,
+    F: FnMut(DrmEvent, &mut Option<smithay::backend::drm::DrmEventMetadata>, &mut S) + 'static,
+{
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_RDWR | O_NONBLOCK. O_CLOEXEC is set by std's OpenOptions by
+    // default since Rust 1.20; explicit O_NONBLOCK matches the libseat
+    // path's flags.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| {
+            io::Error::other(format!("open {} (direct, no libseat): {e}", path.display()))
+        })?;
+    let owned_fd: OwnedFd = file.into();
+    let device_fd = DrmDeviceFd::new(DeviceFd::from(owned_fd));
+    build_drm_pipeline(
+        device_fd,
+        MasterAcquisition::Direct,
+        loop_handle,
+        drm_event_handler,
+        wallpaper_config,
+    )
+}
+
+/// Whether the DRM fd was opened with master already held by another
+/// process (libseat / seatd brokered case) or whether we must issue
+/// `DRM_IOCTL_SET_MASTER` ourselves (the direct-open Phase B case).
+#[derive(Clone, Copy)]
+enum MasterAcquisition {
+    /// libseat/seatd is the master; halmasuit holds a brokered fd
+    /// without master designation. NEVER call `acquire_master_lock`
+    /// in this mode — it would race seatd.
+    FromSeatd,
+    /// halmasuit opened `/dev/dri/card0` directly and must issue
+    /// `SET_MASTER` to become master. Used in the Phase B
+    /// boot-from-initrd deployment, where no seatd exists.
+    Direct,
+}
+
+// reason: a single linear DRM→GBM→EGL→GLES→DrmCompositor→calloop
+// init sequence shared by `setup_drm_backend` and `setup_drm_direct`.
+// The ordering is load-bearing (master before GBM, EGL before GLES,
+// surface before compositor); splitting it into more helpers scatters
+// that ordering across the module for no readability or testability
+// gain.
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear hardware-init sequence; ordering is load-bearing"
+)]
+fn build_drm_pipeline<S, F>(
+    device_fd: DrmDeviceFd,
+    master: MasterAcquisition,
+    loop_handle: &smithay::reexports::calloop::LoopHandle<'static, S>,
+    drm_event_handler: F,
+    wallpaper_config: Option<WallpaperConfig>,
+) -> io::Result<(
+    DrmBackend,
+    smithay::reexports::calloop::RegistrationToken,
+    Output,
+)>
+where
+    S: 'static,
+    F: FnMut(DrmEvent, &mut Option<smithay::backend::drm::DrmEventMetadata>, &mut S) + 'static,
+{
     // DrmDevice + its event notifier. `drm` must be `mut` so we can
     // call `create_surface` on it below.
     let (mut drm, notifier) = DrmDevice::new(device_fd.clone(), true)
         .map_err(|e| io::Error::other(format!("DrmDevice::new: {e}")))?;
+
+    // SET_MASTER for the direct-open path. drm-rs's
+    // `ControlDevice::acquire_master_lock` issues `DRM_IOCTL_SET_MASTER`;
+    // idempotent on an fd that already has master (the libseat path
+    // skips it on principle to avoid racing seatd, not because it
+    // would fail).
+    if matches!(master, MasterAcquisition::Direct) {
+        drm.acquire_master_lock()
+            .map_err(|e| io::Error::other(format!("DRM SET_MASTER (direct): {e}")))?;
+    }
 
     // Pick connector + mode + CRTC. Same shape as the B.1 slice; the
     // resource-handle enumeration goes through drm-rs (re-exposed via
@@ -475,6 +591,8 @@ where
             frame_counter: 0,
             #[cfg(feature = "frame_audit")]
             snapshot_buf: crate::dbus::new_buffer(),
+            #[cfg(feature = "frame_audit")]
+            wallpaper_only_buf: crate::dbus::new_buffer(),
         },
         registration_token,
         output,
@@ -769,19 +887,21 @@ impl DrmBackend {
         self.render_with_elements_inner(output, &elements, clear_color)
     }
 
-    fn render_with_elements_inner<E>(
+    fn render_with_elements_inner(
         &mut self,
         output: &smithay::output::Output,
-        elements: &[E],
+        elements: &[SceneElement],
         clear_color: [u8; 4],
-    ) -> io::Result<bool>
-    where
-        E: smithay::backend::renderer::element::RenderElement<GlesRenderer>,
-    {
+    ) -> io::Result<bool> {
         let color = xrgb_le_to_color32f(clear_color);
         let render_res = self
             .compositor
-            .render_frame::<_, E>(&mut self.renderer, elements, color, FrameFlags::DEFAULT)
+            .render_frame::<_, SceneElement>(
+                &mut self.renderer,
+                elements,
+                color,
+                FrameFlags::DEFAULT,
+            )
             .map_err(|e| io::Error::other(format!("render_frame: {e}")))?;
 
         if render_res.is_empty {
@@ -823,15 +943,12 @@ impl DrmBackend {
     /// the same element set and clear. The cost (an extra render +
     /// GPU→CPU sync) is exactly why this is feature-gated.
     #[cfg(feature = "frame_audit")]
-    fn audit_frame<E>(
+    fn audit_frame(
         &mut self,
         output: &smithay::output::Output,
-        elements: &[E],
+        elements: &[SceneElement],
         clear_color: [u8; 4],
-    ) -> io::Result<()>
-    where
-        E: smithay::backend::renderer::element::RenderElement<GlesRenderer>,
-    {
+    ) -> io::Result<()> {
         let (rgba, wu, hu) = self.read_frame_rgba(output, elements, clear_color)?;
         let stats = crate::frame_audit::analyze(&rgba, wu, hu);
         // Publish the frame for the D-Bus `Snapshot()` reader. A
@@ -852,6 +969,72 @@ impl DrmBackend {
             phash: stats.phash,
         });
         self.frame_counter += 1;
+        // Wallpaper-plane-only auxiliary capture (closes C-G1: the
+        // session-scene golden has niri's opaque fullscreen toplevel
+        // covering the wallpaper plane, so all six matrix cells'
+        // session goldens otherwise end up byte-identical). Re-render
+        // ONLY the wallpaper element to an offscreen texture and
+        // publish it to a separate slot the D-Bus
+        // `SnapshotScene(path, "wallpaper-only")` call can read.
+        //
+        // We REUSE the wallpaper element the live render already
+        // built — do NOT call `self.wallpaper.render_element` again.
+        // Re-calling would advance per-frame state in
+        // `ShaderBackend` / `VideoBackend` (frame_counter, last_frame,
+        // texture upload), so the live render's NEXT frame would see
+        // mid-frame state drift. Best-effort: a failure logs and
+        // skips the publish so the main snapshot path keeps working.
+        if let Err(e) = self.audit_wallpaper_only(output, elements, clear_color) {
+            tracing::warn!(error = %e, "frame_audit wallpaper-only readback failed");
+        }
+        Ok(())
+    }
+
+    /// Render JUST the wallpaper element from `elements` (no cursor /
+    /// no layers / no foreground toplevel) into an offscreen texture
+    /// and publish the bytes to `wallpaper_only_buf`.
+    ///
+    /// Reuses the already-built wallpaper element from the live
+    /// composition's `elements` slice rather than calling
+    /// `WallpaperBackend::render_element` again — the shader + video
+    /// backends mutate per-frame timing state on every call and a
+    /// second call would corrupt the live render's next frame. If no
+    /// wallpaper element is in the list (legacy-clear path), returns
+    /// Ok without publishing.
+    #[cfg(feature = "frame_audit")]
+    fn audit_wallpaper_only(
+        &mut self,
+        output: &smithay::output::Output,
+        elements: &[SceneElement],
+        clear_color: [u8; 4],
+    ) -> io::Result<()> {
+        // Wallpaper variants live in the SceneElement enum.
+        // `scene_elements` pushes the wallpaper at the bottom of the
+        // front-to-back list (its `debug_assert_eq!(slot,
+        // elements.len(), "wallpaper is the bottom-most element")`
+        // pins this invariant), and the cursor is prepended AT THE
+        // FRONT — so after cursor prepend the wallpaper is at the
+        // back, i.e. `elements.last()`. `O(1)`; falls through to
+        // `Ok(())` on the legacy-clear path where no wallpaper
+        // element was pushed (the bottom element is then a layer or
+        // toplevel, which the variant filter rejects).
+        let Some(wallpaper_elem) = elements.last().filter(|e| {
+            matches!(
+                e,
+                SceneElement::Wallpaper(_) | SceneElement::WallpaperShader(_)
+            )
+        }) else {
+            return Ok(());
+        };
+        let one = std::slice::from_ref(wallpaper_elem);
+        let (rgba, wu, hu) = self.read_frame_rgba(output, one, clear_color)?;
+        if let Ok(mut slot) = self.wallpaper_only_buf.lock() {
+            *slot = Some(crate::dbus::FrameBuf {
+                rgba,
+                width: wu,
+                height: hu,
+            });
+        }
         Ok(())
     }
 
@@ -865,15 +1048,12 @@ impl DrmBackend {
     /// offscreen GLES render-target mechanism lives in its own cohesive
     /// `frame_audit`-gated module so production never compiles it.
     #[cfg(feature = "frame_audit")]
-    fn read_frame_rgba<E>(
+    fn read_frame_rgba(
         &mut self,
         output: &smithay::output::Output,
-        elements: &[E],
+        elements: &[SceneElement],
         clear_color: [u8; 4],
-    ) -> io::Result<(Vec<u8>, usize, usize)>
-    where
-        E: smithay::backend::renderer::element::RenderElement<GlesRenderer>,
-    {
+    ) -> io::Result<(Vec<u8>, usize, usize)> {
         let color = xrgb_le_to_color32f(clear_color);
         crate::offscreen::read_frame_rgba(&mut self.renderer, output, elements, color)
     }

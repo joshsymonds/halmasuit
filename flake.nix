@@ -290,6 +290,37 @@
             };
           };
 
+          # halmasuit-luks — Phase B systemd password-agent Wayland
+          # client. Spawned by initramfs systemd alongside halmasuit
+          # in the `services.halmasuit.fromInitrd.enable` deployment;
+          # watches /run/systemd/ask-password/ for LUKS unlock
+          # requests, prompts the user via a fullscreen xdg_toplevel
+          # over halmasuit's wayland socket, writes responses to the
+          # agent socket. Replaceable by any other implementation of
+          # the systemd password-agent protocol.
+          #
+          # nativeBuildInputs/buildInputs: smithay-client-toolkit's
+          # xkbcommon-sys build script probes pkg-config for
+          # libxkbcommon (same as halmasuit's own build).
+          halmasuit-luks = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-luks";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags   = [ "-p" "halmasuit-luks" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs       = [ pkgs.libxkbcommon ];
+            doCheck = false;
+            meta = {
+              description = "Phase B systemd password-agent Wayland client for halmasuit";
+              license     = pkgs.lib.licenses.asl20;
+              mainProgram = "halmasuit-luks";
+            };
+          };
+
           # halmasuit-session — the socket-activated privileged
           # PAM-lifecycle broker (Epic #1 R6). The sole libpam-linking
           # crate in the workspace (R14), now via the hand-rolled
@@ -687,6 +718,130 @@
         drm-master-probe-phase4 = import ./tests/drm-master-probe-phase4.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
+        };
+        # Phase B (initramfs survival): real halmasuit binary in
+        # boot.initrd.systemd.services with SurviveFinalKillSignal=yes,
+        # asserts PID + DRM-master + Wayland-socket continuity across
+        # switch_root, single NDJSON stream observable post-pivot.
+        initrd-survival = import ./tests/initrd-survival.nix {
+          system            = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-luks    = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+        };
+        # Phase B hard gate: real LUKS-backed VM, real PAM auth via
+        # halmasuit-vm-client over the abstract @halmasuit-greetd
+        # socket, full survival + chroot + greeter + auth → session.
+        full-boot-flash = import ./tests/full-boot-flash.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit           = self.packages.x86_64-linux.halmasuit;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+        };
+        # Phase B LUKS unlock gate: real cryptsetup, real
+        # systemd-cryptsetup ask-password producer, real
+        # systemd password-agent wire. halmasuit-luks runs in
+        # non-interactive responder mode (--passphrase-from PATH)
+        # and answers the ask-file; the LUKS volume actually
+        # unlocks. Isolates the wire contract from the Wayland UI
+        # path (which is exercised by the full deployment shape).
+        luks-unlock = import ./tests/luks-unlock.nix {
+          system         = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit-luks = self.packages.x86_64-linux.halmasuit-luks;
+        };
+        # Phase B kernel-handoff-to-session pixmap continuity gate.
+        # The Plymouth-removability proof: extends the same
+        # exact-stream no-flash mechanism the rootfs visual-* family
+        # uses (frame_audit build + frame_rendered events +
+        # assert_no_flash_stream) to the boot-from-initrd timeline.
+        # Consumes halmasuit-debug, same as the visual-* checks.
+        visual-initrd-pixmap = import ./tests/visual-initrd-pixmap.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit           = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Epic #35 Phase B golden-boot — first cell of the matrix:
+        # LUKS side-volume × image wallpaper. Real DankGreeter
+        # driven by machine.send_chars; real niri as the
+        # broker-launched session; per-variant per-scene goldens.
+        visual-phase-b-side-image = import ./tests/visual-phase-b-side-image.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Epic #35 cell (side, shader): same shape, animated GLSL
+        # fragment-shader wallpaper (tests/fixtures/wallpaper-shader.glsl).
+        visual-phase-b-side-shader = import ./tests/visual-phase-b-side-shader.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Epic #35 cell (side, video): same shape, real h264 (ffmpeg-built
+        # testsrc), looping, with a PNG fallback. Exercises the
+        # halmasuit-decoder sandbox + DecoderRelay through the fromInitrd
+        # path on top of the rest of the Phase B end-to-end arc.
+        # Epic #35 cell (enc, image): LUKS rootfs (not a side volume).
+        # Same arc, dual-boot specialisation pattern (cf.
+        # nixos/tests/systemd-initrd-luks-password.nix): first boot
+        # luksFormats /dev/vdb + `bootctl set-default cryptroot`,
+        # second boot enters the specialisation; halmasuit-luks
+        # responds to the cryptroot-mount ask-password prompt.
+        visual-phase-b-enc-image = import ./tests/visual-phase-b-enc-image.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Epic #35 cell (enc, shader): LUKS rootfs + GLSL shader wallpaper.
+        visual-phase-b-enc-shader = import ./tests/visual-phase-b-enc-shader.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Epic #35 cell (enc, video): LUKS rootfs + h264 video wallpaper.
+        # Final matrix cell.
+        visual-phase-b-enc-video = import ./tests/visual-phase-b-enc-video.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-decoder   = self.packages.x86_64-linux.halmasuit-decoder;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        visual-phase-b-side-video = import ./tests/visual-phase-b-side-video.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-decoder   = self.packages.x86_64-linux.halmasuit-decoder;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
         };
         # Visual gates consume `halmasuit-debug` (frame_audit on): the
         # capture path is the in-process `Snapshot()` D-Bus method,
