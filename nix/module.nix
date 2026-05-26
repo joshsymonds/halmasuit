@@ -868,6 +868,21 @@ in
          HALMASUIT_BROKER_PEER_UID = toString brokerPeerUid;
          # PAM service file lookup key — /etc/pam.d/<value>.
          HALMASUIT_PAM_SERVICE = cfg.pamService;
+         # Epic #47 R1: broker is the policy authority for greeter
+         # spawn. The compositor is unprivileged + can't setuid
+         # itself; it sends `SpawnGreeter` and the broker reads
+         # these env vars to fork-then-drop the greeter child. Same
+         # values the compositor unit's env has (so the in-compositor
+         # and broker-side resolution match exactly — drift here would
+         # mean the greeter runs as a different uid depending on which
+         # path spawned it, which is unsafe).
+         HALMASUIT_GREETER_UID  = toString cfg.greeterUid;
+         HALMASUIT_GREETER_GID  = toString config.users.groups.${cfg.greeterGroup}.gid;
+         HALMASUIT_GREETER_NAME = cfg.greeterUser;
+         HALMASUIT_GREETER_HOME = "/var/empty";
+         HALMASUIT_GREETD_SOCKET = "/run/halmasuit/greetd.sock";
+       } // lib.optionalAttrs (cfg.greeterCommand != null) {
+         HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
        };
      };
 

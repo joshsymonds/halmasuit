@@ -47,7 +47,6 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -752,6 +751,36 @@ impl HalmasuitState {
                     to: halmasuit_introspect::Foreground::Greeter,
                 });
                 self.set_keyboard_focus(None);
+                // Epic #47 R1: the previous session's uid lingered in
+                // `session_uid` and the swap_gate had transitioned to a
+                // terminal Reverted state — both blocked the next login
+                // from succeeding. Clear and re-arm.
+                self.session_uid = None;
+                self.swap = swap_gate::SwapGate::new();
+                // Respawn the greeter so the user can log back in. The
+                // SIGKILL at swap time left `state.greeter = None`;
+                // ask the broker (uid 998 compositor cannot setuid
+                // to greeter uid; broker is the policy authority).
+                // Degraded state on failure: log + continue, wallpaper
+                // stays visible, no greeter — operator can systemctl
+                // restart halmasuit to recover.
+                match broker_spawn_greeter() {
+                    Ok(handle) => {
+                        tracing::info!(
+                            greeter_pid = handle.pid,
+                            "greeter respawned via broker after session end"
+                        );
+                        emit(&Event::GreeterSpawned { pid: handle.pid });
+                        self.greeter = Some(handle);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "post-logout broker_spawn_greeter failed; halmasuit running \
+                             without a greeter until operator intervenes"
+                        );
+                    }
+                }
             }
         }
         // Re-composite now so the swap/revert is visible this frame and
@@ -2207,28 +2236,28 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
         }
     }
 
-    // (2) Spawn greeter while still root (child setresuids in pre_exec).
-    if let Some(cmd) = greeter_command_from_env() {
-        match spawn_greeter(state.greeter_uid, &cmd) {
-            Ok(handle) => {
-                tracing::info!(
-                    greeter_pid = handle.pid,
-                    greeter_cmd = %cmd.display(),
-                    "post-pivot greeter spawned"
-                );
-                emit(&Event::GreeterSpawned { pid: handle.pid });
-                emit(&Event::ForegroundChanged {
-                    to: halmasuit_introspect::Foreground::Greeter,
-                });
-                state.greeter = Some(handle);
-            }
-            Err(e) => {
-                tracing::error!(error = %e, greeter_cmd = %cmd.display(), "post-pivot greeter spawn failed");
-                step_errors.push(format!("spawn_greeter: {e}"));
-            }
+    // (2) Spawn greeter via broker. The broker reads
+    // HALMASUIT_GREETER_COMMAND/UID/etc. from its own env and forks-
+    // then-drops to the greeter uid; the compositor is already
+    // uid 998 here (Phase B fromInitrd dropped before this runs in
+    // some configurations) so a setuid-from-compositor would EPERM
+    // anyway. Broker is the policy authority (Epic #47 R1).
+    match broker_spawn_greeter() {
+        Ok(handle) => {
+            tracing::info!(
+                greeter_pid = handle.pid,
+                "post-pivot greeter spawned via broker"
+            );
+            emit(&Event::GreeterSpawned { pid: handle.pid });
+            emit(&Event::ForegroundChanged {
+                to: halmasuit_introspect::Foreground::Greeter,
+            });
+            state.greeter = Some(handle);
         }
-    } else {
-        tracing::warn!("HALMASUIT_GREETER_COMMAND unset post-pivot; running without a greeter");
+        Err(e) => {
+            tracing::error!(error = %e, "post-pivot broker_spawn_greeter failed");
+            step_errors.push(format!("broker_spawn_greeter: {e}"));
+        }
     }
 
     // libinput / libseat — post-pivot wiring for input device fds.
@@ -2650,14 +2679,6 @@ fn compositor_uid_from_env() -> io::Result<Option<u32>> {
     })
 }
 
-/// Path of the greeter binary to exec at startup. Returns `None` when
-/// `HALMASUIT_GREETER_COMMAND` is unset (dev mode — halmasuit runs
-/// without a greeter). Production deployments always set it via
-/// `services.halmasuit.greeterCommand`.
-fn greeter_command_from_env() -> Option<PathBuf> {
-    std::env::var_os("HALMASUIT_GREETER_COMMAND").map(PathBuf::from)
-}
-
 /// Resolve the wallpaper config from environment. Returns `None`
 /// when neither `HALMASUIT_WALLPAPER_CONFIG` nor `HALMASUIT_WALLPAPER_PATH`
 /// is set — non-visual integration tests run without a wallpaper
@@ -2688,176 +2709,76 @@ fn wallpaper_config_from_env() -> io::Result<Option<wallpaper::WallpaperConfig>>
 /// variable greeters look up for the auth socket.
 ///
 /// # Errors
-/// Bubbles passwd-lookup failure, fork failure, or exec failure
-/// with context.
-fn spawn_greeter(greeter_uid: u32, command: &Path) -> io::Result<GreeterHandle> {
-    use nix::unistd::{Gid, Uid, User};
-    use std::os::unix::process::CommandExt;
-
-    // Phase B v2: in the fromInitrd deployment, halmasuit's retained
-    // initramfs root has no /etc/passwd visible to its process root
-    // (cross-pivot per-process root divergence — see nix/module.nix's
-    // "Phase B v1 → v2" docstring). `User::from_uid` would fail with
-    // ENOENT in that case. Fall back to env-provided identity fields
-    // (HALMASUIT_GREETER_GID/NAME/HOME) when the passwd lookup fails.
-    // The rootfs `enable` deployment hits the Ok branch as before.
-    let (gid_raw, greeter_name, greeter_home) =
-        if let Ok(Some(u)) = User::from_uid(Uid::from_raw(greeter_uid)) {
-            (u.gid.as_raw(), u.name.clone(), u.dir)
-        } else {
-            // If HALMASUIT_GREETER_GID is unset (or unparsable) we fall
-            // back to using `greeter_uid` as the gid. That's the right
-            // default when greeter uid == gid (the auto-created system
-            // user shape the module ships out of the box), but breaks
-            // silently if an operator overrides ONE of greeterUid /
-            // greeterGroup without the other. Surface that case so
-            // misconfiguration is greppable rather than mysterious
-            // permission errors later.
-            let env_gid_raw = std::env::var("HALMASUIT_GREETER_GID")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok());
-            let env_gid: u32 = env_gid_raw.unwrap_or(greeter_uid);
-            if env_gid_raw.is_none() {
-                tracing::warn!(
-                    uid = greeter_uid,
-                    fallback_gid = env_gid,
-                    "HALMASUIT_GREETER_GID unset/unparsable on env-fallback path; \
-                     defaulting gid to greeter uid (correct only when uid == gid)"
-                );
-            }
-            let env_name = std::env::var("HALMASUIT_GREETER_NAME")
-                .unwrap_or_else(|_| format!("halmasuit-greeter-{greeter_uid}"));
-            let env_home = PathBuf::from(
-                std::env::var("HALMASUIT_GREETER_HOME").unwrap_or_else(|_| "/var/empty".to_owned()),
-            );
-            tracing::warn!(
-                uid = greeter_uid,
-                gid = env_gid,
-                name = %env_name,
-                home = ?env_home,
-                "getpwuid failed; using env-provided greeter identity fallback"
-            );
-            (env_gid, env_name, env_home)
-        };
-
-    let mut cmd = Command::new(command);
-    cmd.env_clear()
-        .env("USER", &greeter_name)
-        .env("LOGNAME", &greeter_name)
-        .env("HOME", greeter_home.as_os_str())
-        .env("XDG_RUNTIME_DIR", "/run/halmasuit")
-        .env("WAYLAND_DISPLAY", "wayland-0")
-        // GREETD_SOCK MUST match the path/abstract-name halmasuit's
-        // own greetd listener bound to. The fromInitrd deployment
-        // uses an abstract socket (`@halmasuit-greetd`) to bridge
-        // the cross-pivot mount-namespace boundary; the rootfs
-        // deployment uses `/run/halmasuit/greetd.sock`. Reading
-        // through the same helper as `setup_greetd_listener` keeps
-        // the two ends in lockstep — hardcoding the filesystem path
-        // here would break the greeter's BeginAuth in the fromInitrd
-        // shape because the abstract socket is unreachable via
-        // `connect("/run/halmasuit/greetd.sock")`.
-        .env("GREETD_SOCK", greetd_socket_path_from_env())
-        // PATH so the greeter can exec children (session command,
-        // PAM helpers). Match systemd's default unit PATH.
-        .env(
-            "PATH",
-            "/run/wrappers/bin:/run/current-system/sw/bin:/usr/bin:/bin",
-        );
-
-    // SAFETY: `pre_exec` runs in the forked child between `fork(2)`
-    // and `execve(2)`. The closure must only call async-signal-safe
-    // syscalls (man signal-safety(7)). `setgroups`, `setresgid`,
-    // and `setresuid` are all on the AS-safe list. We do NOT
-    // allocate, log, or take any Rust mutex here.
-    let target_gid = Gid::from_raw(gid_raw);
-    let target_uid = Uid::from_raw(greeter_uid);
-    #[expect(
-        unsafe_code,
-        reason = "pre_exec runs between fork and exec; closure body is async-signal-safe"
-    )]
-    unsafe {
-        cmd.pre_exec(move || {
-            // Restore the default signal mask. The parent (halmasuit)
-            // blocks SIGTERM/SIGINT to drive them via calloop's
-            // signalfd source; that mask propagates through fork+
-            // execve and would leave the greeter unable to receive
-            // either signal — systemd's SIGTERM on unit stop is
-            // ignored, the cgroup never empties, and the unit ends
-            // up in 'failed' state after the final-sigterm timeout.
-            let empty = nix::sys::signal::SigSet::empty();
-            nix::sys::signal::sigprocmask(
-                nix::sys::signal::SigmaskHow::SIG_SETMASK,
-                Some(&empty),
-                None,
-            )?;
-
-            nix::unistd::setgroups(&[target_gid])?;
-            nix::unistd::setresgid(target_gid, target_gid, target_gid)?;
-            nix::unistd::setresuid(target_uid, target_uid, target_uid)?;
-            Ok(())
-        });
-    }
-
-    let child = cmd
-        .spawn()
-        .map_err(|e| io::Error::other(format!("spawn greeter {}: {e}", command.display())))?;
-    let pid = child.id();
-    // Acquire a pidfd for the freshly-spawned child. The pidfd is the
-    // race-free signal target — `kill(pid, …)` after SIGCHLD reaps
-    // the entry can hit a recycled pid (and with our retained
-    // `CAP_KILL`, would signal whichever unrelated process now holds
-    // it). pidfd_send_signal targets the original task by fd and
-    // returns `ESRCH` once that task has terminated, regardless of
-    // pid reuse. There is a tiny window between Command::spawn
-    // returning and our pidfd_open here in which the greeter could
-    // exit and a new process inherit the pid — for which we
-    // tolerate the same risk one round (the next kill returns
-    // ESRCH if reused, plus the freshly-opened pidfd is still
-    // bound to whatever was at the pid at fd-open time).
-    let pidfd =
-        pidfd_open_for(pid).map_err(|e| io::Error::other(format!("pidfd_open({pid}): {e}")))?;
-    // Child handle is dropped here. On Unix, Child::drop is a no-op
-    // (doesn't kill, doesn't reap); we no longer need the type-level
-    // identity once the pidfd is in hand. SIGCHLD reaper handles
-    // termination accounting via waitpid.
-    drop(child);
-    Ok(GreeterHandle { pid, pidfd })
-}
-
-/// Open a pidfd for an existing pid.
+/// Ask the broker to spawn the greeter (Epic #47 R1).
 ///
-/// Wraps `pidfd_open(2)` (Linux ≥ 5.3). Returns an `OwnedFd` that
-/// can be passed to `pidfd_send_signal_owned` for race-free signal
-/// delivery, then closed on drop.
+/// Replaces the prior in-compositor `spawn_greeter`: the compositor
+/// no longer holds CAP_SETUID (it has empty bounding set), so it
+/// cannot setresuid to the greeter uid itself. The broker (already
+/// root, holds the privileges) does the fork-then-drop; the
+/// compositor sends `CompositorToBroker::SpawnGreeter` on a TRANSIENT
+/// broker connection and consumes the `BrokerToCompositor::
+/// GreeterSpawned { pid }` reply + the pidfd-via-SCM_RIGHTS.
+///
+/// Sync recv is correct here for the same reason `RequestRootFd`'s
+/// initial connect is sync: this only fires at startup + on Revert,
+/// not from the live render path; no calloop frame is racing. The
+/// broker side also doesn't block — it spawns + replies + closes.
 ///
 /// # Errors
-/// Any errno from `pidfd_open` (notably `ESRCH` if the pid has
-/// already exited between fork and this call).
-fn pidfd_open_for(pid: u32) -> io::Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd;
+/// Any error from `connect_broker`, `send`, `recv_with_fd`, or a
+/// broker reply that doesn't carry the SCM_RIGHTS pidfd attachment.
+fn broker_spawn_greeter() -> io::Result<GreeterHandle> {
+    use std::os::fd::AsFd;
 
-    let pid_signed = i32::try_from(pid)
-        .map_err(|_| io::Error::other(format!("pid {pid} does not fit in i32")))?;
-    // SAFETY: `pidfd_open(2)` is a numeric syscall with no pointer
-    // arguments. Returns a non-negative fd on success or -1 with
-    // errno set on failure. We construct the OwnedFd only on success.
-    #[expect(unsafe_code, reason = "raw pidfd_open syscall via libc")]
-    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::pid_t::from(pid_signed), 0_u32) };
-    if raw < 0 {
-        return Err(io::Error::last_os_error());
+    use halmasuit_session_ipc::{BrokerToCompositor, CompositorToBroker};
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+    let broker_path = broker_socket_path_from_env();
+    let chan = connect_broker(&broker_path)
+        .map_err(|e| io::Error::other(format!("connect_broker for SpawnGreeter: {e:?}")))?;
+    chan.send(&CompositorToBroker::SpawnGreeter)
+        .map_err(|e| io::Error::other(format!("send SpawnGreeter: {e:?}")))?;
+    // `recv_with_fd` is MSG_DONTWAIT, so a fresh response isn't ready
+    // until the broker has forked + sent. Poll with a generous
+    // timeout — broker-side spawn is bounded by `fork() + exec()`
+    // plus a few syscalls, well under 5s in practice. Failure to
+    // get a reply within this window means the broker died or
+    // refused the request (SO_PEERCRED gate, env not configured).
+    let mut pollfds = [PollFd::new(chan.as_fd(), PollFlags::POLLIN)];
+    let n = poll(
+        &mut pollfds,
+        PollTimeout::try_from(5_000_i32).unwrap_or(PollTimeout::MAX),
+    )
+    .map_err(|e| io::Error::other(format!("poll broker reply: {e}")))?;
+    if n == 0 {
+        return Err(io::Error::other(
+            "broker did not reply to SpawnGreeter within 5s",
+        ));
     }
-    // syscall returns `c_long` (i64 on x86_64); a valid fd from
-    // `pidfd_open(2)` fits in i32 by construction (kernel-side
-    // fd allocator caps well below INT_MAX). Use try_from for the
-    // narrowing to surface any future drift.
-    let raw_fd: i32 = i32::try_from(raw)
-        .map_err(|_| io::Error::other(format!("pidfd_open returned out-of-range fd {raw}")))?;
-    // SAFETY: `raw_fd` is a fresh kernel fd from the successful
-    // syscall above; nothing else holds it.
-    #[expect(unsafe_code, reason = "wrap fresh fd into OwnedFd")]
-    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
-    Ok(fd)
+    let (frame, pidfd) = chan
+        .recv_with_fd()
+        .map_err(|e| io::Error::other(format!("recv GreeterSpawned: {e:?}")))?
+        .ok_or_else(|| io::Error::other("broker closed without sending GreeterSpawned"))?;
+    let pid = match frame {
+        BrokerToCompositor::GreeterSpawned { pid } => pid,
+        other => {
+            return Err(io::Error::other(format!(
+                "broker reply was not GreeterSpawned: {other:?}"
+            )));
+        }
+    };
+    let pidfd = pidfd
+        .ok_or_else(|| io::Error::other("broker GreeterSpawned reply missing SCM_RIGHTS pidfd"))?;
+    // i32 → u32: pid is unsigned in this crate's GreeterHandle to
+    // match Command::id()'s legacy shape. A negative wire value
+    // indicates broker-side narrowing failure (it sends -1 if it
+    // couldn't fit the pid in i32). Treat -1 as "broker spawned but
+    // could not report pid"; the pidfd is still the authority.
+    let pid_u32 = u32::try_from(pid).unwrap_or(0);
+    Ok(GreeterHandle {
+        pid: pid_u32,
+        pidfd,
+    })
 }
 
 /// Send a signal to a pidfd. Race-free wrt pid reuse — if the
@@ -3865,22 +3786,23 @@ fn main() -> io::Result<()> {
         (Some(token), uid, svc)
     };
 
-    // Spawn the configured greeter while halmasuit is still root.
-    // The child uses `pre_exec` to setresuid into the greeter user
-    // before execve, so the greeter never sees root. After the fork,
-    // the parent (halmasuit) proceeds into its own privilege drop
-    // below. Greeter failure logs but doesn't abort halmasuit:
+    // Ask the broker to spawn the configured greeter (Epic #47 R1).
+    // The broker is the policy authority — it reads
+    // HALMASUIT_GREETER_COMMAND/UID/etc. from its own env, forks-
+    // then-drops a child to the greeter uid, returns the pidfd via
+    // SCM_RIGHTS. Greeter failure logs but doesn't abort halmasuit:
     // operators may run halmasuit without a greeter during dev.
     //
     // Skipped in the initramfs path: the greeter is the rootfs
     // login UI; an analogous "halmasuit-luks" prompt for the
-    // initramfs path lands as its own task.
+    // initramfs path lands as its own task. (The post-pivot
+    // `run_post_pivot_setup` does the broker-spawn for fromInitrd.)
     let greeter = if in_initramfs {
         None
-    } else if let Some(cmd) = greeter_command_from_env() {
-        match spawn_greeter(greeter_uid, &cmd) {
+    } else {
+        match broker_spawn_greeter() {
             Ok(handle) => {
-                tracing::info!(greeter_pid = handle.pid, greeter_cmd = %cmd.display(), "greeter spawned");
+                tracing::info!(greeter_pid = handle.pid, "greeter spawned via broker");
                 emit(&Event::GreeterSpawned { pid: handle.pid });
                 emit(&Event::ForegroundChanged {
                     to: halmasuit_introspect::Foreground::Greeter,
@@ -3888,16 +3810,10 @@ fn main() -> io::Result<()> {
                 Some(handle)
             }
             Err(e) => {
-                tracing::error!(error = %e, greeter_cmd = %cmd.display(), "greeter spawn failed");
+                tracing::error!(error = %e, "broker_spawn_greeter failed");
                 None
             }
         }
-    } else {
-        tracing::warn!(
-            "HALMASUIT_GREETER_COMMAND unset; halmasuit running without a greeter. \
-             Production deployments set this via services.halmasuit.greeterCommand."
-        );
-        None
     };
 
     // Cache output-mode-derived constants once; the mode is stable

@@ -92,7 +92,7 @@ calloop.workspace            = true
 # broker (the BrokerSession PamSession — Epic R3 / Amendment A4/A5).
 # `uio`: recvmsg/SCM_RIGHTS to receive the poll-only leader pidfd
 # backstop the broker passes on `SessionOpened` (Amendment A5.6).
-nix = { workspace = true, features = ["user", "signal", "process", "socket", "uio", "fs"] }
+nix = { workspace = true, features = ["user", "signal", "process", "socket", "uio", "fs", "poll"] }
 # drm-rs types reach halmasuit via `smithay::reexports::drm` — same
 # version smithay itself uses (0.14 at the pinned rev), avoiding the
 # multi-version-of-drm problem (smithay's DrmDevice impls drm 0.14's
