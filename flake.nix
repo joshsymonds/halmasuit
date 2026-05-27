@@ -1017,6 +1017,21 @@
           halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Epic #61 R3.5: video cell of the wallpaper-shutdown-survival
+        # matrix. Asserts the full animation invariants (frame counter
+        # advances + phash progression) plus the shared survival
+        # invariants. Drives the halmasuit-decoder relay path end-to-
+        # end through the shutdown sequence.
+        visual-shutdown-video = import ./tests/visual-shutdown-video.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-decoder                 = self.packages.x86_64-linux.halmasuit-decoder;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # R13 forcing function (the reason this epic exists): the
         # real DMS DankGreeter (Quickshell/Qt6 + greeter-niri) as
         # halmasuit's greeter. Scaffolded at epic #2 close (8925ca5);
