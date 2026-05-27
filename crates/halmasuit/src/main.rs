@@ -2964,6 +2964,28 @@ fn classify_reaped_child(
 /// means the next render has no non-wallpaper elements, so the
 /// screen is wallpaper-only from this point until kernel halt.
 fn graceful_shutdown(state: &mut HalmasuitState, reason: ShutdownReason) {
+    // R2.4: idempotent on re-entry. PrepareForShutdown triggers
+    // graceful_shutdown first (~0-1 s before the kill spree), and
+    // systemd-shutdown's broad SIGTERM (which SurviveFinalKillSignal
+    // is *supposed* to exempt, but our cgroup hardening seems to
+    // interfere with the exemption in some systemd-version /
+    // ProtectKernelTunables-shaped combinations — empirically
+    // observed via repeated coredumps in the pivot-survival test)
+    // would otherwise re-enter graceful_shutdown against a paused
+    // DrmDevice. The second call into smithay's render path —
+    // `render_layer_elements` against a `set_active(false)`
+    // DrmCompositor whose surfaces have been retained-without-strong-
+    // refs — is the crash site. Bail early on the second entry; the
+    // first call already did everything we need (greeter killed,
+    // wallpaper-only composited, device paused, libinput unsubscribed).
+    if state.shutting_down {
+        tracing::info!(
+            ?reason,
+            "graceful_shutdown re-entry while already shutting down; ignored"
+        );
+        return;
+    }
+
     if let Some(g) = state.greeter.take() {
         let pid = g.pid;
         match pidfd_send_signal(&g.pidfd, libc::SIGKILL) {
