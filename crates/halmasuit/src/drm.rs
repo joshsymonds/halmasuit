@@ -164,6 +164,18 @@ struct CachedNamed {
 /// `HalmasuitState`. Dropping this value releases the master, tears
 /// down EGL, and lets the kernel reset the CRTC.
 pub struct DrmBackend {
+    /// The smithay `DrmDevice` we used to create the `DrmCompositor`'s
+    /// surface. Retained on state so that `graceful_shutdown` can call
+    /// [`DrmDevice::pause`] on it (R2.4): pause flips the internal
+    /// `active` AtomicBool to false (cascading to every surface) and
+    /// releases the master lock, after which every render entry on
+    /// `DrmCompositor` / `AtomicDrmSurface` / `LegacyDrmSurface`
+    /// short-circuits to `Err(DeviceInactive)` instead of issuing a
+    /// page-flip ioctl. The kernel keeps refreshing the last-bound
+    /// framebuffer from its plane state until something else
+    /// reprograms the CRTC — which during shutdown nothing does, so
+    /// the wallpaper stays on-screen until kernel halt.
+    pub device: DrmDevice,
     /// The smithay `DrmCompositor` driving our single CRTC. Owns the
     /// `DrmSurface` (and through it the `crtc::Handle`), the GBM
     /// allocator, the framebuffer exporter, and the swapchain. Pinned
@@ -239,6 +251,24 @@ impl DrmBackend {
     /// pick up the swap otherwise).
     pub fn tick_wallpaper(&mut self) -> bool {
         self.wallpaper.tick(&mut self.renderer)
+    }
+
+    /// Pause the underlying [`DrmDevice`] so smithay's render path
+    /// short-circuits to `DeviceInactive` on every subsequent
+    /// `queue_frame` / `commit_frame` / `surface.commit` /
+    /// `surface.page_flip` (R2.4). Called from `graceful_shutdown`
+    /// AFTER the wallpaper-only recomposite — by the time pause
+    /// runs, the kernel's CRTC plane state already points at the
+    /// wallpaper framebuffer, and the kernel keeps refreshing that
+    /// frame autonomously until the CRTC is reprogrammed (which
+    /// during the shutdown sequence nothing does). The render path
+    /// becoming a no-op past this point is the GREEN-state invariant
+    /// the pivot-survival test asserts on: no more ioctls means
+    /// nothing to EACCES against during the systemd→systemd-shutdown
+    /// handoff, and nothing to panic on if upstream renames /dev/dri
+    /// devices mid-pivot.
+    pub fn pause(&mut self) {
+        self.device.pause();
     }
 }
 
@@ -507,6 +537,7 @@ where
 
     Ok((
         DrmBackend {
+            device: drm,
             compositor,
             renderer,
             wallpaper,

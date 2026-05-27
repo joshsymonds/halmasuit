@@ -28,7 +28,7 @@ workspace = true
 # (epic G1/R3/R6) — that is production behavior, not frame_audit.
 # The exact-image audit math (`frame_audit`) is arithmetic over the
 # readback bytes; no `img_hash`.
-frame_audit = ["dep:zbus", "dep:png"]
+frame_audit = ["dep:png"]
 
 [dependencies]
 halmasuit-introspect = { path = "../halmasuit-introspect", version = "0.1" }
@@ -122,7 +122,13 @@ serde = { workspace = true }
 serde_json.workspace = true
 # frame_audit-only. `optional = true` keeps them out of the default
 # (production) dependency graph entirely; `frame_audit` turns them on.
-zbus = { workspace = true, optional = true }
+# zbus is a production dep (no longer feature-gated): halmasuit
+# subscribes to org.freedesktop.login1.PrepareForShutdown to learn
+# "shutdown is imminent" under `SurviveFinalKillSignal=yes` (where
+# the SIGTERM kill spree never reaches us). The `frame_audit`
+# feature also uses zbus to serve the diagnostic `Snapshot()`
+# method; that path is still gated, but zbus itself is unconditional.
+zbus = { workspace = true }
 png  = { workspace = true, optional = true }
 caps.workspace = true
 # libc for raw syscall wrappers: pidfd_open / pidfd_send_signal

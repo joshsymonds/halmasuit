@@ -379,8 +379,17 @@ pub enum ShutdownReason {
     SignalTerm,
     /// SIGINT (Ctrl-C in the foreground; rarely seen in production).
     SignalInt,
-    /// Internal request (e.g., logind `PrepareForShutdown` once D-Bus
-    /// integration lands).
+    /// `org.freedesktop.login1.Manager.PrepareForShutdown(true)` —
+    /// the canonical "shutdown is imminent" cue under
+    /// `SurviveFinalKillSignal=yes`, where systemd-shutdown's SIGTERM
+    /// kill spree never reaches halmasuit. systemd-logind emits this
+    /// signal at the very start of the shutdown sequence (before any
+    /// unit stop), giving the compositor a deterministic moment to
+    /// run `graceful_shutdown` while the user-session and broker are
+    /// still alive.
+    PrepareForShutdown,
+    /// Internal request that doesn't fit the above (reserved; used
+    /// for tests and future operator-initiated paths).
     Internal,
 }
 

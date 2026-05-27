@@ -2985,11 +2985,29 @@ fn graceful_shutdown(state: &mut HalmasuitState, reason: ShutdownReason) {
     state.foreground = halmasuit_introspect::Foreground::Greeter;
 
     // Recomposite once so the wallpaper-only state is visible this
-    // frame, not via a stale intermediate.
-    if let Some(backend) = state.drm_backend.as_mut()
-        && let Err(e) = backend.render_layer_elements(&state.output, None, HALMASUIT_BRAND_CLEAR)
-    {
-        tracing::warn!(error = %e, "graceful_shutdown: render_layer_elements failed");
+    // frame, not via a stale intermediate. THEN pause the device —
+    // ordering matters: pause flips smithay's `active` AtomicBool to
+    // false, after which every render entry short-circuits to
+    // `DeviceInactive` without issuing an ioctl. If we paused first
+    // the wallpaper-only recomposite would never reach the kernel.
+    if let Some(backend) = state.drm_backend.as_mut() {
+        if let Err(e) = backend.render_layer_elements(&state.output, None, HALMASUIT_BRAND_CLEAR) {
+            tracing::warn!(error = %e, "graceful_shutdown: render_layer_elements failed");
+        }
+        // R2.4: pause smithay's view of the device. The kernel keeps
+        // refreshing the just-bound wallpaper framebuffer from CRTC
+        // plane state autonomously (probe-validated by
+        // drm-master-probe-phase{1,2}). All later
+        // `render_one_frame` / `render_layer_elements` / per-VBlank
+        // `frame_submitted` calls in `handle_drm_event` will see
+        // `DrmDevice::is_active() == false` and return
+        // `Err(DeviceInactive)` cheaply, so the smithay → ioctl
+        // surface is closed for the rest of the shutdown sequence —
+        // no EACCES races, no GBM/page-flip ioctls during the
+        // systemd→systemd-shutdown handoff, no smithay error logs
+        // crowding the kmsg ring next to our liveness writes.
+        backend.pause();
+        tracing::info!("graceful_shutdown: DrmDevice paused (render path now no-op)");
     }
 
     // R2.2 / R2.3: remove the libinput source from the calloop loop.
@@ -3038,6 +3056,127 @@ fn write_kmsg(line: &str) {
     if let Err(e) = stdout.flush() {
         tracing::warn!(error = %e, "write_kmsg: flush failed");
     }
+}
+
+/// Spawn a background thread that subscribes to
+/// `org.freedesktop.login1.Manager.PrepareForShutdown` and posts each
+/// `(true,)` signal into a calloop channel back to the main loop, where
+/// the receiving callback triggers `graceful_shutdown`.
+///
+/// Why a thread + channel and not async-zbus inline: halmasuit's
+/// calloop is sync, smithay's reexports of calloop don't enable the
+/// `executor` feature, and zbus's `blocking::Connection` is a clean
+/// fit. The thread owns a Connection + signal-stream iterator; calloop
+/// receives only `bool` payloads. The thread exits naturally when the
+/// channel's receiver drops (which happens on compositor shutdown — at
+/// which point the system bus is also tearing down, so the iterator's
+/// next read would error anyway).
+///
+/// Failure to connect to the system bus or to subscribe is non-fatal:
+/// log + continue. halmasuit still works without PrepareForShutdown
+/// — it just doesn't get the graceful shutdown cue under
+/// `SurviveFinalKillSignal=yes`, and the wallpaper-only mode never
+/// engages. SIGTERM-driven paths (visual-shutdown-tear-down's `kill
+/// -TERM` test posture, and any operator-issued `systemctl stop`) are
+/// unaffected.
+fn spawn_prepare_for_shutdown_watcher(loop_handle: &LoopHandle<'static, HalmasuitState>) {
+    let (tx, channel) = calloop::channel::channel::<bool>();
+    if let Err(e) = loop_handle.insert_source(channel, |event, (), state: &mut HalmasuitState| {
+        let calloop::channel::Event::Msg(arming) = event else {
+            return;
+        };
+        if !arming {
+            // `PrepareForShutdown(false)` means a previously-scheduled
+            // shutdown was cancelled. halmasuit doesn't currently
+            // support resuming from the wallpaper-only state (the
+            // DRM device is paused; smithay doesn't have a clean
+            // "reverse the tear-down" path here). Cancelling
+            // shutdown post-tear-down is a vanishingly rare operator
+            // pattern; log it and rely on the operator to restart
+            // halmasuit if they really meant to keep the session
+            // alive.
+            tracing::info!("PrepareForShutdown(false): not unwinding wallpaper-only state");
+            return;
+        }
+        if state.shutting_down {
+            // Idempotent: a repeated PrepareForShutdown(true) after we
+            // already tore down. systemd-logind broadcasts the signal
+            // to all subscribers and can theoretically emit it more
+            // than once if a `Reboot()` follows a `PowerOff()`.
+            return;
+        }
+        tracing::info!("PrepareForShutdown(true) received; entering graceful_shutdown");
+        graceful_shutdown(state, ShutdownReason::PrepareForShutdown);
+    }) {
+        tracing::error!(error = %e, "insert PrepareForShutdown calloop channel failed");
+        return;
+    }
+
+    if let Err(e) = std::thread::Builder::new()
+        .name("login1-watcher".to_owned())
+        .spawn(move || run_prepare_for_shutdown_loop(&tx))
+    {
+        tracing::error!(error = %e, "spawn login1-watcher thread failed");
+    }
+}
+
+/// Blocking inner loop for the login1 watcher thread. Connects to the
+/// system bus, builds a signal stream on
+/// `org.freedesktop.login1.Manager.PrepareForShutdown`, and forwards
+/// each `(arming: bool,)` payload through `tx`. Exits if the connection
+/// dies, the bus name vanishes, or `tx` is dropped — all of which are
+/// terminal for the watcher's purpose.
+fn run_prepare_for_shutdown_loop(tx: &calloop::channel::Sender<bool>) {
+    let conn = match zbus::blocking::Connection::system() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "login1-watcher: zbus system() failed; no shutdown cue");
+            return;
+        }
+    };
+
+    // Subscribe to Manager.PrepareForShutdown.  zbus's blocking
+    // MatchRule/signal-iterator path is the canonical "watch for a
+    // specific signal forever" shape.  See zbus 5.x docs.
+    let proxy = match zbus::blocking::Proxy::new(
+        &conn,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "login1-watcher: Proxy::new failed");
+            return;
+        }
+    };
+
+    let iter = match proxy.receive_signal("PrepareForShutdown") {
+        Ok(it) => it,
+        Err(e) => {
+            tracing::warn!(error = %e, "login1-watcher: receive_signal failed");
+            return;
+        }
+    };
+
+    tracing::info!("login1-watcher: subscribed to PrepareForShutdown");
+
+    for msg in iter {
+        let arming: bool = match msg.body().deserialize() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "login1-watcher: PrepareForShutdown body decode failed");
+                continue;
+            }
+        };
+        if tx.send(arming).is_err() {
+            // Receiver gone → compositor is shutting down on its own
+            // (or never made it past startup). Nothing left to do.
+            tracing::info!("login1-watcher: channel closed; exiting");
+            return;
+        }
+    }
+    tracing::info!("login1-watcher: signal stream ended");
 }
 
 /// Reap zombie children (coalesced SIGCHLD: one signal may cover
@@ -3973,6 +4112,20 @@ fn main() -> io::Result<()> {
             )
             .map_err(|e| io::Error::other(format!("insert liveness timer: {e}")))?;
     }
+
+    // Epic #47 R2.4: org.freedesktop.login1.PrepareForShutdown(true)
+    // subscription. systemd-logind broadcasts this signal at the
+    // very start of every shutdown sequence (poweroff, reboot,
+    // suspend, hibernate, kexec) — BEFORE the unit-stop kill spree,
+    // before `SurviveFinalKillSignal=yes` could possibly become
+    // relevant. It's the canonical "shutdown is imminent" cue for
+    // long-lived system processes that need to clean up gracefully.
+    // halmasuit subscribes to it (via a dedicated zbus-blocking
+    // thread that posts into a calloop channel back to the main
+    // loop) and treats it as the trigger for `graceful_shutdown` —
+    // greeter killed, wallpaper-only recomposite, `DrmDevice::pause`,
+    // and the rest of the wallpaper-only paint-until-halt path.
+    spawn_prepare_for_shutdown_watcher(&loop_handle);
 
     // greetd socket setup. Production: NixOS module sets
     // HALMASUIT_GREETD_SOCKET to `/run/halmasuit/greetd.sock` and
