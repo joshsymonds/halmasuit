@@ -288,4 +288,38 @@ def run(machine, visual, *, cell_name, lukshape, no_flash_mode):
             "excluded)"
         )
 
+    # ── Phash-progression for animated cells (R3.6) ─────────────────
+    # Catches the "frozen frame would pass today" gap: the no-flash
+    # stream check above asserts every frame_rendered is non-degenerate
+    # with stable pixel_count and zero sentinel pixels, but it does
+    # NOT compare consecutive phashes — a pathological "render the
+    # same frame N times" bug satisfies all those checks. Asserting
+    # the phash stream actually varies catches it.
+    #
+    # Image cells skip this (image is static — frames ARE supposed to
+    # be identical). Shader and video cells assert it with thresholds
+    # matched to their fixtures' boot-time animation characteristic.
+    if "image" not in cell_name:
+        import phash_progression
+        events = visual.introspect_events(machine)
+        if "shader" in cell_name:
+            # The 60s-period sine shader has subtle frame-to-frame
+            # change in the boot window; loose thresholds prove
+            # animation without false positives.
+            phash_progression.assert_animating(
+                events,
+                min_distinct_phashes=3,
+                min_hamming_max=8,
+            )
+        elif "video" in cell_name:
+            # testsrc + 8x8 phash quantization → low distinct count,
+            # high pairwise Hamming spread. Matches the shutdown-video
+            # cell's tuning.
+            phash_progression.assert_animating(
+                events,
+                min_distinct_phashes=3,
+                min_hamming_max=20,
+            )
+        print(f"PASS: phash progression for {cell_name} (frames are distinct, not frozen)")
+
     print(f"visual-{cell_name}: ALL ASSERTIONS PASSED")
