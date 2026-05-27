@@ -234,13 +234,28 @@ def run(machine, visual, *, cell_name, lukshape, no_flash_mode):
     #   no-flash anchor is — decoder startup may have produced an
     #   empty fbo at the read moment.
     time.sleep(2)
-    visual.assert_matches_golden(machine, f"{cell_name}-session")
-    print("PASS: session-scene golden")
-    if no_flash_mode == "strict":
-        visual.assert_matches_golden(
-            machine, f"{cell_name}-wallpaper", scene="wallpaper-only"
+    # SSIMULACRA2 goldens only fit STATIC content. Animated cells
+    # (shader, video) have R3.1's wallpaper-tick driving continuous
+    # animation post-boot, so the captured frame's iTime varies
+    # boot-to-boot and a fixed golden can't match. The
+    # phash_progression assertion further down replaces this for
+    # animated cells — it proves the wallpaper IS animating (frames
+    # are distinct) without depending on a fixed-iTime golden.
+    is_animated = "shader" in cell_name or "video" in cell_name
+    if not is_animated:
+        visual.assert_matches_golden(machine, f"{cell_name}-session")
+        print("PASS: session-scene golden")
+        if no_flash_mode == "strict":
+            visual.assert_matches_golden(
+                machine, f"{cell_name}-wallpaper", scene="wallpaper-only"
+            )
+            print("PASS: wallpaper-only golden (variant-distinct)")
+    else:
+        print(
+            f"SKIP: SSIMULACRA2 golden for animated cell {cell_name!r} — "
+            f"phash_progression assertion below covers the animating-"
+            f"content invariant without iTime-stability requirement."
         )
-        print("PASS: wallpaper-only golden (variant-distinct)")
 
     # ── No-flash invariant over the full timeline ───────────────────
     if no_flash_mode == "strict":
