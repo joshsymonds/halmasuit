@@ -1003,6 +1003,20 @@
           halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Epic #61 R3.4: image cell of the wallpaper-shutdown-survival
+        # matrix. Pairs with pivot-survival (shader cell, has phash-
+        # progression + frame-counter advancing assertions). Image is
+        # static, so this cell asserts only the survival invariants
+        # (PID continuity, no coredump, liveness past pivot marker).
+        visual-shutdown-image = import ./tests/visual-shutdown-image.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # R13 forcing function (the reason this epic exists): the
         # real DMS DankGreeter (Quickshell/Qt6 + greeter-niri) as
         # halmasuit's greeter. Scaffolded at epic #2 close (8925ca5);
