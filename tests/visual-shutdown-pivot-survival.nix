@@ -229,6 +229,11 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     import re
+    import sys
+
+    sys.path.insert(0, "${./lib}")
+
+    import phash_progression
 
     machine.start()
     machine.wait_for_unit("multi-user.target")
@@ -401,6 +406,57 @@ pkgs.testers.runNixOSTest {
         f"{len(shutdown_frames)} liveness samples). The wallpaper-engine "
         f"tick is driving renders through shutdown — shader/video "
         f"wallpaper continues animating."
+    )
+
+    # ── Phash-progression assertion ────────────────────────────────
+    # Beyond "the counter is advancing", prove the RENDERED PIXELS
+    # are actually different across frames. The frame counter check
+    # above proves render_one_frame is being called and is queuing
+    # frames; phash_progression proves those frames carry distinct
+    # pixel content (closes the "render same frame N times" gap).
+    #
+    # Halmasuit-debug emits Event::FrameRendered per frame via the
+    # frame_audit feature. Those events flow through tracing's JSON
+    # formatter on stderr → journald → /dev/console. We can't call
+    # `visual.introspect_events(machine)` after machine.shutdown()
+    # because that would `journalctl` against a powered-off VM;
+    # parse the same JSON envelopes out of the captured console
+    # text instead. (Same shape, no machine handle required.)
+    import json as _json
+    all_events = []
+    for line in console.splitlines():
+        # Console framing strips ANSI but lines still wrap. Find the
+        # first JSON object on the line.
+        brace = line.find('{"timestamp"')
+        if brace < 0:
+            continue
+        try:
+            outer = _json.loads(line[brace:])
+        except ValueError:
+            continue
+        inner = outer.get("fields", {}).get("json")
+        if not inner:
+            continue
+        try:
+            ev = _json.loads(inner)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and "event" in ev:
+            all_events.append(ev)
+    phash_progression.assert_animating(
+        all_events,
+        min_distinct_phashes=3,
+        min_hamming_max=8,
+    )
+    frame_rendered_events = [
+        e for e in all_events
+        if e.get("event") == "frame_rendered" and "phash" in e
+    ]
+    distinct_phashes = {int(e["phash"]) for e in frame_rendered_events}
+    print(
+        f"PASS: phash progression — {len(distinct_phashes)} distinct "
+        f"phashes across {len(frame_rendered_events)} frame_rendered "
+        f"events. The shader is animating (not frozen)."
     )
 
     # ── No-coredump assertion ──────────────────────────────────────
