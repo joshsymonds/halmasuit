@@ -136,7 +136,14 @@ pkgs.testers.runNixOSTest {
         # `frames=N` progression assertion in testScript depends on.
         # (Per-wallpaper-type matrix — image + video + golden-image
         # comparison — lands in the follow-up R3 epic.)
-        wallpaper = { type = "shader"; source = ./fixtures/wallpaper-shader.glsl; };
+        # `wallpaper-shader-fast.glsl` has a 1-second period (vs 60s in
+        # the original `wallpaper-shader.glsl`) — that's deliberate for
+        # this shutdown matrix cell, where the post-pivot observation
+        # window is ~700 ms and a 60s shader's R-channel sine moves
+        # < 1.2% of its period across the slice, too small to drive
+        # phash variance reliably. The fast fixture's 1s sine moves
+        # ~70% of its period across the same slice → easy phash variance.
+        wallpaper = { type = "shader"; source = ./fixtures/wallpaper-shader-fast.glsl; };
         greeterCommand = "${pkgs.writeShellScript "halmasuit-pivot-survival-greeter" ''
           export HALMASUIT_TESTCLIENT_KEYBOARD=1
           export HALMASUIT_TESTCLIENT_LAYER=top

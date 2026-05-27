@@ -256,11 +256,14 @@ pkgs.testers.runNixOSTest {
     # what's on screen right before halmasuit enters shutdown — i.e.
     # what the user sees as the system begins to power off.
     #
-    # For image wallpapers, this golden is stable across boot timing
-    # (no animation drift); SSIMULACRA2 threshold is the default 90
-    # (perceptual match). For the corresponding goldens, see
-    # `tests/goldens/shutdown-image-session.png`.
-    visual.assert_matches_golden(machine, "shutdown-image-session")
+    # For image wallpapers the rendered scene is fully deterministic
+    # — halmasuit's offscreen llvmpipe readback of a static image
+    # source MUST match its committed golden near-exactly. Use the
+    # ≥95 threshold (`assert_matches_exact`), not the looser ≥90
+    # perceptual threshold — see visual.py:281-303 documenting the
+    # exact-image floor for "the offscreen llvmpipe readback of a
+    # deterministic, known scene".
+    visual.assert_matches_exact(machine, "shutdown-image-session")
     print("PASS: pre-shutdown SSIMULACRA2 golden — image wallpaper visible")
 
     # ── Trigger full system shutdown ────────────────────────────────
