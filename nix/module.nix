@@ -633,21 +633,21 @@ in
         KillMode       = "process";
         # halmasuit emits its NDJSON event stream on stderr via
         # tracing-subscriber; stdout is reserved for the R2.2 shutdown-
-        # liveness writes (one line per 250ms while the wallpaper-only
-        # post-shutdown loop is running). Routing stdout to
-        # `kmsg+console` is the trick that lets those lines survive
-        # the rootfs→shutdownRamfs pivot: systemd opens fd 1 against
-        # /dev/kmsg pre-exec, so the compositor (which has
-        # `ProtectKernelLogs=true` and could not open /dev/kmsg
-        # itself) writes through the inherited fd. The /dev/kmsg
-        # character device is kernel-owned and survives the rootfs
-        # unmount, so post-pivot writes still land on the kernel ring
-        # buffer + serial console — the only observable channel
-        # available to the pivot-survival VM test. `+console` mirrors
-        # the line to /dev/console so the test can read it from the
-        # serial log without going through journald (which dies
-        # before the pivot).
-        StandardOutput = "kmsg";
+        # liveness writes (one line per HALMASUIT_LIVENESS_INTERVAL_MS
+        # while the always-on liveness timer is running). Routing
+        # stdout to `file:/dev/kmsg` is what makes those lines survive
+        # the entire shutdown sequence end-to-end: systemd opens fd 1
+        # against /dev/kmsg directly (NOT through the journal socket,
+        # which `StandardOutput=kmsg` does), so the fd remains valid
+        # after systemd-journald is killed by the shutdown kill spree
+        # and across the rootfs→shutdownRamfs pivot. The compositor
+        # has `ProtectKernelLogs=true` and can't open /dev/kmsg
+        # itself, but the pre-opened fd inherited from systemd works
+        # regardless. The /dev/kmsg character device is kernel-owned
+        # and survives every userspace teardown, so writes land in
+        # the kernel ring buffer (visible via dmesg and on the serial
+        # console) all the way until the kernel halts.
+        StandardOutput = "file:/dev/kmsg";
         StandardError  = "journal";
         # RuntimeDirectory creates /run/halmasuit/ with the unit's UID.
         # Unit starts as root, so /run/halmasuit is owned root:<Group=>;
@@ -1161,12 +1161,12 @@ in
          ];
          ExecStart      = lib.getExe cfg.package;
          Restart        = "no";
-         # kmsg+console for the same R2.2 shutdown-liveness reason as
+         # `file:/dev/kmsg` for the same shutdown-liveness reason as
          # the rootfs unit (see the long comment in the `enable`
-         # branch above): halmasuit writes a liveness line every
-         # 250ms to stdout while shutting_down=true; routing through
-         # /dev/kmsg lets those lines outlive the rootfs unmount.
-         StandardOutput = "kmsg";
+         # branch above): halmasuit writes liveness lines on stdout;
+         # `file:/dev/kmsg` has systemd open the device directly so
+         # the fd survives journald death and the rootfs pivot.
+         StandardOutput = "file:/dev/kmsg";
          StandardError  = "journal";
          # Cross-pivot per-process-root divergence: at switch_root
          # halmasuit's process-root diverges from rootfs systemd's

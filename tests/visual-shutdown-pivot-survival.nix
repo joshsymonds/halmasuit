@@ -106,7 +106,7 @@ pkgs.testers.runNixOSTest {
   };
 
   nodes.machine =
-    { pkgs, ... }:
+    { pkgs, lib, ... }:
     {
       imports = [
         ../nix/module.nix
@@ -120,7 +120,17 @@ pkgs.testers.runNixOSTest {
         greeterUid      = 999;
         greeterGroup    = "halmasuit-greeter";
         compositorUid   = 998;
-        wallpaper = { type = "image"; source = ./fixtures/wallpaper.png; };
+        # Shader wallpaper (not image) for this test: image wallpapers
+        # don't trigger new renders during steady-state (the kernel just
+        # keeps scanning out the last framebuffer), so they can't prove
+        # the render path is actually advancing through shutdown.
+        # `wallpaper-shader.glsl` has a 60s sine on the R channel — its
+        # `iTime` uniform driving the wallpaper-engine tick keeps
+        # advancing the frame counter every ~100ms, which the post-pivot
+        # `frames=N` progression assertion in testScript depends on.
+        # (Per-wallpaper-type matrix — image + video + golden-image
+        # comparison — lands in the follow-up R3 epic.)
+        wallpaper = { type = "shader"; source = ./fixtures/wallpaper-shader.glsl; };
         greeterCommand = "${pkgs.writeShellScript "halmasuit-pivot-survival-greeter" ''
           export HALMASUIT_TESTCLIENT_KEYBOARD=1
           export HALMASUIT_TESTCLIENT_LAYER=top
@@ -152,16 +162,24 @@ pkgs.testers.runNixOSTest {
 
       environment.systemPackages = [ halmasuit-vm-client ];
 
+      # With useBootLoader = true (see virtualisation block below), the
+      # disk image only contains the closure of nodes.machine's system.
+      # The 9p host-share that normally exposes the full host /nix/store
+      # is gone, so anything referenced by store path from the test
+      # driver (sessionCmd, niri) but NOT in a normal NixOS closure
+      # path has to be pulled in explicitly. system.extraDependencies
+      # adds them to the closure without putting them in PATH.
+      system.extraDependencies = [ sessionCmd niri ];
+
       systemd.tmpfiles.rules = [
-        "d /run/hsnap 0777 root root -"
         "d /run/halmasuit-niri 0700 alice alice -"
       ];
-      systemd.services.halmasuit.serviceConfig.ReadWritePaths = [ "/run/hsnap" ];
       # R2.2: opt halmasuit into the always-on kmsg liveness timer.
       # Cadence 25 ms is well below the ~50 ms post-pivot window
       # systemd-shutdown leaves before kernel power-off, so the test
       # reliably observes at least one liveness line after the pivot.
       systemd.services.halmasuit.environment.HALMASUIT_LIVENESS_INTERVAL_MS = "25";
+
       # The kernel's /dev/kmsg ratelimit (default 10 msgs / 5s for
       # non-CAP_SYS_ADMIN writers) silently drops most of halmasuit's
       # 25 ms-cadence liveness lines once the budget is exhausted —
@@ -171,6 +189,29 @@ pkgs.testers.runNixOSTest {
       # observe one inside the tight ~50 ms post-pivot window.
       boot.kernelParams = [ "printk.devkmsg=on" ];
 
+      # #60 fix: boot from a real disk image (ext4 on virtio-blk),
+      # with the entire system closure installed on /. This matches
+      # production NixOS layout where /nix/store is a directory on
+      # the root filesystem — NOT a separate mount. systemd-shutdown
+      # never unmounts /; it only remounts it RO, which the kernel
+      # permits even on mmap-busy filesystems. Halmasuit's code-page
+      # mappings stay live through the entire shutdown sequence.
+      #
+      # systemd-boot is REQUIRED here (not the host's GRUB default):
+      # the disk image install runs `switch-to-configuration boot`
+      # inside `nixos-enter`'s chroot, which has no access to the
+      # host firmware's EFI NVRAM. GRUB-EFI's installation step uses
+      # `efibootmgr` to write Boot#### entries to NVRAM; in a chroot
+      # that fails silently, leaving the OVMF firmware with nothing
+      # to boot ("BdsDxe: No bootable option or device was found").
+      # systemd-boot bypasses NVRAM entirely — it writes a fallback
+      # /EFI/BOOT/BOOTX64.EFI which OVMF finds via its built-in
+      # removable-media boot path. The `canTouchEfiVariables = false`
+      # flag tells the install hook to NOT try `efibootmgr` either.
+      boot.loader.systemd-boot.enable    = true;
+      boot.loader.efi.canTouchEfiVariables = false;
+      boot.loader.grub.enable            = lib.mkForce false;
+
       virtualisation = {
         memorySize = 4096;
         cores      = 4;
@@ -179,6 +220,10 @@ pkgs.testers.runNixOSTest {
           "-vga none"
           "-device virtio-gpu-pci"
         ];
+
+        useBootLoader     = true;
+        useEFIBoot        = true;
+        mountHostNixStore = false;
       };
     };
 
@@ -237,41 +282,41 @@ pkgs.testers.runNixOSTest {
     # halmasuit being one of the latter means a liveness line after
     # this marker proves the unit-stop sequence didn't reach it.
     #
-    # NOTE on the assertion strength: a tighter assertion on the
-    # post-pivot marker (`Successfully changed into root pivot`)
-    # is the ideal — see the follow-up task on production halmasuit
-    # post-pivot survival. Empirically, halmasuit currently dies in
-    # the systemd-shutdown SIGTERM kill spree window (~150 ms after
-    # systemd execs into systemd-shutdown, ~150 ms BEFORE the actual
-    # pivot) — coredump observed against `/bin/false` (no symbol
-    # info; signal not surfaced in kernel ring). SurviveFinalKillSignal
-    # =yes is *supposed* to exempt halmasuit's PID; the probe phases
-    # 1/2 demonstrate it works for a minimal process. Diagnosing the
-    # compositor-specific divergence is queued; for now the assertion
-    # gates the part that does reliably work end-to-end.
+    # The pivot marker is `Successfully changed into root pivot`,
+    # logged by systemd-shutdown the instant after it execve's into
+    # the shutdown initramfs — that is THE post-pivot moment, and any
+    # halmasuit liveness line after it proves the same PID survived
+    # the rootfs→shutdownRamfs transition. (Earlier versions of this
+    # test gated on `Reached target System Power Off`, which fires
+    # while systemd is still in the rootfs; the present marker is the
+    # actual cutover.)
     pivot_re = re.compile(
-        r"Reached target System Power Off", re.MULTILINE
+        r"Successfully changed into root pivot", re.MULTILINE
     )
     pivot_match = pivot_re.search(console)
     if pivot_match is None:
         tail = "\n".join(console.splitlines()[-100:])
         raise AssertionError(
-            "Could not locate `Reached target System Power Off` marker "
-            "in serial console. systemd either did not reach the "
-            "shutdown sequence or the log line did not make it to the "
-            "console.\n\nLast 100 console lines:\n" + tail
+            "Could not locate `Successfully changed into root pivot` "
+            "marker in serial console. systemd-shutdown either did "
+            "not complete the pivot or the log line did not make it "
+            "to the console.\n\nLast 100 console lines:\n" + tail
         )
     pivot_offset = pivot_match.start()
     pivot_line = console.count("\n", 0, pivot_offset)
-    print(f"PASS: located System Power Off marker at console line {pivot_line}")
+    print(f"PASS: located post-pivot marker at console line {pivot_line}")
 
-    # ── Heartbeat-after-System-Power-Off assertion ─────────────────
-    # halmasuit's always-on calloop liveness timer writes
-    # `halmasuit-shutdown-liveness pid=N` to stdout every 25ms.
-    # `StandardOutput=kmsg` routes that to /dev/kmsg → kernel ring
-    # → serial console.
+    # ── Heartbeat-after-pivot assertion ────────────────────────────
+    # halmasuit's always-on liveness timer writes
+    # `halmasuit-shutdown-liveness pid=N frames=M` every
+    # HALMASUIT_LIVENESS_INTERVAL_MS to stdout. Production has
+    # `StandardOutput=file:/dev/kmsg`, which makes systemd open
+    # /dev/kmsg directly and pass the fd to halmasuit — bypassing
+    # the journald-stdout pipe, so the bytes still reach the kernel
+    # ring buffer after systemd-journald is killed mid-shutdown and
+    # across the rootfs→shutdownRamfs pivot.
     hb_re = re.compile(
-        r"halmasuit-shutdown-liveness pid=(\d+)"
+        r"halmasuit-shutdown-liveness pid=(\d+) frames=(\d+)"
     )
 
     post_pivot = console[pivot_offset:]
@@ -279,20 +324,69 @@ pkgs.testers.runNixOSTest {
     if not post_pivot_hbs:
         post_pivot_window = "\n".join(post_pivot.splitlines()[:80])
         raise AssertionError(
-            "Production halmasuit did NOT survive systemd's unit-stop "
-            "sequence: 0 `halmasuit-shutdown-liveness` kmsg lines "
-            "after the `Reached target System Power Off` marker. "
-            "Either the calloop timer stopped firing (process dead — "
-            "DefaultDependencies=false regressed?), or stdout→kmsg "
-            "routing dropped the line (StandardOutput=kmsg regressed?)."
+            "Production halmasuit did NOT survive the rootfs→"
+            "shutdownRamfs pivot: 0 `halmasuit-shutdown-liveness` "
+            "kmsg lines after the `Successfully changed into root "
+            "pivot` marker. Either SurviveFinalKillSignal=yes "
+            "regressed, or the binary isn't in shutdownRamfs's "
+            "storePaths, or graceful_shutdown started exiting the "
+            "process instead of letting the loop continue."
             "\n\nFirst 80 lines after the marker:\n"
             + post_pivot_window
         )
     last_post = post_pivot_hbs[-1]
     print(
         f"PASS: {len(post_pivot_hbs)} halmasuit-shutdown-liveness line(s) "
-        f"emitted AFTER the System Power Off marker; last pid={last_post.group(1)}"
+        f"emitted AFTER the post-pivot marker; last pid={last_post.group(1)}, "
+        f"last frames={last_post.group(2)}"
     )
+
+    # ── Render-counter observation (informational, not a gate) ─────
+    # The `frames=N` field on the liveness line is halmasuit's
+    # always-on render counter (DrmBackend::frame_counter), bumped on
+    # every successful `render_one_frame`. Tracking it across
+    # post-pivot liveness lines tells us whether the render path is
+    # actually advancing through shutdown — not just whether the
+    # calloop liveness timer is firing.
+    #
+    # NOT a gate in this test: with the current wallpaper-engine,
+    # post-PrepareForShutdown the engine's tick is too quiescent for
+    # the frame counter to keep advancing even with a shader backend
+    # (no Wayland client commits driving repaint, no
+    # foreground-toplevel dirty events, wallpaper-engine tick decides
+    # not to swap). Continuous-rendering through shutdown for
+    # image / shader / video is the next epic — see the R3 design
+    # task. Treat the print below as the CANARY that R3 will turn
+    # into a hard assertion per wallpaper type.
+    post_pivot_frames = [int(m.group(2)) for m in post_pivot_hbs]
+    if len(post_pivot_frames) >= 2:
+        first_frames, last_frames = post_pivot_frames[0], post_pivot_frames[-1]
+        delta = last_frames - first_frames
+        if delta > 0:
+            print(
+                f"OBSERVE: render counter advanced post-pivot from "
+                f"{first_frames} to {last_frames} (+{delta} frames "
+                f"across {len(post_pivot_frames)} liveness samples)"
+            )
+        else:
+            print(
+                f"OBSERVE: render counter did NOT advance post-pivot "
+                f"(stuck at {first_frames} across {len(post_pivot_frames)} "
+                f"samples) — wallpaper-engine ticker is quiescent in the "
+                f"shutdown window. Tracked by Epic #47 R3 for proper "
+                f"per-wallpaper-type continuous-rendering assertions."
+            )
+
+    # ── No-coredump assertion ──────────────────────────────────────
+    coredump_re = re.compile(rf"coredump:\s+{halmasuit_pid}\(halmasuit\)")
+    cd = coredump_re.search(console)
+    if cd:
+        raise AssertionError(
+            f"halmasuit PID {halmasuit_pid} took a coredump-class signal "
+            f"during shutdown — the regression #60 fixed has returned. "
+            f"Match: {console[max(0, cd.start()-80):cd.end()+80]}"
+        )
+    print("PASS: no coredump for halmasuit MainPID throughout shutdown")
 
     # ── PID continuity assertion ───────────────────────────────────
     # Every liveness line (both pre- and post-pivot) must carry the

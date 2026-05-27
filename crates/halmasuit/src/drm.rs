@@ -164,18 +164,6 @@ struct CachedNamed {
 /// `HalmasuitState`. Dropping this value releases the master, tears
 /// down EGL, and lets the kernel reset the CRTC.
 pub struct DrmBackend {
-    /// The smithay `DrmDevice` we used to create the `DrmCompositor`'s
-    /// surface. Retained on state so that `graceful_shutdown` can call
-    /// [`DrmDevice::pause`] on it (R2.4): pause flips the internal
-    /// `active` AtomicBool to false (cascading to every surface) and
-    /// releases the master lock, after which every render entry on
-    /// `DrmCompositor` / `AtomicDrmSurface` / `LegacyDrmSurface`
-    /// short-circuits to `Err(DeviceInactive)` instead of issuing a
-    /// page-flip ioctl. The kernel keeps refreshing the last-bound
-    /// framebuffer from its plane state until something else
-    /// reprograms the CRTC — which during shutdown nothing does, so
-    /// the wallpaper stays on-screen until kernel halt.
-    pub device: DrmDevice,
     /// The smithay `DrmCompositor` driving our single CRTC. Owns the
     /// `DrmSurface` (and through it the `crtc::Handle`), the GBM
     /// allocator, the framebuffer exporter, and the swapchain. Pinned
@@ -206,9 +194,14 @@ pub struct DrmBackend {
     /// `started_at` anchors animation timing — `Instant`-based
     /// elapsed time chooses the active animation frame.
     cursor: CursorRenderState,
-    /// Monotonic frame counter for the `frame_audit` `FrameRendered`
-    /// stream. Only exists in `halmasuit-debug`.
-    #[cfg(feature = "frame_audit")]
+    /// Monotonic frame counter, incremented on every successful render
+    /// path through `render_one_frame` / `render_layer_elements` /
+    /// the wallpaper-engine tick. Always present (not feature-gated):
+    /// production halmasuit exposes it via the shutdown-liveness line
+    /// so the pivot-survival test can assert the render loop is
+    /// actually advancing the counter post-pivot (not just dispatching
+    /// the calloop liveness timer). `halmasuit-debug` also surfaces it
+    /// as `Event::FrameRendered.frame_id` for the `frame_audit` stream.
     frame_counter: u64,
     /// Latest composited frame, published every audited frame for the
     /// D-Bus `Snapshot()` method to read. Only exists in
@@ -251,24 +244,6 @@ impl DrmBackend {
     /// pick up the swap otherwise).
     pub fn tick_wallpaper(&mut self) -> bool {
         self.wallpaper.tick(&mut self.renderer)
-    }
-
-    /// Pause the underlying [`DrmDevice`] so smithay's render path
-    /// short-circuits to `DeviceInactive` on every subsequent
-    /// `queue_frame` / `commit_frame` / `surface.commit` /
-    /// `surface.page_flip` (R2.4). Called from `graceful_shutdown`
-    /// AFTER the wallpaper-only recomposite — by the time pause
-    /// runs, the kernel's CRTC plane state already points at the
-    /// wallpaper framebuffer, and the kernel keeps refreshing that
-    /// frame autonomously until the CRTC is reprogrammed (which
-    /// during the shutdown sequence nothing does). The render path
-    /// becoming a no-op past this point is the GREEN-state invariant
-    /// the pivot-survival test asserts on: no more ioctls means
-    /// nothing to EACCES against during the systemd→systemd-shutdown
-    /// handoff, and nothing to panic on if upstream renames /dev/dri
-    /// devices mid-pivot.
-    pub fn pause(&mut self) {
-        self.device.pause();
     }
 }
 
@@ -537,7 +512,6 @@ where
 
     Ok((
         DrmBackend {
-            device: drm,
             compositor,
             renderer,
             wallpaper,
@@ -549,7 +523,6 @@ where
                 cached: None,
                 started_at: std::time::Instant::now(),
             },
-            #[cfg(feature = "frame_audit")]
             frame_counter: 0,
             #[cfg(feature = "frame_audit")]
             snapshot_buf: crate::dbus::new_buffer(),
@@ -874,6 +847,13 @@ impl DrmBackend {
             .queue_frame(())
             .map_err(|e| io::Error::other(format!("queue_frame: {e}")))?;
 
+        // Advance the always-on render counter. `audit_frame` reads
+        // (counter - 1) for `Event::FrameRendered.frame_id` so the
+        // first emitted frame is still id=0; production halmasuit
+        // exposes the post-increment value via `frame_counter()` for
+        // the shutdown-liveness line's `frames=N` field.
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+
         // The frame is now queued for scanout. Under `frame_audit`
         // (halmasuit-debug only) re-render the identical element set
         // into an offscreen texture, read it back, analyze it, and
@@ -891,6 +871,16 @@ impl DrmBackend {
         let _ = output;
 
         Ok(true)
+    }
+
+    /// Total frames the render path has queued for scanout. Monotonic,
+    /// wraps on u64 overflow. Read by the shutdown-liveness timer to
+    /// prove (via the `frames=N` field of the liveness line) that the
+    /// render loop is actually advancing through shutdown — not just
+    /// that the calloop event loop is firing the liveness timer.
+    #[must_use]
+    pub const fn frame_counter(&self) -> u64 {
+        self.frame_counter
     }
 
     /// Re-render `elements` (+ the clear color) into an offscreen
@@ -922,15 +912,18 @@ impl DrmBackend {
                 height: hu,
             });
         }
+        // The caller (`render_one_frame`) bumped `frame_counter`
+        // after `queue_frame` succeeded; subtract one so the first
+        // frame is still emitted as id=0 (matches every existing
+        // visual test's frame-id assumptions).
         halmasuit_introspect::emit(&halmasuit_introspect::Event::FrameRendered {
-            frame_id: self.frame_counter,
+            frame_id: self.frame_counter.wrapping_sub(1),
             pixel_count: stats.pixel_count,
             clear_pixel_count: stats.clear_pixel_count,
             black_pixel_count: stats.black_pixel_count,
             degenerate: stats.degenerate,
             phash: stats.phash,
         });
-        self.frame_counter += 1;
         // Wallpaper-plane-only auxiliary capture (closes C-G1: the
         // session-scene golden has niri's opaque fullscreen toplevel
         // covering the wallpaper plane, so all six matrix cells'

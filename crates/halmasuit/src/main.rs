@@ -1089,18 +1089,20 @@ impl HalmasuitState {
     /// one-frame-per-commit; fine for these low-frequency scenes).
     /// The foreground toplevel is composited above the layer
     /// background by `render_layer_elements`.
+    ///
+    /// Keeps rendering when `shutting_down` is true so video and
+    /// shader wallpapers continue animating through shutdown. After
+    /// graceful_shutdown clears `foreground_toplevel`, the composite
+    /// is wallpaper-only — exactly the frame stream the user sees
+    /// from PrepareForShutdown to kernel halt.
     fn repaint(&mut self) {
-        // R2.2: post-SIGTERM the last wallpaper frame is what the
-        // kernel keeps scanning out. Skip the render call to avoid
-        // touching the GPU stack while systemd-shutdown tears
-        // adjacent subsystems down.
-        if self.shutting_down {
-            return;
-        }
-        let fg_surface = self
-            .foreground_toplevel
-            .as_ref()
-            .map(|t| t.wl_surface().clone());
+        let fg_surface = if self.shutting_down {
+            None
+        } else {
+            self.foreground_toplevel
+                .as_ref()
+                .map(|t| t.wl_surface().clone())
+        };
         if let Some(backend) = self.drm_backend.as_mut()
             && let Err(e) = backend.render_layer_elements(
                 &self.output,
@@ -2964,20 +2966,14 @@ fn classify_reaped_child(
 /// means the next render has no non-wallpaper elements, so the
 /// screen is wallpaper-only from this point until kernel halt.
 fn graceful_shutdown(state: &mut HalmasuitState, reason: ShutdownReason) {
-    // R2.4: idempotent on re-entry. PrepareForShutdown triggers
-    // graceful_shutdown first (~0-1 s before the kill spree), and
-    // systemd-shutdown's broad SIGTERM (which SurviveFinalKillSignal
-    // is *supposed* to exempt, but our cgroup hardening seems to
-    // interfere with the exemption in some systemd-version /
-    // ProtectKernelTunables-shaped combinations — empirically
-    // observed via repeated coredumps in the pivot-survival test)
-    // would otherwise re-enter graceful_shutdown against a paused
-    // DrmDevice. The second call into smithay's render path —
-    // `render_layer_elements` against a `set_active(false)`
-    // DrmCompositor whose surfaces have been retained-without-strong-
-    // refs — is the crash site. Bail early on the second entry; the
-    // first call already did everything we need (greeter killed,
-    // wallpaper-only composited, device paused, libinput unsubscribed).
+    // Idempotent on re-entry. PrepareForShutdown triggers graceful_shutdown
+    // first (~0-1 s before the kill spree); the broadcast SIGTERM that
+    // follows triggers a second invocation through the signal handler.
+    // (`SurviveFinalKillSignal=yes` only exempts the final SIGKILL — the
+    // SIGTERM that precedes it is always delivered.) The second call has
+    // no work to do: the greeter is already gone, the wallpaper-only
+    // recomposite already landed, libinput is already unsubscribed.
+    // Bail early.
     if state.shutting_down {
         tracing::info!(
             ?reason,
@@ -3006,30 +3002,27 @@ fn graceful_shutdown(state: &mut HalmasuitState, reason: ShutdownReason) {
     state.foreground_toplevel = None;
     state.foreground = halmasuit_introspect::Foreground::Greeter;
 
-    // Recomposite once so the wallpaper-only state is visible this
-    // frame, not via a stale intermediate. THEN pause the device —
-    // ordering matters: pause flips smithay's `active` AtomicBool to
-    // false, after which every render entry short-circuits to
-    // `DeviceInactive` without issuing an ioctl. If we paused first
-    // the wallpaper-only recomposite would never reach the kernel.
-    if let Some(backend) = state.drm_backend.as_mut() {
-        if let Err(e) = backend.render_layer_elements(&state.output, None, HALMASUIT_BRAND_CLEAR) {
-            tracing::warn!(error = %e, "graceful_shutdown: render_layer_elements failed");
-        }
-        // R2.4: pause smithay's view of the device. The kernel keeps
-        // refreshing the just-bound wallpaper framebuffer from CRTC
-        // plane state autonomously (probe-validated by
-        // drm-master-probe-phase{1,2}). All later
-        // `render_one_frame` / `render_layer_elements` / per-VBlank
-        // `frame_submitted` calls in `handle_drm_event` will see
-        // `DrmDevice::is_active() == false` and return
-        // `Err(DeviceInactive)` cheaply, so the smithay → ioctl
-        // surface is closed for the rest of the shutdown sequence —
-        // no EACCES races, no GBM/page-flip ioctls during the
-        // systemd→systemd-shutdown handoff, no smithay error logs
-        // crowding the kmsg ring next to our liveness writes.
-        backend.pause();
-        tracing::info!("graceful_shutdown: DrmDevice paused (render path now no-op)");
+    // Recomposite immediately so the wallpaper-only state is visible
+    // this frame, not via a stale intermediate. From this point on the
+    // device is NOT paused — the existing per-VBlank render loop keeps
+    // driving new frames into the wallpaper plane through the entire
+    // shutdown sequence. That's load-bearing for video and shader
+    // wallpapers: they need continuous CPU/GPU work to animate, and
+    // pausing the DrmDevice (the previous R2.4 behavior) froze them on
+    // the last-flipped framebuffer. With the device left active, image
+    // wallpapers look identical (the same composited frame), shaders
+    // keep animating, and videos keep decoding all the way until the
+    // kernel halts the process.
+    //
+    // The trade-off: smithay's render path may surface transient
+    // errors during the shutdown handoff (broker dbus disconnect,
+    // page-flip ioctls colliding with the systemd-shutdown takeover).
+    // Those are logged at WARN and ignored — render_one_frame's
+    // existing error path drops the failing frame and continues.
+    if let Some(backend) = state.drm_backend.as_mut()
+        && let Err(e) = backend.render_layer_elements(&state.output, None, HALMASUIT_BRAND_CLEAR)
+    {
+        tracing::warn!(error = %e, "graceful_shutdown: render_layer_elements failed");
     }
 
     // R2.2 / R2.3: remove the libinput source from the calloop loop.
@@ -3056,7 +3049,13 @@ fn graceful_shutdown(state: &mut HalmasuitState, reason: ShutdownReason) {
     // ran, which is what's needed under SurviveFinalKillSignal=yes
     // where SIGTERM is never delivered.
     let pid = std::process::id();
-    write_kmsg(&format!("halmasuit-shutdown-liveness pid={pid} init"));
+    let frames = state
+        .drm_backend
+        .as_ref()
+        .map_or(0, drm::DrmBackend::frame_counter);
+    write_kmsg(&format!(
+        "halmasuit-shutdown-liveness pid={pid} frames={frames} init"
+    ));
 }
 
 /// Best-effort write of a liveness line. The shutdown-liveness timer
@@ -3069,15 +3068,61 @@ fn graceful_shutdown(state: &mut HalmasuitState, reason: ShutdownReason) {
 /// the kernel, so writes survive the rootfs→shutdownRamfs pivot —
 /// post-pivot lines still land on the kernel ring buffer + serial
 /// console, where the pivot-survival VM test reads them back.
+/// A stderr wrapper that silently swallows write errors. tracing_subscriber's
+/// fmt layer ultimately routes through `_eprint`, which **panics** when its
+/// write returns `Err` ("failed printing to stderr"). During shutdown,
+/// systemd-journald is killed mid-spree and halmasuit's `StandardOutput=kmsg`
+/// pipe breaks; the next `tracing::info!`/`warn!` panics, the default panic
+/// handler ALSO writes to stderr, that ALSO panics, and Rust's runtime
+/// resolves "panic while panicking" by calling `std::process::abort()` —
+/// which is exactly the SIGABRT this whole investigation was chasing. The
+/// fix is to never let a write error propagate out of the tracing writer.
+///
+/// `make_shutdown_safe_stderr` is the MakeWriter the fmt layer calls per
+/// event; `ShutdownSafeStderr` is the actual `io::Write` it returns. We
+/// take a fresh lock per event (cheap, matches what `io::stderr` does).
+struct ShutdownSafeStderr(std::io::StderrLock<'static>);
+
+impl io::Write for ShutdownSafeStderr {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let _ = self.0.write(buf);
+        // Always claim full success so tracing's `_eprint` path never
+        // sees an `Err` and never panics. Bytes that don't reach the
+        // kernel ring buffer during shutdown are by definition not
+        // recoverable anyway.
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        let _ = self.0.flush();
+        Ok(())
+    }
+}
+
+fn make_shutdown_safe_stderr() -> ShutdownSafeStderr {
+    ShutdownSafeStderr(io::stderr().lock())
+}
+
+/// Write a single line to the kernel ring buffer via halmasuit's
+/// stdout. The unit's `StandardOutput=file:/dev/kmsg` arranges for
+/// systemd (as PID 1, with the necessary privileges) to open
+/// `/dev/kmsg` directly and pass that fd as stdout — bypassing
+/// journald entirely. The fd survives `systemd-journald` being
+/// killed mid-shutdown, so liveness lines keep landing in dmesg
+/// through the rootfs→shutdownRamfs pivot until kernel halt.
+///
+/// Deliberately ignores write/flush errors. The same double-panic
+/// hazard documented on `ShutdownSafeStderr` would fire if these
+/// were routed through `tracing::warn!` during shutdown — stderr is
+/// the same potentially-broken pipe as stdout in dev environments
+/// without `file:/dev/kmsg`, and `_eprint`'s `failed printing to
+/// stderr` panic would abort the process. Silently dropping bytes
+/// is fine: by the time write_kmsg would fail, there's no surviving
+/// log sink to report the failure to anyway.
 fn write_kmsg(line: &str) {
     use std::io::Write as _;
     let mut stdout = std::io::stdout().lock();
-    if let Err(e) = writeln!(stdout, "{line}") {
-        tracing::warn!(error = %e, "write_kmsg: writeln failed");
-    }
-    if let Err(e) = stdout.flush() {
-        tracing::warn!(error = %e, "write_kmsg: flush failed");
-    }
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
 }
 
 /// Spawn a background thread that subscribes to
@@ -3665,7 +3710,7 @@ fn main() -> io::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .json()
-        .with_writer(io::stderr)
+        .with_writer(make_shutdown_safe_stderr)
         .with_env_filter(env_filter)
         .init();
 
@@ -4127,8 +4172,20 @@ fn main() -> io::Result<()> {
         loop_handle
             .insert_source(
                 Timer::from_duration(interval),
-                move |_deadline, (), _state: &mut HalmasuitState| {
-                    write_kmsg(&format!("halmasuit-shutdown-liveness pid={pid}"));
+                move |_deadline, (), state: &mut HalmasuitState| {
+                    // `frames=N` is the always-on render counter from
+                    // DrmBackend. Asserting this is INCREASING across
+                    // post-pivot liveness lines proves the render loop
+                    // is actually advancing — not just that the calloop
+                    // liveness timer is firing. (See visual-shutdown-
+                    // pivot-survival.nix's frame-progression assertion.)
+                    let frames = state
+                        .drm_backend
+                        .as_ref()
+                        .map_or(0, drm::DrmBackend::frame_counter);
+                    write_kmsg(&format!(
+                        "halmasuit-shutdown-liveness pid={pid} frames={frames}"
+                    ));
                     TimeoutAction::ToDuration(interval)
                 },
             )
@@ -4369,11 +4426,12 @@ fn main() -> io::Result<()> {
             .insert_source(
                 wallpaper_tick,
                 |_deadline, &mut (), state: &mut HalmasuitState| {
-                    // R2.2: skip wallpaper-engine work once shutdown
-                    // tear-down has run; the last frame stays on screen
-                    // via the kernel-bound framebuffer.
-                    if !state.shutting_down
-                        && let Some(backend) = state.drm_backend.as_mut()
+                    // Run unconditionally — including while shutting_down
+                    // — so video and shader wallpaper backends keep
+                    // advancing through shutdown. Image wallpapers tick
+                    // a no-op and stay visually identical; shader/video
+                    // produce continuously different frames.
+                    if let Some(backend) = state.drm_backend.as_mut()
                         && backend.tick_wallpaper()
                         && let Err(e) =
                             backend.render_one_frame(&state.output, HALMASUIT_BRAND_CLEAR)
