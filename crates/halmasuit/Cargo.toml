@@ -68,14 +68,14 @@ smithay = { workspace = true, features = [
     # committed wl_clients into a frame. Required by B.3's wlr-layer-shell
     # path; depended on transitively by B.5+ when we layer toplevels.
     "desktop",
-    # Epic layer E (input): seatd brokers the DRM fd (replacing
-    # self-SET_MASTER — validated by drm-master-probe Phase 4) and the
-    # libinput device fds. `backend_udev` is what enables `input/udev`
-    # (`Libinput::new_with_udev` / `udev_assign_seat`) — `backend_libinput`
-    # alone does not. Input/seat is CORE, not frame_audit-gated.
-    "backend_session_libseat",
+    # Input subsystem. halmasuit opens `/dev/dri/card0` and
+    # `/dev/input/event*` directly while still root (no libseat / no
+    # seatd anywhere in the runtime closure — R2.3). `backend_libinput`
+    # gives us smithay's `LibinputInputBackend` calloop adapter; we
+    # construct the `Libinput` context via `Libinput::new_from_path`
+    # with halmasuit's own `DirectInputInterface`, so neither
+    # `backend_session_libseat` nor `backend_udev` is needed.
     "backend_libinput",
-    "backend_udev",
 ] }
 # calloop comes in two ways: (1) via smithay's reexport for general
 # event-loop use, (2) directly here for the `signals` feature smithay

@@ -43,13 +43,10 @@ use smithay::backend::renderer::element::render_elements;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
-use smithay::backend::session::Session;
-use smithay::backend::session::libseat::LibSeatSession;
 use smithay::output::{Mode as OutputMode, Output, OutputModeSource, PhysicalProperties, Subpixel};
 use smithay::reexports::drm::Device as BaseDrmDevice;
 use smithay::reexports::drm::control::Device as ControlDevice;
 use smithay::reexports::drm::control::connector;
-use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::DeviceFd;
 
 use crate::wallpaper::{
@@ -245,70 +242,32 @@ impl DrmBackend {
     }
 }
 
-/// Set up the full DRM/GBM/EGL/GLES/DrmCompositor stack on the device
-/// at `path`. The DRM fd is opened through the libseat `session`
-/// (seatd brokers it and owns DRM master — halmasuit never issues
-/// `SET_MASTER`; the improved privilege posture validated by
-/// drm-master-probe Phase 4). Picks the first connected connector +
-/// its preferred mode + first CRTC, builds a GBM allocator + EGL
-/// display + GLES renderer + DrmCompositor wrapping that surface,
-/// registers the DRM event source with calloop for vblank
-/// notifications, and returns the retained backend plus a smithay
-/// `Output` for the caller to register as a global.
+/// Set up the full DRM/GBM/EGL/GLES/DrmCompositor stack by opening the
+/// DRM device at `path` directly and issuing `DRM_IOCTL_SET_MASTER`
+/// ourselves. halmasuit is a system compositor: it owns master for its
+/// entire process lifetime, in both the rootfs and the initramfs
+/// deployment paths. No libseat / no seatd anywhere in the runtime
+/// closure (R2.3) — the kernel's "first opener wins" rule grants us
+/// master implicitly on open, and the subsequent `acquire_master_lock`
+/// is idempotent. Probes drm-master-probe-phase{1,2} validated that
+/// the master designation survives both `setresuid` (privilege drop)
+/// and `switch_root` (initramfs→rootfs pivot) when paired with
+/// `SurviveFinalKillSignal=yes`.
 ///
-/// The caller is responsible for calling `output.create_global::<S>(&display_handle)`
-/// after this returns — we don't do it here because that call requires
-/// `S: GlobalDispatch<WlOutput, …>` which is implemented at the
-/// caller's site, not in this module.
+/// Picks the first connected connector + its preferred mode + first
+/// CRTC, builds a GBM allocator + EGL display + GLES renderer +
+/// DrmCompositor wrapping that surface, registers the DRM event source
+/// with calloop for vblank notifications, and returns the retained
+/// backend plus a smithay `Output` for the caller to register as a
+/// global.
+///
+/// The caller is responsible for calling
+/// `output.create_global::<S>(&display_handle)` after this returns —
+/// that call requires `S: GlobalDispatch<WlOutput, …>` which is
+/// implemented at the caller's site, not in this module.
 ///
 /// `drm_event_handler` is invoked from inside the calloop callback
 /// when `DrmEvent::VBlank` fires.
-///
-/// # Errors
-///
-/// Bubbles any DRM ioctl, GBM allocation, EGL initialization, or
-/// calloop registration failure with context.
-pub fn setup_drm_backend<S, F>(
-    session: &mut LibSeatSession,
-    path: &Path,
-    loop_handle: &smithay::reexports::calloop::LoopHandle<'static, S>,
-    drm_event_handler: F,
-    wallpaper_config: Option<WallpaperConfig>,
-) -> io::Result<(
-    DrmBackend,
-    smithay::reexports::calloop::RegistrationToken,
-    Output,
-)>
-where
-    S: 'static,
-    F: FnMut(DrmEvent, &mut Option<smithay::backend::drm::DrmEventMetadata>, &mut S) + 'static,
-{
-    // seatd brokers the DRM fd (it holds master; we never SET_MASTER).
-    // O_CLOEXEC|O_NONBLOCK|O_RDWR matches the anvil udev pattern.
-    let owned_fd = session
-        .open(path, OFlags::RDWR | OFlags::CLOEXEC | OFlags::NONBLOCK)
-        .map_err(|e| io::Error::other(format!("libseat session.open({}): {e}", path.display())))?;
-    let device_fd = DrmDeviceFd::new(DeviceFd::from(owned_fd));
-    build_drm_pipeline(
-        device_fd,
-        MasterAcquisition::FromSeatd,
-        loop_handle,
-        drm_event_handler,
-        wallpaper_config,
-    )
-}
-
-/// Set up the full DRM/GBM/EGL/GLES/DrmCompositor stack by opening the
-/// DRM device at `path` **directly** (no libseat brokerage) and
-/// issuing `DRM_IOCTL_SET_MASTER` ourselves. The Phase B boot-from-
-/// initrd deployment path: in initramfs there is no seatd to broker
-/// the fd and no other DRM consumer to contend with, so halmasuit
-/// owns master direct for its process lifetime. drm-master-probe
-/// Phase 1+2 validated that the master designation survives both
-/// `setresuid` and `switch_root` via `SurviveFinalKillSignal=yes`.
-///
-/// Same returned shape as [`setup_drm_backend`]; the caller registers
-/// the smithay `Output` global from its concrete-state context.
 ///
 /// # Errors
 ///
@@ -331,55 +290,29 @@ where
     use std::os::fd::OwnedFd;
     use std::os::unix::fs::OpenOptionsExt;
     // O_RDWR | O_NONBLOCK. O_CLOEXEC is set by std's OpenOptions by
-    // default since Rust 1.20; explicit O_NONBLOCK matches the libseat
-    // path's flags.
+    // default since Rust 1.20.
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
-        .map_err(|e| {
-            io::Error::other(format!("open {} (direct, no libseat): {e}", path.display()))
-        })?;
+        .map_err(|e| io::Error::other(format!("open {}: {e}", path.display())))?;
     let owned_fd: OwnedFd = file.into();
     let device_fd = DrmDeviceFd::new(DeviceFd::from(owned_fd));
-    build_drm_pipeline(
-        device_fd,
-        MasterAcquisition::Direct,
-        loop_handle,
-        drm_event_handler,
-        wallpaper_config,
-    )
-}
-
-/// Whether the DRM fd was opened with master already held by another
-/// process (libseat / seatd brokered case) or whether we must issue
-/// `DRM_IOCTL_SET_MASTER` ourselves (the direct-open Phase B case).
-#[derive(Clone, Copy)]
-enum MasterAcquisition {
-    /// libseat/seatd is the master; halmasuit holds a brokered fd
-    /// without master designation. NEVER call `acquire_master_lock`
-    /// in this mode — it would race seatd.
-    FromSeatd,
-    /// halmasuit opened `/dev/dri/card0` directly and must issue
-    /// `SET_MASTER` to become master. Used in the Phase B
-    /// boot-from-initrd deployment, where no seatd exists.
-    Direct,
+    build_drm_pipeline(device_fd, loop_handle, drm_event_handler, wallpaper_config)
 }
 
 // reason: a single linear DRM→GBM→EGL→GLES→DrmCompositor→calloop
-// init sequence shared by `setup_drm_backend` and `setup_drm_direct`.
-// The ordering is load-bearing (master before GBM, EGL before GLES,
-// surface before compositor); splitting it into more helpers scatters
-// that ordering across the module for no readability or testability
-// gain.
+// init sequence used by `setup_drm_direct`. The ordering is
+// load-bearing (master before GBM, EGL before GLES, surface before
+// compositor); splitting it into more helpers scatters that ordering
+// across the module for no readability or testability gain.
 #[allow(
     clippy::too_many_lines,
     reason = "linear hardware-init sequence; ordering is load-bearing"
 )]
 fn build_drm_pipeline<S, F>(
     device_fd: DrmDeviceFd,
-    master: MasterAcquisition,
     loop_handle: &smithay::reexports::calloop::LoopHandle<'static, S>,
     drm_event_handler: F,
     wallpaper_config: Option<WallpaperConfig>,
@@ -397,15 +330,13 @@ where
     let (mut drm, notifier) = DrmDevice::new(device_fd.clone(), true)
         .map_err(|e| io::Error::other(format!("DrmDevice::new: {e}")))?;
 
-    // SET_MASTER for the direct-open path. drm-rs's
-    // `ControlDevice::acquire_master_lock` issues `DRM_IOCTL_SET_MASTER`;
-    // idempotent on an fd that already has master (the libseat path
-    // skips it on principle to avoid racing seatd, not because it
-    // would fail).
-    if matches!(master, MasterAcquisition::Direct) {
-        drm.acquire_master_lock()
-            .map_err(|e| io::Error::other(format!("DRM SET_MASTER (direct): {e}")))?;
-    }
+    // SET_MASTER. drm-rs's `ControlDevice::acquire_master_lock` issues
+    // `DRM_IOCTL_SET_MASTER`; idempotent on an fd that already has
+    // master (which it should, courtesy of the kernel's "first opener
+    // wins" rule — but call this explicitly so the master designation
+    // is recorded against this fd before we touch CRTCs).
+    drm.acquire_master_lock()
+        .map_err(|e| io::Error::other(format!("DRM SET_MASTER: {e}")))?;
 
     // Pick connector + mode + CRTC. Same shape as the B.1 slice; the
     // resource-handle enumeration goes through drm-rs (re-exposed via

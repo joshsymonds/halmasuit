@@ -514,13 +514,15 @@ in
     # requests the name; shipping it unconditionally keeps the module
     # single-codepath. `services.dbus.enable` is required because the
     # minimal VM-test images don't bring the system bus up otherwise.
-    # seatd: the root device broker libseat connects to. halmasuit
-    # acquires its DRM (and, layer E2, libinput) fds through a
-    # LibSeatSession instead of self-issuing SET_MASTER — the
-    # privilege posture validated by drm-master-probe Phase 4 (seatd
-    # owns master; halmasuit never does). Required for ALL halmasuit
-    # deployments now, not just a test.
-    services.seatd.enable = true;
+    # Epic #47 R2.3: seatd is NOT enabled. halmasuit is a system
+    # compositor that owns DRM master + input device fds for its
+    # entire process lifetime; it opens /dev/dri/card0 and
+    # /dev/input/event* directly via setup_drm_direct +
+    # setup_libinput_direct while still root, then privilege-drops.
+    # No libseat / no seatd anywhere in the runtime closure —
+    # collapsing the standing-root-daemon survival surface that
+    # would otherwise have to be carried across the rootfs→
+    # shutdownRamfs pivot.
 
     services.dbus.enable = true;
     services.dbus.packages = [
@@ -548,11 +550,6 @@ in
     systemd.services.halmasuit = {
       description = "halmasuit — Linux system compositor";
       wantedBy    = [ "multi-user.target" ];
-      # seatd must be up before halmasuit so `LibSeatSession::new()`
-      # can reach the seatd socket while halmasuit is still root
-      # (pre-privilege-drop). `requires` so a seatd failure fails
-      # halmasuit loudly rather than silently losing the GPU.
-      #
       # `halmasuit-session.socket` ordered before us so the broker's
       # SOCK_SEQPACKET listening socket is bound (PID 1 owns it) by the
       # time the compositor relays its first greeter auth to it (Epic
@@ -570,23 +567,21 @@ in
         "sysinit.target"
         "basic.target"
         "local-fs.target"
-        "seatd.service"
         "halmasuit-session.socket"
       ];
-      # `Wants` rather than `Requires` for all dependencies: required
-      # at boot for halmasuit to function (LibSeatSession::new fails
-      # without seatd; some sysinit paths are mandatory), but
-      # `Requires` causes systemd to cascade-stop halmasuit when any
-      # of these units stops during shutdown, defeating the survive-
-      # the-pivot architecture. Boot ordering is enforced by `After=`
-      # (above); if a dependency fails to start, halmasuit's own
-      # initialization fails for cause, not via a propagation cascade.
-      # `Before=shutdown.target` is explicit so the start ordering is
-      # preserved (we still want halmasuit started before shutdown.target
-      # is considered reachable), but with `DefaultDependencies=false`
-      # there is no implicit `Conflicts=shutdown.target` so reaching
-      # shutdown.target doesn't trigger halmasuit's stop.
-      wants       = [ "sysinit.target" "seatd.service" ];
+      # `Wants` rather than `Requires`: required at boot for halmasuit
+      # to function (some sysinit paths are mandatory), but `Requires`
+      # causes systemd to cascade-stop halmasuit when sysinit.target
+      # stops during shutdown, defeating the survive-the-pivot
+      # architecture. Boot ordering is enforced by `After=` (above);
+      # if sysinit fails, halmasuit's own initialization fails for
+      # cause, not via a propagation cascade. `Before=shutdown.target`
+      # is explicit so the start ordering is preserved (we still want
+      # halmasuit started before shutdown.target is considered
+      # reachable), but with `DefaultDependencies=false` there is no
+      # implicit `Conflicts=shutdown.target` so reaching shutdown.target
+      # doesn't trigger halmasuit's stop.
+      wants       = [ "sysinit.target" ];
       before      = [ "shutdown.target" ];
 
       unitConfig = {
@@ -728,10 +723,6 @@ in
         # (dri_gbm.so) still loads from the dlopen search path. The
         # libglvnd dispatch also looks here for vendor JSON.
         LD_LIBRARY_PATH = "/run/opengl-driver/lib";
-        # Force libseat's seatd backend. halmasuit runs as a system
-        # service with no logind session, so libseat's autodetect
-        # (logind → seatd → builtin) is ambiguous; pin it.
-        LIBSEAT_BACKEND = "seatd";
         # R8b-render — xcursor theme + size for halmasuit's visible
         # cursor render path. Propagated through the broker
         # session-leader env allowlist so the child compositor
@@ -1005,8 +996,10 @@ in
            services.halmasuit.fromInitrd.enable and
            services.halmasuit.enable cannot both be true. They are
            mutually exclusive deployment shapes:
-             - enable = true       → rootfs-only, libseat-brokered DRM
+             - enable = true       → rootfs-only, direct DRM
              - fromInitrd.enable   → boot-from-initrd, direct DRM
+           (R2.3: both shapes are direct-DRM / direct-input — no
+            libseat / no seatd anywhere in the runtime closure.)
          '';
        }
        {
@@ -1032,10 +1025,10 @@ in
      # indirection in initramfs).
      hardware.graphics.enable = true;
 
-     # halmasuit needs seatd in rootfs too (post-pivot, when the broker
-     # session-leader child connects to negotiate device acquisition).
-     # Same shape as the rootfs `enable` deployment.
-     services.seatd.enable = true;
+     # Epic #47 R2.3: seatd is NOT enabled — halmasuit opens DRM +
+     # input devices directly via setup_drm_direct +
+     # setup_libinput_direct, no libseat brokerage anywhere in the
+     # runtime closure.
 
      # System bus + halmasuit ownership policy for the post-pivot
      # rootfs dbus-broker. halmasuit-debug's `Snapshot()` D-Bus thread

@@ -176,7 +176,6 @@ pkgs.testers.runNixOSTest {
 
     machine.start()
     machine.wait_for_unit("multi-user.target")
-    machine.wait_for_unit("seatd.service")
     machine.wait_for_unit("halmasuit.service")
 
     machine.wait_until_succeeds(

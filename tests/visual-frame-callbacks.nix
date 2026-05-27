@@ -142,7 +142,6 @@ pkgs.testers.runNixOSTest {
 
     machine.start()
     machine.wait_for_unit("multi-user.target")
-    machine.wait_for_unit("seatd.service")
     machine.wait_for_unit("halmasuit.service")
 
     # halmasuit has reached steady scanout and spawned niri as its

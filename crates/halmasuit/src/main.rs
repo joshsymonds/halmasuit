@@ -69,9 +69,7 @@ use smithay::backend::input::{
     Event as InputEventTrait, InputEvent, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
     PointerMotionEvent,
 };
-use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::session::Session;
-use smithay::backend::session::libseat::{LibSeatSession, LibSeatSessionNotifier};
+use smithay::backend::libinput::LibinputInputBackend;
 use smithay::desktop::layer_map_for_output;
 use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::keyboard::FilterResult;
@@ -310,34 +308,15 @@ struct HalmasuitState {
     /// `Session`. Gates keyboard focus (greeter layer vs session
     /// toplevel) so focus follows the lifecycle, not connection order.
     foreground: halmasuit_introspect::Foreground,
-    /// The libseat session brokering halmasuit's DRM (and, in E2, the
-    /// libinput) device fds. Retained for the process lifetime: if it
-    /// drops, seatd tears the session down and the brokered fds are
-    /// revoked. `None` only on the SKIP (no-DRM/dev) path. Epic
-    /// layer E; survival across the privilege drop validated by
-    /// drm-master-probe Phase 4.
-    libseat_session: Option<LibSeatSession>,
-    /// Epic #47 R2.2: holds the LibSeatSessionNotifier alive without
-    /// registering it as a calloop source. The notifier owns the
-    /// strong `Rc<Internal>` that LibSeatSession's `Weak` references —
-    /// dropping the notifier turns the session into `Error::SessionLost`
-    /// for every operation. So we keep it on state to keep the Rc
-    /// alive, but never feed it to calloop, because
-    /// `LibSeatSessionNotifier::process_events`
-    /// (smithay-0.7.0/src/backend/session/libseat.rs:215) unwraps the
-    /// inner `seat.dispatch(0)` result, which panics with `Errno 107
-    /// "Transport endpoint not connected"` the moment seatd's socket
-    /// goes away — either during the systemd-shutdown kill spree, or
-    /// any time seatd's own process exits ahead of halmasuit. The
-    /// panic is caught by `run_loop_iteration`, but the source stays
-    /// perpetually ready, producing a tight panic-recover loop that
-    /// starves the shutdown-liveness timer. halmasuit currently has
-    /// no VT-switching support, so the activate/pause events the
-    /// notifier would surface are unused.
-    libseat_notifier_held: Option<LibSeatSessionNotifier>,
-    /// `graceful_shutdown` removes the libinput source so the calloop
-    /// loop stops dispatching against the input fds after the
-    /// wallpaper-only tear-down has run.
+    /// Registration token for the libinput calloop source. halmasuit
+    /// opens `/dev/input/event*` directly (no libseat brokerage; R2.3)
+    /// while still root via `setup_libinput_direct`; libinput holds
+    /// the OwnedFds across the subsequent privilege drop. `None` on
+    /// the SKIP (no-DRM/dev) path and on the initramfs-pre-pivot path
+    /// (the post-pivot `setup_post_pivot_input` populates it once
+    /// `/dev/input/event*` is available on the rootfs). The token is
+    /// removed by `graceful_shutdown` so the calloop loop stops
+    /// dispatching against the input subsystem during shutdown.
     libinput_token: Option<RegistrationToken>,
 
     // ── greetd I/O ──────────────────────────────────────────────────────
@@ -394,7 +373,7 @@ struct HalmasuitState {
     greetd_listener_token: Option<RegistrationToken>,
 
     /// The GLES + GBM + DrmCompositor stack. Constructed in `main()`
-    /// while still root via [`drm::setup_drm_backend`]; the underlying
+    /// while still root via [`drm::setup_drm_direct`]; the underlying
     /// DRM fd's master designation survives the subsequent `setresuid`
     /// to the compositor user (drm-master-probe Phase 1).
     ///
@@ -2326,27 +2305,22 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
         }
     }
 
-    // libinput / libseat — post-pivot wiring for input device fds.
-    // The Phase B initramfs phase deliberately skips libseat (no seatd
-    // pre-pivot — see the `in_initramfs` branch in `main`); DRM is
-    // direct-opened with SET_MASTER instead. seatd comes up post-pivot
-    // as a rootfs unit, and from this point libinput can broker the
-    // keyboard / pointer / touch fds through it. Without this branch
-    // the wl_seat capabilities advertise but never carry events —
-    // halmasuit ignores host keystrokes / pointer motion entirely and
-    // any Wayland greeter ends up unfocusable.
-    //
-    // The DRM side stays direct-opened from initramfs; libseat brokers
-    // ONLY the input subsystem here. drm-master-probe Phase 4
-    // validated that a libseat session survives the subsequent
-    // setresuid in `drop_privileges` below.
+    // libinput — post-pivot input wiring. The Phase B initramfs phase
+    // deliberately starts with no libinput (no `/dev/input/event*` on
+    // devtmpfs is interesting pre-pivot — only halmasuit-luks needs
+    // input, and it handles its own raw VT). Post-pivot, the rootfs
+    // is mounted and `/dev/input/event*` is populated; we enumerate
+    // them directly via `setup_libinput_direct` (R2.3: no libseat / no
+    // seatd anywhere in the runtime closure). halmasuit is still root
+    // at this point — `drop_privileges` runs further down — so the
+    // direct opens succeed.
     //
     // Errors are degraded-state recoverable (same posture as
-    // setup_greetd_listener / spawn_greeter above): if seatd is
-    // unreachable or udev_assign_seat fails, log + continue without
+    // setup_greetd_listener / spawn_greeter above): if /dev/input is
+    // missing or libinput rejects every device, log + continue without
     // input. The visible surface still composites; only interactive
     // greeters lose input.
-    if state.libseat_session.is_none() {
+    if state.libinput_token.is_none() {
         step_errors.extend(setup_post_pivot_input(state));
     }
 
@@ -2487,85 +2461,136 @@ fn apply_chroot_to_root_fd(root_fd: &std::os::fd::OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Post-pivot libseat + libinput attach (Phase B fromInitrd path only).
+/// Post-pivot libinput attach (Phase B fromInitrd path only).
 ///
-/// The Phase B initramfs phase deliberately skips libseat — no seatd
-/// pre-pivot, DRM is direct-opened with SET_MASTER. seatd comes up
-/// post-pivot as a rootfs unit, after which libinput can broker the
-/// keyboard / pointer / touch fds through it. Without this branch the
-/// `wl_seat` capabilities advertise but never carry events; halmasuit
-/// ignores host keystrokes and any Wayland greeter is unfocusable.
-///
-/// DRM stays direct-opened from initramfs; libseat brokers ONLY the
-/// input subsystem here. drm-master-probe Phase 4 validated that the
-/// libseat session survives the subsequent `setresuid` in
-/// `drop_privileges`.
+/// The Phase B initramfs phase deliberately starts with no libinput
+/// — there's no input subsystem available until the rootfs is up
+/// (`/dev/input/event*` lives on devtmpfs, which the kernel mounts
+/// before the rootfs is selected, but no input is needed pre-pivot
+/// because halmasuit-luks is the only thing reading password input
+/// and it handles its own raw VT). Post-pivot, we enumerate input
+/// devices via the same direct-open path the rootfs deployment uses
+/// — see `setup_libinput_direct`. No libseat, no seatd, no brokerage:
+/// the running compositor is still root at this point (privilege drop
+/// happens later in `run_post_pivot_setup`'s sequence).
 ///
 /// Each step is degraded-state recoverable (same posture as
-/// setup_greetd_listener / spawn_greeter in `run_post_pivot_setup`):
+/// `setup_greetd_listener` / `spawn_greeter` in `run_post_pivot_setup`):
 /// errors are returned as strings for the caller's `step_errors`
 /// aggregate; the function never panics or returns Err.
 fn setup_post_pivot_input(state: &mut HalmasuitState) -> Vec<String> {
     let mut errs: Vec<String> = Vec::new();
-    // "Fail loud" marker: LibSeatSession::new ultimately calls
-    // libseat_open_seat → poll(-1) (unbounded; no upstream timeout),
-    // and the smithay types LibSeatSession + LibSeatSessionNotifier
-    // are !Send (hold an Rc), so we can't wrap the call on a watchdog
-    // thread without invasive smithay changes. The practical failure
-    // mode is "seatd not running" → connect EAGAIN → fast Err; the
-    // pathological "seatd accepted but never replies" hang shows up
-    // as halmasuit silently stuck inside this function. Emit a
-    // before/after pair so a missing "post-pivot: LibSeatSession::new
-    // returned" line in the journal pinpoints the hang to seatd
-    // rather than to compositor logic.
-    tracing::info!("post-pivot: calling LibSeatSession::new (blocks until seatd responds)");
-    let (session, libseat_notifier) = match LibSeatSession::new() {
-        Ok(pair) => pair,
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "post-pivot: LibSeatSession::new failed (is seatd reachable?)"
-            );
-            errs.push(format!("post-pivot LibSeatSession::new: {e}"));
-            return errs;
-        }
-    };
-    tracing::info!(seat = %session.seat(), "post-pivot: LibSeatSession::new returned");
-    // R2.2: capture the notifier on state without registering it as
-    // a calloop source. See `HalmasuitState::libseat_notifier_held`
-    // for the panic-loop reasoning and for why we can't drop it
-    // outright.
-    state.libseat_notifier_held = Some(libseat_notifier);
-    match attach_libinput(&state.loop_handle, &session) {
+    match setup_libinput_direct(&state.loop_handle) {
         Ok(token) => {
             state.libinput_token = Some(token);
-            tracing::info!(seat = %session.seat(), "post-pivot: libinput backend attached");
+            tracing::info!("post-pivot: libinput backend attached (direct, no libseat)");
         }
         Err(e) => {
-            tracing::error!(error = %e, "post-pivot: attach_libinput failed");
-            errs.push(format!("post-pivot attach_libinput: {e}"));
+            tracing::error!(error = %e, "post-pivot: setup_libinput_direct failed");
+            errs.push(format!("post-pivot setup_libinput_direct: {e}"));
         }
     }
-    state.libseat_session = Some(session);
     errs
 }
 
-/// Build a libinput backend brokered through `session`, attach it to
-/// the calloop, and dispatch events to `HalmasuitState::dispatch_libinput`.
-/// Used by both the rootfs deployment (in `main`) and the Phase B
-/// post-pivot path (in `setup_post_pivot_input`); both walk the same
-/// four-stage sequence (Libinput::new_with_udev → udev_assign_seat →
-/// LibinputInputBackend::new → loop_handle.insert_source).
-fn attach_libinput(
+/// Direct-open `LibinputInterface` impl: no libseat / seatd brokerage.
+///
+/// `setup_libinput_direct` calls into this while halmasuit is still
+/// root, so the O_RDWR opens against `/dev/input/event*` succeed against
+/// the kernel's uaccess-tagged ACL the same way they would for any other
+/// root opener. libinput stashes the resulting OwnedFds; after
+/// `drop_privileges` the compositor runs as the compositor user, but the
+/// fds remain valid — Linux checks file permissions at `open(2)`, not
+/// at subsequent `read(2)` / `write(2)`.
+struct DirectInputInterface;
+impl smithay::reexports::input::LibinputInterface for DirectInputInterface {
+    fn open_restricted(
+        &mut self,
+        path: &std::path::Path,
+        flags: i32,
+    ) -> Result<std::os::fd::OwnedFd, i32> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let accmode = flags & libc::O_ACCMODE;
+        std::fs::OpenOptions::new()
+            .custom_flags(flags)
+            .read(accmode == libc::O_RDONLY || accmode == libc::O_RDWR)
+            .write(accmode == libc::O_WRONLY || accmode == libc::O_RDWR)
+            .open(path)
+            .map(std::os::fd::OwnedFd::from)
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
+    }
+    fn close_restricted(&mut self, fd: std::os::fd::OwnedFd) {
+        drop(fd);
+    }
+}
+
+/// Build a libinput backend that opens `/dev/input/event*` devices
+/// directly (no libseat / seatd brokerage), attach it to the calloop,
+/// and dispatch events to `HalmasuitState::dispatch_libinput`.
+///
+/// halmasuit is a system compositor and enumerates input devices once
+/// at startup — no udev-monitor-driven hotplug. Newly-plugged USB
+/// devices won't be picked up without a compositor restart (intentional;
+/// matches the "system compositor enumerated at boot" framing). The
+/// trade for that loss is removing seatd from the runtime closure
+/// entirely, which collapses the rootfs→shutdownRamfs pivot survival
+/// surface (R2.3): no standing root daemon to keep alive across the
+/// pivot, no smithay `LibSeatSessionNotifier` panic vector when seatd
+/// dies mid-shutdown.
+///
+/// Each `/dev/input/eventN` open happens via `DirectInputInterface`
+/// while halmasuit is still root. libinput retains the OwnedFds;
+/// subsequent reads work after `drop_privileges` because the kernel
+/// checks file permissions at `open()`, not on later I/O.
+fn setup_libinput_direct(
     loop_handle: &LoopHandle<'static, HalmasuitState>,
-    session: &LibSeatSession,
 ) -> io::Result<RegistrationToken> {
-    let mut libinput = smithay::reexports::input::Libinput::new_with_udev(
-        LibinputSessionInterface::from(session.clone()),
+    let mut libinput = smithay::reexports::input::Libinput::new_from_path(DirectInputInterface);
+    let entries = match std::fs::read_dir("/dev/input") {
+        Ok(it) => it,
+        Err(e) => {
+            // Test / SKIP-DRM environments may have no /dev/input. Log
+            // and proceed with a libinput context that has no devices;
+            // the calloop source still drives correctly (it just never
+            // produces events).
+            tracing::warn!(
+                error = %e,
+                "/dev/input: read_dir failed; no input devices will be enumerated"
+            );
+            return loop_handle
+                .insert_source(
+                    LibinputInputBackend::new(libinput),
+                    |event, (), state: &mut HalmasuitState| state.dispatch_libinput(event),
+                )
+                .map_err(|e| io::Error::other(format!("insert libinput backend: {e}")));
+        }
+    };
+    let mut device_count = 0u32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("event") {
+            continue;
+        }
+        let Some(path_str) = path.to_str() else {
+            continue;
+        };
+        // `path_add_device` calls back into `DirectInputInterface::
+        // open_restricted`. `None` means libinput rejected the device
+        // (e.g., kernel reported no input-class capability). Log +
+        // skip; not fatal.
+        if libinput.path_add_device(path_str).is_none() {
+            tracing::debug!(path = %path.display(), "libinput.path_add_device refused");
+            continue;
+        }
+        device_count += 1;
+    }
+    tracing::info!(
+        device_count,
+        "libinput direct: enumerated /dev/input/event* devices"
     );
-    libinput
-        .udev_assign_seat(&session.seat())
-        .map_err(|()| io::Error::other(format!("libinput udev_assign_seat({})", session.seat())))?;
     loop_handle
         .insert_source(
             LibinputInputBackend::new(libinput),
@@ -2967,13 +2992,13 @@ fn graceful_shutdown(state: &mut HalmasuitState, reason: ShutdownReason) {
         tracing::warn!(error = %e, "graceful_shutdown: render_layer_elements failed");
     }
 
-    // R2.2: remove the libinput source from the calloop loop.
-    // halmasuit doesn't need libinput post-shutdown (no input
-    // routing to a dead session), and the inputs come from
-    // libseat-mediated fds that may go away when seatd exits.
-    // (The libseat notifier is deliberately NEVER registered with
-    // calloop — see the field doc on `libseat_notifier_held` for
-    // the panic-loop reasoning.)
+    // R2.2 / R2.3: remove the libinput source from the calloop loop.
+    // halmasuit doesn't need libinput post-shutdown (no input routing
+    // to a dying session). With R2.3's direct-open libinput
+    // (`setup_libinput_direct`), the device fds are owned by the
+    // libinput context — removing the calloop source stops dispatch;
+    // dropping the source's owner drops the libinput context, which
+    // closes the fds.
     if let Some(tok) = state.libinput_token.take() {
         state.loop_handle.remove(tok);
     }
@@ -3569,102 +3594,61 @@ fn main() -> io::Result<()> {
         EventLoop::try_new().map_err(io::Error::other)?;
     let loop_handle = event_loop.handle();
 
-    // Build the DRM backend if a device path was resolved. Three paths:
+    // Build the DRM backend if a device path was resolved. Two paths
+    // (R2.3 collapsed the prior three into two by removing the libseat-
+    // brokered branch):
     //
-    // 1. `Some(path)` + `in_initramfs`: open `/dev/dri/card0` directly
-    //    and issue SET_MASTER ourselves (no libseat, no libinput).
-    //    drm-master-probe Phases 1+2 validated the survival semantics.
-    // 2. `Some(path)` + !`in_initramfs`: production rootfs deployment —
-    //    libseat brokers the DRM fd, seatd holds master, libinput
-    //    routes input through the same session.
-    // 3. `None`: the dev/test SKIP path — synthesized 1920x1080
+    // 1. `Some(path)`: open `/dev/dri/card0` directly and issue
+    //    `SET_MASTER` ourselves (no libseat, no seatd). Same for both
+    //    rootfs and initramfs deployments — halmasuit is a system
+    //    compositor and holds master for its entire lifetime. Probes
+    //    drm-master-probe-phase{1,2,4} validated that the master
+    //    designation survives both `setresuid` and `switch_root`. In
+    //    rootfs mode, libinput is enumerated here too via the direct-
+    //    open path; in initramfs mode, libinput attaches post-pivot
+    //    once `/dev/input/event*` is available on the rootfs.
+    // 2. `None`: the dev/test SKIP path — synthesized 1920x1080
     //    placeholder so wl_clients can still discover an output global.
-    let (drm_backend, drm_token, output, libseat_session, libseat_notifier_held, libinput_token) =
-        if let Some(path) = &drm_device_path {
-            if in_initramfs {
-                // Direct-DRM path (Phase B). No libseat (no seatd in the
-                // initramfs); no libinput (no input is needed before
-                // halmasuit-luks lands in a follow-up task).
-                let (backend, token, real_output) =
-                    drm::setup_drm_direct(path, &loop_handle, handle_drm_event, wallpaper_config)?;
-                real_output.create_global::<HalmasuitState>(&display_handle);
-                emit(&Event::PhaseEntered {
-                    phase: Phase::DrmMasterAcquired,
-                });
-                // Phase B / initramfs path: no libseat at all (no seatd
-                // pre-pivot). The post-pivot attach in
-                // `attach_libseat_libinput_post_pivot` fills in
-                // `libseat_notifier_held` + `libinput_token` once the
-                // rootfs is up.
-                (Some(backend), Some(token), real_output, None, None, None)
-            } else {
-                // Open the libseat session (seatd backend) while still
-                // root, BEFORE the privilege drop below. seatd brokers
-                // the DRM + input fds and owns DRM master; halmasuit
-                // never SET_MASTERs. drm-master-probe Phase 4 validated
-                // this session survives the subsequent setresuid.
-                let (mut session, libseat_notifier) = LibSeatSession::new().map_err(|e| {
-                    io::Error::other(format!("LibSeatSession::new (is seatd reachable?): {e}"))
-                })?;
-                // R2.2: capture the notifier on state without registering
-                // it as a calloop source. See the field doc on
-                // `HalmasuitState::libseat_notifier_held` for the panic-
-                // loop reasoning and for why we can't just drop it (the
-                // notifier owns the strong Rc that the session's Weak
-                // references — drop it and every session op returns
-                // `Error::SessionLost`).
-                let libseat_notifier_held = Some(libseat_notifier);
-                let (backend, token, real_output) = drm::setup_drm_backend(
-                    &mut session,
-                    path,
-                    &loop_handle,
-                    handle_drm_event,
-                    wallpaper_config,
-                )?;
-
-                // libinput, fed device fds through the SAME seatd session
-                // (validated surviving setresuid by drm-master-probe
-                // Phase 4). Events are routed to the keyboard-focused
-                // client. Same four-stage sequence as the Phase B post-pivot
-                // path; extracted to `attach_libinput`.
-                let libinput_tok = attach_libinput(&loop_handle, &session)?;
-
-                real_output.create_global::<HalmasuitState>(&display_handle);
-                emit(&Event::PhaseEntered {
-                    phase: Phase::DrmMasterAcquired,
-                });
-                (
-                    Some(backend),
-                    Some(token),
-                    real_output,
-                    Some(session),
-                    libseat_notifier_held,
-                    Some(libinput_tok),
-                )
-            }
+    let (drm_backend, drm_token, output, libinput_token) = if let Some(path) = &drm_device_path {
+        let (backend, token, real_output) =
+            drm::setup_drm_direct(path, &loop_handle, handle_drm_event, wallpaper_config)?;
+        real_output.create_global::<HalmasuitState>(&display_handle);
+        emit(&Event::PhaseEntered {
+            phase: Phase::DrmMasterAcquired,
+        });
+        // Rootfs deployment: enumerate input here. Initramfs deployment:
+        // `setup_post_pivot_input` runs the same `setup_libinput_direct`
+        // call post-pivot. Either way, no libseat: each `/dev/input/
+        // event*` is opened directly while halmasuit is still root.
+        let libinput_tok = if in_initramfs {
+            None
         } else {
-            // SKIP path: synthesized placeholder. Geometry is invented;
-            // the advertisement exists so clients can discover an output
-            // and proceed past their wl_registry phase.
-            let output_mode = Mode {
-                size: (1920, 1080).into(),
-                refresh: 60_000, // 60 Hz, in mHz per the wl_output spec
-            };
-            let synth = Output::new(
-                "output-0".to_owned(),
-                PhysicalProperties {
-                    size: (480, 270).into(), // mm; ~96 DPI assumption
-                    subpixel: Subpixel::Unknown,
-                    make: "halmasuit".to_owned(),
-                    model: "synthesized-1080p".to_owned(),
-                    serial_number: String::new(),
-                },
-            );
-            synth.create_global::<HalmasuitState>(&display_handle);
-            synth.change_current_state(Some(output_mode), None, None, Some((0, 0).into()));
-            synth.set_preferred(output_mode);
-            (None, None, synth, None, None, None)
+            Some(setup_libinput_direct(&loop_handle)?)
         };
+        (Some(backend), Some(token), real_output, libinput_tok)
+    } else {
+        // SKIP path: synthesized placeholder. Geometry is invented;
+        // the advertisement exists so clients can discover an output
+        // and proceed past their wl_registry phase.
+        let output_mode = Mode {
+            size: (1920, 1080).into(),
+            refresh: 60_000, // 60 Hz, in mHz per the wl_output spec
+        };
+        let synth = Output::new(
+            "output-0".to_owned(),
+            PhysicalProperties {
+                size: (480, 270).into(), // mm; ~96 DPI assumption
+                subpixel: Subpixel::Unknown,
+                make: "halmasuit".to_owned(),
+                model: "synthesized-1080p".to_owned(),
+                serial_number: String::new(),
+            },
+        );
+        synth.create_global::<HalmasuitState>(&display_handle);
+        synth.change_current_state(Some(output_mode), None, None, Some((0, 0).into()));
+        synth.set_preferred(output_mode);
+        (None, None, synth, None)
+    };
 
     // R10 (convergence): zwp_linux_dmabuf_v1 global. Mesa-EGL
     // clients prefer dmabuf over wl_shm — without this global they
@@ -4091,8 +4075,6 @@ fn main() -> io::Result<()> {
         foreground_toplevel: None,
         popups: PopupManager::default(),
         foreground: halmasuit_introspect::Foreground::Greeter,
-        libseat_session,
-        libseat_notifier_held,
         libinput_token,
         loop_handle: loop_handle.clone(),
         connections: HashMap::new(),
