@@ -166,6 +166,26 @@ impl WallpaperEngine {
         self.maybe_swap_fallback(renderer)
     }
 
+    /// Does the active backend want continuous renders driven by the
+    /// wallpaper-tick timer, regardless of whether [`Self::tick`]
+    /// requested a fallback swap?
+    ///
+    /// Static (image) backends return `false`: nothing per-frame
+    /// changes, so re-rendering the same texture every tick wastes
+    /// GLES draw calls without producing distinct frames. Animated
+    /// (shader, video) backends return `true`: their on-screen
+    /// content varies frame-to-frame, and the tick cadence is what
+    /// drives the animation.
+    ///
+    /// `false` when no backend is configured (`has_backend() ==
+    /// false`) — the SKIP-path test setup, the dev/no-DRM path.
+    #[must_use]
+    pub fn wants_continuous_render(&self) -> bool {
+        self.backend
+            .as_ref()
+            .is_some_and(|b| b.wants_continuous_render())
+    }
+
     /// Private swap entry point — exists so future epics (bus-event
     /// driven swap, runtime config reload) can plug in without
     /// reshaping the engine. Phase-A: never called; intentionally

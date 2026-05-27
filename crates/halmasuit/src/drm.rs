@@ -245,6 +245,17 @@ impl DrmBackend {
     pub fn tick_wallpaper(&mut self) -> bool {
         self.wallpaper.tick(&mut self.renderer)
     }
+
+    /// Whether the active wallpaper backend wants the wallpaper-tick
+    /// timer to drive renders continuously (independent of fallback
+    /// swap requests). Image backends return `false`; shader and
+    /// video return `true`. Read by the wallpaper-tick callback in
+    /// `main.rs` to decide whether to call `render_one_frame` on
+    /// every tick OR only when [`Self::tick_wallpaper`] returns true.
+    #[must_use]
+    pub fn wallpaper_wants_continuous(&self) -> bool {
+        self.wallpaper.wants_continuous_render()
+    }
 }
 
 /// Set up the full DRM/GBM/EGL/GLES/DrmCompositor stack by opening the

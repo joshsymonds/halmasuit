@@ -3760,9 +3760,18 @@ fn main() -> io::Result<()> {
     // wallpaper anchor emitted below.
     let wallpaper_config = wallpaper_config_from_env()?;
     let wallpaper_configured = wallpaper_config.is_some();
-    let wallpaper_is_video = matches!(
+    // Whether the configured wallpaper needs the periodic wallpaper-engine
+    // tick — true for any animated backend (shader, video). Image is
+    // static so the tick would be pure waste. This mirrors the runtime
+    // `WallpaperBackend::wants_continuous_render` decision, but at the
+    // config layer because the timer is registered BEFORE the backend
+    // is instantiated.
+    let wallpaper_needs_tick = matches!(
         wallpaper_config,
-        Some(crate::wallpaper::WallpaperConfig::Video { .. })
+        Some(
+            crate::wallpaper::WallpaperConfig::Video { .. }
+                | crate::wallpaper::WallpaperConfig::Shader { .. }
+        )
     );
 
     // Initialize the Wayland display + protocol state.
@@ -4387,59 +4396,74 @@ fn main() -> io::Result<()> {
     }
 
     // Wallpaper-engine background tick: a calloop timer at 100 ms
-    // drives [`DrmBackend::tick_wallpaper`], which delegates to
-    // [`WallpaperEngine::tick`]. Tick has two responsibilities:
+    // drives [`DrmBackend::tick_wallpaper`] AND
+    // [`DrmBackend::wallpaper_wants_continuous`]-gated renders for
+    // animated wallpaper backends (shader, video). Three
+    // responsibilities:
     // (1) call the active backend's
-    //     [`WallpaperBackend::poll_pending`] — only `VideoBackend`
-    //     does useful work, draining the decoder's IPC socket
-    //     independently of the render path; and
+    //     [`WallpaperBackend::poll_pending`] — `VideoBackend` drains
+    //     the decoder's IPC socket independently of the render path;
+    //     other backends no-op.
     // (2) check whether the active backend has requested a
     //     fallback swap (e.g. relay-dead after the restart budget
     //     exhausted) and execute it — load-bearing for VM-test
     //     Gate 6 / Epic #12 Req 10's "fallback after N forced
     //     crashes" criterion.
+    // (3) for `wants_continuous_render` backends, drive
+    //     `render_one_frame` every tick so animation advances even
+    //     when no Wayland client commits are firing repaints. THIS
+    //     IS LOAD-BEARING through shutdown — once niri exits during
+    //     `graceful_shutdown`, there are no client commits, and the
+    //     tick is the only path that keeps shader/video frames
+    //     advancing all the way to kernel halt (Epic #61 R3.1).
     //
-    // For image/shader/no-wallpaper configurations, registering
-    // the timer would wake the compositor 10× per second forever
-    // for a no-op — preventing deep-idle CPU states on battery-
-    // backed hardware. Gate the registration on the wallpaper
-    // type.
+    // For image/no-wallpaper configurations, registering the timer
+    // would wake the compositor 10× per second forever for a no-op
+    // — preventing deep-idle CPU states on battery-backed hardware.
+    // Gate the registration on `wallpaper_needs_tick`, which mirrors
+    // `WallpaperBackend::wants_continuous_render` at config-time.
     //
     // 100 ms is a deliberate compromise: low enough to bound
-    // crash-recovery latency below human-perceptible levels, high
-    // enough that an idle compositor stays mostly asleep. Frame-
-    // delivery latency for active playback is unaffected because
-    // render_element ALSO polls when the render path fires; the
-    // timer is the keepalive for periods when the render loop has
-    // stopped (wallpaper content stabilized → no new vblanks).
-    //
-    // When tick reports a fallback swap fired, the callback
-    // queues an explicit `render_one_frame` — otherwise the
-    // newly-installed fallback would sit in the engine without
-    // reaching the screen, because a dead relay produces no
-    // content → no vblank → no render path activation.
+    // crash-recovery latency below human-perceptible levels and to
+    // animate a shader at 10 fps (visible motion), high enough that
+    // an idle compositor stays mostly asleep when the wallpaper is
+    // static. Frame-delivery latency for active playback is
+    // unaffected because `render_element` ALSO polls when the render
+    // path fires; the timer is the keepalive for periods when the
+    // render loop has stopped (wallpaper content stabilized → no new
+    // vblanks).
     //
     // Wraps around forever via `TimeoutAction::ToDuration(period)`.
-    if wallpaper_is_video {
+    if wallpaper_needs_tick {
         let wallpaper_tick = calloop::timer::Timer::immediate();
         loop_handle
             .insert_source(
                 wallpaper_tick,
                 |_deadline, &mut (), state: &mut HalmasuitState| {
-                    // Run unconditionally — including while shutting_down
-                    // — so video and shader wallpaper backends keep
-                    // advancing through shutdown. Image wallpapers tick
-                    // a no-op and stay visually identical; shader/video
-                    // produce continuously different frames.
-                    if let Some(backend) = state.drm_backend.as_mut()
-                        && backend.tick_wallpaper()
-                        && let Err(e) =
-                            backend.render_one_frame(&state.output, HALMASUIT_BRAND_CLEAR)
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            "wallpaper-tick: render after fallback swap failed",
-                        );
+                    // Render every tick for backends that need continuous
+                    // animation (shader, video — `wants_continuous_render`
+                    // returns true), OR when `tick_wallpaper` returns
+                    // true to acknowledge a fallback swap. Static
+                    // backends (image) skip the render — the kernel keeps
+                    // scanning out the last-flipped framebuffer and
+                    // re-rendering the same texture every 100ms would
+                    // be wasted GLES work. Critically: continuous renders
+                    // fire even while `shutting_down` is true, so a
+                    // shader's `iTime` keeps advancing and a video's
+                    // decoder frames keep reaching the screen all the way
+                    // until the kernel halts the process.
+                    if let Some(backend) = state.drm_backend.as_mut() {
+                        let fallback_swapped = backend.tick_wallpaper();
+                        let needs_render = fallback_swapped || backend.wallpaper_wants_continuous();
+                        if needs_render
+                            && let Err(e) =
+                                backend.render_one_frame(&state.output, HALMASUIT_BRAND_CLEAR)
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                "wallpaper-tick: render failed",
+                            );
+                        }
                     }
                     calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(100))
                 },

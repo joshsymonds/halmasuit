@@ -80,4 +80,85 @@ pub trait WallpaperBackend: Send {
     fn requested_fallback(&self) -> Option<FallbackKind> {
         None
     }
+
+    /// Does this backend need the wallpaper-engine tick to keep
+    /// driving render calls regardless of whether [`Self::requested_fallback`]
+    /// has fired?
+    ///
+    /// Default `false` — suitable for static backends ([`super::ImageBackend`])
+    /// where the kernel keeps scanning out the last-flipped framebuffer
+    /// and no per-frame state advances.
+    ///
+    /// [`super::ShaderBackend`] and [`super::VideoBackend`] override this
+    /// to `true`: a shader's `iTime` uniform advances every
+    /// `render_element` call (so cadence == animation rate), and a video
+    /// backend's decoder produces frames asynchronously that the render
+    /// path must consume on every tick. Without this, the wallpaper-tick
+    /// timer in `main.rs` would only call `render_one_frame` when a
+    /// fallback swap fires, leaving shader/video frozen on the last
+    /// frame whenever no Wayland client commits drive `frame_pending`
+    /// — most visibly during the post-PrepareForShutdown window.
+    fn wants_continuous_render(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::backend::renderer::gles::GlesRenderer;
+    use smithay::utils::{Logical, Size};
+
+    /// Minimal backend that inherits every default. Verifies the
+    /// trait's default `wants_continuous_render` is `false` — the
+    /// behavior `ImageBackend` relies on without overriding.
+    struct DefaultBackend;
+    impl WallpaperBackend for DefaultBackend {
+        fn render_element(
+            &mut self,
+            _renderer: &mut GlesRenderer,
+            _output_size: Size<i32, Logical>,
+        ) -> io::Result<SceneElement> {
+            unreachable!("DefaultBackend is for trait-method tests only")
+        }
+    }
+
+    /// Backend that overrides `wants_continuous_render` to `true`.
+    /// Verifies the override path compiles and dispatches correctly —
+    /// the contract `ShaderBackend` and `VideoBackend` both rely on.
+    struct ContinuousBackend;
+    impl WallpaperBackend for ContinuousBackend {
+        fn render_element(
+            &mut self,
+            _renderer: &mut GlesRenderer,
+            _output_size: Size<i32, Logical>,
+        ) -> io::Result<SceneElement> {
+            unreachable!("ContinuousBackend is for trait-method tests only")
+        }
+        fn wants_continuous_render(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn wants_continuous_render_defaults_to_false() {
+        assert!(!DefaultBackend.wants_continuous_render());
+    }
+
+    #[test]
+    fn wants_continuous_render_can_be_overridden_to_true() {
+        assert!(ContinuousBackend.wants_continuous_render());
+    }
+
+    /// Dynamic dispatch through a `Box<dyn WallpaperBackend>` reaches
+    /// the override — this is what `WallpaperEngine` actually does
+    /// (it stores `Option<Box<dyn WallpaperBackend>>`). Guards against
+    /// a future regression where someone makes the method `Self`-bound.
+    #[test]
+    fn wants_continuous_render_dispatches_through_dyn_trait() {
+        let static_b: Box<dyn WallpaperBackend> = Box::new(DefaultBackend);
+        let continuous_b: Box<dyn WallpaperBackend> = Box::new(ContinuousBackend);
+        assert!(!static_b.wants_continuous_render());
+        assert!(continuous_b.wants_continuous_render());
+    }
 }

@@ -271,6 +271,18 @@ impl ShaderBackend {
 }
 
 impl WallpaperBackend for ShaderBackend {
+    /// Shader wallpapers need the wallpaper-engine tick to drive
+    /// renders unconditionally: every `render_element` call advances
+    /// `iTime` from `Instant::now()`, so the tick cadence IS the
+    /// shader's animation rate. Without this, the wallpaper-tick
+    /// timer in `main.rs` only fires `render_one_frame` when a
+    /// fallback swap is requested (which never happens for a stable
+    /// shader), so post-PrepareForShutdown the shader freezes on
+    /// whichever frame the last Wayland client commit produced.
+    fn wants_continuous_render(&self) -> bool {
+        true
+    }
+
     fn render_element(
         &mut self,
         _renderer: &mut GlesRenderer,

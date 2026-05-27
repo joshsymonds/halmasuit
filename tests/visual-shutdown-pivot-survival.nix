@@ -306,6 +306,23 @@ pkgs.testers.runNixOSTest {
     pivot_line = console.count("\n", 0, pivot_offset)
     print(f"PASS: located post-pivot marker at console line {pivot_line}")
 
+    # Wider window for the render-counter-advancing assertion: starts
+    # at `Reached target System Power Off` (systemd's last action
+    # before exec'ing into systemd-shutdown — graceful_shutdown has
+    # already run by this point) and extends to end of trace. This
+    # window typically spans ~700-900ms and captures multiple
+    # wallpaper-engine ticks, whereas the post-pivot slice is often
+    # too narrow (<100ms before kernel halt) for the 100ms tick
+    # cadence to register progression.
+    shutdown_start_re = re.compile(r"Reached target System Power Off", re.MULTILINE)
+    shutdown_start_match = shutdown_start_re.search(console)
+    if shutdown_start_match is None:
+        raise AssertionError(
+            "Could not locate `Reached target System Power Off` marker "
+            "for the shutdown-window frame-advancement assertion."
+        )
+    shutdown_window_start = shutdown_start_match.start()
+
     # ── Heartbeat-after-pivot assertion ────────────────────────────
     # halmasuit's always-on liveness timer writes
     # `halmasuit-shutdown-liveness pid=N frames=M` every
@@ -341,41 +358,50 @@ pkgs.testers.runNixOSTest {
         f"last frames={last_post.group(2)}"
     )
 
-    # ── Render-counter observation (informational, not a gate) ─────
+    # ── Render-counter-advancing assertion (hard gate) ─────────────
     # The `frames=N` field on the liveness line is halmasuit's
     # always-on render counter (DrmBackend::frame_counter), bumped on
-    # every successful `render_one_frame`. Tracking it across
-    # post-pivot liveness lines tells us whether the render path is
-    # actually advancing through shutdown — not just whether the
-    # calloop liveness timer is firing.
+    # every successful `render_one_frame`. Asserting it strictly
+    # increases ACROSS THE SHUTDOWN WINDOW proves the wallpaper-engine
+    # tick is actually advancing the render path through shutdown —
+    # not just that the calloop liveness timer is firing on an
+    # otherwise-idle loop.
     #
-    # NOT a gate in this test: with the current wallpaper-engine,
-    # post-PrepareForShutdown the engine's tick is too quiescent for
-    # the frame counter to keep advancing even with a shader backend
-    # (no Wayland client commits driving repaint, no
-    # foreground-toplevel dirty events, wallpaper-engine tick decides
-    # not to swap). Continuous-rendering through shutdown for
-    # image / shader / video is the next epic — see the R3 design
-    # task. Treat the print below as the CANARY that R3 will turn
-    # into a hard assertion per wallpaper type.
-    post_pivot_frames = [int(m.group(2)) for m in post_pivot_hbs]
-    if len(post_pivot_frames) >= 2:
-        first_frames, last_frames = post_pivot_frames[0], post_pivot_frames[-1]
-        delta = last_frames - first_frames
-        if delta > 0:
-            print(
-                f"OBSERVE: render counter advanced post-pivot from "
-                f"{first_frames} to {last_frames} (+{delta} frames "
-                f"across {len(post_pivot_frames)} liveness samples)"
-            )
-        else:
-            print(
-                f"OBSERVE: render counter did NOT advance post-pivot "
-                f"(stuck at {first_frames} across {len(post_pivot_frames)} "
-                f"samples) — wallpaper-engine ticker is quiescent in the "
-                f"shutdown window. Tracked by Epic #47 R3 for proper "
-                f"per-wallpaper-type continuous-rendering assertions."
-            )
+    # Why the wider window (System Power Off → end of trace, not just
+    # post-pivot): the wallpaper-tick fires at 100ms cadence, but the
+    # post-pivot slice is typically only ~30-100ms before kernel
+    # halt — too narrow to reliably capture multiple ticks. The
+    # broader window includes graceful_shutdown's wallpaper-only
+    # composite AND all the wallpaper-engine ticks between
+    # PrepareForShutdown and kernel halt, which is the actual
+    # invariant we care about: "halmasuit kept producing frames
+    # through the entire shutdown sequence."
+    shutdown_hbs = list(hb_re.finditer(console[shutdown_window_start:]))
+    shutdown_frames = [int(m.group(2)) for m in shutdown_hbs]
+    if len(shutdown_frames) < 2:
+        raise AssertionError(
+            f"Need at least 2 post-System-Power-Off liveness lines to "
+            f"assert frame progression; got {len(shutdown_frames)}. "
+            f"Either HALMASUIT_LIVENESS_INTERVAL_MS is too high or the "
+            f"shutdown window is too short."
+        )
+    first_frames, last_frames = shutdown_frames[0], shutdown_frames[-1]
+    delta = last_frames - first_frames
+    if delta <= 0:
+        raise AssertionError(
+            f"halmasuit's render counter did NOT advance across the "
+            f"shutdown window: first={first_frames}, last={last_frames}. "
+            f"The wallpaper-engine tick is not driving renders through "
+            f"shutdown — shader/video wallpaper would freeze. "
+            f"All shutdown-window frame counts: {shutdown_frames}"
+        )
+    print(
+        f"PASS: render counter advanced across shutdown window from "
+        f"{first_frames} to {last_frames} (+{delta} frames across "
+        f"{len(shutdown_frames)} liveness samples). The wallpaper-engine "
+        f"tick is driving renders through shutdown — shader/video "
+        f"wallpaper continues animating."
+    )
 
     # ── No-coredump assertion ──────────────────────────────────────
     coredump_re = re.compile(rf"coredump:\s+{halmasuit_pid}\(halmasuit\)")
