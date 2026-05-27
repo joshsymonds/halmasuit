@@ -145,7 +145,13 @@ pkgs.testers.runNixOSTest {
 
       systemd.tmpfiles.rules = [
         "d /run/halmasuit-niri 0700 alice alice -"
+        # /run/hsnap is where halmasuit's D-Bus `Snapshot()` method
+        # writes PNG captures; `visual.capture()` reads from there.
+        "d /run/hsnap 0777 root root -"
       ];
+      # Required so halmasuit (running as the compositor user after
+      # privilege drop) can write its Snapshot() PNGs under /run/hsnap.
+      systemd.services.halmasuit.serviceConfig.ReadWritePaths = [ "/run/hsnap" ];
       # R2.2: opt halmasuit into the always-on kmsg liveness timer.
       # Cadence 25 ms is well below the ~50 ms post-pivot window
       # systemd-shutdown leaves before kernel power-off, so the test
@@ -200,7 +206,15 @@ pkgs.testers.runNixOSTest {
     };
 
   testScript = ''
+    import os
     import re
+    import sys
+
+    sys.path.insert(0, "${./lib}")
+    os.environ["PATH"] = "${ssimulacra2-cli}/bin:" + os.environ.get("PATH", "")
+    os.environ.setdefault("GOLDENS_DIR", "${./goldens}")
+
+    import visual
 
     machine.start()
     machine.wait_for_unit("multi-user.target")
@@ -235,6 +249,19 @@ pkgs.testers.runNixOSTest {
         "systemctl show -p MainPID --value halmasuit.service"
     ).strip()
     print(f"PASS: halmasuit pid {halmasuit_pid} with niri session up")
+
+    # ── Pre-shutdown SSIMULACRA2 golden assertion ──────────────────
+    # Capture the current composited frame via D-Bus Snapshot() and
+    # compare to the committed golden. Proves the image wallpaper is
+    # what's on screen right before halmasuit enters shutdown — i.e.
+    # what the user sees as the system begins to power off.
+    #
+    # For image wallpapers, this golden is stable across boot timing
+    # (no animation drift); SSIMULACRA2 threshold is the default 90
+    # (perceptual match). For the corresponding goldens, see
+    # `tests/goldens/shutdown-image-session.png`.
+    visual.assert_matches_golden(machine, "shutdown-image-session")
+    print("PASS: pre-shutdown SSIMULACRA2 golden — image wallpaper visible")
 
     # ── Trigger full system shutdown ────────────────────────────────
     # `machine.shutdown()` issues `systemctl poweroff` over the
