@@ -558,8 +558,60 @@ in
       # time the compositor relays its first greeter auth to it (Epic
       # #1 R3). NOT `requires`: the broker is socket-activated and
       # idle-exits — only the socket need exist, not a running service.
-      after       = [ "local-fs.target" "seatd.service" "halmasuit-session.socket" ];
-      requires    = [ "seatd.service" ];
+      #
+      # `DefaultDependencies = false` (in unitConfig below) suppresses
+      # the implicit `Conflicts=shutdown.target` + `Before=shutdown.target`
+      # + `After=sysinit.target` + `After=basic.target` injection — we
+      # WANT halmasuit to survive the shutdown sequence, but we still
+      # need the sysinit / basic ordering, so they're re-added here
+      # explicitly. `Before=shutdown.target` ordering is also explicit
+      # so that systemd-shutdown runs AFTER halmasuit has been started.
+      after       = [
+        "sysinit.target"
+        "basic.target"
+        "local-fs.target"
+        "seatd.service"
+        "halmasuit-session.socket"
+      ];
+      # `Wants` rather than `Requires` for all dependencies: required
+      # at boot for halmasuit to function (LibSeatSession::new fails
+      # without seatd; some sysinit paths are mandatory), but
+      # `Requires` causes systemd to cascade-stop halmasuit when any
+      # of these units stops during shutdown, defeating the survive-
+      # the-pivot architecture. Boot ordering is enforced by `After=`
+      # (above); if a dependency fails to start, halmasuit's own
+      # initialization fails for cause, not via a propagation cascade.
+      # `Before=shutdown.target` is explicit so the start ordering is
+      # preserved (we still want halmasuit started before shutdown.target
+      # is considered reachable), but with `DefaultDependencies=false`
+      # there is no implicit `Conflicts=shutdown.target` so reaching
+      # shutdown.target doesn't trigger halmasuit's stop.
+      wants       = [ "sysinit.target" "seatd.service" ];
+      before      = [ "shutdown.target" ];
+
+      unitConfig = {
+        # Epic #47 R2.2: halmasuit MUST survive systemd-shutdown's
+        # final kill spree so it can keep painting the wallpaper
+        # plane through the rootfs→shutdownRamfs pivot until the
+        # kernel halts.
+        #
+        # `DefaultDependencies=false` suppresses the implicit
+        # `Conflicts=shutdown.target` + `Before=shutdown.target`
+        # pair systemd would otherwise inject; without it systemd
+        # stops halmasuit during the normal shutdown unit-stop
+        # sequence, the unit enters 'failed' state, and when
+        # systemd-shutdown's broad kill spree fires the
+        # `SurviveFinalKillSignal=yes` exemption no longer applies
+        # to the unit's PID (it's no longer "active"). With
+        # DefaultDependencies=false halmasuit stays active through
+        # the entire shutdown sequence; the only kill attempt is
+        # systemd-shutdown's final SIGTERM/SIGKILL, which
+        # SurviveFinalKillSignal=yes blocks. Same pattern the
+        # halmasuit-shutdown-probe-phase{0,1,2} units use; same
+        # pattern is load-bearing for the production binary.
+        DefaultDependencies   = false;
+        SurviveFinalKillSignal = "yes";
+      };
 
       serviceConfig = {
         Type           = "simple";
@@ -569,9 +621,38 @@ in
         # to recover from.
         Restart        = "on-failure";
         RestartSec     = "1s";
-        # Capture stderr only; halmasuit emits its NDJSON event stream
-        # there. stdout stays silent for now.
-        StandardOutput = "null";
+        # Epic #47 R2.2: `KillMode=process` confines `systemctl stop
+        # halmasuit.service` (dev workflow) to signaling halmasuit's
+        # main PID only, leaving any child trees alone. Paired with
+        # `DefaultDependencies=false` in unitConfig (which removes the
+        # implicit shutdown.target conflict), this unit no longer
+        # participates in systemd's unit-stop phase during system
+        # shutdown — the only kill attempt halmasuit sees during
+        # shutdown is systemd-shutdown's broad SIGTERM/SIGKILL kill
+        # spree, which `SurviveFinalKillSignal=yes` blocks. The
+        # SIGTERM IS forwarded to halmasuit at that point (the kill
+        # spree sends SIGTERM first, then SIGKILL; SurviveFinalKillSignal
+        # only suppresses the SIGKILL), triggering
+        # `graceful_shutdown` and the wallpaper-only post-shutdown
+        # paint loop right before the rootfs→shutdownRamfs pivot.
+        KillMode       = "process";
+        # halmasuit emits its NDJSON event stream on stderr via
+        # tracing-subscriber; stdout is reserved for the R2.2 shutdown-
+        # liveness writes (one line per 250ms while the wallpaper-only
+        # post-shutdown loop is running). Routing stdout to
+        # `kmsg+console` is the trick that lets those lines survive
+        # the rootfs→shutdownRamfs pivot: systemd opens fd 1 against
+        # /dev/kmsg pre-exec, so the compositor (which has
+        # `ProtectKernelLogs=true` and could not open /dev/kmsg
+        # itself) writes through the inherited fd. The /dev/kmsg
+        # character device is kernel-owned and survives the rootfs
+        # unmount, so post-pivot writes still land on the kernel ring
+        # buffer + serial console — the only observable channel
+        # available to the pivot-survival VM test. `+console` mirrors
+        # the line to /dev/console so the test can read it from the
+        # serial log without going through journald (which dies
+        # before the pivot).
+        StandardOutput = "kmsg";
         StandardError  = "journal";
         # RuntimeDirectory creates /run/halmasuit/ with the unit's UID.
         # Unit starts as root, so /run/halmasuit is owned root:<Group=>;
@@ -760,6 +841,21 @@ in
      security.pam.services = lib.mkIf cfg.installPamConfig {
        ${cfg.pamService} = {};
      };
+
+     # Epic #47 R2.2: ship halmasuit (+ its transitive closure: Mesa,
+     # libgbm, libglvnd, libdrm, glibc, ld-linux, …) into the shutdown
+     # initramfs. systemd-shutdown pivots into /run/initramfs at the
+     # tail of the shutdown sequence; processes that survive via
+     # `SurviveFinalKillSignal=yes` continue running with the same
+     # PID + fds, but their mmap'd executable + libraries must be
+     # backed by the shutdownRamfs tmpfs — otherwise the rootfs
+     # unmount that follows pulls them out from under the running
+     # process. halmasuit-shutdown-probe-phase{1,2} validated this
+     # is sufficient (with `SurviveFinalKillSignal=yes`) for the
+     # process + its DRM master to survive the pivot. nix-store
+     # closure resolution via storePaths picks up the transitive
+     # deps automatically.
+     systemd.shutdownRamfs.storePaths = [ "${cfg.package}/bin/halmasuit" ];
 
      systemd.sockets."halmasuit-session" = {
        description = "halmasuit-session privileged PAM-lifecycle broker socket";
@@ -1072,7 +1168,12 @@ in
          ];
          ExecStart      = lib.getExe cfg.package;
          Restart        = "no";
-         StandardOutput = "journal";
+         # kmsg+console for the same R2.2 shutdown-liveness reason as
+         # the rootfs unit (see the long comment in the `enable`
+         # branch above): halmasuit writes a liveness line every
+         # 250ms to stdout while shutting_down=true; routing through
+         # /dev/kmsg lets those lines outlive the rootfs unmount.
+         StandardOutput = "kmsg";
          StandardError  = "journal";
          # Cross-pivot per-process-root divergence: at switch_root
          # halmasuit's process-root diverges from rootfs systemd's

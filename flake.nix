@@ -985,6 +985,24 @@
           halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Epic #47 R2.2 hard gate: production halmasuit survives the
+        # rootfs→shutdownRamfs pivot under an actual `systemctl
+        # poweroff`. Pivot survival was probe-validated in
+        # halmasuit-shutdown-probe-phase{1,2}; this test exercises
+        # the production binary (with the broker-launched greeter,
+        # the real DRM backend, the SurviveFinalKillSignal unit
+        # directive, and the systemd.shutdownRamfs.storePaths
+        # wiring) and asserts the same PID emits liveness lines
+        # AFTER the post-pivot `shutdown[1]:` marker.
+        visual-shutdown-pivot-survival = import ./tests/visual-shutdown-pivot-survival.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # R13 forcing function (the reason this epic exists): the
         # real DMS DankGreeter (Quickshell/Qt6 + greeter-niri) as
         # halmasuit's greeter. Scaffolded at epic #2 close (8925ca5);

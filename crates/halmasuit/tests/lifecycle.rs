@@ -8,9 +8,15 @@
 //! The tracing-subscriber JSON formatter wraps each emit() call in its own
 //! envelope (timestamp, level, target, fields). Our inner JSON sits in
 //! `fields.json` as a string. These helpers parse both layers.
+//!
+//! Epic #47 R2.2 contract: SIGTERM emits `Event::Shutdown` and runs the
+//! graceful tear-down, but halmasuit KEEPS RUNNING — it does NOT exit.
+//! Survival through kernel halt is what carries the wallpaper plane
+//! through systemd-shutdown's rootfs→shutdownRamfs pivot. These tests
+//! therefore observe the event then SIGKILL to clean up the child.
 
 use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,8 +26,6 @@ use nix::unistd::Pid;
 use tempfile::TempDir;
 
 const TIMEOUT_EVENT: Duration = Duration::from_secs(3);
-const TIMEOUT_EXIT: Duration = Duration::from_secs(5);
-const EXIT_POLL: Duration = Duration::from_millis(10);
 
 /// Spawn the halmasuit binary with stderr piped, and a background thread
 /// shuttling stderr lines into a channel. Returns the child handle plus the
@@ -102,18 +106,35 @@ fn send_signal(child: &Child, sig: Signal) {
     signal::kill(Pid::from_raw(pid), sig).expect("kill(2) failed");
 }
 
-fn wait_for_exit(mut child: Child) -> ExitStatus {
-    let deadline = Instant::now() + TIMEOUT_EXIT;
-    loop {
-        match child.try_wait().expect("try_wait failed") {
-            Some(status) => return status,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("halmasuit did not exit within {TIMEOUT_EXIT:?}");
-            }
-            None => thread::sleep(EXIT_POLL),
-        }
+/// Epic #47 R2.2 contract: halmasuit's main loop never exits on its
+/// own — survival through systemd-shutdown's kill spree is what
+/// preserves the wallpaper plane across the rootfs→shutdownRamfs
+/// pivot. Tests that observe a `Shutdown` event must SIGKILL the
+/// child to terminate it, never wait on a clean exit.
+fn kill_and_reap(mut child: Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Assert that the child is STILL running a brief moment after a
+/// SIGTERM. The R2.2 contract is that SIGTERM emits the Shutdown
+/// event and runs the wallpaper-only tear-down but does NOT exit
+/// the main loop. A zero exit at this point would mean halmasuit
+/// regressed back to the R2.1 contract and the wallpaper would
+/// black out during the pivot.
+fn assert_still_running(child: &mut Child) {
+    // 50ms is enough for graceful_shutdown to have unwound from
+    // the signal handler — the calloop dispatch returns
+    // immediately after — but well under any plausible exit window
+    // if the contract were broken.
+    thread::sleep(Duration::from_millis(50));
+    match child.try_wait().expect("try_wait failed") {
+        None => {} // still running — correct
+        Some(status) => panic!(
+            "halmasuit exited ({status:?}) after SIGTERM — R2.2 contract \
+             requires the process to keep painting wallpaper until \
+             external SIGKILL / kernel halt"
+        ),
     }
 }
 
@@ -174,12 +195,12 @@ fn emits_started_init_then_wayland_ready_within_one_second() {
     );
 
     send_signal(&child, Signal::SIGTERM);
-    let _ = wait_for_exit(child);
+    kill_and_reap(child);
 }
 
 #[test]
-fn sigterm_emits_shutdown_signal_term_and_exits_zero() {
-    let (child, rx, _runtime_dir) = spawn();
+fn sigterm_emits_shutdown_signal_term_and_keeps_running() {
+    let (mut child, rx, _runtime_dir) = spawn();
 
     // Drain startup events.
     let _ = next_event(&rx); // started
@@ -196,13 +217,13 @@ fn sigterm_emits_shutdown_signal_term_and_exits_zero() {
         "SIGTERM must map to signal_term: {shutdown}"
     );
 
-    let status = wait_for_exit(child);
-    assert!(status.success(), "expected clean exit, got {status:?}");
+    assert_still_running(&mut child);
+    kill_and_reap(child);
 }
 
 #[test]
-fn sigint_emits_shutdown_signal_int_and_exits_zero() {
-    let (child, rx, _runtime_dir) = spawn();
+fn sigint_emits_shutdown_signal_int_and_keeps_running() {
+    let (mut child, rx, _runtime_dir) = spawn();
 
     let _ = next_event(&rx); // started
     let _ = next_event(&rx); // phase_entered init
@@ -218,8 +239,8 @@ fn sigint_emits_shutdown_signal_int_and_exits_zero() {
         "SIGINT must map to signal_int: {shutdown}"
     );
 
-    let status = wait_for_exit(child);
-    assert!(status.success(), "expected clean exit, got {status:?}");
+    assert_still_running(&mut child);
+    kill_and_reap(child);
 }
 
 #[test]
@@ -256,5 +277,5 @@ fn tracing_target_is_halmasuit_event() {
     );
 
     send_signal(&child, Signal::SIGTERM);
-    let _ = wait_for_exit(child);
+    kill_and_reap(child);
 }

@@ -71,7 +71,7 @@ use smithay::backend::input::{
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::session::Session;
-use smithay::backend::session::libseat::LibSeatSession;
+use smithay::backend::session::libseat::{LibSeatSession, LibSeatSessionNotifier};
 use smithay::desktop::layer_map_for_output;
 use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::keyboard::FilterResult;
@@ -107,15 +107,14 @@ const MAX_GREETD_CONNECTIONS: usize = 4;
 /// protocol adds its `*State` here as it lands.
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "running / frame_pending / shutdown_armed / \
+    reason = "frame_pending / shutdown_armed / shutting_down / \
               session_first_frame_emitted are semantically distinct \
-              lifecycle bits (main-loop run flag / per-tick render \
-              coalesce / shutdown gating / swap-gate key signaling). \
-              Folding them into a bitflag enum would obscure call-site \
-              intent without removing the per-flag cost."
+              lifecycle bits (per-tick render coalesce / shutdown-signal \
+              arming / post-shutdown render gating / swap-gate key \
+              signaling). Folding them into a bitflag enum would obscure \
+              call-site intent without removing the per-flag cost."
 )]
 struct HalmasuitState {
-    running: bool,
     display_handle: DisplayHandle,
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -318,6 +317,28 @@ struct HalmasuitState {
     /// layer E; survival across the privilege drop validated by
     /// drm-master-probe Phase 4.
     libseat_session: Option<LibSeatSession>,
+    /// Epic #47 R2.2: holds the LibSeatSessionNotifier alive without
+    /// registering it as a calloop source. The notifier owns the
+    /// strong `Rc<Internal>` that LibSeatSession's `Weak` references —
+    /// dropping the notifier turns the session into `Error::SessionLost`
+    /// for every operation. So we keep it on state to keep the Rc
+    /// alive, but never feed it to calloop, because
+    /// `LibSeatSessionNotifier::process_events`
+    /// (smithay-0.7.0/src/backend/session/libseat.rs:215) unwraps the
+    /// inner `seat.dispatch(0)` result, which panics with `Errno 107
+    /// "Transport endpoint not connected"` the moment seatd's socket
+    /// goes away — either during the systemd-shutdown kill spree, or
+    /// any time seatd's own process exits ahead of halmasuit. The
+    /// panic is caught by `run_loop_iteration`, but the source stays
+    /// perpetually ready, producing a tight panic-recover loop that
+    /// starves the shutdown-liveness timer. halmasuit currently has
+    /// no VT-switching support, so the activate/pause events the
+    /// notifier would surface are unused.
+    libseat_notifier_held: Option<LibSeatSessionNotifier>,
+    /// `graceful_shutdown` removes the libinput source so the calloop
+    /// loop stops dispatching against the input fds after the
+    /// wallpaper-only tear-down has run.
+    libinput_token: Option<RegistrationToken>,
 
     // ── greetd I/O ──────────────────────────────────────────────────────
     /// LoopHandle for inserting per-connection sources from inside
@@ -359,6 +380,15 @@ struct HalmasuitState {
     /// fromInitrd), the flag flips true at startup completion — there's
     /// no boot pivot to ignore.
     shutdown_armed: bool,
+    /// Epic #47 R2.2: set by `graceful_shutdown` after the wallpaper-
+    /// only recomposite. The render path observes this to keep the
+    /// wallpaper plane composited (no greeter, no session toplevel)
+    /// from now until the kernel halts the process. halmasuit's main
+    /// loop has no clean-exit termination — it keeps painting through
+    /// the rootfs→shutdownRamfs pivot via SurviveFinalKillSignal +
+    /// the shutdownRamfs storePaths wiring (probe-validated by
+    /// halmasuit-shutdown-probe-phase{0,1,2}).
+    shutting_down: bool,
     /// Held so the registered listener token survives for the lifetime
     /// of the compositor; calloop drops the source on shutdown.
     greetd_listener_token: Option<RegistrationToken>,
@@ -1081,6 +1111,13 @@ impl HalmasuitState {
     /// The foreground toplevel is composited above the layer
     /// background by `render_layer_elements`.
     fn repaint(&mut self) {
+        // R2.2: post-SIGTERM the last wallpaper frame is what the
+        // kernel keeps scanning out. Skip the render call to avoid
+        // touching the GPU stack while systemd-shutdown tears
+        // adjacent subsystems down.
+        if self.shutting_down {
+            return;
+        }
         let fg_surface = self
             .foreground_toplevel
             .as_ref()
@@ -2494,20 +2531,20 @@ fn setup_post_pivot_input(state: &mut HalmasuitState) -> Vec<String> {
         }
     };
     tracing::info!(seat = %session.seat(), "post-pivot: LibSeatSession::new returned");
-    if let Err(e) = state.loop_handle.insert_source(
-        libseat_notifier,
-        |event, (), _state: &mut HalmasuitState| {
-            tracing::info!(?event, "libseat session event (post-pivot)");
-        },
-    ) {
-        tracing::error!(error = %e, "post-pivot: insert libseat notifier failed");
-        errs.push(format!("insert libseat notifier: {e}"));
-    }
-    if let Err(e) = attach_libinput(&state.loop_handle, &session) {
-        tracing::error!(error = %e, "post-pivot: attach_libinput failed");
-        errs.push(format!("post-pivot attach_libinput: {e}"));
-    } else {
-        tracing::info!(seat = %session.seat(), "post-pivot: libinput backend attached");
+    // R2.2: capture the notifier on state without registering it as
+    // a calloop source. See `HalmasuitState::libseat_notifier_held`
+    // for the panic-loop reasoning and for why we can't drop it
+    // outright.
+    state.libseat_notifier_held = Some(libseat_notifier);
+    match attach_libinput(&state.loop_handle, &session) {
+        Ok(token) => {
+            state.libinput_token = Some(token);
+            tracing::info!(seat = %session.seat(), "post-pivot: libinput backend attached");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "post-pivot: attach_libinput failed");
+            errs.push(format!("post-pivot attach_libinput: {e}"));
+        }
     }
     state.libseat_session = Some(session);
     errs
@@ -2522,7 +2559,7 @@ fn setup_post_pivot_input(state: &mut HalmasuitState) -> Vec<String> {
 fn attach_libinput(
     loop_handle: &LoopHandle<'static, HalmasuitState>,
     session: &LibSeatSession,
-) -> io::Result<()> {
+) -> io::Result<RegistrationToken> {
     let mut libinput = smithay::reexports::input::Libinput::new_with_udev(
         LibinputSessionInterface::from(session.clone()),
     );
@@ -2534,7 +2571,6 @@ fn attach_libinput(
             LibinputInputBackend::new(libinput),
             |event, (), state: &mut HalmasuitState| state.dispatch_libinput(event),
         )
-        .map(|_token| ())
         .map_err(|e| io::Error::other(format!("insert libinput backend: {e}")))
 }
 
@@ -2883,19 +2919,25 @@ fn classify_reaped_child(
     }
 }
 
-/// Epic #47 R2.1: graceful shutdown. SIGKILL the greeter (if alive),
-/// composite wallpaper-only (no greeter, no session toplevel), emit
-/// `Event::Shutdown`, set `state.running = false` so the main loop
-/// exits on the next dispatch.
+/// Epic #47 R2 graceful shutdown.
 ///
-/// The wallpaper plane is composited from frame 0 by the existing
-/// `render_layer_elements` path; setting `state.greeter = None` and
-/// `state.foreground_toplevel = None` means the next render has no
-/// non-wallpaper elements, so the screen is wallpaper-only from this
-/// point until process exit. R2.2 will extend this so the wallpaper
-/// keeps painting THROUGH the rootfs→shutdownRamfs pivot until the
-/// kernel halts; for now the wallpaper holds until systemd-shutdown
-/// SIGKILLs halmasuit (the partial-scope alternative).
+/// SIGKILL the greeter (if alive), composite wallpaper-only (no
+/// greeter, no session toplevel), emit `Event::Shutdown`. The main
+/// loop KEEPS RUNNING — halmasuit stays alive painting the wallpaper
+/// through systemd-shutdown's kill spree and through the rootfs→
+/// shutdownRamfs pivot, until the kernel halts the process. This is
+/// the production form of what halmasuit-shutdown-probe-phase{0,1,2}
+/// empirically validated; the `SurviveFinalKillSignal=yes` unit
+/// directive + the binary's presence in `systemd.shutdownRamfs.
+/// storePaths` are what let the same PID + same DRM master survive
+/// the pivot.
+///
+/// The render path observes `state.shutting_down` to suppress any
+/// greeter/session input (R2.2); the wallpaper plane is composited
+/// from frame 0 by the existing `render_layer_elements` path; setting
+/// `state.greeter = None` and `state.foreground_toplevel = None`
+/// means the next render has no non-wallpaper elements, so the
+/// screen is wallpaper-only from this point until kernel halt.
 fn graceful_shutdown(state: &mut HalmasuitState, reason: ShutdownReason) {
     if let Some(g) = state.greeter.take() {
         let pid = g.pid;
@@ -2925,8 +2967,52 @@ fn graceful_shutdown(state: &mut HalmasuitState, reason: ShutdownReason) {
         tracing::warn!(error = %e, "graceful_shutdown: render_layer_elements failed");
     }
 
+    // R2.2: remove the libinput source from the calloop loop.
+    // halmasuit doesn't need libinput post-shutdown (no input
+    // routing to a dead session), and the inputs come from
+    // libseat-mediated fds that may go away when seatd exits.
+    // (The libseat notifier is deliberately NEVER registered with
+    // calloop — see the field doc on `libseat_notifier_held` for
+    // the panic-loop reasoning.)
+    if let Some(tok) = state.libinput_token.take() {
+        state.loop_handle.remove(tok);
+    }
+
     emit(&Event::Shutdown { reason });
-    state.running = false;
+    state.shutting_down = true;
+
+    // R2.2 liveness signal: write one kmsg line on entry so that
+    // tests which deliver SIGTERM directly (visual-shutdown-tear-down
+    // sends `kill -TERM`, not the SurviveFinalKillSignal-blocked
+    // shutdown spree) can observe the transition immediately. The
+    // periodic liveness cadence is driven by the always-on
+    // `HALMASUIT_LIVENESS_INTERVAL_MS` timer registered at startup —
+    // that one fires regardless of whether the SIGTERM signal handler
+    // ran, which is what's needed under SurviveFinalKillSignal=yes
+    // where SIGTERM is never delivered.
+    let pid = std::process::id();
+    write_kmsg(&format!("halmasuit-shutdown-liveness pid={pid} init"));
+}
+
+/// Best-effort write of a liveness line. The shutdown-liveness timer
+/// hits this every 250ms while halmasuit is in the post-SIGTERM
+/// wallpaper-only mode. The NixOS module pins halmasuit's stdout to
+/// `StandardOutput=journal+kmsg`, so systemd opens fd 1 against
+/// /dev/kmsg pre-exec (bypassing the compositor's `ProtectKernelLogs`
+/// seccomp filter, which only blocks the compositor from opening it
+/// itself). The inherited fd is a character-device handle owned by
+/// the kernel, so writes survive the rootfs→shutdownRamfs pivot —
+/// post-pivot lines still land on the kernel ring buffer + serial
+/// console, where the pivot-survival VM test reads them back.
+fn write_kmsg(line: &str) {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    if let Err(e) = writeln!(stdout, "{line}") {
+        tracing::warn!(error = %e, "write_kmsg: writeln failed");
+    }
+    if let Err(e) = stdout.flush() {
+        tracing::warn!(error = %e, "write_kmsg: flush failed");
+    }
 }
 
 /// Reap zombie children (coalesced SIGCHLD: one signal may cover
@@ -3274,6 +3360,19 @@ fn handle_drm_event(
     _meta: &mut Option<smithay::backend::drm::DrmEventMetadata>,
     state: &mut HalmasuitState,
 ) {
+    // Epic #47 R2.2: once `graceful_shutdown` has run, halmasuit is in
+    // the wallpaper-only paint-until-halt state. The last frame is
+    // already scanned out and the kernel keeps refreshing it from the
+    // bound framebuffer (probe phase 2 validated this). Skipping all
+    // per-VBlank ioctls + per-surface presentation-feedback + layer-
+    // map walks avoids interacting with any of the subsystems
+    // systemd-shutdown is concurrently dismantling (libseat, dbus,
+    // greeter/session client trees), which is where the post-SIGTERM
+    // unwrap panics that broke an earlier iteration of the
+    // pivot-survival test originated.
+    if state.shutting_down {
+        return;
+    }
     match event {
         smithay::backend::drm::DrmEvent::VBlank(_crtc) => {
             // R5 (convergence epic): release dead popups before any
@@ -3480,83 +3579,92 @@ fn main() -> io::Result<()> {
     //    routes input through the same session.
     // 3. `None`: the dev/test SKIP path — synthesized 1920x1080
     //    placeholder so wl_clients can still discover an output global.
-    let (drm_backend, drm_token, output, libseat_session) = if let Some(path) = &drm_device_path {
-        if in_initramfs {
-            // Direct-DRM path (Phase B). No libseat (no seatd in the
-            // initramfs); no libinput (no input is needed before
-            // halmasuit-luks lands in a follow-up task).
-            let (backend, token, real_output) =
-                drm::setup_drm_direct(path, &loop_handle, handle_drm_event, wallpaper_config)?;
-            real_output.create_global::<HalmasuitState>(&display_handle);
-            emit(&Event::PhaseEntered {
-                phase: Phase::DrmMasterAcquired,
-            });
-            (Some(backend), Some(token), real_output, None)
-        } else {
-            // Open the libseat session (seatd backend) while still
-            // root, BEFORE the privilege drop below. seatd brokers
-            // the DRM + input fds and owns DRM master; halmasuit
-            // never SET_MASTERs. drm-master-probe Phase 4 validated
-            // this session survives the subsequent setresuid.
-            let (mut session, libseat_notifier) = LibSeatSession::new().map_err(|e| {
-                io::Error::other(format!("LibSeatSession::new (is seatd reachable?): {e}"))
-            })?;
-            // Service libseat session (activate/pause) events. v1
-            // in-VM: no VT switching (epic out-of-scope) — log only,
-            // but the source MUST be registered so libseat's event
-            // fd is drained.
-            loop_handle
-                .insert_source(
-                    libseat_notifier,
-                    |event, (), _state: &mut HalmasuitState| {
-                        tracing::info!(?event, "libseat session event");
-                    },
+    let (drm_backend, drm_token, output, libseat_session, libseat_notifier_held, libinput_token) =
+        if let Some(path) = &drm_device_path {
+            if in_initramfs {
+                // Direct-DRM path (Phase B). No libseat (no seatd in the
+                // initramfs); no libinput (no input is needed before
+                // halmasuit-luks lands in a follow-up task).
+                let (backend, token, real_output) =
+                    drm::setup_drm_direct(path, &loop_handle, handle_drm_event, wallpaper_config)?;
+                real_output.create_global::<HalmasuitState>(&display_handle);
+                emit(&Event::PhaseEntered {
+                    phase: Phase::DrmMasterAcquired,
+                });
+                // Phase B / initramfs path: no libseat at all (no seatd
+                // pre-pivot). The post-pivot attach in
+                // `attach_libseat_libinput_post_pivot` fills in
+                // `libseat_notifier_held` + `libinput_token` once the
+                // rootfs is up.
+                (Some(backend), Some(token), real_output, None, None, None)
+            } else {
+                // Open the libseat session (seatd backend) while still
+                // root, BEFORE the privilege drop below. seatd brokers
+                // the DRM + input fds and owns DRM master; halmasuit
+                // never SET_MASTERs. drm-master-probe Phase 4 validated
+                // this session survives the subsequent setresuid.
+                let (mut session, libseat_notifier) = LibSeatSession::new().map_err(|e| {
+                    io::Error::other(format!("LibSeatSession::new (is seatd reachable?): {e}"))
+                })?;
+                // R2.2: capture the notifier on state without registering
+                // it as a calloop source. See the field doc on
+                // `HalmasuitState::libseat_notifier_held` for the panic-
+                // loop reasoning and for why we can't just drop it (the
+                // notifier owns the strong Rc that the session's Weak
+                // references — drop it and every session op returns
+                // `Error::SessionLost`).
+                let libseat_notifier_held = Some(libseat_notifier);
+                let (backend, token, real_output) = drm::setup_drm_backend(
+                    &mut session,
+                    path,
+                    &loop_handle,
+                    handle_drm_event,
+                    wallpaper_config,
+                )?;
+
+                // libinput, fed device fds through the SAME seatd session
+                // (validated surviving setresuid by drm-master-probe
+                // Phase 4). Events are routed to the keyboard-focused
+                // client. Same four-stage sequence as the Phase B post-pivot
+                // path; extracted to `attach_libinput`.
+                let libinput_tok = attach_libinput(&loop_handle, &session)?;
+
+                real_output.create_global::<HalmasuitState>(&display_handle);
+                emit(&Event::PhaseEntered {
+                    phase: Phase::DrmMasterAcquired,
+                });
+                (
+                    Some(backend),
+                    Some(token),
+                    real_output,
+                    Some(session),
+                    libseat_notifier_held,
+                    Some(libinput_tok),
                 )
-                .map_err(|e| io::Error::other(format!("insert libseat notifier: {e}")))?;
-            let (backend, token, real_output) = drm::setup_drm_backend(
-                &mut session,
-                path,
-                &loop_handle,
-                handle_drm_event,
-                wallpaper_config,
-            )?;
-
-            // libinput, fed device fds through the SAME seatd session
-            // (validated surviving setresuid by drm-master-probe
-            // Phase 4). Events are routed to the keyboard-focused
-            // client. Same four-stage sequence as the Phase B post-pivot
-            // path; extracted to `attach_libinput`.
-            attach_libinput(&loop_handle, &session)?;
-
-            real_output.create_global::<HalmasuitState>(&display_handle);
-            emit(&Event::PhaseEntered {
-                phase: Phase::DrmMasterAcquired,
-            });
-            (Some(backend), Some(token), real_output, Some(session))
-        }
-    } else {
-        // SKIP path: synthesized placeholder. Geometry is invented;
-        // the advertisement exists so clients can discover an output
-        // and proceed past their wl_registry phase.
-        let output_mode = Mode {
-            size: (1920, 1080).into(),
-            refresh: 60_000, // 60 Hz, in mHz per the wl_output spec
+            }
+        } else {
+            // SKIP path: synthesized placeholder. Geometry is invented;
+            // the advertisement exists so clients can discover an output
+            // and proceed past their wl_registry phase.
+            let output_mode = Mode {
+                size: (1920, 1080).into(),
+                refresh: 60_000, // 60 Hz, in mHz per the wl_output spec
+            };
+            let synth = Output::new(
+                "output-0".to_owned(),
+                PhysicalProperties {
+                    size: (480, 270).into(), // mm; ~96 DPI assumption
+                    subpixel: Subpixel::Unknown,
+                    make: "halmasuit".to_owned(),
+                    model: "synthesized-1080p".to_owned(),
+                    serial_number: String::new(),
+                },
+            );
+            synth.create_global::<HalmasuitState>(&display_handle);
+            synth.change_current_state(Some(output_mode), None, None, Some((0, 0).into()));
+            synth.set_preferred(output_mode);
+            (None, None, synth, None, None, None)
         };
-        let synth = Output::new(
-            "output-0".to_owned(),
-            PhysicalProperties {
-                size: (480, 270).into(), // mm; ~96 DPI assumption
-                subpixel: Subpixel::Unknown,
-                make: "halmasuit".to_owned(),
-                model: "synthesized-1080p".to_owned(),
-                serial_number: String::new(),
-            },
-        );
-        synth.create_global::<HalmasuitState>(&display_handle);
-        synth.change_current_state(Some(output_mode), None, None, Some((0, 0).into()));
-        synth.set_preferred(output_mode);
-        (None, None, synth, None)
-    };
 
     // R10 (convergence): zwp_linux_dmabuf_v1 global. Mesa-EGL
     // clients prefer dmabuf over wl_shm — without this global they
@@ -3844,6 +3952,44 @@ fn main() -> io::Result<()> {
         )
         .map_err(|e| io::Error::other(format!("insert popup-cleanup timer: {e}")))?;
 
+    // Epic #47 R2.2 liveness timer.
+    //
+    // systemd-shutdown's `SurviveFinalKillSignal=yes` semantics
+    // SUPPRESS the SIGTERM that would otherwise trigger
+    // `graceful_shutdown` — protected units never see it. Without
+    // that signal halmasuit can't infer "shutdown is happening" and
+    // can't switch into a faster liveness cadence, so we keep one
+    // always-running calloop timer that writes
+    // `halmasuit-shutdown-liveness pid=N` to stdout (routed to
+    // /dev/kmsg by `StandardOutput=kmsg`). The kmsg writes survive
+    // the rootfs→shutdownRamfs pivot because /dev/kmsg is a kernel-
+    // owned character device that doesn't go away with the rootfs
+    // unmount.
+    //
+    // The cadence is gated on the `HALMASUIT_LIVENESS_INTERVAL_MS`
+    // environment variable: unset (the production default), the
+    // timer is not registered at all and there is no kmsg noise.
+    // The VM pivot-survival test sets it to a small value (25 ms,
+    // well below the ~50 ms window between post-pivot pivot-marker
+    // and kernel power-off) so it can reliably observe at least one
+    // liveness line post-pivot.
+    if let Ok(interval_ms_str) = std::env::var("HALMASUIT_LIVENESS_INTERVAL_MS")
+        && let Ok(interval_ms) = interval_ms_str.parse::<u64>()
+        && interval_ms > 0
+    {
+        let interval = Duration::from_millis(interval_ms);
+        let pid = std::process::id();
+        loop_handle
+            .insert_source(
+                Timer::from_duration(interval),
+                move |_deadline, (), _state: &mut HalmasuitState| {
+                    write_kmsg(&format!("halmasuit-shutdown-liveness pid={pid}"));
+                    TimeoutAction::ToDuration(interval)
+                },
+            )
+            .map_err(|e| io::Error::other(format!("insert liveness timer: {e}")))?;
+    }
+
     // greetd socket setup. Production: NixOS module sets
     // HALMASUIT_GREETD_SOCKET to `/run/halmasuit/greetd.sock` and
     // HALMASUIT_GREETER_UID to the greeter system user's uid.
@@ -3908,7 +4054,6 @@ fn main() -> io::Result<()> {
     );
 
     let mut state = HalmasuitState {
-        running: true,
         display_handle,
         compositor_state,
         xdg_shell_state,
@@ -3947,6 +4092,8 @@ fn main() -> io::Result<()> {
         popups: PopupManager::default(),
         foreground: halmasuit_introspect::Foreground::Greeter,
         libseat_session,
+        libseat_notifier_held,
+        libinput_token,
         loop_handle: loop_handle.clone(),
         connections: HashMap::new(),
         next_conn_id: 0,
@@ -3959,6 +4106,7 @@ fn main() -> io::Result<()> {
         // this true on `Phase::RootfsReady` — before that, SIGTERM is
         // the boot kill spree and stays ignored.
         shutdown_armed: !in_initramfs,
+        shutting_down: false,
         greetd_listener_token,
         drm_backend,
         _drm_token: drm_token,
@@ -4064,7 +4212,11 @@ fn main() -> io::Result<()> {
             .insert_source(
                 wallpaper_tick,
                 |_deadline, &mut (), state: &mut HalmasuitState| {
-                    if let Some(backend) = state.drm_backend.as_mut()
+                    // R2.2: skip wallpaper-engine work once shutdown
+                    // tear-down has run; the last frame stays on screen
+                    // via the kernel-bound framebuffer.
+                    if !state.shutting_down
+                        && let Some(backend) = state.drm_backend.as_mut()
                         && backend.tick_wallpaper()
                         && let Err(e) =
                             backend.render_one_frame(&state.output, HALMASUIT_BRAND_CLEAR)
@@ -4307,8 +4459,16 @@ fn main() -> io::Result<()> {
     // by the calloop source above.
     // Consecutive failed-iteration counter for the R5 degrade-in-place
     // log rate-limiter; reset on the first clean iteration.
+    //
+    // Epic #47 R2.2: there is no clean-exit termination. halmasuit
+    // paints from initramfs handoff through kernel halt; the SIGTERM/
+    // SIGINT path runs `graceful_shutdown` (greeter killed, wallpaper-
+    // only recomposite, Event::Shutdown emitted) but the loop keeps
+    // dispatching so the wallpaper plane survives systemd-shutdown's
+    // rootfs→shutdownRamfs pivot. External SIGKILL or kernel halt is
+    // what stops the process.
     let mut consecutive_errors = 0u32;
-    while state.running {
+    loop {
         run_loop_iteration(&mut consecutive_errors, || {
             event_loop
                 .dispatch(Some(Duration::from_millis(16)), &mut state)
@@ -4327,11 +4487,6 @@ fn main() -> io::Result<()> {
             Ok(())
         });
     }
-
-    // Reached only via the deliberate Shutdown path (`state.running`
-    // cleared in the SIGTERM/SIGINT closure): a clean exit 0, which
-    // systemd's `Restart=on-failure` correctly does NOT restart.
-    Ok(())
 }
 
 #[cfg(test)]

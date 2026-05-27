@@ -156,6 +156,9 @@ test-vm:
     echo "── visual-shutdown-tear-down ──"
     nix build .#checks.x86_64-linux.visual-shutdown-tear-down -L --print-build-logs --no-link
     echo
+    echo "── visual-shutdown-pivot-survival ──"
+    nix build .#checks.x86_64-linux.visual-shutdown-pivot-survival -L --print-build-logs --no-link
+    echo
     # R13 forcing function: real DMS DankGreeter (Quickshell+Qt6) as
     # halmasuit's greeter over the wallpaper, no-flash invariant intact.
     echo "── visual-dankgreeter ──"
