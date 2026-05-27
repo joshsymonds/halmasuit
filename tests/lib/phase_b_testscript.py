@@ -29,6 +29,8 @@ The body assumes `import os`, `import sys`, `import time`, `import re`
 already happened in the cell shim.
 """
 
+import phash_progression
+
 
 def fg_events(machine, visual):
     return [
@@ -315,8 +317,14 @@ def run(machine, visual, *, cell_name, lukshape, no_flash_mode):
     # be identical). Shader and video cells assert it with thresholds
     # matched to their fixtures' boot-time animation characteristic.
     if "image" not in cell_name:
-        import phash_progression
-        events = visual.introspect_events(machine)
+        # Cache: video cells already captured `events` via the no-flash
+        # suffix path above (line 277). Reuse it instead of re-shelling
+        # to `journalctl -b -u halmasuit -o cat --no-pager` and reparsing
+        # the entire boot journal a second time.
+        if no_flash_mode != "strict" and "events" in locals():
+            pass  # `events` from the suffix branch is fresh enough
+        else:
+            events = visual.introspect_events(machine)
         if "shader" in cell_name:
             # The 60s-period sine shader has subtle frame-to-frame
             # change in the boot window; loose thresholds prove

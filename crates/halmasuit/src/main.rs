@@ -3765,14 +3765,12 @@ fn main() -> io::Result<()> {
     // static so the tick would be pure waste. This mirrors the runtime
     // `WallpaperBackend::wants_continuous_render` decision, but at the
     // config layer because the timer is registered BEFORE the backend
-    // is instantiated.
-    let wallpaper_needs_tick = matches!(
-        wallpaper_config,
-        Some(
-            crate::wallpaper::WallpaperConfig::Video { .. }
-                | crate::wallpaper::WallpaperConfig::Shader { .. }
-        )
-    );
+    // is instantiated. The agreement test in
+    // `wallpaper::config::tests::needs_tick_agrees_with_backend_runtime`
+    // pins these two views to stay in sync across future variant adds.
+    let wallpaper_needs_tick = wallpaper_config
+        .as_ref()
+        .is_some_and(crate::wallpaper::WallpaperConfig::needs_tick);
 
     // Initialize the Wayland display + protocol state.
     let display: Display<HalmasuitState> = Display::new().map_err(io::Error::other)?;
@@ -4440,27 +4438,26 @@ fn main() -> io::Result<()> {
             .insert_source(
                 wallpaper_tick,
                 |_deadline, &mut (), state: &mut HalmasuitState| {
-                    // Render every tick for backends that need continuous
-                    // animation (shader, video — `wants_continuous_render`
-                    // returns true), OR when `tick_wallpaper` returns
-                    // true to acknowledge a fallback swap. Static
-                    // backends (image) skip the render — the kernel keeps
-                    // scanning out the last-flipped framebuffer and
-                    // re-rendering the same texture every 100ms would
-                    // be wasted GLES work. Critically: continuous renders
-                    // fire even while `shutting_down` is true, so a
-                    // shader's `iTime` keeps advancing and a video's
-                    // decoder frames keep reaching the screen all the way
-                    // until the kernel halts the process.
+                    // `DrmBackend::tick_wallpaper` returns a
+                    // [`WallpaperTickAction`] encoding both the fallback-
+                    // swap state-machine step AND whether the backend
+                    // wants a per-tick render. Match on it and render if
+                    // the action is non-Idle (Render{Continuous,AndSwapped}).
+                    // Static backends (image) return `Idle` — the kernel
+                    // keeps scanning out the last-flipped framebuffer
+                    // and we don't waste GLES draw calls. Animated
+                    // backends (shader, video) return `RenderContinuous`
+                    // every tick — shader's `iTime` advances + video's
+                    // decoder frames reach the screen until kernel halt.
                     if let Some(backend) = state.drm_backend.as_mut() {
-                        let fallback_swapped = backend.tick_wallpaper();
-                        let needs_render = fallback_swapped || backend.wallpaper_wants_continuous();
-                        if needs_render
+                        let action = backend.tick_wallpaper();
+                        if action.wants_render()
                             && let Err(e) =
                                 backend.render_one_frame(&state.output, HALMASUIT_BRAND_CLEAR)
                         {
                             tracing::warn!(
                                 error = %e,
+                                ?action,
                                 "wallpaper-tick: render failed",
                             );
                         }

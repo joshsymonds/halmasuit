@@ -425,27 +425,7 @@ pkgs.testers.runNixOSTest {
     # because that would `journalctl` against a powered-off VM;
     # parse the same JSON envelopes out of the captured console
     # text instead. (Same shape, no machine handle required.)
-    import json as _json
-    all_events = []
-    for line in console.splitlines():
-        # Console framing strips ANSI but lines still wrap. Find the
-        # first JSON object on the line.
-        brace = line.find('{"timestamp"')
-        if brace < 0:
-            continue
-        try:
-            outer = _json.loads(line[brace:])
-        except ValueError:
-            continue
-        inner = outer.get("fields", {}).get("json")
-        if not inner:
-            continue
-        try:
-            ev = _json.loads(inner)
-        except ValueError:
-            continue
-        if isinstance(ev, dict) and "event" in ev:
-            all_events.append(ev)
+    all_events = phash_progression.events_from_console(console)
     # Video testsrc has high inter-frame visual variation but the
     # 8x8-average phash quantizes many similar frames into the same
     # hash bucket — empirically 5-6 distinct phashes across ~75

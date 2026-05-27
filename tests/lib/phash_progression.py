@@ -45,7 +45,52 @@ imports — it consumes the dict-shaped event stream
 canonical failure / success shapes.
 """
 
+import json
 from typing import Any, Callable, Optional
+
+
+def events_from_console(console: str) -> list[dict[str, Any]]:
+    """Parse halmasuit's introspection event stream from a captured
+    serial-console string.
+
+    Mirrors `visual.introspect_events(machine)` but consumes a
+    static `console` string rather than calling `journalctl` on a
+    live VM — required after `machine.shutdown()` returns, where
+    the VM is gone but the captured console log is still available
+    via `machine.get_console_log()`.
+
+    halmasuit emits `Event::FrameRendered` (and other events) via
+    tracing-subscriber's JSON formatter on stderr → journald →
+    /dev/console. The console line is roughly
+    `[time] halmasuit[pid]: {"timestamp":...,"fields":{"json":"<inner>"}}`;
+    this parser locates the outer JSON envelope, decodes it, and
+    decodes the inner `fields.json` payload which IS the Event.
+
+    Returns the same `list[dict]` shape as `visual.introspect_events`,
+    suitable for `assert_animating` and downstream filtering.
+    """
+    events: list[dict[str, Any]] = []
+    for line in console.splitlines():
+        # Find the outer envelope's `{"timestamp"` prefix; some
+        # console framing prepends ANSI/wrapping noise that the
+        # `json.loads` of the bare line would reject.
+        brace = line.find('{"timestamp"')
+        if brace < 0:
+            continue
+        try:
+            outer = json.loads(line[brace:])
+        except ValueError:
+            continue
+        inner = outer.get("fields", {}).get("json")
+        if not inner:
+            continue
+        try:
+            ev = json.loads(inner)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and "event" in ev:
+            events.append(ev)
+    return events
 
 
 def hamming_u64(a: int, b: int) -> int:

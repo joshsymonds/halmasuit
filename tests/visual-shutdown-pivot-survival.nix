@@ -1,21 +1,27 @@
-# tests/visual-shutdown-pivot-survival.nix — Epic #47 R2 hard gate.
+# tests/visual-shutdown-pivot-survival.nix — Epic #47 R2 hard gate
+# AND Epic #61 R3 shader-cell hard gate.
 #
-# Production halmasuit (NOT the shutdown probe) survives systemd's
-# unit-stop sequence under `systemctl poweroff` — its PID stays alive
-# past `Reached target System Power Off`, the last log line systemd
-# emits before exec'ing into systemd-shutdown. This is the part of
-# the survive-the-pivot architecture we currently land reliably end-
-# to-end. Tighter (post-pivot) liveness is what the shutdown probe
-# phases 1/2 demonstrate at the kernel-primitive level for a minimal
-# process; the production compositor reaches the same point as the
-# probe up to the kill-spree boundary but then dies (coredump
-# observed; SurviveFinalKillSignal exemption isn't holding for our
-# unit, root cause TBD) before the actual pivot. The architectural
-# cleanup landed in R2.3 (no libseat / no seatd) and R2.4
-# (PrepareForShutdown + `DrmDevice::pause`) made the System-Power-
-# Off-marker survival ROBUST and added the canonical shutdown
-# detection cue; the remaining post-kill-spree survival is a
-# diagnostic follow-up.
+# DUAL SCOPE — this file is both:
+#   (1) the canonical pivot-survival test (PID continuity across the
+#       rootfs→shutdownRamfs pivot, no coredump, liveness lines past
+#       the post-pivot marker), and
+#   (2) the shader cell of the wallpaper-shutdown-survival matrix
+#       (frame_counter advances across the shutdown window + phash
+#       progression proves the shader is animating, not frozen).
+#
+# Sibling matrix cells:
+#   visual-shutdown-image.nix — image wallpaper (SSIMULACRA2 golden,
+#       no animation assertions; image is static).
+#   visual-shutdown-video.nix — video wallpaper (same assertion
+#       shape as this file but with testsrc-tuned phash thresholds).
+#
+# Why the dual scope: in R3.1 we made the wallpaper-engine tick
+# drive renders continuously for animated backends. The existing
+# pivot-survival test already used a shader wallpaper, so it became
+# the natural home for the shader-cell animation assertions. A pure
+# rename to `visual-shutdown-shader.nix` would lose the historical
+# git blame trail; the docstring on this comment block + the
+# in-script section dividers make the dual scope discoverable.
 #
 # Sequence:
 #   1. Boot halmasuit; broker-spawn greeter; auth → niri up.
@@ -422,27 +428,7 @@ pkgs.testers.runNixOSTest {
     # because that would `journalctl` against a powered-off VM;
     # parse the same JSON envelopes out of the captured console
     # text instead. (Same shape, no machine handle required.)
-    import json as _json
-    all_events = []
-    for line in console.splitlines():
-        # Console framing strips ANSI but lines still wrap. Find the
-        # first JSON object on the line.
-        brace = line.find('{"timestamp"')
-        if brace < 0:
-            continue
-        try:
-            outer = _json.loads(line[brace:])
-        except ValueError:
-            continue
-        inner = outer.get("fields", {}).get("json")
-        if not inner:
-            continue
-        try:
-            ev = _json.loads(inner)
-        except ValueError:
-            continue
-        if isinstance(ev, dict) and "event" in ev:
-            all_events.append(ev)
+    all_events = phash_progression.events_from_console(console)
     phash_progression.assert_animating(
         all_events,
         min_distinct_phashes=3,

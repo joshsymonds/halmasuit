@@ -237,24 +237,46 @@ impl DrmBackend {
     /// [`setup_drm_backend`] for `WallpaperConfig::Video`
     /// configurations. For non-video backends this is a no-op.
     ///
-    /// Returns `true` iff a fallback swap fired this tick — the
-    /// timer callback in `main.rs` uses this to queue an explicit
-    /// render so the newly-installed fallback reaches the screen
-    /// (idle render loop after relay-death produces no vblank to
-    /// pick up the swap otherwise).
-    pub fn tick_wallpaper(&mut self) -> bool {
-        self.wallpaper.tick(&mut self.renderer)
+    /// Returns the wallpaper-tick decision: drives the per-tick render
+    /// AND the fallback-swap state machine in a single call. The
+    /// `main.rs` wallpaper-tick callback consumes this and renders if
+    /// the action is non-`Idle`.
+    pub fn tick_wallpaper(&mut self) -> WallpaperTickAction {
+        let fallback_swapped = self.wallpaper.tick(&mut self.renderer);
+        let wants_continuous = self.wallpaper.wants_continuous_render();
+        match (fallback_swapped, wants_continuous) {
+            (true, _) => WallpaperTickAction::RenderAndSwapped,
+            (false, true) => WallpaperTickAction::RenderContinuous,
+            (false, false) => WallpaperTickAction::Idle,
+        }
     }
+}
 
-    /// Whether the active wallpaper backend wants the wallpaper-tick
-    /// timer to drive renders continuously (independent of fallback
-    /// swap requests). Image backends return `false`; shader and
-    /// video return `true`. Read by the wallpaper-tick callback in
-    /// `main.rs` to decide whether to call `render_one_frame` on
-    /// every tick OR only when [`Self::tick_wallpaper`] returns true.
+/// Outcome of `DrmBackend::tick_wallpaper` — encodes both the
+/// fallback-swap state-machine step AND whether the active backend
+/// needs a per-tick render. `main.rs`'s wallpaper-tick callback
+/// matches on this to decide whether to call `render_one_frame`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WallpaperTickAction {
+    /// No render needed this tick. Static-wallpaper config (image)
+    /// with no fallback swap pending — the kernel keeps scanning out
+    /// the last-flipped framebuffer.
+    Idle,
+    /// Render this tick because the active backend wants continuous
+    /// renders (shader, video — `wants_continuous_render() == true`),
+    /// not because a swap fired.
+    RenderContinuous,
+    /// A fallback swap fired this tick (e.g. video relay died); the
+    /// freshly-installed fallback must reach the screen, so the
+    /// caller queues a render.
+    RenderAndSwapped,
+}
+
+impl WallpaperTickAction {
+    /// `true` iff this action wants the caller to invoke `render_one_frame`.
     #[must_use]
-    pub fn wallpaper_wants_continuous(&self) -> bool {
-        self.wallpaper.wants_continuous_render()
+    pub const fn wants_render(self) -> bool {
+        !matches!(self, Self::Idle)
     }
 }
 
