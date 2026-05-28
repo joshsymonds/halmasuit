@@ -724,7 +724,7 @@
         };
         # Multi-DRM-device regression gate (Epic: halmasuit multi-DRM-
         # device support, DRM4). Two virtio-gpu-pci devices at pinned
-        # BDFs (0000:00:05.0, 0000:00:06.0 → card0, card1); three
+        # BDFs (0000:00:0e.0, 0000:00:0f.0 → card0, card1); three
         # checks exercise Auto / Path / Pci modes and assert halmasuit
         # opens the configured card. Catches the class of bug we hit
         # on gnomon where blindly opening card0 hits the wrong GPU.

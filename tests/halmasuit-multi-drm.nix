@@ -80,8 +80,8 @@ pkgs.testers.runNixOSTest {
         diskSize   = 1024;
         # Two virtio-gpu-pci devices at pinned BDFs. The default qemu-
         # vm module already adds one (typically `-device virtio-gpu-pci`
-        # without addr=); we add an explicit one at 0000:00:05.0
-        # alongside a second at 0000:00:06.0 so we have a deterministic
+        # without addr=); we add two explicit virtio-gpu devices at
+        # PCI slots 0x0e and 0x0f (→ 0000:00:0e.0 / 0000:00:0f.0) so
         # PCI topology and KNOW which BDF to feed `pci:` mode.
         #
         # `-vga none` suppresses QEMU's default VGA (which would
@@ -114,7 +114,7 @@ pkgs.testers.runNixOSTest {
         f"expected two virtio-gpu cards (card0, card1); got: {cards}"
     )
 
-    # Confirm BDF assignment: card0 → 0000:00:05.0, card1 → 0000:00:06.0
+    # Confirm BDF assignment: card0 → 0000:00:0e.0, card1 → 0000:00:0f.0
     bdf0 = machine.succeed(
         "basename $(readlink /sys/class/drm/card0/device)"
     ).strip()
@@ -168,6 +168,25 @@ pkgs.testers.runNixOSTest {
         f"expected halmasuit to open ${expectedPath}, got {resolved}. "
         f"All resolved-path log lines: {resolved_paths}"
     )
+
+    # For Auto mode specifically, additionally assert that
+    # `find_auto` actually enumerated `/dev/dri/card*` rather than
+    # the resolver silently returning the first card without probing.
+    # Without this, a regression that returned `cards[0]` unconditionally
+    # would still pass `resolved == "/dev/dri/card0"`. The `DRM auto-
+    # discover: enumerated card candidates` log line lists BOTH
+    # virtio-gpu cards from the substrate.
+    is_auto = ${if drmDevice == null then "True" else "False"}
+    if is_auto:
+        enumerated = re.search(
+            r'DRM auto-discover: enumerated card candidates.*card0.*card1',
+            raw,
+            flags=re.DOTALL,
+        )
+        assert enumerated is not None, (
+            "Auto mode: expected halmasuit to enumerate both cards. "
+            f"Journal: {raw[-2000:]}"
+        )
 
     print(
         f"halmasuit-multi-drm-${testName}: PASS "

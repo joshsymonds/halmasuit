@@ -123,6 +123,17 @@ let
     then {}
     else { HALMASUIT_DRM_DEVICE = cfg.drmDevice; };
 
+  # `systemd-udev-settle.service` is documented upstream as "not
+  # recommended" (systemd-udev-settle.service(8): "There can be no
+  # guarantee that hardware is fully discovered at any specific
+  # time."). The recommendation is to wait on a specific
+  # `dev-X.device` unit instead — which we DO use for Path mode
+  # (`dev-dri-cardN.device` below). For Auto and Pci modes we don't
+  # know the cardN at Nix-eval, so settle is the only available
+  # signal that "all DRM device nodes that ARE going to materialize
+  # have materialized." The risk the upstream warning points at —
+  # "settle returns but a slow-arriving device pops up later" —
+  # is handled by the Rust resolver's 10s deadline-bounded retry.
   drmDeviceUnitDeps =
     [ "systemd-udev-settle.service" ]
     ++ lib.optionals (drmCardMatch != null) [
@@ -675,9 +686,11 @@ in
     # minimal VM-test images don't bring the system bus up otherwise.
     # Epic #47 R2.3: seatd is NOT enabled. halmasuit is a system
     # compositor that owns DRM master + input device fds for its
-    # entire process lifetime; it opens /dev/dri/card0 and
-    # /dev/input/event* directly via setup_drm_direct +
-    # setup_libinput_direct while still root, then privilege-drops.
+    # entire process lifetime; it opens the DRM device resolved by
+    # `services.halmasuit.drmDevice` (Auto-discover by default, or
+    # an explicit path / PCI BDF override) and /dev/input/event*
+    # directly via setup_drm_direct + setup_libinput_direct while
+    # still root, then privilege-drops.
     # No libseat / no seatd anywhere in the runtime closure —
     # collapsing the standing-root-daemon survival surface that
     # would otherwise have to be carried across the rootfs→

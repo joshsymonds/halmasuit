@@ -338,8 +338,10 @@ pub enum Phase {
     /// compositor system user. Emitted after the drop succeeds;
     /// subsequent code runs unprivileged.
     Deprivileged,
-    /// DRM master acquired on `/dev/dri/card0` (or the device named
-    /// by `HALMASUIT_DRM_DEVICE`). The file descriptor lives for the
+    /// DRM master acquired on the device resolved by
+    /// `HALMASUIT_DRM_DEVICE` (see `halmasuit::drm::DrmDeviceSpec` —
+    /// Auto-discover by default, or an explicit path / PCI BDF
+    /// override). The file descriptor lives for the
     /// process lifetime — drm-master-probe Phase 1 validated that
     /// the master designation survives `setresuid`, so subsequent
     /// phases run as the compositor user with master still held.

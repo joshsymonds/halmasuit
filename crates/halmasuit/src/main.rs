@@ -2757,8 +2757,12 @@ fn drm_device_path_from_env() -> io::Result<Option<PathBuf>> {
     let raw = std::env::var_os("HALMASUIT_DRM_DEVICE")
         .and_then(|v| v.into_string().ok())
         .unwrap_or_default();
+    // Do NOT include `raw` in the error message — see
+    // `drm::DrmDeviceSpecParseError`'s rationale for redacting input
+    // out of error displays (env value may someday come from a less-
+    // trusted source).
     let spec = drm::DrmDeviceSpec::from_env_value(&raw)
-        .map_err(|e| io::Error::other(format!("HALMASUIT_DRM_DEVICE: {e}")))?;
+        .map_err(|e| io::Error::other(format!("HALMASUIT_DRM_DEVICE rejected: {e}")))?;
     tracing::info!(?spec, "resolving DRM device");
     let path = drm::resolve_drm_device(&spec, DRM_RESOLVE_DEADLINE)?;
     tracing::info!(?path, "DRM device resolved");
@@ -3836,10 +3840,12 @@ fn main() -> io::Result<()> {
     // (R2.3 collapsed the prior three into two by removing the libseat-
     // brokered branch):
     //
-    // 1. `Some(path)`: open `/dev/dri/card0` directly and issue
-    //    `SET_MASTER` ourselves (no libseat, no seatd). Same for both
-    //    rootfs and initramfs deployments — halmasuit is a system
-    //    compositor and holds master for its entire lifetime. Probes
+    // 1. `Some(path)`: open the path resolved from `drm_device_path_from_env`
+    //    (see `drm::DrmDeviceSpec` for the env contract — Auto-discover
+    //    / Path / Pci) directly and issue `SET_MASTER` ourselves (no
+    //    libseat, no seatd). Same for both rootfs and initramfs
+    //    deployments — halmasuit is a system compositor and holds
+    //    master for its entire lifetime. Probes
     //    drm-master-probe-phase{1,2,4} validated that the master
     //    designation survives both `setresuid` and `switch_root`. In
     //    rootfs mode, libinput is enumerated here too via the direct-

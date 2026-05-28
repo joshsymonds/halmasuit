@@ -30,6 +30,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use thiserror::Error;
+
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags};
@@ -159,20 +161,22 @@ pub enum DrmDeviceSpec {
 pub struct PciBdf(String);
 
 /// Parser-rejection reasons for [`PciBdf::parse`].
-#[derive(Debug, thiserror::Error)]
+///
+/// The raw input is deliberately NOT included in the `Display` impl.
+/// `HALMASUIT_DRM_DEVICE` is set from a trusted source (the NixOS unit
+/// `environment =` block) today, but if the source ever changes (e.g.,
+/// consumed from a less-trusted env pass-through), echoing the raw
+/// input into journald would leak attacker-controlled bytes into logs.
+/// Callers wanting the raw value back must capture it themselves
+/// before calling `parse`.
+#[derive(Debug, Error)]
 pub enum BdfParseError {
     /// The string doesn't match the `DDDD:BB:DD.F` shape.
-    #[error("PCI BDF must be 'DDDD:BB:DD.F' (got: {got:?})")]
-    BadFormat {
-        /// The offending input, for diagnostics.
-        got: String,
-    },
+    #[error("PCI BDF must be 'DDDD:BB:DD.F'")]
+    BadFormat,
     /// The function digit is outside `0..=7`.
-    #[error("PCI BDF function digit must be 0-7 (got: {got:?})")]
-    BadFunction {
-        /// The offending input, for diagnostics.
-        got: String,
-    },
+    #[error("PCI BDF function digit must be 0-7")]
+    BadFunction,
 }
 
 impl PciBdf {
@@ -186,30 +190,29 @@ impl PciBdf {
     /// Returns [`BdfParseError::BadFunction`] if the function digit is
     /// `>= 8` (PCI functions are 3 bits).
     pub fn parse(s: &str) -> Result<Self, BdfParseError> {
-        let bad_format = || BdfParseError::BadFormat { got: s.to_owned() };
-
         // Shape: 4 hex : 2 hex : 2 hex . 1 hex
-        let (domain_bus_dev, function) = s.rsplit_once('.').ok_or_else(bad_format)?;
+        let (domain_bus_dev, function) = s.rsplit_once('.').ok_or(BdfParseError::BadFormat)?;
         if function.len() != 1 {
-            return Err(bad_format());
+            return Err(BdfParseError::BadFormat);
         }
-        let function_digit = u8::from_str_radix(function, 16).map_err(|_| bad_format())?;
+        let function_digit =
+            u8::from_str_radix(function, 16).map_err(|_| BdfParseError::BadFormat)?;
         if function_digit > 7 {
-            return Err(BdfParseError::BadFunction { got: s.to_owned() });
+            return Err(BdfParseError::BadFunction);
         }
 
         let parts: Vec<&str> = domain_bus_dev.split(':').collect();
         if parts.len() != 3 {
-            return Err(bad_format());
+            return Err(BdfParseError::BadFormat);
         }
         let [domain, bus, device] = [parts[0], parts[1], parts[2]];
         if domain.len() != 4 || bus.len() != 2 || device.len() != 2 {
-            return Err(bad_format());
+            return Err(BdfParseError::BadFormat);
         }
         // Validate each segment is pure hex.
-        u32::from_str_radix(domain, 16).map_err(|_| bad_format())?;
-        u8::from_str_radix(bus, 16).map_err(|_| bad_format())?;
-        u8::from_str_radix(device, 16).map_err(|_| bad_format())?;
+        u32::from_str_radix(domain, 16).map_err(|_| BdfParseError::BadFormat)?;
+        u8::from_str_radix(bus, 16).map_err(|_| BdfParseError::BadFormat)?;
+        u8::from_str_radix(device, 16).map_err(|_| BdfParseError::BadFormat)?;
 
         Ok(Self(s.to_ascii_lowercase()))
     }
@@ -226,22 +229,63 @@ impl DrmDeviceSpec {
     ///
     /// Empty input → [`DrmDeviceSpec::Auto`]. A `pci:`-prefixed value
     /// is parsed via [`PciBdf::parse`]. Anything else is treated as a
-    /// path (no validation; the resolver's `Path` arm checks existence).
+    /// path and must look like `/dev/dri/cardN` (a literal DRM device
+    /// path) — the parser rejects other shapes with [`PathShapeError`]
+    /// as defense-in-depth against environments where the env var
+    /// might come from a less-trusted source than the unit's static
+    /// `environment =` block.
     ///
     /// # Errors
     ///
     /// Returns [`BdfParseError`] if a `pci:`-prefixed value has an
-    /// unparsable BDF.
-    pub fn from_env_value(s: &str) -> Result<Self, BdfParseError> {
+    /// unparsable BDF, or [`PathShapeError`] (boxed via
+    /// [`DrmDeviceSpecParseError`]) if a path-shaped value doesn't
+    /// match `/dev/dri/card[0-9]+`.
+    pub fn from_env_value(s: &str) -> Result<Self, DrmDeviceSpecParseError> {
         if s.is_empty() {
             Ok(Self::Auto)
         } else if let Some(rest) = s.strip_prefix("pci:") {
             Ok(Self::Pci(PciBdf::parse(rest)?))
-        } else {
+        } else if is_dev_dri_card_path(s) {
             Ok(Self::Path(PathBuf::from(s)))
+        } else {
+            Err(DrmDeviceSpecParseError::BadPath(PathShapeError))
         }
     }
 }
+
+/// Reject anything that isn't structurally `/dev/dri/card[0-9]+`.
+///
+/// Implementing without regex to avoid a dep just for this; the shape
+/// is fixed and trivial.
+fn is_dev_dri_card_path(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("/dev/dri/card") else {
+        return false;
+    };
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Errors from [`DrmDeviceSpec::from_env_value`].
+///
+/// The raw input string is deliberately NOT included in the message —
+/// `HALMASUIT_DRM_DEVICE` is set from a trusted source today, but if
+/// the source ever changes (e.g., consumed from a less-trusted env
+/// pass-through), logging the raw input could surface attacker-
+/// controlled bytes into journald.
+#[derive(Debug, Error)]
+pub enum DrmDeviceSpecParseError {
+    /// The `pci:`-prefixed value failed BDF validation.
+    #[error("HALMASUIT_DRM_DEVICE pci: value did not parse as a BDF")]
+    BadBdf(#[from] BdfParseError),
+    /// The path-shaped value wasn't `/dev/dri/card[0-9]+`.
+    #[error("HALMASUIT_DRM_DEVICE path must match /dev/dri/card[0-9]+")]
+    BadPath(#[from] PathShapeError),
+}
+
+/// Marker error type — see [`DrmDeviceSpecParseError::BadPath`].
+#[derive(Debug, Error)]
+#[error("path shape rejected")]
+pub struct PathShapeError;
 
 /// How often the retry loop polls when the device isn't there yet.
 const RESOLVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -266,17 +310,25 @@ const RESOLVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// failing call.
 pub fn resolve_drm_device(spec: &DrmDeviceSpec, deadline: Duration) -> io::Result<PathBuf> {
     let start = Instant::now();
+    // First probe is unconditional — when the device is already there
+    // (the common case), avoid any sleep before resolution.
+    if let Some(p) = try_resolve_once(spec)? {
+        return Ok(p);
+    }
+    // Subsequent probes: sleep, then check deadline BEFORE probing.
+    // This keeps the probe count bounded by ceil(deadline / interval)
+    // rather than doing one extra probe AFTER the deadline trips.
     loop {
-        if let Some(p) = try_resolve_once(spec)? {
-            return Ok(p);
-        }
+        std::thread::sleep(RESOLVE_POLL_INTERVAL);
         if start.elapsed() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("no DRM device satisfies {spec:?} within {deadline:?}"),
             ));
         }
-        std::thread::sleep(RESOLVE_POLL_INTERVAL);
+        if let Some(p) = try_resolve_once(spec)? {
+            return Ok(p);
+        }
     }
 }
 
@@ -286,10 +338,16 @@ fn try_resolve_once(spec: &DrmDeviceSpec) -> io::Result<Option<PathBuf>> {
     match spec {
         DrmDeviceSpec::Auto => find_auto(),
         DrmDeviceSpec::Path(p) => {
-            if p.exists() {
-                Ok(Some(p.clone()))
-            } else {
-                Ok(None)
+            // `symlink_metadata` (vs. `Path::exists` → `metadata`)
+            // does not traverse symlinks. We're addressing a literal
+            // DRM device node; a symlink in `/dev/dri/` (whatever its
+            // target) is rejected. Defense-in-depth against a future
+            // wiring that might let a less-trusted source set the env.
+            match std::fs::symlink_metadata(p) {
+                Ok(md) if md.file_type().is_symlink() => Ok(None),
+                Ok(_) => Ok(Some(p.clone())),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
             }
         }
         DrmDeviceSpec::Pci(bdf) => find_by_bdf(bdf),
@@ -302,24 +360,41 @@ fn try_resolve_once(spec: &DrmDeviceSpec) -> io::Result<Option<PathBuf>> {
 /// rather than fail — a card that's busy or otherwise unopenable
 /// shouldn't block discovery of a usable card.
 fn find_auto() -> io::Result<Option<PathBuf>> {
-    let Ok(read_dir) = std::fs::read_dir("/dev/dri") else {
-        // /dev/dri itself doesn't exist yet — caller retries.
-        return Ok(None);
+    // Honor the resolver contract: NotFound is "not yet — caller
+    // retries"; any other error (EACCES, EIO, EMFILE…) propagates so
+    // the operator sees the real failure instead of a misleading
+    // deadline-exhausted NotFound at the end of the 10s wait. Matches
+    // `find_by_bdf`'s shape below.
+    let read_dir = match std::fs::read_dir("/dev/dri") {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
     };
 
-    let mut cards: Vec<PathBuf> = read_dir
-        .filter_map(Result::ok)
-        .filter_map(|e| {
-            let n = e.file_name();
-            let s = n.to_str()?;
-            if !s.starts_with("card") {
-                return None;
-            }
-            s[4..].parse::<u32>().ok()?;
-            Some(e.path())
-        })
-        .collect();
+    let mut cards: Vec<PathBuf> = Vec::new();
+    for entry in read_dir {
+        // Same posture for per-entry I/O errors: propagate rather
+        // than silently skip.
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.starts_with("card") {
+            continue;
+        }
+        if name_str[4..].parse::<u32>().is_err() {
+            continue;
+        }
+        cards.push(entry.path());
+    }
     cards.sort();
+
+    // Trace the discovered card list so the multi-DRM VM test can
+    // assert Auto-mode actually iterated the directory (rather than
+    // a regression that hardcoded /dev/dri/card0 returning the same
+    // card without probing anything).
+    tracing::info!(?cards, "DRM auto-discover: enumerated card candidates");
 
     for card in cards {
         if card_has_connected_connector(&card)? {
@@ -1447,13 +1522,70 @@ mod tests {
         assert!(DrmDeviceSpec::from_env_value("pci:00:01:00.0").is_err());
         assert!(DrmDeviceSpec::from_env_value("pci:0000:1:00.0").is_err());
         assert!(DrmDeviceSpec::from_env_value("pci:0000:01:0.0").is_err());
-        // Function digit > 7.
+        // Function digit > 7. Wrapped: BadBdf → BadFunction.
         assert!(matches!(
             DrmDeviceSpec::from_env_value("pci:0000:01:00.8"),
-            Err(BdfParseError::BadFunction { .. })
+            Err(DrmDeviceSpecParseError::BadBdf(BdfParseError::BadFunction))
         ));
         // Missing function separator.
         assert!(DrmDeviceSpec::from_env_value("pci:0000:01:00").is_err());
+    }
+
+    #[test]
+    fn non_dev_dri_card_path_rejected() {
+        // Path shape validation (review S-1 hardening): the Path arm
+        // must NOT accept arbitrary strings — only literal
+        // `/dev/dri/cardN` paths. Defense-in-depth against future
+        // wirings that might let a less-trusted source set the env.
+        for bad in [
+            "/etc/shadow",
+            "/dev/null",
+            "/dev/dri/renderD128", // valid DRM device but not a card
+            "/dev/dri/card",       // missing the number
+            "/dev/dri/card-foo",   // non-numeric suffix
+            "/dev/dri/cardabc",    // hex isn't accepted; must be decimal digits
+            "../../etc/passwd",
+            "card0",
+            "/dev/../etc/shadow",
+        ] {
+            assert!(
+                matches!(
+                    DrmDeviceSpec::from_env_value(bad),
+                    Err(DrmDeviceSpecParseError::BadPath(_))
+                ),
+                "path {bad:?} should be rejected"
+            );
+        }
+        // And the canonical shapes pass.
+        for good in ["/dev/dri/card0", "/dev/dri/card1", "/dev/dri/card42"] {
+            assert!(
+                DrmDeviceSpec::from_env_value(good).is_ok(),
+                "path {good:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_errors_do_not_echo_raw_input() {
+        // Review S-3 hardening: BdfParseError's Display must NOT
+        // include the offending input string. Defense-in-depth against
+        // attacker-controlled bytes reaching journald via the error
+        // path.
+        let secret = "pci:0000:00:00.f"; // Bad function digit
+        let err = DrmDeviceSpec::from_env_value(secret).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(secret) && !msg.contains("00.f"),
+            "error message echoed raw input: {msg:?}"
+        );
+        // And a structural-format failure with attacker-shaped input.
+        let secret2 = "pci:ATTACKER-CONTROLLED-STRING";
+        let err2 = DrmDeviceSpec::from_env_value(secret2).unwrap_err();
+        let msg2 = err2.to_string();
+        assert!(
+            !msg2.contains("ATTACKER"),
+            "error message echoed raw input: {msg2:?}"
+        );
     }
 
     #[test]
@@ -1483,7 +1615,7 @@ mod tests {
         for f in 8..=15 {
             let s = format!("0000:01:00.{f:x}");
             assert!(
-                matches!(PciBdf::parse(&s), Err(BdfParseError::BadFunction { .. })),
+                matches!(PciBdf::parse(&s), Err(BdfParseError::BadFunction)),
                 "function {f:x} should be BadFunction"
             );
         }
@@ -1524,11 +1656,21 @@ mod tests {
         // for "an extant path the resolver should accept." (The
         // resolver doesn't validate the path is actually a DRM
         // device — that's `setup_drm_direct`'s job.)
-        let r = resolve_drm_device(
-            &DrmDeviceSpec::Path(PathBuf::from("/dev/null")),
-            Duration::from_millis(50),
-        )
-        .expect("/dev/null should resolve");
+        let start = Instant::now();
+        let deadline = Duration::from_millis(500);
+        let r = resolve_drm_device(&DrmDeviceSpec::Path(PathBuf::from("/dev/null")), deadline)
+            .expect("/dev/null should resolve");
+        let elapsed = start.elapsed();
         assert_eq!(r, PathBuf::from("/dev/null"));
+        // Immediacy assertion: the resolver must NOT sleep when the
+        // path already exists. A regression that always sleeps the
+        // full deadline (or `RESOLVE_POLL_INTERVAL`) before checking
+        // would still produce the right path; this assertion catches
+        // that class.
+        assert!(
+            elapsed < RESOLVE_POLL_INTERVAL,
+            "resolver should return without sleeping when path exists; \
+             elapsed={elapsed:?} (poll interval={RESOLVE_POLL_INTERVAL:?})"
+        );
     }
 }

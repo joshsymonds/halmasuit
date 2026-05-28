@@ -68,7 +68,8 @@ smithay = { workspace = true, features = [
     # committed wl_clients into a frame. Required by B.3's wlr-layer-shell
     # path; depended on transitively by B.5+ when we layer toplevels.
     "desktop",
-    # Input subsystem. halmasuit opens `/dev/dri/card0` and
+    # Input subsystem. halmasuit opens the DRM device resolved by
+    # `services.halmasuit.drmDevice` (see `drm::DrmDeviceSpec`) and
     # `/dev/input/event*` directly while still root (no libseat / no
     # seatd anywhere in the runtime closure — R2.3). `backend_libinput`
     # gives us smithay's `LibinputInputBackend` calloop adapter; we
