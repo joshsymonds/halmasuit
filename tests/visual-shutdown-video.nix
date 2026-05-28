@@ -32,7 +32,6 @@
   halmasuit-session,
   halmasuit-vm-client,
   halmasuit-layer-shell-test-client,
-  ssimulacra2-cli,
 }:
 
 let
