@@ -30,8 +30,8 @@
 //! this module unconditionally; `halmasuit-debug` may own both
 //! names from the same process).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use halmasuit_introspect::Phase;
@@ -160,6 +160,14 @@ pub struct CompositorObservability {
     /// backend via `set_frame_counter`, so `GetFrameCounter` observes
     /// the live render count.
     pub frame_counter: Arc<AtomicU64>,
+    /// Snapshot of nested-compositor windows as `(pid, app_id,
+    /// title)` (R-honest.4). The surface handles are `!Send`, so the
+    /// calloop thread snapshots them to this plain `Vec` on every
+    /// window-set change; `ListWindows` (and R3.x the overlay) clone
+    /// it out under the lock. pid is the SO_PEERCRED pid captured at
+    /// client-accept — never client-asserted. The only `Mutex` field
+    /// (a `Vec` isn't atomic); the rest are lock-free atomics.
+    pub windows: Arc<Mutex<Vec<(u32, String, String)>>>,
 }
 
 impl CompositorObservability {
@@ -170,6 +178,7 @@ impl CompositorObservability {
         Self {
             startup: Instant::now(),
             frame_counter: Arc::new(AtomicU64::new(0)),
+            windows: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -223,23 +232,19 @@ impl Compositor1 {
         self.state.frame_counter.load(Ordering::Relaxed)
     }
 
-    /// List nested-compositor windows (foreground toplevel + any
-    /// layer-shell surfaces). Returns an array of (pid, app_id,
-    /// title) tuples.
-    ///
-    /// R3.3 stub returns an empty array. R3.x will populate this
-    /// from `HalmasuitState`'s introspection trackers once those
-    /// are exposed across the thread boundary.
-    #[allow(
-        clippy::unused_self,
-        reason = "trivial stub; R3.x will read window state"
-    )]
-    #[allow(
-        clippy::missing_const_for_fn,
-        reason = "zbus #[interface] macros generate non-const trampolines; the stub will become non-const in R3.x"
-    )]
+    /// List nested-compositor windows (xdg toplevels + layer-shell
+    /// surfaces) as `(pid, app_id, title)` tuples (R-honest.4). Clones
+    /// the snapshot the calloop thread maintains in the shared
+    /// `windows` store — the surface handles themselves are `!Send`
+    /// and never cross to this DBus thread. pid is SO_PEERCRED. An
+    /// empty list means no nested windows (the internal wallpaper
+    /// plane is not a wl_client and never appears here).
     fn list_windows(&self) -> Vec<(u32, String, String)> {
-        Vec::new()
+        self.state
+            .windows
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     /// Broker reachability state as a stable snake_case name: one of
@@ -369,6 +374,41 @@ mod tests {
         assert_eq!(comp.get_broker_status(), "failed");
         // Never the removed stub.
         assert_ne!(comp.get_broker_status(), "Unknown");
+    }
+
+    /// R-honest.4: `ListWindows` clones whatever the calloop thread
+    /// has snapshotted into the shared `windows` store. Verify the
+    /// DBus read reflects a write through the SAME Arc (the snapshot
+    /// path the compositor uses), and that an empty store yields an
+    /// empty list (not a stub).
+    #[test]
+    fn list_windows_reflects_shared_store() {
+        let state = CompositorObservability::new();
+        let comp = Compositor1::new(state.clone());
+        // Empty store → empty list.
+        assert!(comp.list_windows().is_empty());
+        // A snapshot written through the shared Arc (as the calloop
+        // thread does via refresh_window_snapshot) is visible to the
+        // DBus reader.
+        *state.windows.lock().unwrap() = vec![
+            (
+                1234,
+                "halmasuit.test.toplevel".to_owned(),
+                "Test Window".to_owned(),
+            ),
+            (5678, "wlr-layer".to_owned(), String::new()),
+        ];
+        let listed = comp.list_windows();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed[0],
+            (
+                1234,
+                "halmasuit.test.toplevel".to_owned(),
+                "Test Window".to_owned()
+            )
+        );
+        assert_eq!(listed[1].0, 5678);
     }
 
     /// R-honest.2: `record_phase` updates the global store and

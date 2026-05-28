@@ -471,6 +471,11 @@ struct ClientState {
     /// authority (R8), but it IS how the compositor knows whose pixels
     /// just arrived.
     uid: u32,
+    /// SO_PEERCRED pid of the connecting peer, captured at accept
+    /// (Epic #71 R-honest.4). Surfaced via the `Compositor1`
+    /// `ListWindows` snapshot — kernel-attested, NEVER client-asserted
+    /// (CLAUDE.md "always SO_PEERCRED on the socket").
+    pid: u32,
 }
 
 impl ClientData for ClientState {
@@ -1270,6 +1275,67 @@ impl HalmasuitState {
                 tracing::info!("FOREGROUND_TOPLEVEL_KEYBOARD_FOCUSED");
             }
             self.set_keyboard_focus(Some(surface.clone()));
+            // A toplevel with a buffer + foreground focus has set its
+            // title/app_id by now (clients set those before their
+            // first commit). Refresh the window snapshot so
+            // Compositor1.ListWindows reflects the live metadata.
+            self.refresh_window_snapshot();
+        }
+    }
+
+    /// Epic #71 R-honest.4: snapshot the current nested-compositor
+    /// windows (xdg toplevels + layer-shell surfaces) into the shared
+    /// `Compositor1` observability store. Runs on the calloop thread
+    /// because the surface handles are `!Send` — the DBus thread only
+    /// ever reads the resulting plain `Vec`. pid is the SO_PEERCRED
+    /// pid captured at client-accept (`ClientState::pid`), never
+    /// client-asserted. Called on every window-set change
+    /// (toplevel mapped/focused/destroyed, layer mapped/destroyed).
+    fn refresh_window_snapshot(&self) {
+        use smithay::wayland::compositor::with_states;
+        use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+
+        let surface_pid = |surface: &WlSurface| -> u32 {
+            surface
+                .client()
+                .and_then(|c| c.get_data::<ClientState>().map(|cs| cs.pid))
+                .unwrap_or(0)
+        };
+
+        let mut windows: Vec<(u32, String, String)> = Vec::new();
+
+        for toplevel in self.xdg_shell_state.toplevel_surfaces() {
+            let surface = toplevel.wl_surface();
+            let (app_id, title) = with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .map(|d| {
+                        let d = d.lock().unwrap();
+                        (
+                            d.app_id.clone().unwrap_or_default(),
+                            d.title.clone().unwrap_or_default(),
+                        )
+                    })
+                    .unwrap_or_default()
+            });
+            windows.push((surface_pid(surface), app_id, title));
+        }
+
+        // Layer-shell surfaces have no title/app_id — their namespace
+        // is the closest identity. Reported as app_id with empty title.
+        let map = layer_map_for_output(&self.output);
+        for layer in map.layers() {
+            windows.push((
+                surface_pid(layer.wl_surface()),
+                layer.namespace().to_owned(),
+                String::new(),
+            ));
+        }
+        drop(map);
+
+        if let Ok(mut slot) = self.dbus_state.windows.lock() {
+            *slot = windows;
         }
     }
 
@@ -1340,6 +1406,10 @@ impl WlrLayerShellHandler for HalmasuitState {
         if let Err(e) = map.map_layer(&desktop_surface) {
             tracing::warn!(error = ?e, "failed to map layer surface");
         }
+        // R-honest.4: refresh AFTER dropping the LayerMap lock —
+        // refresh_window_snapshot re-locks it.
+        drop(map);
+        self.refresh_window_snapshot();
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
@@ -1373,6 +1443,8 @@ impl WlrLayerShellHandler for HalmasuitState {
         {
             tracing::warn!(error = %e, "render_layer_elements on layer_destroyed failed");
         }
+        // R-honest.4: a layer surface left the map.
+        self.refresh_window_snapshot();
     }
 }
 smithay::delegate_layer_shell!(HalmasuitState);
@@ -1411,6 +1483,10 @@ impl XdgShellHandler for HalmasuitState {
         self.output.enter(surface.wl_surface());
         tracing::info!(w, h, "xdg_toplevel mapped as fullscreen foreground");
         self.foreground_toplevel = Some(surface);
+        // R-honest.4: a new toplevel exists (title/app_id may still be
+        // unset until first commit; the focus path re-snapshots once
+        // the buffer + metadata arrive).
+        self.refresh_window_snapshot();
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -1456,6 +1532,9 @@ impl XdgShellHandler for HalmasuitState {
                 self.apply_swap_action(a);
             }
         }
+        // R-honest.4: toplevel gone — refresh regardless of whether it
+        // was the foreground (it left `toplevel_surfaces()`).
+        self.refresh_window_snapshot();
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
@@ -4255,6 +4334,7 @@ fn main() -> io::Result<()> {
             let client_data = Arc::new(ClientState {
                 compositor_state: CompositorClientState::default(),
                 uid: creds.uid,
+                pid: creds.pid,
             });
             match state.display_handle.insert_client(stream, client_data) {
                 Ok(_client) => tracing::debug!("new wl_client accepted"),

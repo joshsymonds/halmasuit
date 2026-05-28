@@ -26,6 +26,7 @@
   nixpkgs,
   halmasuit,
   halmasuit-session,
+  halmasuit-toplevel-test-client,
 }:
 
 let
@@ -80,6 +81,27 @@ pkgs.testers.runNixOSTest {
 
       users.users.test.group = "test";
       users.groups.test.gid  = 1000;
+
+      # A real xdg_toplevel client (sets title + app_id) so
+      # ListWindows has a genuine window to report. NOT auto-started —
+      # the testScript launches it after scanout, same pattern as
+      # visual-halmasuit-toplevel. Runs as the greeter uid (authorized
+      # on the wayland socket); its SO_PEERCRED pid is what ListWindows
+      # must report.
+      systemd.services.test-toplevel = {
+        description = "Compositor1 ListWindows fixture: xdg_toplevel client";
+        after    = [ "halmasuit.service" ];
+        serviceConfig = {
+          User  = "halmasuit-greeter";
+          Group = "halmasuit-greeter";
+          ExecStart = "${halmasuit-toplevel-test-client}/bin/halmasuit-toplevel-test-client";
+          Environment = [
+            "XDG_RUNTIME_DIR=/run/halmasuit"
+            "WAYLAND_DISPLAY=wayland-0"
+          ];
+          Restart = "no";
+        };
+      };
 
       # gdbus (from glib) is the DBus client the test driver uses to
       # call Compositor1 methods.
@@ -148,6 +170,21 @@ pkgs.testers.runNixOSTest {
         "--object-path /org/halmasuit/Compositor1 "
         "--method org.halmasuit.Compositor1.GetUptime",
         timeout=30,
+    )
+
+    # Launch a real xdg_toplevel client (sets title + app_id) so
+    # ListWindows has a genuine window to report. Wait for halmasuit
+    # to map it AND the client to paint, so the snapshot (taken when
+    # the toplevel gets its buffer + focus) has the metadata.
+    machine.succeed("systemctl start test-toplevel.service")
+    machine.wait_until_succeeds(
+        "journalctl -u halmasuit | grep -qF "
+        "'xdg_toplevel mapped as fullscreen foreground'",
+        timeout=60,
+    )
+    machine.wait_until_succeeds(
+        "journalctl -u test-toplevel | grep -qF 'toplevel-test-client: painted'",
+        timeout=60,
     )
 
     # ── Assertion 1: GetFrameCounter is NON-ZERO ──
@@ -239,6 +276,42 @@ pkgs.testers.runNixOSTest {
         f"last connect_broker must have succeeded; got {broker!r}."
     )
 
+    # ── Assertion 1d: ListWindows reports the REAL toplevel ──
+    # The R3.3 stub returned []. The test-toplevel client is mapped +
+    # painted, so the calloop-thread snapshot must contain it with its
+    # app_id, title, and a real SO_PEERCRED pid. gdbus prints an
+    # a(uss) array, e.g.
+    #   ([(uint32 1234, 'halmasuit.test.toplevel', 'halmasuit-toplevel-test-client')],)
+    windows_raw = machine.succeed(
+        "gdbus call --system --dest org.halmasuit.Compositor1 "
+        "--object-path /org/halmasuit/Compositor1 "
+        "--method org.halmasuit.Compositor1.ListWindows"
+    ).strip()
+    print(f"ListWindows: {windows_raw}")
+    assert "halmasuit.test.toplevel" in windows_raw, (
+        f"ListWindows must report the test client's app_id "
+        f"'halmasuit.test.toplevel'; got: {windows_raw}"
+    )
+    assert "halmasuit-toplevel-test-client" in windows_raw, (
+        f"ListWindows must report the test client's title "
+        f"'halmasuit-toplevel-test-client'; got: {windows_raw}"
+    )
+    # A real SO_PEERCRED pid (> 0), and it must match the actual
+    # test-toplevel service PID (kernel-attested, not client-asserted).
+    win_pids = [int(p) for p in re.findall(r"uint32 (\d+)", windows_raw)]
+    assert win_pids and all(p > 0 for p in win_pids), (
+        f"ListWindows pids must be real (>0); got {win_pids} from {windows_raw}"
+    )
+    svc_pid = int(
+        machine.succeed(
+            "systemctl show -p MainPID --value test-toplevel.service"
+        ).strip()
+    )
+    assert svc_pid in win_pids, (
+        f"ListWindows must report the test-toplevel service's real PID "
+        f"{svc_pid} (SO_PEERCRED, kernel-attested); got pids {win_pids}."
+    )
+
     # ── Assertion 2: GetUptime returns LIVE values (not a frozen
     # construction-time snapshot) ── deterministic, independent of
     # render/vblank/damage. State-based poll (not a bare sleep, per
@@ -267,7 +340,9 @@ pkgs.testers.runNixOSTest {
     print("PASS: org.halmasuit.Compositor1 returns REAL, LIVE values.")
     print(f"      GetFrameCounter={frames} (>0 → render feeds the shared")
     print(f"      Arc, not the 0 stub); GetPhase={phase!r} (real phase,")
-    print(f"      matches journal, not the 'Running' stub); GetUptime "
+    print("      matches journal, not the 'Running' stub);")
+    print(f"      ListWindows reports the test toplevel w/ real pid "
+          f"{svc_pid} (not the [] stub); GetUptime "
           f"{uptime_first}→{uptime_second} (live, not frozen).")
     print("=" * 70)
   '';

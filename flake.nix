@@ -820,6 +820,8 @@
           inherit nixpkgs;
           halmasuit         = self.packages.x86_64-linux.halmasuit;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-toplevel-test-client =
+            self.packages.x86_64-linux.halmasuit-toplevel-test-client;
         };
         # Epic #71 R1.4: master-drop timeout invariant (systemd
         # #21388 regression gate). Broker MUST FAIL the request on
