@@ -106,6 +106,13 @@ let
   serviceEnv         = svc.environment;
   serviceExecPre     = builtins.toString svc.serviceConfig.ExecStartPre;
 
+  # Pull the nvidia-devnodes script out of ExecStartPre — used by
+  # the script-runtime simulation in check #7 below.
+  devnodesScriptPath = pkgs.lib.findFirst
+    (s: pkgs.lib.hasInfix "halmasuit-nvidia-devnodes" (toString s))
+    null
+    svc.serviceConfig.ExecStartPre;
+
   # Stringify env for grep — `Environment=KEY=value` is the unit-file
   # shape NixOS will emit, but the structured `environment` attrset
   # is the source of truth.
@@ -170,6 +177,62 @@ EOF
   # in the cpio, and systemd dies with status=203/EXEC.
   grep -qE 'halmasuit-nvidia-devnodes' $out/initrd-store-paths.txt \
     || fail "halmasuit-nvidia-devnodes not in boot.initrd.systemd.storePaths"
+
+  # ── (7) Script-runtime simulation: nvidia-devnodes against
+  #       a fixture /proc tree ─────────────────────────────────────
+  # The gen-386 regression gate. Closure checks (#5, #6) verify the
+  # script's binary deps are present, but they say nothing about
+  # whether the script's LOGIC actually creates the expected /dev
+  # nodes. Gen 386 shipped a buggy `grep '^Minor'` pattern that
+  # silently matched nothing on the real /proc/driver/nvidia/gpus/*/
+  # information format (which has "Device Minor:" — the line starts
+  # with "Device"). Script succeeded with set -e, /dev/nvidia0 never
+  # got mknod'd, libEGL_nvidia died at GBM platform registration.
+  #
+  # Strategy: set up a minimal fake /proc tree mimicking the kernel's
+  # output format, sed-substitute the script's absolute mknod into
+  # `echo` and the /dev + /proc paths into the fixture dirs, then
+  # assert the expected mknod-calls fire by grepping stdout.
+  echo "── script-runtime simulation ─────────────────────────────"
+  fixture=$TMPDIR/devnode-fixture
+  mkdir -p $fixture/proc/driver/nvidia/gpus/0/ $fixture/dev
+  printf 'Model:         NVIDIA TestGPU\nDevice Minor: \t 0\n' \
+    > $fixture/proc/driver/nvidia/gpus/0/information
+  printf 'Character devices:\n  1 mem\n235 nvidia-uvm\n' \
+    > $fixture/proc/devices
+
+  # Patch the script: substitute mknod → echo, /proc/ → fixture,
+  # /dev/ → fixture. The `[ -e /dev/X ]` guards now check fixture
+  # paths (empty dir) so mknod IS called every time. The grep/cut/tr
+  # invocations stay intact so we exercise the real text-parsing.
+  patched=$TMPDIR/script-patched.sh
+  ${pkgs.gnused}/bin/sed \
+    -e "s|/nix/store/[^/]*-coreutils[^/]*/bin/mknod|echo MKNOD|g" \
+    -e "s|/proc/driver|$fixture/proc/driver|g" \
+    -e "s|/proc/devices|$fixture/proc/devices|g" \
+    -e "s|/dev/nvidia|$fixture/dev/nvidia|g" \
+    "${devnodesScriptPath}" > $patched
+  chmod +x $patched
+
+  echo "── patched script output ────────────────────────"
+  set +e
+  sim_out=$(${pkgs.bash}/bin/bash $patched 2>&1)
+  sim_rc=$?
+  set -e
+  echo "$sim_out"
+  [ $sim_rc -eq 0 ] || fail "script returned non-zero rc=$sim_rc"
+
+  echo "── verifying expected mknod calls ────────────────"
+  echo "$sim_out" | ${pkgs.gnugrep}/bin/grep -qE 'MKNOD.*nvidiactl c 195 255' \
+    || fail "no mknod for /dev/nvidiactl"
+  echo "$sim_out" | ${pkgs.gnugrep}/bin/grep -qE 'MKNOD.*nvidia0 c 195 0' \
+    || fail "no mknod for /dev/nvidia0 (regex broke?)"
+  echo "$sim_out" | ${pkgs.gnugrep}/bin/grep -qE 'MKNOD.*nvidia-modeset c 195 254' \
+    || fail "no mknod for /dev/nvidia-modeset"
+  echo "$sim_out" | ${pkgs.gnugrep}/bin/grep -qE 'MKNOD.*nvidia-uvm c 235 0' \
+    || fail "no mknod for /dev/nvidia-uvm (uvm major regex broke?)"
+  echo "$sim_out" | ${pkgs.gnugrep}/bin/grep -qE 'MKNOD.*nvidia-uvm-tools c 235 1' \
+    || fail "no mknod for /dev/nvidia-uvm-tools"
 
   # ── (6) Every text-format storePaths entry's /nix/store refs are
   #       ALSO in storePaths ────────────────────────────────────────

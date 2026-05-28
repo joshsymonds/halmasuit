@@ -1669,6 +1669,15 @@ in
          __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS =
            lib.makeSearchPath "share/egl/egl_external_platform.d"
              cfg.rendering.extraInitrdStorePaths;
+         # NVIDIA EGL platform-loader debug. Logs to stderr (which
+         # systemd routes to journal). Enables diagnostics for the
+         # "EGL_KHR_platform_gbm not registered even though the
+         # plugin closure is present" failure mode — libEGL_nvidia
+         # silently skips plugin registration on certain init
+         # failures, and only this env reveals what tripped.
+         __EGL_EXTERNAL_PLATFORM_DEBUG = "1";
+         LIBGL_DEBUG                   = "verbose";
+         EGL_LOG_LEVEL                 = "debug";
        } // lib.optionalAttrs (cfg.greeterCommand != null) {
          # Greeter binary halmasuit fork+execs post-pivot.
          HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
