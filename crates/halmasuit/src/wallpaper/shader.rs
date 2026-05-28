@@ -56,6 +56,20 @@ void main() {
 }
 ";
 
+/// GLSL ES 1.00 needs `GL_OES_standard_derivatives` explicitly
+/// enabled to call `fwidth` / `dFdx` / `dFdy`. Mesa's compiler
+/// (the headless VM-test substrate) accepts these without the
+/// directive; NVIDIA's GLSL compiler is strict and rejects them
+/// with `error C7532: global function fwidth requires "#version
+/// 300" or later`. Since smithay forces `#version 100`, the only
+/// fix is the extension directive — and per the GLSL spec it must
+/// appear after `#version` but before any non-preprocessor token,
+/// so `assemble_source` prepends it (smithay's `#version 100\n`
+/// lands immediately before whatever we return). This was the
+/// gnomon Phase B failure mode once the EGL stack finally came up:
+/// real NVIDIA hardware rejected the hexrain wallpaper's `fwidth`.
+const DERIVATIVES_EXTENSION: &str = "#extension GL_OES_standard_derivatives : enable";
+
 /// Detect Shadertoy-shape shaders by the entry-point signature.
 /// Substring is unambiguous: `mainImage(` only appears in the
 /// Shadertoy convention; declared-uniform shaders write
@@ -64,14 +78,31 @@ fn is_shadertoy_shape(src: &str) -> bool {
     src.contains("mainImage(")
 }
 
+/// Whether the shader calls a derivative builtin that GLSL ES 1.00
+/// gates behind `GL_OES_standard_derivatives`. Word-ish substring
+/// match is sufficient: these tokens don't otherwise appear in GLSL.
+fn uses_derivatives(src: &str) -> bool {
+    src.contains("fwidth") || src.contains("dFdx") || src.contains("dFdy")
+}
+
 /// Stitch the final shader source. If the user wrote a Shadertoy-
 /// shape shader, wrap with the preamble + wrapper; otherwise pass
-/// the source through untouched (declared-uniforms shape).
+/// the source through untouched (declared-uniforms shape). When the
+/// source uses derivative builtins, the `GL_OES_standard_derivatives`
+/// directive is prepended so it lands directly after smithay's
+/// injected `#version 100` (where extension directives must live).
+/// The directive is only added when needed and only when the user
+/// didn't already declare it, keeping derivative-free shaders pristine.
 fn assemble_source(user_src: &str) -> String {
-    if is_shadertoy_shape(user_src) {
+    let body = if is_shadertoy_shape(user_src) {
         format!("{SHADERTOY_PREAMBLE}\n{user_src}\n{SHADERTOY_WRAPPER}")
     } else {
         user_src.to_string()
+    };
+    if uses_derivatives(&body) && !body.contains(DERIVATIVES_EXTENSION) {
+        format!("{DERIVATIVES_EXTENSION}\n{body}")
+    } else {
+        body
     }
 }
 
@@ -480,6 +511,53 @@ mod tests {
             PHASE_B_SHADER_FIXTURE.contains("iResolution"),
             "fixture must reference iResolution so the per-frame \
              uniform bind for the resolution vec3 runs"
+        );
+    }
+
+    #[test]
+    fn derivative_using_shader_gets_oes_extension_directive_first() {
+        // A shader that calls `fwidth` must have the
+        // GL_OES_standard_derivatives extension enabled, and the
+        // directive must come BEFORE any other line so that — after
+        // smithay prepends `#version 100\n` — it sits immediately
+        // after the version (the only legal spot for #extension).
+        // Regression gate for the gnomon NVIDIA hexrain failure;
+        // Mesa (VM substrate) compiles fwidth without it but NVIDIA
+        // rejects it.
+        let src = "void main() { float e = fwidth(gl_FragCoord.x); gl_FragColor = vec4(e); }";
+        let assembled = assemble_source(src);
+        assert!(
+            assembled.starts_with(DERIVATIVES_EXTENSION),
+            "derivative-using shader must lead with the extension \
+             directive so it lands right after smithay's #version 100; \
+             got:\n{assembled}"
+        );
+        // Sanity: smithay forbids #version in our source.
+        assert!(!assembled.contains("#version"));
+    }
+
+    #[test]
+    fn derivative_free_shader_is_left_pristine() {
+        // No fwidth/dFdx/dFdy → no extension directive injected.
+        let src = "void main() { gl_FragColor = vec4(1.0); }";
+        let assembled = assemble_source(src);
+        assert!(
+            !assembled.contains("GL_OES_standard_derivatives"),
+            "derivative-free shaders must not gain the directive"
+        );
+    }
+
+    #[test]
+    fn derivatives_directive_not_double_injected() {
+        // If the user already enabled the extension, don't add a
+        // second copy.
+        let src = "#extension GL_OES_standard_derivatives : enable\n\
+                   void main() { gl_FragColor = vec4(fwidth(gl_FragCoord.x)); }";
+        let assembled = assemble_source(src);
+        assert_eq!(
+            assembled.matches("GL_OES_standard_derivatives").count(),
+            1,
+            "extension directive must appear exactly once"
         );
     }
 

@@ -1693,7 +1693,7 @@ in
          # NO glibc dir in their RUNPATH — they rely on the system
          # ld.so.cache / default /lib to resolve glibc, neither of
          # which exists in an initramfs. libglvnd dlopens
-         # libEGL_nvidia, which DT_NEEDEDs `librt.so.1`; halmasuit's
+         # libEGL_nvidia, which has a DT_NEEDED on `librt.so.1`; halmasuit's
          # OWN closure doesn't need librt, so it's the one glibc lib
          # neither copied into the initramfs NOR findable at runtime,
          # and the vendor dlopen fails SILENTLY — libglvnd falls back
