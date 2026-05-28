@@ -761,6 +761,19 @@
           expectedPath = "/dev/dri/card0";
           testName     = "auto";
         };
+        # NVIDIA-EGL env shape regression gate. Cannot replicate the
+        # actual NVIDIA failure in CI (no single-GPU passthrough on
+        # consumer Blackwell); asserts the UNIT shape — that
+        # `__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS` is set on the nvidia
+        # branch — which is the load-bearing fact for libEGL to find
+        # the GBM platform plugin. Catches the gnomon 2026-05-28
+        # failure mode deterministically.
+        halmasuit-nvidia-egl-env = import ./tests/halmasuit-nvidia-egl-env.nix {
+          system    = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit            = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
+        };
         # Epic #1 R12: first real-PAM gate. run_pam_auth against the
         # real libpam stack with the real test user — NO mock.
         run-pam-auth = import ./tests/run-pam-auth.nix {

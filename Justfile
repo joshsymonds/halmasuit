@@ -74,6 +74,9 @@ test-vm:
     echo "── halmasuit-multi-drm-auto ──"
     nix build .#checks.x86_64-linux.halmasuit-multi-drm-auto -L --print-build-logs --no-link
     echo
+    echo "── halmasuit-nvidia-egl-env ──"
+    nix build .#checks.x86_64-linux.halmasuit-nvidia-egl-env -L --print-build-logs --no-link
+    echo
     echo "── initrd-survival ──"
     nix build .#checks.x86_64-linux.initrd-survival -L --print-build-logs --no-link
     echo

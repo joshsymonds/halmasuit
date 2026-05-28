@@ -518,13 +518,17 @@ in
           `__EGL_VENDOR_LIBRARY_FILENAMES` so libglvnd dispatches
           through the NVIDIA proprietary ICD. Consumers needing
           additional NVIDIA closures (egl-wayland, egl-gbm) add
-          them via `rendering.extraInitrdStorePaths` — the module
-          stays generic to the choice of platform plugin set. The
-          `nvidia-drm` runtime path is NOT exercised by any
-          halmasuit VM test (research established no single-GPU
-          passthrough route on consumer Blackwell); validation
-          happens at deploy-time on the consumer's actual
-          hardware, gated by bootloader rollback.
+          them via `rendering.extraInitrdStorePaths`; the same
+          list ALSO drives `__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS`
+          so libEGL finds the platform plugin JSON descriptors
+          (the GBM platform plugin is what makes the
+          `EGL_KHR_platform_gbm` extension available — required by
+          smithay's DRM backend). The module stays generic to the
+          choice of platform plugin set. The `nvidia-drm` runtime
+          path is NOT exercised by any halmasuit VM test (research
+          established no single-GPU passthrough route on consumer
+          Blackwell); validation happens at deploy-time on the
+          consumer's actual hardware, gated by bootloader rollback.
         '';
       };
 
@@ -920,6 +924,25 @@ in
         __GLX_VENDOR_LIBRARY_NAME = "nvidia";
         __EGL_VENDOR_LIBRARY_FILENAMES =
           "${cfg.rendering.nvidiaPackage}/share/glvnd/egl_vendor.d/10_nvidia.json";
+        # EGL external platform plugin discovery. libEGL only
+        # registers `EGL_KHR_platform_gbm` / `EGL_KHR_platform_wayland`
+        # when it loads the corresponding plugin descriptors at
+        # startup. NVIDIA ships those plugins as separate packages
+        # (egl-gbm, egl-wayland) that emit JSON descriptors at
+        # `share/egl/egl_external_platform.d/`; libEGL searches
+        # `$__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS` (colon-separated)
+        # for them. The descriptors reference plugin .so files by
+        # absolute /nix/store path, so LD_LIBRARY_PATH stays
+        # unchanged — only this env is needed. Without it, smithay
+        # logs "Skipping EGL platform … Missing extensions:
+        # [\"EGL_KHR_platform_gbm\"]" and halmasuit dies at
+        # `EGLDisplay::new` — the gnomon-day-after-multi-DRM
+        # failure mode. The consumer supplies the plugin packages
+        # via `rendering.extraInitrdStorePaths`; this expression
+        # derives the search path from that list.
+        __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS =
+          lib.makeSearchPath "share/egl/egl_external_platform.d"
+            cfg.rendering.extraInitrdStorePaths;
       } // lib.optionalAttrs (cfg.greeterCommand != null) {
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.
@@ -1523,6 +1546,18 @@ in
          __GLX_VENDOR_LIBRARY_NAME = "nvidia";
          __EGL_VENDOR_LIBRARY_FILENAMES =
            "${cfg.rendering.nvidiaPackage}/share/glvnd/egl_vendor.d/10_nvidia.json";
+         # See the rootfs unit's docstring on this var (mirrored
+         # there). The initramfs case is the one that bit gnomon
+         # — Phase B halmasuit died at `EGLDisplay::new` with
+         # "Missing extensions: [\"EGL_KHR_platform_gbm\"]"
+         # because the platform plugin descriptors at
+         # `${egl-gbm}/share/egl/egl_external_platform.d/15_nvidia_gbm.json`
+         # were unreachable without this env. Both paths feed off
+         # the same `extraInitrdStorePaths` list so the rootfs +
+         # initramfs envs stay consistent.
+         __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS =
+           lib.makeSearchPath "share/egl/egl_external_platform.d"
+             cfg.rendering.extraInitrdStorePaths;
        } // lib.optionalAttrs (cfg.greeterCommand != null) {
          # Greeter binary halmasuit fork+execs post-pivot.
          HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
