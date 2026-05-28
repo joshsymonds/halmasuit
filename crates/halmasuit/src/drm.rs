@@ -609,10 +609,11 @@ where
 }
 
 impl DrmBackend {
-    /// Epic #71 R2.2: release DRM master so another VT (text console
-    /// fbcon, or another seat compositor) can take over the display
-    /// while halmasuit is hidden. Called from `VtSwitcher`'s
-    /// `before_drop_master` hook BEFORE the kernel switches away.
+    /// Epic #71 R-honest.7: release DRM master so another VT (text
+    /// console fbcon, or a getty) can take over the display while
+    /// halmasuit is backgrounded. Called from
+    /// `HalmasuitState::handle_vt_relsig` on the kernel's relsig BEFORE
+    /// it `VT_RELDISP`s the switch away.
     ///
     /// Idempotent (the underlying DROP_MASTER ioctl is no-op if we
     /// already don't hold master). Does NOT tear down the
@@ -626,8 +627,8 @@ impl DrmBackend {
     /// successful frame after `resume()` re-paints.
     ///
     /// # Errors
-    /// Bubbles DROP_MASTER ioctl errno. Caller (R2.2 hook) logs and
-    /// continues — the VT switch proceeds regardless.
+    /// Bubbles DROP_MASTER ioctl errno. The caller logs and continues —
+    /// the VT switch proceeds regardless.
     pub fn pause(&self) -> io::Result<()> {
         self.compositor
             .surface()
@@ -637,15 +638,15 @@ impl DrmBackend {
         Ok(())
     }
 
-    /// Epic #71 R2.2: re-acquire DRM master after returning from a
-    /// VT switch (e.g. user pressed Ctrl+Alt+F<halmasuit's VT> to
-    /// come back). Idempotent. Called from `VtSwitcher`'s
-    /// `on_activated` hook after the kernel has switched TO us.
+    /// Epic #71 R-honest.7: re-acquire DRM master after the kernel
+    /// switches back to halmasuit's home VT. Idempotent. Called from
+    /// `HalmasuitState::handle_vt_acqsig` on the kernel's acqsig before
+    /// it `VT_RELDISP(ackacq)`s.
     ///
     /// # Errors
     /// Bubbles SET_MASTER ioctl errno. If this fails the display
-    /// stays blank — the caller (R2.x signalfd handler) should log
-    /// loudly. The user can press Ctrl+Alt+F<other> + back to retry.
+    /// stays blank — the caller (`handle_vt_acqsig`) logs loudly. The
+    /// user can switch away + back to retry.
     pub fn resume(&self) -> io::Result<()> {
         self.compositor
             .surface()

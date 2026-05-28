@@ -3,15 +3,15 @@
 Research probe for **Epic #71 Phase 0**: empirically validates whether
 the compositor (unprivileged, no `CAP_SYS_TTY_CONFIG`) can drive the
 entire VT cooperative-switching state machine — `TIOCSCTTY` +
-`VT_SETMODE` + `VT_RELDISP` (both arg variants) — using only an
-inherited fd whose source process is the privileged broker.
+`VT_SETMODE` + `VT_RELDISP` (both arg variants) — on a VT fd it owns.
 
 Not production code. The production VT-switching path lives in
-`halmasuit-session` (broker) and `halmasuit` (compositor).
+`halmasuit`'s `vt_switch.rs` (the home-VT model — R-honest.7).
 
 ## Verdict
 
-**PASS — broker-passes-fd model is fully viable.**
+**PASS — an unprivileged compositor can own its VT and drive the
+cooperative handshake without `CAP_SYS_TTY_CONFIG`.**
 
 Captured in NixOS test VM (`tests/vt-probe-phase0.nix`) running:
 
@@ -38,47 +38,45 @@ if (current->signal->tty == tty || capable(CAP_SYS_TTY_CONFIG))
 The first arm matches once `TIOCSCTTY` makes the inherited fd's TTY
 the calling process's controlling TTY. The cap is not required.
 
-## Implication for Epic #71's broker design
+## Implication: the home-VT model
 
-The broker (`halmasuit-session`) only needs to:
+This result is the empirical foundation of the production **home-VT
+model** (`halmasuit/src/vt_switch.rs`, R-honest.7): because the
+unprivileged compositor can drive `TIOCSCTTY`/`VT_SETMODE`/`VT_RELDISP`
+itself, it owns its own ("home") VT directly and the broker has NO VT
+role at all.
 
-1. Open `/dev/ttyN` (it has the necessary group access — root, or
-   member of the `tty` group).
-2. Pass the fd to the compositor over the existing SCM_RIGHTS-capable
-   socket.
-3. Receive the compositor's "I dropped DRM master, ack" message.
-4. Call `VT_ACTIVATE(target)` — this is the only ioctl the broker
-   itself needs to make (and it does require `CAP_SYS_TTY_CONFIG`,
-   which the broker holds as part of its capability set).
+The compositor handles the entire cooperative-switching state machine
+in-process:
 
-The compositor handles the rest of the cooperative-switching state
-machine entirely in-process:
+1. Open `/dev/tty<home>` in its **root startup window** (the same
+   window that opens the DRM master fd), then `setsid()` + `TIOCSCTTY`
+   + `VT_SETMODE PROCESS` + `VT_ACTIVATE` to bring it to the
+   foreground. The controlling-TTY designation survives the privilege
+   drop, so the VT ioctls keep working unprivileged thereafter (this
+   probe's result).
+2. A switch is a local `VT_ACTIVATE(target)` — the target VT (a getty)
+   is never grabbed.
+3. relsig/acqsig are **realtime signals** (`SIGRTMIN+4`/`+5`, not
+   SIGUSR1/2 — those are stolen by Mesa/EGL threads, freedesktop
+   #87322), delivered on a dedicated `signalfd` calloop source.
+   relsig → `drm.pause()` + `VT_RELDISP(release)`; acqsig →
+   `drm.resume()` + `VT_RELDISP(VT_ACKACQ)`.
 
-- `setsid()` after privilege drop.
-- `TIOCSCTTY` on the inherited fd.
-- `VT_SETMODE PROCESS` with relsig=SIGUSR1, acqsig=SIGUSR2.
-- Signal handling via `signalfd` (matches halmasuit's existing
-  calloop-driven signal model).
-- `VT_RELDISP(VT_ACKACQ)` on SIGUSR2 (kernel switched TO our VT).
-- `VT_RELDISP(1)` on SIGUSR1 (kernel switching AWAY from our VT).
-
-No SCM_RIGHTS-back-pass of the fd. No broker-mediated `VT_RELDISP`
-calls. The protocol surface between broker and compositor stays
-narrow: open + fd-pass + the existing PAM-broker message bus.
+The broker is not involved in VT switching. Liveness is enforced by a
+systemd watchdog (`WatchdogSec` + `sd_notify` from the calloop loop), so
+a hung compositor is SIGKILLed by systemd and the kernel's `reset_vc`
+reverts the VT to `VT_AUTO` — never a broker-side concern.
 
 ## What the probe does NOT validate
 
-- The production broker protocol (the specific message types,
-  rate-limiting, timeout enforcement). All of that lands in
-  Epic #71's R-series implementation tasks.
-- The drop-master-then-VT_ACTIVATE ordering (systemd #21388 lesson).
-  That's enforced at the broker; the probe doesn't open a DRM device.
-- The watchdog for a compositor that hangs in its SIGUSR1 handler.
-  Also a broker-side concern.
-- Behavior when `/dev/ttyN` already has another session's controlling
-  process (e.g., a getty). The probe runs in a test VM where tty2
-  is not actively claimed; the production broker should pick a VT
-  number that's documented as available or detect the collision.
+- The drop-master-then-`VT_RELDISP` ordering (systemd #21388 lesson).
+  The probe doesn't open a DRM device; the production
+  `handle_vt_relsig` enforces it (pause master, then ack).
+- The getty-collision behavior the home-VT model exists to avoid:
+  grabbing a getty's VT gets the fd revoked by `vhangup()`. The
+  probe runs against tty2 in a test VM; production owns a getty-free
+  home VT (`HALMASUIT_HOME_VT`, e.g. tty8).
 
 ## How to run
 

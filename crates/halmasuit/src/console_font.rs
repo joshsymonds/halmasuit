@@ -17,14 +17,6 @@
 //! dep posture as the rest of halmasuit. Bit order: each of the 8
 //! row-bytes has **bit 0 = leftmost pixel** (LSB-left).
 
-// The blitter + helpers are consumed by the diagnostic-overlay
-// renderer in R-honest.6. Landed here standalone + unit-tested
-// first. Same staged-surface pattern as vt_switch.rs.
-#![allow(
-    dead_code,
-    reason = "consumed by the diagnostic overlay renderer in R-honest.6"
-)]
-
 include!("console_font_data.rs");
 
 /// Glyph cell dimensions (px). font8x8 is 8x8.
@@ -42,28 +34,6 @@ pub const fn glyph(ch: char) -> [u8; 8] {
     } else {
         FONT8X8_BASIC['?' as usize]
     }
-}
-
-/// Pixel dimensions `(w, h)` that [`blit_str`] will occupy for
-/// `text`: width = longest line × `GLYPH_W`, height = line count ×
-/// `GLYPH_H`. Lets the overlay size/position its panel before
-/// blitting.
-#[must_use]
-pub fn text_dims(text: &str) -> (i32, i32) {
-    let mut max_cols = 0_i32;
-    let mut cols = 0_i32;
-    let mut lines = 1_i32;
-    for ch in text.chars() {
-        if ch == '\n' {
-            max_cols = max_cols.max(cols);
-            cols = 0;
-            lines += 1;
-        } else {
-            cols += 1;
-        }
-    }
-    max_cols = max_cols.max(cols);
-    (max_cols * GLYPH_W, lines * GLYPH_H)
 }
 
 /// Blit `text` into the RGBA8 buffer `buf` (row stride `stride_px`
@@ -139,15 +109,6 @@ mod tests {
         // A non-ASCII char renders the '?' glyph, not garbage / panic.
         assert_eq!(glyph('\u{1F600}'), FONT8X8_BASIC['?' as usize]);
         assert_eq!(glyph('é'), FONT8X8_BASIC['?' as usize]);
-    }
-
-    /// `text_dims` matches the line/column geometry `blit_str` walks.
-    #[test]
-    fn text_dims_counts_lines_and_longest_row() {
-        assert_eq!(text_dims(""), (0, GLYPH_H));
-        assert_eq!(text_dims("abc"), (3 * GLYPH_W, GLYPH_H));
-        assert_eq!(text_dims("ab\ncde"), (3 * GLYPH_W, 2 * GLYPH_H));
-        assert_eq!(text_dims("\n"), (0, 2 * GLYPH_H));
     }
 
     /// Bit order is load-bearing: font8x8 puts bit 0 at the LEFTMOST

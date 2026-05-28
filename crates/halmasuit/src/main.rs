@@ -379,11 +379,11 @@ struct HalmasuitState {
     /// re-renders. `None` only if the channel failed to register
     /// (the overlay then shows an empty journal section).
     journal_tx: Option<calloop::channel::Sender<String>>,
-    /// Epic #71 R-honest.7: the VT fd the compositor became the
-    /// `VT_PROCESS` controller of via the last successful VT switch.
-    /// Retained (NOT dropped) so the SIGUSR1 (relsig) / SIGUSR2
-    /// (acqsig) handlers can `VT_RELDISP` the cooperative-switch
-    /// handshake against it. `None` until the first switch activates.
+    /// Epic #71 R-honest.7: the compositor's HOME vt fd — opened in the
+    /// root startup window and made the `VT_PROCESS` controller. Retained
+    /// for the process lifetime so the relsig / acqsig handlers can
+    /// `VT_RELDISP` the cooperative-switch handshake against it. `None`
+    /// when no home VT is configured (`HALMASUIT_HOME_VT` unset).
     vt_fd: Option<std::os::fd::OwnedFd>,
     /// Epic #71 R3.3: state shared with the Compositor1 DBus server
     /// thread. Holds the startup `Instant` (for `GetUptime`) and
@@ -726,7 +726,7 @@ impl HalmasuitState {
         }
     }
 
-    /// Epic #71 R-honest.7: handle the kernel's VT relsig (SIGUSR1) —
+    /// Epic #71 R-honest.7: handle the kernel's VT relsig —
     /// "release your VT, someone's switching away". Per the systemd
     /// #21388 ordering, drop DRM master FIRST, then `VT_RELDISP` with
     /// the RELEASE arg so the kernel completes the switch to the
@@ -749,7 +749,7 @@ impl HalmasuitState {
         }
     }
 
-    /// Epic #71 R-honest.7: handle the kernel's VT acqsig (SIGUSR2) —
+    /// Epic #71 R-honest.7: handle the kernel's VT acqsig —
     /// "your VT is active again". Reacquire DRM master, then
     /// `VT_RELDISP` with the ACKACQ arg to confirm the acquire.
     fn handle_vt_acqsig(&self) {

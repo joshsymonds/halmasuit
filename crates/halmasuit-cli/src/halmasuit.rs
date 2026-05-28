@@ -148,14 +148,17 @@ fn cmd_logs(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The `org.halmasuit.Compositor1` D-Bus triple this CLI talks to —
+/// bus name, object path, interface. MUST match what `halmasuit`'s
+/// `dbus_compositor1.rs` serves. Named so the unit test pins the exact
+/// strings the live proxy uses (a typo'd rename here fails the test).
+const COMPOSITOR1_BUS: &str = "org.halmasuit.Compositor1";
+const COMPOSITOR1_PATH: &str = "/org/halmasuit/Compositor1";
+const COMPOSITOR1_IFACE: &str = "org.halmasuit.Compositor1";
+
 fn compositor1_proxy(conn: &zbus::blocking::Connection) -> Result<zbus::blocking::Proxy<'static>> {
-    zbus::blocking::Proxy::new(
-        conn,
-        "org.halmasuit.Compositor1",
-        "/org/halmasuit/Compositor1",
-        "org.halmasuit.Compositor1",
-    )
-    .context("build Compositor1 proxy")
+    zbus::blocking::Proxy::new(conn, COMPOSITOR1_BUS, COMPOSITOR1_PATH, COMPOSITOR1_IFACE)
+        .context("build Compositor1 proxy")
 }
 
 #[cfg(test)]
@@ -191,24 +194,16 @@ mod tests {
         }
     }
 
-    /// `compositor1_proxy` builds the proxy with the right
-    /// destination/path/interface triple. We can't actually
-    /// connect in a unit test without a live bus, but we can
-    /// verify the strings as a smoke test against typos.
+    /// Pins the exact `org.halmasuit.Compositor1` triple the live
+    /// `compositor1_proxy` uses (it references these same consts), so an
+    /// accidental edit to the CLI's bus name / object path / interface
+    /// fails CI. These MUST match what `halmasuit`'s dbus_compositor1.rs
+    /// serves; the compositor1-dbus.nix VM test exercises the end-to-end
+    /// match against the live server.
     #[test]
-    fn compositor1_triple_is_consistent() {
-        // The triple ("org.halmasuit.Compositor1",
-        //            "/org/halmasuit/Compositor1",
-        //            "org.halmasuit.Compositor1") MUST match what
-        // dbus_compositor1.rs serves. Encode that as a string
-        // comparison here so a future rename trips both sides.
-        assert_eq!(
-            "org.halmasuit.Compositor1", "org.halmasuit.Compositor1",
-            "bus name + interface match"
-        );
-        assert_eq!(
-            "/org/halmasuit/Compositor1", "/org/halmasuit/Compositor1",
-            "object path"
-        );
+    fn compositor1_triple_matches_served_contract() {
+        assert_eq!(super::COMPOSITOR1_BUS, "org.halmasuit.Compositor1");
+        assert_eq!(super::COMPOSITOR1_PATH, "/org/halmasuit/Compositor1");
+        assert_eq!(super::COMPOSITOR1_IFACE, "org.halmasuit.Compositor1");
     }
 }

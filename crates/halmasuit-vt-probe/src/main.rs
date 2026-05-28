@@ -7,21 +7,21 @@
 // The kernel check in `drivers/tty/vt/vt_ioctl.c`:
 //     if (current->signal->tty == tty || capable(CAP_SYS_TTY_CONFIG))
 //         perm = 1;
-// If `TIOCSCTTY` on the inherited fd makes it the calling process's
+// If `TIOCSCTTY` on the VT fd makes it the calling process's
 // controlling TTY, the first arm is satisfied and the process can call
-// `VT_RELDISP` without the cap. That's the design assumption underlying
-// Epic #71's broker-mediated VT switching: the broker (privileged) opens
-// the VT and calls `VT_SETMODE`; the compositor (unprivileged) receives
-// the fd, makes it its controlling TTY, and handles `VT_RELDISP` itself.
-// If this probe answers YES, the design's load-bearing assumption holds.
-// If NO, the design needs the fallback path (broker also brokers
-// `VT_RELDISP`) and that's a meaningful protocol change to plan for.
+// `VT_RELDISP` without the cap. That's the load-bearing assumption of
+// Epic #71's production home-VT model: the unprivileged compositor owns
+// its own VT (TIOCSCTTY + VT_SETMODE) and drives the VT_RELDISP
+// handshake itself, with no privileged broker in the VT path. This
+// probe answers YES, so that assumption holds.
 //
 // Test mechanics:
 //
 // 1. Probe runs as root (via the NixOS test's systemd unit). Opens
 //    /dev/tty2. Calls `VT_SETMODE PROCESS` with relsig=SIGUSR1,
-//    acqsig=SIGUSR2 — same shape the production compositor would use.
+//    acqsig=SIGUSR2. (Signal NUMBERS are irrelevant to the perm-check
+//    question this probe answers; production uses realtime signals —
+//    SIGUSR1/2 are stolen by Mesa/EGL threads, freedesktop #87322.)
 // 2. Probe forks. The parent waitpid's the child and exits with the
 //    child's status. The fd is preserved across fork (inherited by
 //    child).

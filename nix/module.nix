@@ -999,9 +999,8 @@ in
          #   CAP_SYS_ADMIN     pam_namespace, pam_loginuid, fork+exec
          #   CAP_DAC_READ_SEARCH  /etc/shadow read via shadow group
          #   CAP_SYS_PTRACE    pam_keyinit edge cases
-         #   CAP_SYS_TTY_CONFIG  Epic #71 R1 VT_ACTIVATE ioctl
-         #                       (compositor never holds this; broker
-         #                       fires the ioctl on its behalf)
+         # (The broker has NO VT role: halmasuit owns its home VT
+         # directly — Epic #71 R-honest.7 home-VT model.)
          SupplementaryGroups = [ "shadow" ];
          # Generous backstop ONLY (a wedged module is bounded by the
          # broker's per-worker RLIMIT_CPU + SIGKILL-anytime + idle

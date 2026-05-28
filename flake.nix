@@ -762,10 +762,11 @@
           inherit nixpkgs;
         };
         # Epic #71 Phase 0 probe: validate that an unprivileged process
-        # can call TIOCSCTTY + VT_RELDISP on an inherited VT fd without
-        # holding CAP_SYS_TTY_CONFIG. The production broker-passes-fd
-        # design assumes this works; the probe answers the question
-        # empirically before production commits.
+        # can call TIOCSCTTY + VT_RELDISP on a VT fd without holding
+        # CAP_SYS_TTY_CONFIG. This is the empirical foundation the
+        # home-VT model relies on — halmasuit owns its home VT directly
+        # and drives the cooperative handshake as the unprivileged
+        # compositor (R-honest.7).
         vt-probe-phase0 = import ./tests/vt-probe-phase0.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
