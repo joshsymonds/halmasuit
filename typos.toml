@@ -15,6 +15,13 @@ Inh = "Inh"
 CapInh = "CapInh"
 # Plural of PNG. typos rewrites "PNGs" → "PONs".
 PNGs = "PNGs"
+# Level Of Detail — standard graphics term used in
+# crates/kushuh/ARCHITECTURE.md's distant-star LOD discussion.
+# typos suggests "LOAD".
+LOD = "LOD"
+# Simon Ser, sway/wlroots maintainer, referenced by surname in
+# crates/kushuh/ARCHITECTURE.md. typos suggests "Set".
+Ser = "Ser"
 
 [files]
 extend-exclude = [

@@ -27,7 +27,8 @@
 //     front-to-back element list composites every surface over it
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
@@ -105,6 +106,311 @@ pub fn xrgb_le_to_color32f(bytes: [u8; 4]) -> Color32F {
         f32::from(bytes[0]) / 255.0,
         1.0,
     )
+}
+
+// ─── DRM device selection ────────────────────────────────────────────
+//
+// Halmasuit historically opened `/dev/dri/card0` directly, which works
+// on single-DRM-device hosts (every test VM) but fails on real hardware
+// where the kernel may register multiple DRM devices in non-deterministic
+// order (e.g., gnomon: simpledrm + chipset-side DRM + NVIDIA — card0 ends
+// up being the wrong device). `DrmDeviceSpec` + `resolve_drm_device`
+// replace that hardcode with a three-mode selector:
+//
+//   * `Auto`  — iterate `/dev/dri/card*`, pick the first with at least
+//                one `Connection::Connected` connector (libdrm probe).
+//   * `Path`  — open the supplied path as-is.
+//   * `Pci`   — match by PCI BDF via `/sys/class/drm/cardN/device`.
+//
+// All three modes wrap a deadline-bounded retry: udev may not have
+// finished creating the device node when halmasuit's initramfs unit
+// fires (`systemd-modules-load` deactivates BEFORE udev drains its event
+// queue), so the resolver polls every 100ms up to `deadline`, retrying
+// on `ErrorKind::NotFound` and propagating any other error immediately.
+
+/// How the caller specifies which DRM device halmasuit should open.
+///
+/// Parsed from the `HALMASUIT_DRM_DEVICE` env var:
+///   * empty / unset → [`DrmDeviceSpec::Auto`]
+///   * starts with `pci:` → [`DrmDeviceSpec::Pci`] with the parsed BDF
+///   * anything else → [`DrmDeviceSpec::Path`]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrmDeviceSpec {
+    /// Iterate `/dev/dri/card*` and pick the first card with at least
+    /// one connector reporting `Connection::Connected`.
+    Auto,
+    /// Use the exact path as-is. The caller knows which `cardN` it
+    /// wants (e.g., explicit gnomon-side override during early bringup
+    /// before the operator has measured the PCI BDF).
+    Path(PathBuf),
+    /// Look up the matching `/dev/dri/cardN` by reading
+    /// `/sys/class/drm/cardN/device` and comparing against the BDF.
+    /// Stable across reboots regardless of kernel probe order.
+    Pci(PciBdf),
+}
+
+/// A validated PCI BDF in `DDDD:BB:DD.F` format (domain `[0-9a-f]{4}`,
+/// bus `[0-9a-f]{2}`, device `[0-9a-f]{2}`, function `[0-7]`).
+///
+/// Stored normalized to lowercase so the comparison against
+/// `/sys/class/drm/cardN/device` symlinks (which Linux emits in
+/// lowercase) is a simple string match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PciBdf(String);
+
+/// Parser-rejection reasons for [`PciBdf::parse`].
+#[derive(Debug, thiserror::Error)]
+pub enum BdfParseError {
+    /// The string doesn't match the `DDDD:BB:DD.F` shape.
+    #[error("PCI BDF must be 'DDDD:BB:DD.F' (got: {got:?})")]
+    BadFormat {
+        /// The offending input, for diagnostics.
+        got: String,
+    },
+    /// The function digit is outside `0..=7`.
+    #[error("PCI BDF function digit must be 0-7 (got: {got:?})")]
+    BadFunction {
+        /// The offending input, for diagnostics.
+        got: String,
+    },
+}
+
+impl PciBdf {
+    /// Parse a `DDDD:BB:DD.F` string. Accepts both hex cases; stores
+    /// normalized to lowercase.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BdfParseError::BadFormat`] if the structural shape is
+    /// wrong (missing separators, wrong digit count, non-hex digits).
+    /// Returns [`BdfParseError::BadFunction`] if the function digit is
+    /// `>= 8` (PCI functions are 3 bits).
+    pub fn parse(s: &str) -> Result<Self, BdfParseError> {
+        let bad_format = || BdfParseError::BadFormat { got: s.to_owned() };
+
+        // Shape: 4 hex : 2 hex : 2 hex . 1 hex
+        let (domain_bus_dev, function) = s.rsplit_once('.').ok_or_else(bad_format)?;
+        if function.len() != 1 {
+            return Err(bad_format());
+        }
+        let function_digit = u8::from_str_radix(function, 16).map_err(|_| bad_format())?;
+        if function_digit > 7 {
+            return Err(BdfParseError::BadFunction { got: s.to_owned() });
+        }
+
+        let parts: Vec<&str> = domain_bus_dev.split(':').collect();
+        if parts.len() != 3 {
+            return Err(bad_format());
+        }
+        let [domain, bus, device] = [parts[0], parts[1], parts[2]];
+        if domain.len() != 4 || bus.len() != 2 || device.len() != 2 {
+            return Err(bad_format());
+        }
+        // Validate each segment is pure hex.
+        u32::from_str_radix(domain, 16).map_err(|_| bad_format())?;
+        u8::from_str_radix(bus, 16).map_err(|_| bad_format())?;
+        u8::from_str_radix(device, 16).map_err(|_| bad_format())?;
+
+        Ok(Self(s.to_ascii_lowercase()))
+    }
+
+    /// The BDF as a lowercase string (e.g., `0000:01:00.0`).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl DrmDeviceSpec {
+    /// Parse a `HALMASUIT_DRM_DEVICE` env value into a spec.
+    ///
+    /// Empty input → [`DrmDeviceSpec::Auto`]. A `pci:`-prefixed value
+    /// is parsed via [`PciBdf::parse`]. Anything else is treated as a
+    /// path (no validation; the resolver's `Path` arm checks existence).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BdfParseError`] if a `pci:`-prefixed value has an
+    /// unparsable BDF.
+    pub fn from_env_value(s: &str) -> Result<Self, BdfParseError> {
+        if s.is_empty() {
+            Ok(Self::Auto)
+        } else if let Some(rest) = s.strip_prefix("pci:") {
+            Ok(Self::Pci(PciBdf::parse(rest)?))
+        } else {
+            Ok(Self::Path(PathBuf::from(s)))
+        }
+    }
+}
+
+/// How often the retry loop polls when the device isn't there yet.
+const RESOLVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Resolve a [`DrmDeviceSpec`] to a concrete `/dev/dri/cardN` path,
+/// retrying on `NotFound`-class errors until either resolution
+/// succeeds or `deadline` elapses (polls every
+/// [`RESOLVE_POLL_INTERVAL`]).
+///
+/// `Auto` iterates `/dev/dri/card*`, opens each, and picks the first
+/// card with at least one connector reporting `Connection::Connected`.
+/// `Path` returns the supplied path once it exists. `Pci` looks up the
+/// matching card via `/sys/class/drm/cardN/device`.
+///
+/// Non-`NotFound` errors (e.g., `EACCES` reading `/dev/dri/`) propagate
+/// immediately without retry — the caller will not recover by polling.
+///
+/// # Errors
+///
+/// Returns [`io::Error`] of kind `NotFound` if the deadline elapses
+/// without resolution; propagates any other I/O error from the first
+/// failing call.
+pub fn resolve_drm_device(spec: &DrmDeviceSpec, deadline: Duration) -> io::Result<PathBuf> {
+    let start = Instant::now();
+    loop {
+        if let Some(p) = try_resolve_once(spec)? {
+            return Ok(p);
+        }
+        if start.elapsed() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no DRM device satisfies {spec:?} within {deadline:?}"),
+            ));
+        }
+        std::thread::sleep(RESOLVE_POLL_INTERVAL);
+    }
+}
+
+/// Single pass at resolution. `Ok(None)` means "not yet — retry";
+/// `Err(_)` propagates immediately to the caller.
+fn try_resolve_once(spec: &DrmDeviceSpec) -> io::Result<Option<PathBuf>> {
+    match spec {
+        DrmDeviceSpec::Auto => find_auto(),
+        DrmDeviceSpec::Path(p) => {
+            if p.exists() {
+                Ok(Some(p.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+        DrmDeviceSpec::Pci(bdf) => find_by_bdf(bdf),
+    }
+}
+
+/// Iterate `/dev/dri/card*` and return the first card with a
+/// connected connector. Opens each card read-write (libdrm's
+/// connection probe needs that). On error opening a card, skip it
+/// rather than fail — a card that's busy or otherwise unopenable
+/// shouldn't block discovery of a usable card.
+fn find_auto() -> io::Result<Option<PathBuf>> {
+    let Ok(read_dir) = std::fs::read_dir("/dev/dri") else {
+        // /dev/dri itself doesn't exist yet — caller retries.
+        return Ok(None);
+    };
+
+    let mut cards: Vec<PathBuf> = read_dir
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let n = e.file_name();
+            let s = n.to_str()?;
+            if !s.starts_with("card") {
+                return None;
+            }
+            s[4..].parse::<u32>().ok()?;
+            Some(e.path())
+        })
+        .collect();
+    cards.sort();
+
+    for card in cards {
+        if card_has_connected_connector(&card)? {
+            return Ok(Some(card));
+        }
+    }
+    Ok(None)
+}
+
+/// Open `path` and check whether any connector reports
+/// `Connection::Connected`. Returns `Ok(false)` for "no connected
+/// connector"; opens that fail with `NotFound` translate to
+/// `Ok(false)` (treated as "skip this card, try the next"). Other
+/// errors propagate.
+fn card_has_connected_connector(path: &Path) -> io::Result<bool> {
+    use std::os::fd::OwnedFd;
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let owned_fd: OwnedFd = file.into();
+    let device_fd = DrmDeviceFd::new(DeviceFd::from(owned_fd));
+
+    // ControlDevice's `resource_handles` returns the connector list;
+    // `get_connector` reads each connector's current state.
+    let Ok(handles) = ControlDevice::resource_handles(&device_fd) else {
+        return Ok(false);
+    };
+    for &handle in handles.connectors() {
+        if let Ok(info) = ControlDevice::get_connector(&device_fd, handle, false)
+            && info.state() == connector::State::Connected
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Walk `/sys/class/drm/card*/device` and return the `/dev/dri/cardN`
+/// whose symlink target's basename matches `bdf`. `Ok(None)` means
+/// "no match yet" (caller retries — udev may not have populated the
+/// sysfs link yet).
+fn find_by_bdf(bdf: &PciBdf) -> io::Result<Option<PathBuf>> {
+    let read_dir = match std::fs::read_dir("/sys/class/drm") {
+        Ok(d) => d,
+        // /sys/class/drm hasn't been populated yet — caller retries.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let target_bdf = bdf.as_str();
+
+    for entry in read_dir {
+        // Propagate I/O errors reading the directory (e.g., EACCES)
+        // instead of swallowing them — the caller cannot recover by
+        // polling.
+        let entry = entry?;
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        if !name.starts_with("card") || name[4..].parse::<u32>().is_err() {
+            continue;
+        }
+
+        // The `device` symlink may legitimately be absent on partial
+        // udev population — treat NotFound as "skip this card, try the
+        // next" and propagate other errors.
+        let device_symlink = entry.path().join("device");
+        let target = match std::fs::read_link(&device_symlink) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let Some(basename_os) = target.file_name() else {
+            continue;
+        };
+        let Some(basename) = basename_os.to_str() else {
+            continue;
+        };
+        if basename.eq_ignore_ascii_case(target_bdf) {
+            return Ok(Some(PathBuf::from(format!("/dev/dri/{name}"))));
+        }
+    }
+    Ok(None)
 }
 
 render_elements! {
@@ -1100,4 +1406,129 @@ mod tests {
     // `crate::wallpaper::tests::wallpaper_is_the_bottom_most_element`
     // — the `wallpaper_slot` helper now lives there alongside the
     // engine that consumes it.
+
+    // ── DRM device spec parsing + resolver tests ────────────────────
+    // These tests cover [`DrmDeviceSpec::from_env_value`],
+    // [`PciBdf::parse`], and the [`resolve_drm_device`] deadline
+    // behavior for the Path arm. Auto and Pci runtime probing are
+    // exercised by the multi-DRM VM test (DRM5).
+
+    #[test]
+    fn empty_env_parses_to_auto() {
+        assert_eq!(
+            DrmDeviceSpec::from_env_value("").unwrap(),
+            DrmDeviceSpec::Auto
+        );
+    }
+
+    #[test]
+    fn path_env_parses_to_path() {
+        match DrmDeviceSpec::from_env_value("/dev/dri/card1").unwrap() {
+            DrmDeviceSpec::Path(p) => assert_eq!(p, PathBuf::from("/dev/dri/card1")),
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pci_env_parses_to_pci_with_valid_bdf() {
+        match DrmDeviceSpec::from_env_value("pci:0000:01:00.0").unwrap() {
+            DrmDeviceSpec::Pci(b) => assert_eq!(b.as_str(), "0000:01:00.0"),
+            other => panic!("expected Pci, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pci_env_with_malformed_bdf_returns_error() {
+        // Empty after the prefix.
+        assert!(DrmDeviceSpec::from_env_value("pci:").is_err());
+        // Not hex.
+        assert!(DrmDeviceSpec::from_env_value("pci:bogus").is_err());
+        // Wrong segment lengths.
+        assert!(DrmDeviceSpec::from_env_value("pci:00:01:00.0").is_err());
+        assert!(DrmDeviceSpec::from_env_value("pci:0000:1:00.0").is_err());
+        assert!(DrmDeviceSpec::from_env_value("pci:0000:01:0.0").is_err());
+        // Function digit > 7.
+        assert!(matches!(
+            DrmDeviceSpec::from_env_value("pci:0000:01:00.8"),
+            Err(BdfParseError::BadFunction { .. })
+        ));
+        // Missing function separator.
+        assert!(DrmDeviceSpec::from_env_value("pci:0000:01:00").is_err());
+    }
+
+    #[test]
+    fn pci_bdf_lowercase_and_uppercase_hex_both_accepted_normalized_to_lowercase() {
+        assert_eq!(
+            PciBdf::parse("0000:01:00.0").unwrap().as_str(),
+            "0000:01:00.0"
+        );
+        assert_eq!(
+            PciBdf::parse("ABCD:0F:00.0").unwrap().as_str(),
+            "abcd:0f:00.0"
+        );
+        assert_eq!(
+            PciBdf::parse("abcd:0f:00.0").unwrap().as_str(),
+            "abcd:0f:00.0"
+        );
+    }
+
+    #[test]
+    fn pci_bdf_function_boundaries() {
+        // 0..=7 must all parse.
+        for f in 0..=7 {
+            let s = format!("0000:01:00.{f:x}");
+            assert!(PciBdf::parse(&s).is_ok(), "function {f} should parse");
+        }
+        // 8..=F must reject as BadFunction.
+        for f in 8..=15 {
+            let s = format!("0000:01:00.{f:x}");
+            assert!(
+                matches!(PciBdf::parse(&s), Err(BdfParseError::BadFunction { .. })),
+                "function {f:x} should be BadFunction"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_path_mode_nonexistent_times_out_after_deadline() {
+        let deadline = Duration::from_millis(300);
+        let start = Instant::now();
+        let r = resolve_drm_device(
+            &DrmDeviceSpec::Path(PathBuf::from(
+                "/dev/dri/halmasuit-test-definitely-does-not-exist",
+            )),
+            deadline,
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            r.is_err(),
+            "should fail for nonexistent path after deadline, got: {r:?}"
+        );
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::NotFound);
+        // Loop polls every 100ms; deadline 300ms gives ~3 iterations.
+        // Total elapsed should be at least the deadline, and well under
+        // 1s (no hang).
+        assert!(
+            elapsed >= deadline,
+            "resolver returned before deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "resolver hung past deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_path_mode_existing_returns_immediately() {
+        // /dev/null exists on every test host; use it as a stand-in
+        // for "an extant path the resolver should accept." (The
+        // resolver doesn't validate the path is actually a DRM
+        // device — that's `setup_drm_direct`'s job.)
+        let r = resolve_drm_device(
+            &DrmDeviceSpec::Path(PathBuf::from("/dev/null")),
+            Duration::from_millis(50),
+        )
+        .expect("/dev/null should resolve");
+        assert_eq!(r, PathBuf::from("/dev/null"));
+    }
 }

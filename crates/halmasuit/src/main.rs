@@ -2727,6 +2727,17 @@ const HALMASUIT_BRAND_CLEAR: [u8; 4] =
 /// Fail-closed under euid 0 if the bypass is requested — the SKIP path
 /// disarms a core architectural invariant and must not be honored from
 /// the production systemd unit.
+///
+/// `HALMASUIT_DRM_DEVICE` accepts three shapes (see [`drm::DrmDeviceSpec`]):
+///   * empty / unset — auto-discover by iterating `/dev/dri/card*` and
+///     picking the first card with a connected connector
+///   * `/dev/dri/cardN` — use that path directly
+///   * `pci:DDDD:BB:DD.F` — resolve the BDF via `/sys/class/drm`
+///
+/// The resolver retries on `NotFound`-class errors for up to
+/// [`DRM_RESOLVE_DEADLINE`] (10 s) to absorb the initramfs-side race
+/// where halmasuit's unit may fire before udev finishes creating the
+/// device node for a freshly-loaded `nvidia_drm` module.
 fn drm_device_path_from_env() -> io::Result<Option<PathBuf>> {
     if std::env::var_os("HALMASUIT_SKIP_DRM_MASTER").is_some() {
         if nix::unistd::geteuid().is_root() {
@@ -2742,11 +2753,25 @@ fn drm_device_path_from_env() -> io::Result<Option<PathBuf>> {
         );
         return Ok(None);
     }
-    Ok(Some(std::env::var_os("HALMASUIT_DRM_DEVICE").map_or_else(
-        || PathBuf::from("/dev/dri/card0"),
-        PathBuf::from,
-    )))
+
+    let raw = std::env::var_os("HALMASUIT_DRM_DEVICE")
+        .and_then(|v| v.into_string().ok())
+        .unwrap_or_default();
+    let spec = drm::DrmDeviceSpec::from_env_value(&raw)
+        .map_err(|e| io::Error::other(format!("HALMASUIT_DRM_DEVICE: {e}")))?;
+    tracing::info!(?spec, "resolving DRM device");
+    let path = drm::resolve_drm_device(&spec, DRM_RESOLVE_DEADLINE)?;
+    tracing::info!(?path, "DRM device resolved");
+    Ok(Some(path))
 }
+
+/// How long [`drm::resolve_drm_device`] retries on `NotFound`-class
+/// errors before giving up. 10 s is comfortably above the observed
+/// gnomon race (nvidia_drm module insertion → udev node creation
+/// completes within a few hundred ms of `systemd-modules-load.service`
+/// deactivating); short enough that a missing GPU fails the boot
+/// reasonably fast.
+const DRM_RESOLVE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Resolve compositor uid from env. `HALMASUIT_COMPOSITOR_UID` is
 /// the operator's contract: when set to a valid `u32`, halmasuit
