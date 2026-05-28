@@ -574,14 +574,34 @@ impl HalmasuitState {
             ChordAction::VtSwitch(vt) => self.trigger_vt_switch(vt),
             ChordAction::OverlayToggle => {
                 self.diag_overlay_open = !self.diag_overlay_open;
-                tracing::info!(
-                    open = self.diag_overlay_open,
-                    "diagnostic overlay toggled (R3.1 — rendering lands in R3.2)",
-                );
+                tracing::info!(open = self.diag_overlay_open, "diagnostic overlay toggled",);
+                self.apply_overlay_state();
             }
             ChordAction::OverlayDismiss => {
                 self.diag_overlay_open = false;
                 tracing::info!("diagnostic overlay dismissed via Esc");
+                self.apply_overlay_state();
+            }
+        }
+    }
+
+    /// Epic #71 R3.2: push the current `diag_overlay_open` state into
+    /// the DRM backend AND trigger an immediate render so the
+    /// overlay appears/disappears without waiting for the next
+    /// natural commit. No-ops cleanly when the headless test path
+    /// has no DRM backend.
+    fn apply_overlay_state(&mut self) {
+        let open = self.diag_overlay_open;
+        let fg = self
+            .foreground_toplevel
+            .as_ref()
+            .map(|t| t.wl_surface().clone());
+        if let Some(backend) = self.drm_backend.as_mut() {
+            backend.set_overlay_visible(open);
+            if let Err(e) =
+                backend.render_layer_elements(&self.output, fg.as_ref(), HALMASUIT_BRAND_CLEAR)
+            {
+                tracing::warn!(error = %e, "render_layer_elements on overlay toggle failed");
             }
         }
     }

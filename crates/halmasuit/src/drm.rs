@@ -122,11 +122,16 @@ render_elements! {
     /// picks which. `CursorMemory` is the named-cursor pixmap from
     /// the loaded xcursor theme (R8b-render); always prepended at
     /// INDEX 0 (topmost) above every client surface.
+    /// `DiagOverlay` (Epic #71 R3.2) is a semitransparent panel
+    /// composited above every other element except the cursor.
+    /// Only emitted when `overlay_visible` is true; R3.x will layer
+    /// a text panel on top of this base.
     pub SceneElement<=GlesRenderer>;
     Surface         = WaylandSurfaceRenderElement<GlesRenderer>,
     Wallpaper       = TextureRenderElement<GlesTexture>,
     WallpaperShader = smithay::backend::renderer::gles::element::PixelShaderElement,
     CursorMemory    = smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement<GlesRenderer>,
+    DiagOverlay     = smithay::backend::renderer::element::solid::SolidColorRenderElement,
 }
 
 /// R8b-render cursor state. Lives on `DrmBackend` (next to the
@@ -203,6 +208,13 @@ pub struct DrmBackend {
     /// the calloop liveness timer). `halmasuit-debug` also surfaces it
     /// as `Event::FrameRendered.frame_id` for the `frame_audit` stream.
     frame_counter: u64,
+    /// Epic #71 R3.2: whether to composite the diagnostic overlay
+    /// element this frame. Toggled by `set_overlay_visible` from
+    /// `HalmasuitState::handle_chord_action` in response to
+    /// `Ctrl+Alt+Shift+Esc` / `Esc`-when-open. R3.x will layer
+    /// state-text on top of this base panel.
+    overlay_visible: bool,
+
     /// Latest composited frame, published every audited frame for the
     /// D-Bus `Snapshot()` method to read. Only exists in
     /// `halmasuit-debug`.
@@ -557,6 +569,8 @@ where
                 started_at: std::time::Instant::now(),
             },
             frame_counter: 0,
+            // Epic #71 R3.2: overlay starts hidden; chord toggles it.
+            overlay_visible: false,
             #[cfg(feature = "frame_audit")]
             snapshot_buf: crate::dbus::new_buffer(),
             #[cfg(feature = "frame_audit")]
@@ -612,6 +626,14 @@ impl DrmBackend {
             .acquire_master_lock()
             .map_err(|e| io::Error::other(format!("DRM SET_MASTER: {e}")))?;
         Ok(())
+    }
+
+    /// Epic #71 R3.2: toggle the diagnostic-overlay composition
+    /// element. Called from `HalmasuitState::handle_chord_action`
+    /// on `Ctrl+Alt+Shift+Esc` / `Esc`-when-open. Cheap state-only
+    /// flip; the visible effect lands on the next render tick.
+    pub const fn set_overlay_visible(&mut self, visible: bool) {
+        self.overlay_visible = visible;
     }
 
     /// R8b-render: install the latest `CursorImageStatus` from the
@@ -851,6 +873,15 @@ impl DrmBackend {
                 elements.push(element);
             }
         }
+        // Epic #71 R3.2: diagnostic overlay composites above every
+        // surface (so it covers the focused app cleanly) but BELOW
+        // the cursor (so the user can still see their pointer).
+        // Insert at index 0 of `elements` now — after cursor logic
+        // below it'll move to index 1 (one below cursor).
+        if self.overlay_visible {
+            let overlay = self.build_overlay_element(output);
+            elements.insert(0, SceneElement::DiagOverlay(overlay));
+        }
         // R8b-render: prepend cursor elements so they sit at index 0
         // (topmost). Smithay's render is front-to-back; the cursor
         // composites OVER all layers + foreground.
@@ -860,6 +891,44 @@ impl DrmBackend {
             return Ok(combined);
         }
         Ok(elements)
+    }
+
+    /// Epic #71 R3.2: build the diagnostic-overlay render element —
+    /// a semitransparent dark fullscreen panel. R3.x will layer
+    /// state-text on top of this base.
+    fn build_overlay_element(
+        &self,
+        output: &smithay::output::Output,
+    ) -> smithay::backend::renderer::element::solid::SolidColorRenderElement {
+        use smithay::backend::renderer::element::Kind;
+        use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+        use smithay::utils::{Point, Rectangle, Size};
+
+        let osize = output.current_mode().map(|m| m.size).unwrap_or_default();
+        let geometry = Rectangle::<i32, smithay::utils::Physical>::new(
+            Point::from((0_i32, 0_i32)),
+            Size::from((osize.w, osize.h)),
+        );
+        // Semitransparent black (~60% opacity). The compositor's
+        // alpha-blend over the wallpaper / foreground gives the
+        // characteristic dimmed-but-readable backdrop a Force-Quit
+        // analog needs. R3.x layers text on top.
+        let color = Color32F::new(0.0, 0.0, 0.0, 0.6);
+        // Id::new() generates a fresh id each frame. For a full-screen
+        // overlay this is fine — damage tracking just re-paints the
+        // whole rect; we'd want a stable id only for partial-damage
+        // optimisation, which doesn't help a fullscreen panel.
+        // CommitCounter is `From<usize>`; the masked-frame-counter
+        // arg gives smithay a monotonic value within usize range.
+        let commit =
+            usize::try_from(self.frame_counter & u64::from(u32::MAX)).expect("masked to u32 range");
+        SolidColorRenderElement::new(
+            smithay::backend::renderer::element::Id::new(),
+            geometry,
+            commit,
+            color,
+            Kind::Unspecified,
+        )
     }
 
     /// Render one frame with no foreground toplevel — the frame-0 /
