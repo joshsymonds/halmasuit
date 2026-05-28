@@ -373,7 +373,7 @@ struct HalmasuitState {
     /// render path to update it). Cloned into the DBus thread at
     /// startup; subsequent writes from the calloop thread are
     /// visible to DBus readers via atomic load.
-    dbus_state: dbus_compositor1::Compositor1State,
+    dbus_state: dbus_compositor1::CompositorObservability,
     /// Epic #47 R2.2: set by `graceful_shutdown` after the wallpaper-
     /// only recomposite. The render path observes this to keep the
     /// wallpaper plane composited (no greeter, no session toplevel)
@@ -4555,7 +4555,7 @@ fn main() -> io::Result<()> {
         diag_overlay_open: false,
         // Epic #71 R3.3: DBus state anchored at startup; the
         // background thread reads from this via Arc clone.
-        dbus_state: dbus_compositor1::Compositor1State::new(),
+        dbus_state: dbus_compositor1::CompositorObservability::new(),
         shutting_down: false,
         greetd_listener_token,
         drm_backend,
@@ -4566,6 +4566,16 @@ fn main() -> io::Result<()> {
         session_first_frame_emitted: false,
         start_time: std::time::Instant::now(),
     };
+
+    // Epic #71 R-honest.1: share the Compositor1 observability frame
+    // counter into the render backend so `GetFrameCounter` (DBus) and
+    // the diagnostic overlay observe the LIVE render count — one Arc,
+    // no second copy. Done here (after state construction, before the
+    // initial render below) so the backend's own bootstrap counter is
+    // never incremented.
+    if let Some(backend) = state.drm_backend.as_mut() {
+        backend.set_frame_counter(state.dbus_state.frame_counter.clone());
+    }
 
     // The wallpaper plane is composited from frame 0 (epic G1/R3/R6):
     // emit the `Wallpaper` first-frame anchor BEFORE the initial

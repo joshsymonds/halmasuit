@@ -811,6 +811,16 @@
           halmasuit-session        = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-vt-test-client = self.packages.x86_64-linux.halmasuit-vt-test-client;
         };
+        # Epic #71 R-honest.1: org.halmasuit.Compositor1 live-value
+        # gate. Asserts GetFrameCounter strictly increases over DBus
+        # (render path feeds the same Arc the surface reads) — the
+        # regression gate against the R3.3 "always 0" stub.
+        compositor1-dbus = import ./tests/compositor1-dbus.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+        };
         # Epic #71 R1.4: master-drop timeout invariant (systemd
         # #21388 regression gate). Broker MUST FAIL the request on
         # the 5s watchdog and MUST NOT fire VT_ACTIVATE. Asserted

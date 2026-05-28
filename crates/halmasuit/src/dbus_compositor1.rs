@@ -34,27 +34,28 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// State the Compositor1 DBus methods read. Held in an `Arc` so the
-/// zbus executor thread can clone-share it with the calloop thread
-/// that produces fresh values. All fields are read-only from the
-/// DBus thread's perspective.
+/// The single source of truth for compositor observability state,
+/// written by the calloop thread and read by BOTH the Compositor1
+/// DBus server thread AND (R3.x) the in-process diagnostic overlay
+/// renderer. `Arc`-wrapped fields so readers clone-share live values
+/// without a per-read copy — the overlay and `halmasuit status` can
+/// never disagree because they read the same atomics.
 #[derive(Clone)]
-pub struct Compositor1State {
+pub struct CompositorObservability {
     /// Process start time (anchored once at compositor startup).
     /// `GetUptime` returns `Instant::now() - startup` in seconds.
     pub startup: Instant,
-    /// Monotonic frame counter, published by the render loop on
-    /// every successful frame. Atomic so the zbus thread reads
-    /// without a mutex. R3.x: wire the render path to actually
-    /// store via this; for R3.3 the field exists and reads as 0.
+    /// Monotonic frame counter — the SAME `Arc` the render backend
+    /// (`DrmBackend`) increments on every successfully-queued frame
+    /// (R-honest.1). Not a copy: `main` hands this clone to the
+    /// backend via `set_frame_counter`, so `GetFrameCounter` observes
+    /// the live render count.
     pub frame_counter: Arc<AtomicU64>,
 }
 
-impl Compositor1State {
-    /// Build the canonical R3.3 state — anchor `startup` to now,
-    /// zero the frame counter. The compositor passes the
-    /// `frame_counter` Arc into the render path so subsequent ticks
-    /// update it.
+impl CompositorObservability {
+    /// Anchor `startup` to now and create the shared frame counter
+    /// (zero until the render backend starts incrementing it).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -64,7 +65,7 @@ impl Compositor1State {
     }
 }
 
-impl Default for Compositor1State {
+impl Default for CompositorObservability {
     fn default() -> Self {
         Self::new()
     }
@@ -72,12 +73,12 @@ impl Default for Compositor1State {
 
 /// The DBus object served at `/org/halmasuit/Compositor1`.
 pub struct Compositor1 {
-    state: Compositor1State,
+    state: CompositorObservability,
 }
 
 impl Compositor1 {
     #[must_use]
-    pub const fn new(state: Compositor1State) -> Self {
+    pub const fn new(state: CompositorObservability) -> Self {
         Self { state }
     }
 }
@@ -96,7 +97,7 @@ impl Compositor1 {
         "Running".to_owned()
     }
 
-    /// Seconds since compositor start. Anchored at `Compositor1State`
+    /// Seconds since compositor start. Anchored at `CompositorObservability`
     /// construction (which happens in main() before the privilege
     /// drop, so this is wall-clock from process start).
     fn get_uptime(&self) -> u64 {
@@ -152,14 +153,14 @@ impl Compositor1 {
 /// Best-effort: a bus that is unreachable or a name that is
 /// policy-denied logs a warning and the thread exits — the
 /// compositor itself is unaffected.
-pub fn serve(state: Compositor1State) {
+pub fn serve(state: CompositorObservability) {
     let Some(conn) = build_connection(state) else {
         return;
     };
     park_with_connection(conn);
 }
 
-fn build_connection(state: Compositor1State) -> Option<zbus::blocking::Connection> {
+fn build_connection(state: CompositorObservability) -> Option<zbus::blocking::Connection> {
     match zbus::blocking::connection::Builder::system()
         .and_then(|b| b.name("org.halmasuit.Compositor1"))
         .and_then(|b| b.serve_at("/org/halmasuit/Compositor1", Compositor1::new(state)))
@@ -226,7 +227,7 @@ mod tests {
         // asserting their count.
 
         // Stage 1: verify Compositor1::new + access work (smoke).
-        let state = Compositor1State::new();
+        let state = CompositorObservability::new();
         let comp = Compositor1::new(state);
 
         // Stage 2: methods exist as expected. The interface is
@@ -239,12 +240,12 @@ mod tests {
         assert_eq!(comp.get_broker_status(), "Unknown");
     }
 
-    /// `Compositor1State::frame_counter` is shared via Arc with the
+    /// `CompositorObservability::frame_counter` is shared via Arc with the
     /// render loop. Verify that incrementing it from one clone is
     /// visible from another (i.e. the Arc is genuine, not a copy).
     #[test]
     fn frame_counter_is_shared_via_arc() {
-        let state = Compositor1State::new();
+        let state = CompositorObservability::new();
         let state_clone = state.clone();
         state.frame_counter.store(42, Ordering::Relaxed);
         assert_eq!(state_clone.frame_counter.load(Ordering::Relaxed), 42);
@@ -254,7 +255,7 @@ mod tests {
     /// 0 immediately after construction and non-negative.
     #[test]
     fn uptime_starts_near_zero() {
-        let state = Compositor1State::new();
+        let state = CompositorObservability::new();
         let comp = Compositor1::new(state);
         // Right after `Instant::now()`, elapsed is < 1s — should be 0.
         assert_eq!(comp.get_uptime(), 0);

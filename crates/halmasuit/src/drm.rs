@@ -207,7 +207,14 @@ pub struct DrmBackend {
     /// actually advancing the counter post-pivot (not just dispatching
     /// the calloop liveness timer). `halmasuit-debug` also surfaces it
     /// as `Event::FrameRendered.frame_id` for the `frame_audit` stream.
-    frame_counter: u64,
+    ///
+    /// Epic #71 R-honest.1: this is an `Arc<AtomicU64>` — the SAME
+    /// counter the Compositor1 DBus surface (`GetFrameCounter`) and
+    /// the diagnostic overlay read. `main` swaps in the shared
+    /// `CompositorObservability::frame_counter` clone via
+    /// `set_frame_counter` before the render loop starts, so there is
+    /// exactly ONE counter (epic anti-pattern: no second copy).
+    frame_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Epic #71 R3.2: whether to composite the diagnostic overlay
     /// element this frame. Toggled by `set_overlay_visible` from
     /// `HalmasuitState::handle_chord_action` in response to
@@ -568,7 +575,11 @@ where
                 cached: None,
                 started_at: std::time::Instant::now(),
             },
-            frame_counter: 0,
+            // Own counter until `main` swaps in the shared
+            // CompositorObservability clone via `set_frame_counter`
+            // (before the render loop starts, so this initial Arc is
+            // never incremented).
+            frame_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // Epic #71 R3.2: overlay starts hidden; chord toggles it.
             overlay_visible: false,
             #[cfg(feature = "frame_audit")]
@@ -920,8 +931,12 @@ impl DrmBackend {
         // optimisation, which doesn't help a fullscreen panel.
         // CommitCounter is `From<usize>`; the masked-frame-counter
         // arg gives smithay a monotonic value within usize range.
-        let commit =
-            usize::try_from(self.frame_counter & u64::from(u32::MAX)).expect("masked to u32 range");
+        let commit = usize::try_from(
+            self.frame_counter
+                .load(std::sync::atomic::Ordering::Relaxed)
+                & u64::from(u32::MAX),
+        )
+        .expect("masked to u32 range");
         SolidColorRenderElement::new(
             smithay::backend::renderer::element::Id::new(),
             geometry,
@@ -999,8 +1014,13 @@ impl DrmBackend {
         // (counter - 1) for `Event::FrameRendered.frame_id` so the
         // first emitted frame is still id=0; production halmasuit
         // exposes the post-increment value via `frame_counter()` for
-        // the shutdown-liveness line's `frames=N` field.
-        self.frame_counter = self.frame_counter.wrapping_add(1);
+        // the shutdown-liveness line's `frames=N` field AND the
+        // Compositor1 DBus `GetFrameCounter` (R-honest.1: same Arc).
+        // `fetch_add` wraps on u64 overflow like the prior
+        // `wrapping_add`. Relaxed: one-way value flow, no
+        // happens-before dependency on other observability fields.
+        self.frame_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // The frame is now queued for scanout. Under `frame_audit`
         // (halmasuit-debug only) re-render the identical element set
@@ -1027,8 +1047,20 @@ impl DrmBackend {
     /// render loop is actually advancing through shutdown — not just
     /// that the calloop event loop is firing the liveness timer.
     #[must_use]
-    pub const fn frame_counter(&self) -> u64 {
+    pub fn frame_counter(&self) -> u64 {
         self.frame_counter
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Epic #71 R-honest.1: replace this backend's frame counter with
+    /// the shared `CompositorObservability` counter so the render
+    /// path, the shutdown-liveness line, `frame_audit`, and the
+    /// Compositor1 DBus `GetFrameCounter` all observe ONE counter.
+    /// Called by `main` after state construction and BEFORE the render
+    /// loop starts, so the backend's initial own-counter is never
+    /// incremented (no frames lost, no second copy).
+    pub fn set_frame_counter(&mut self, shared: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        self.frame_counter = shared;
     }
 
     /// Re-render `elements` (+ the clear color) into an offscreen
@@ -1065,7 +1097,10 @@ impl DrmBackend {
         // frame is still emitted as id=0 (matches every existing
         // visual test's frame-id assumptions).
         halmasuit_introspect::emit(&halmasuit_introspect::Event::FrameRendered {
-            frame_id: self.frame_counter.wrapping_sub(1),
+            frame_id: self
+                .frame_counter
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .wrapping_sub(1),
             pixel_count: stats.pixel_count,
             clear_pixel_count: stats.clear_pixel_count,
             black_pixel_count: stats.black_pixel_count,
