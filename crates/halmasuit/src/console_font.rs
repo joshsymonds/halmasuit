@@ -8,22 +8,24 @@
 //! avoids the heavy font stack the epic forbids: NO cosmic-text,
 //! fontdb, swash, rustybuzz, system-font discovery, or libclang.
 //!
-//! Glyph data is the public-domain `font8x8` basic-latin table
-//! (`font8x8::legacy::BASIC_LEGACY`, MIT-licensed crate wrapping the
-//! dhepper/font8x8 public-domain font). Bit order per font8x8: each
-//! of the 8 row-bytes has **bit 0 = leftmost pixel** (LSB-left), as
-//! the crate's own render example documents. This module is the only
-//! consumer; it adds exactly one trivial zero-dep crate.
+//! Glyph data is the public-domain `font8x8` basic-latin table,
+//! VENDORED into [`FONT8X8_BASIC`] below (copied verbatim from the
+//! `font8x8` crate's `legacy::BASIC_LEGACY`, MIT/Joaquin Rosales,
+//! itself the dhepper/font8x8 public-domain font). It is vendored
+//! rather than taken as a `crates.io` dependency because the nix
+//! build sandbox cannot reach crates.io (403) — same hand-carried-
+//! dep posture as the rest of halmasuit. Bit order: each of the 8
+//! row-bytes has **bit 0 = leftmost pixel** (LSB-left).
 
 // The blitter + helpers are consumed by the diagnostic-overlay
-// renderer in R-honest.6 (the next sub-task); landed here standalone
-// + unit-tested first. Same staged-surface pattern as vt_switch.rs.
+// renderer in R-honest.6. Landed here standalone + unit-tested
+// first. Same staged-surface pattern as vt_switch.rs.
 #![allow(
     dead_code,
     reason = "consumed by the diagnostic overlay renderer in R-honest.6"
 )]
 
-use font8x8::legacy::BASIC_LEGACY;
+include!("console_font_data.rs");
 
 /// Glyph cell dimensions (px). font8x8 is 8x8.
 pub const GLYPH_W: i32 = 8;
@@ -36,9 +38,9 @@ pub const GLYPH_H: i32 = 8;
 pub const fn glyph(ch: char) -> [u8; 8] {
     let code = ch as u32;
     if code < 128 {
-        BASIC_LEGACY[code as usize]
+        FONT8X8_BASIC[code as usize]
     } else {
-        BASIC_LEGACY['?' as usize]
+        FONT8X8_BASIC['?' as usize]
     }
 }
 
@@ -133,10 +135,10 @@ mod tests {
     #[test]
     fn glyph_indexing_and_fallback() {
         assert_eq!(glyph(' '), [0x00; 8], "space is all-zero");
-        assert_eq!(glyph('A'), BASIC_LEGACY['A' as usize]);
+        assert_eq!(glyph('A'), FONT8X8_BASIC['A' as usize]);
         // A non-ASCII char renders the '?' glyph, not garbage / panic.
-        assert_eq!(glyph('\u{1F600}'), BASIC_LEGACY['?' as usize]);
-        assert_eq!(glyph('é'), BASIC_LEGACY['?' as usize]);
+        assert_eq!(glyph('\u{1F600}'), FONT8X8_BASIC['?' as usize]);
+        assert_eq!(glyph('é'), FONT8X8_BASIC['?' as usize]);
     }
 
     /// `text_dims` matches the line/column geometry `blit_str` walks.

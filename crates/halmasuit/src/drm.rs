@@ -119,19 +119,22 @@ render_elements! {
     /// respectively), always the LAST element so every surface
     /// composites over it (epic G1/R3/R6). Exactly one wallpaper
     /// variant is produced per frame — the engine's active backend
-    /// picks which. `CursorMemory` is the named-cursor pixmap from
-    /// the loaded xcursor theme (R8b-render); always prepended at
-    /// INDEX 0 (topmost) above every client surface.
-    /// `DiagOverlay` (Epic #71 R3.2) is a semitransparent panel
-    /// composited above every other element except the cursor.
-    /// Only emitted when `overlay_visible` is true; R3.x will layer
-    /// a text panel on top of this base.
+    /// picks which. `Memory` is a memory-buffer-backed element — used
+    /// for BOTH the named-cursor pixmap from the loaded xcursor theme
+    /// (R8b-render; prepended at INDEX 0, topmost) AND the Epic #71
+    /// diagnostic overlay (R3.2/R-honest.6): a full-output buffer with
+    /// a semitransparent dark backdrop + the diagnostic text (phase,
+    /// broker, window list, journal tail) rasterized via the
+    /// console-font blitter, composited above every surface but BELOW
+    /// the cursor. The two share one variant because they're the same
+    /// inner type (the `render_elements!` macro requires distinct
+    /// per-variant types); z-order is set by position in the element
+    /// list, not the variant.
     pub SceneElement<=GlesRenderer>;
     Surface         = WaylandSurfaceRenderElement<GlesRenderer>,
     Wallpaper       = TextureRenderElement<GlesTexture>,
     WallpaperShader = smithay::backend::renderer::gles::element::PixelShaderElement,
-    CursorMemory    = smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement<GlesRenderer>,
-    DiagOverlay     = smithay::backend::renderer::element::solid::SolidColorRenderElement,
+    Memory          = MemoryRenderBufferRenderElement<GlesRenderer>,
 }
 
 /// R8b-render cursor state. Lives on `DrmBackend` (next to the
@@ -218,9 +221,20 @@ pub struct DrmBackend {
     /// Epic #71 R3.2: whether to composite the diagnostic overlay
     /// element this frame. Toggled by `set_overlay_visible` from
     /// `HalmasuitState::handle_chord_action` in response to
-    /// `Ctrl+Alt+Shift+Esc` / `Esc`-when-open. R3.x will layer
-    /// state-text on top of this base panel.
+    /// `Ctrl+Alt+Shift+Esc` / `Esc`-when-open.
     overlay_visible: bool,
+    /// Epic #71 R-honest.6: the diagnostic text the overlay renders
+    /// (phase / broker / windows / journal tail), composed on the
+    /// calloop thread from the shared observability store + the
+    /// off-thread journal fetch. Set via `set_overlay_text`.
+    overlay_text: String,
+    /// Cached rasterized overlay buffer (semitransparent dark backdrop
+    /// plus the text blitted via the console font). A value of `None`
+    /// means the cache is invalid and the next composite rebuilds it;
+    /// `set_overlay_text` resets it to `None` on every content change.
+    /// The rebuild happens only while the overlay is open, so a closed
+    /// overlay costs nothing.
+    overlay_buffer: Option<MemoryRenderBuffer>,
 
     /// Latest composited frame, published every audited frame for the
     /// D-Bus `Snapshot()` method to read. Only exists in
@@ -582,6 +596,8 @@ where
             frame_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // Epic #71 R3.2: overlay starts hidden; chord toggles it.
             overlay_visible: false,
+            overlay_text: String::new(),
+            overlay_buffer: None,
             #[cfg(feature = "frame_audit")]
             snapshot_buf: crate::dbus::new_buffer(),
             #[cfg(feature = "frame_audit")]
@@ -645,6 +661,18 @@ impl DrmBackend {
     /// flip; the visible effect lands on the next render tick.
     pub const fn set_overlay_visible(&mut self, visible: bool) {
         self.overlay_visible = visible;
+    }
+
+    /// Epic #71 R-honest.6: set the diagnostic text the overlay
+    /// renders and invalidate the cached buffer so the next composite
+    /// rebuilds the panel with the fresh content. Called from the
+    /// calloop thread (chord-open recompose + the off-thread journal
+    /// fetch's calloop-channel handler).
+    pub fn set_overlay_text(&mut self, text: String) {
+        if self.overlay_text != text {
+            self.overlay_text = text;
+            self.overlay_buffer = None; // force rebuild on next composite
+        }
     }
 
     /// R8b-render: install the latest `CursorImageStatus` from the
@@ -756,7 +784,7 @@ impl DrmBackend {
                     None,
                     Kind::Cursor,
                 ) {
-                    Ok(el) => vec![SceneElement::CursorMemory(el)],
+                    Ok(el) => vec![SceneElement::Memory(el)],
                     Err(e) => {
                         tracing::warn!(error = %e, "cursor MemoryRenderBufferRenderElement::from_buffer");
                         Vec::new()
@@ -884,14 +912,15 @@ impl DrmBackend {
                 elements.push(element);
             }
         }
-        // Epic #71 R3.2: diagnostic overlay composites above every
-        // surface (so it covers the focused app cleanly) but BELOW
-        // the cursor (so the user can still see their pointer).
-        // Insert at index 0 of `elements` now — after cursor logic
-        // below it'll move to index 1 (one below cursor).
-        if self.overlay_visible {
-            let overlay = self.build_overlay_element(output);
-            elements.insert(0, SceneElement::DiagOverlay(overlay));
+        // Epic #71 R3.2/R-honest.6: diagnostic overlay composites
+        // above every surface (so it covers the focused app cleanly)
+        // but BELOW the cursor (so the user can still see their
+        // pointer). Insert at index 0 of `elements` now — after the
+        // cursor logic below it'll move to index 1 (one below cursor).
+        if self.overlay_visible
+            && let Some(overlay) = self.build_overlay_element(output)
+        {
+            elements.insert(0, SceneElement::Memory(overlay));
         }
         // R8b-render: prepend cursor elements so they sit at index 0
         // (topmost). Smithay's render is front-to-back; the cursor
@@ -904,45 +933,77 @@ impl DrmBackend {
         Ok(elements)
     }
 
-    /// Epic #71 R3.2: build the diagnostic-overlay render element —
-    /// a semitransparent dark fullscreen panel. R3.x will layer
-    /// state-text on top of this base.
+    /// Epic #71 R-honest.6: build the diagnostic-overlay render
+    /// element — a full-output memory buffer holding a semitransparent
+    /// dark backdrop with the diagnostic text (phase / broker /
+    /// windows / journal tail) rasterized on top via the console-font
+    /// blitter. The buffer is cached (`overlay_buffer`) and rebuilt
+    /// only when `set_overlay_text` invalidates it, so a steady
+    /// open overlay costs one upload, not one per frame. Returns
+    /// `None` if the element can't be built (logged; the overlay just
+    /// doesn't show that frame).
     fn build_overlay_element(
-        &self,
+        &mut self,
         output: &smithay::output::Output,
-    ) -> smithay::backend::renderer::element::solid::SolidColorRenderElement {
+    ) -> Option<MemoryRenderBufferRenderElement<GlesRenderer>> {
         use smithay::backend::renderer::element::Kind;
-        use smithay::backend::renderer::element::solid::SolidColorRenderElement;
-        use smithay::utils::{Point, Rectangle, Size};
+
+        if self.overlay_buffer.is_none() {
+            self.overlay_buffer = Some(self.rasterize_overlay(output));
+        }
+        // Disjoint field borrows: `buffer` borrows `self.overlay_buffer`,
+        // `from_buffer` borrows `self.renderer` — different fields, OK.
+        let buffer = self.overlay_buffer.as_ref()?;
+        match MemoryRenderBufferRenderElement::from_buffer(
+            &mut self.renderer,
+            smithay::utils::Point::from((0.0_f64, 0.0_f64)),
+            buffer,
+            None,
+            None,
+            None,
+            Kind::Unspecified,
+        ) {
+            Ok(el) => Some(el),
+            Err(e) => {
+                tracing::warn!(error = %e, "diagnostic overlay from_buffer failed");
+                None
+            }
+        }
+    }
+
+    /// Rasterize the diagnostic overlay into a full-output RGBA buffer:
+    /// a semitransparent dark backdrop (so the wallpaper/app dims but
+    /// stays faintly visible — the Force-Quit look) with `overlay_text`
+    /// blitted in light console-font glyphs at the top-left. Pure
+    /// CPU work; called only when the cached buffer is invalidated.
+    fn rasterize_overlay(&self, output: &smithay::output::Output) -> MemoryRenderBuffer {
+        /// Backdrop: black at ~60% alpha. Premultiplied-safe (black is
+        /// 0 in every channel regardless of alpha convention).
+        const OVERLAY_BG: [u8; 4] = [0, 0, 0, 153];
+        /// Text: opaque light grey (alpha 255 → premult == straight).
+        const OVERLAY_FG: [u8; 4] = [220, 220, 220, 255];
 
         let osize = output.current_mode().map(|m| m.size).unwrap_or_default();
-        let geometry = Rectangle::<i32, smithay::utils::Physical>::new(
-            Point::from((0_i32, 0_i32)),
-            Size::from((osize.w, osize.h)),
-        );
-        // Semitransparent black (~60% opacity). The compositor's
-        // alpha-blend over the wallpaper / foreground gives the
-        // characteristic dimmed-but-readable backdrop a Force-Quit
-        // analog needs. R3.x layers text on top.
-        let color = Color32F::new(0.0, 0.0, 0.0, 0.6);
-        // Id::new() generates a fresh id each frame. For a full-screen
-        // overlay this is fine — damage tracking just re-paints the
-        // whole rect; we'd want a stable id only for partial-damage
-        // optimisation, which doesn't help a fullscreen panel.
-        // CommitCounter is `From<usize>`; the masked-frame-counter
-        // arg gives smithay a monotonic value within usize range.
-        let commit = usize::try_from(
-            self.frame_counter
-                .load(std::sync::atomic::Ordering::Relaxed)
-                & u64::from(u32::MAX),
-        )
-        .expect("masked to u32 range");
-        SolidColorRenderElement::new(
-            smithay::backend::renderer::element::Id::new(),
-            geometry,
-            commit,
-            color,
-            Kind::Unspecified,
+        let w = osize.w.max(1);
+        let h = osize.h.max(1);
+        let wu = usize::try_from(w).expect("w >= 1");
+        let hu = usize::try_from(h).expect("h >= 1");
+
+        let mut px = vec![0_u8; wu * hu * 4];
+        for chunk in px.chunks_exact_mut(4) {
+            chunk.copy_from_slice(&OVERLAY_BG);
+        }
+        crate::console_font::blit_str(&mut px, wu, hu, 8, 8, &self.overlay_text, OVERLAY_FG);
+
+        // Same Fourcc/byte-order convention as the cursor path:
+        // [R,G,B,A] bytes with Fourcc::Argb8888.
+        MemoryRenderBuffer::from_slice(
+            &px,
+            Fourcc::Argb8888,
+            (w, h),
+            1,
+            smithay::utils::Transform::Normal,
+            None,
         )
     }
 

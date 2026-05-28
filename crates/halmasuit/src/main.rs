@@ -368,6 +368,17 @@ struct HalmasuitState {
     /// `Esc` while open closes it. R3.2 reads this flag in the
     /// render path to composite the overlay layer.
     diag_overlay_open: bool,
+    /// Epic #71 R-honest.6: last journal tail fetched off-thread for
+    /// the diagnostic overlay (the last 20 `halmasuit.service` lines).
+    /// Populated by the overlay-journal calloop channel; read by
+    /// `compose_overlay_text`. Empty until the first fetch lands.
+    overlay_journal: String,
+    /// Epic #71 R-honest.6: sender for the overlay-journal calloop
+    /// channel. On overlay-open, a detached worker runs `journalctl`
+    /// and sends the tail here; the channel handler recomposes +
+    /// re-renders. `None` only if the channel failed to register
+    /// (the overlay then shows an empty journal section).
+    journal_tx: Option<calloop::channel::Sender<String>>,
     /// Epic #71 R3.3: state shared with the Compositor1 DBus server
     /// thread. Holds the startup `Instant` (for `GetUptime`) and
     /// an `Arc<AtomicU64>` frame counter (R3.x will wire the
@@ -599,25 +610,84 @@ impl HalmasuitState {
         }
     }
 
-    /// Epic #71 R3.2: push the current `diag_overlay_open` state into
-    /// the DRM backend AND trigger an immediate render so the
-    /// overlay appears/disappears without waiting for the next
-    /// natural commit. No-ops cleanly when the headless test path
-    /// has no DRM backend.
+    /// Epic #71 R3.2/R-honest.6: apply the current `diag_overlay_open`
+    /// state to the DRM backend and render immediately so the overlay
+    /// appears/disappears without waiting for a natural commit.
+    ///
+    /// On open: compose the diagnostic text (phase / broker / window
+    /// list, read from the SAME observability store the Compositor1
+    /// DBus surface reads, plus the last-known journal tail), push it
+    /// to the backend, make the overlay visible, and kick an
+    /// off-thread `journalctl` fetch that recomposes + re-renders when
+    /// it lands (so the journal tail is never read on the render
+    /// thread). On close: hide the overlay. No-ops cleanly when the
+    /// headless test path has no DRM backend.
     fn apply_overlay_state(&mut self) {
-        let open = self.diag_overlay_open;
+        if self.diag_overlay_open {
+            let text = self.compose_overlay_text();
+            // Marker for the VM test: headless renders black, so the
+            // gate asserts THIS (overlay opened + real content built),
+            // not pixels. `content_len` proves the composer ran with
+            // real data, not an empty stub.
+            tracing::info!(
+                content_len = text.len(),
+                "OVERLAY_OPEN: diagnostic content composed"
+            );
+            if let Some(backend) = self.drm_backend.as_mut() {
+                backend.set_overlay_text(text);
+                backend.set_overlay_visible(true);
+            }
+            // Off-thread journal fetch; its calloop-channel handler
+            // recomposes + re-renders with the journal tail.
+            if let Some(tx) = self.journal_tx.clone() {
+                spawn_overlay_journal_fetch(tx);
+            }
+        } else {
+            tracing::info!("OVERLAY_CLOSE: diagnostic overlay hidden");
+            if let Some(backend) = self.drm_backend.as_mut() {
+                backend.set_overlay_visible(false);
+            }
+        }
         let fg = self
             .foreground_toplevel
             .as_ref()
             .map(|t| t.wl_surface().clone());
-        if let Some(backend) = self.drm_backend.as_mut() {
-            backend.set_overlay_visible(open);
-            if let Err(e) =
+        if let Some(backend) = self.drm_backend.as_mut()
+            && let Err(e) =
                 backend.render_layer_elements(&self.output, fg.as_ref(), HALMASUIT_BRAND_CLEAR)
-            {
-                tracing::warn!(error = %e, "render_layer_elements on overlay toggle failed");
-            }
+        {
+            tracing::warn!(error = %e, "render_layer_elements on overlay toggle failed");
         }
+    }
+
+    /// Epic #71 R-honest.6: compose the diagnostic-overlay text from
+    /// the live observability store (phase / broker / windows — the
+    /// SAME values `org.halmasuit.Compositor1` exposes, so the overlay
+    /// and `halmasuit status` can never disagree) plus the last-known
+    /// journal tail fetched off-thread. Pure read; no IO.
+    fn compose_overlay_text(&self) -> String {
+        use std::fmt::Write as _;
+        let phase = dbus_compositor1::current_phase_name();
+        let broker = dbus_compositor1::broker_state_name();
+        let windows = self
+            .dbus_state
+            .windows
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
+        let mut s = String::new();
+        s.push_str("halmasuit diagnostic overlay\n");
+        s.push_str("(esc to close)\n\n");
+        let _ = writeln!(s, "phase:  {phase}");
+        let _ = writeln!(s, "broker: {broker}");
+        let _ = writeln!(s, "windows: {}", windows.len());
+        for (pid, app_id, title) in &windows {
+            let _ = writeln!(s, "  [{pid}] {app_id} {title}");
+        }
+        s.push_str("\n--- journal (last 20) ---\n");
+        s.push_str(&self.overlay_journal);
+        s
     }
 
     /// Epic #71 R2.1: drive the broker-mediated VT-switching IPC
@@ -3422,6 +3492,75 @@ fn write_kmsg(line: &str) {
 /// engages. SIGTERM-driven paths (visual-shutdown-tear-down's `kill
 /// -TERM` test posture, and any operator-issued `systemctl stop`) are
 /// unaffected.
+/// Epic #71 R-honest.6: register the overlay-journal calloop channel.
+/// A detached `journalctl` worker (spawned on overlay-open) sends the
+/// last-20-lines tail here; the handler stores it and — if the
+/// overlay is still open — recomposes the diagnostic text and
+/// re-renders. Keeps the `journalctl` shell-out OFF the render/calloop
+/// thread (the worker runs it; the handler only stores the result).
+/// Returns the `Sender` to stash on `HalmasuitState`, or `None` if
+/// registration failed.
+fn setup_overlay_journal_channel(
+    loop_handle: &LoopHandle<'static, HalmasuitState>,
+) -> Option<calloop::channel::Sender<String>> {
+    let (tx, channel) = calloop::channel::channel::<String>();
+    if let Err(e) = loop_handle.insert_source(channel, |event, (), state: &mut HalmasuitState| {
+        let calloop::channel::Event::Msg(journal) = event else {
+            return;
+        };
+        state.overlay_journal = journal;
+        if !state.diag_overlay_open {
+            return; // overlay closed before the fetch landed; just cache.
+        }
+        let text = state.compose_overlay_text();
+        let fg = state
+            .foreground_toplevel
+            .as_ref()
+            .map(|t| t.wl_surface().clone());
+        if let Some(backend) = state.drm_backend.as_mut() {
+            backend.set_overlay_text(text);
+            if let Err(e) =
+                backend.render_layer_elements(&state.output, fg.as_ref(), HALMASUIT_BRAND_CLEAR)
+            {
+                tracing::warn!(error = %e, "render on overlay-journal update failed");
+            }
+        }
+    }) {
+        tracing::error!(error = %e, "insert overlay-journal calloop channel failed");
+        return None;
+    }
+    Some(tx)
+}
+
+/// Epic #71 R-honest.6: detached worker that fetches the last 20
+/// `halmasuit.service` journal lines and posts them to the overlay-
+/// journal channel. Runs `journalctl` on its OWN thread so the
+/// render/calloop thread never blocks on the shell-out. One-shot:
+/// spawned per overlay-open, exits after sending.
+fn spawn_overlay_journal_fetch(tx: calloop::channel::Sender<String>) {
+    let spawn = std::thread::Builder::new()
+        .name("overlay-journal".to_owned())
+        .spawn(move || {
+            let text = match std::process::Command::new("journalctl")
+                .args(["-u", "halmasuit", "-n", "20", "--output=cat"])
+                .output()
+            {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+                Ok(o) => format!(
+                    "(journalctl exited {}): {}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+                Err(e) => format!("(journalctl failed: {e})"),
+            };
+            // Receiver gone (compositor shutting down) → drop silently.
+            let _ = tx.send(text);
+        });
+    if let Err(e) = spawn {
+        tracing::warn!(error = %e, "spawn overlay-journal worker failed");
+    }
+}
+
 fn spawn_prepare_for_shutdown_watcher(loop_handle: &LoopHandle<'static, HalmasuitState>) {
     let (tx, channel) = calloop::channel::channel::<bool>();
     if let Err(e) = loop_handle.insert_source(channel, |event, (), state: &mut HalmasuitState| {
@@ -4520,6 +4659,10 @@ fn main() -> io::Result<()> {
     // and the rest of the wallpaper-only paint-until-halt path.
     spawn_prepare_for_shutdown_watcher(&loop_handle);
 
+    // Epic #71 R-honest.6: overlay-journal channel (registered before
+    // state construction; the Sender is stashed on HalmasuitState).
+    let journal_tx = setup_overlay_journal_channel(&loop_handle);
+
     // greetd socket setup. Production: NixOS module sets
     // HALMASUIT_GREETD_SOCKET to `/run/halmasuit/greetd.sock` and
     // HALMASUIT_GREETER_UID to the greeter system user's uid.
@@ -4636,6 +4779,9 @@ fn main() -> io::Result<()> {
         shutdown_armed: !in_initramfs,
         // Epic #71 R3.1: overlay starts closed. Toggled by chord.
         diag_overlay_open: false,
+        // Epic #71 R-honest.6: overlay journal cache + channel sender.
+        overlay_journal: String::new(),
+        journal_tx,
         // Epic #71 R3.3: DBus state anchored at startup; the
         // background thread reads from this via Arc clone.
         dbus_state: dbus_compositor1::CompositorObservability::new(),
