@@ -136,6 +136,11 @@ caps.workspace = true
 # call permitted+effective={CAP_KILL} that the `caps` crate's
 # high-level API doesn't expose).
 libc.workspace = true
+# Epic #71 R-honest.5: public-domain 8x8 bitmap console font for the
+# diagnostic overlay (Tier-1, zero transitive deps). The `legacy`
+# module (BASIC_LEGACY) is available without `std`/`unicode`, so we
+# take neither default feature — no big Unicode tables linked.
+font8x8 = { version = "0.3.1", default-features = false }
 
 [dev-dependencies]
 nix        = { workspace = true, features = ["signal", "user", "ioctl", "process", "socket"] }
