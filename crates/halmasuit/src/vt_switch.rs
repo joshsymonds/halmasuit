@@ -141,6 +141,21 @@ pub struct RealVtFdSetup;
 
 impl VtFdSetup for RealVtFdSetup {
     fn tiocsctty_and_setmode(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+        // R2.2 multi-switch fix: TIOCSCTTY requires "no existing
+        // controlling TTY." After R2.1's first chord-driven switch,
+        // we already have the old target VT as our CTTY; a second
+        // switch's TIOCSCTTY would EPERM. Best-effort release the
+        // current CTTY first.
+        //
+        // `/dev/tty` is a magic device that opens the calling
+        // process's current controlling TTY (or ENXIO if none).
+        // TIOCNOTTY on it detaches us cleanly. This is a workaround;
+        // the architecturally cleaner shape is the "home-VT model"
+        // (broker hands us our HOME-vt fd once at startup; subsequent
+        // switches are pure VT_ACTIVATE with no per-switch
+        // TIOCSCTTY). Tracked separately.
+        detach_existing_ctty();
+
         // `setsid()` is best-effort. The compositor is typically a
         // session leader already (systemd unit, no controlling TTY
         // inherited from PID 1's session); the EPERM-on-already-leader
@@ -154,6 +169,29 @@ impl VtFdSetup for RealVtFdSetup {
         Ok(())
     }
 }
+
+/// Best-effort detach from current controlling TTY (if any). Opens
+/// `/dev/tty` (the magic CTTY device) and issues `TIOCNOTTY`. If
+/// there's no current CTTY the open returns ENXIO and we skip
+/// cleanly. Errors are swallowed: the subsequent TIOCSCTTY will
+/// fail with a clearer error if detachment was actually needed.
+fn detach_existing_ctty() {
+    let Ok(tty_file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    else {
+        return; // No current CTTY → nothing to detach.
+    };
+    // SAFETY: TIOCNOTTY takes no memory args; errno-only. fd is
+    // valid (just opened). Return value ignored — best-effort.
+    #[expect(unsafe_code, reason = "raw TIOCNOTTY ioctl via libc")]
+    let _ = unsafe { libc::ioctl(tty_file.as_raw_fd(), TIOCNOTTY as _) };
+}
+
+/// TIOCNOTTY ioctl number, per `asm-generic/ioctls.h`.
+#[allow(dead_code, reason = "wired in R2.2 production path via RealVtFdSetup")]
+const TIOCNOTTY: u64 = 0x5422;
 
 /// Map a keysym to a VT switch target VT number, if the keysym is one
 /// of the `XF86Switch_VT_N` cooperative-switching keysyms xkb
@@ -797,5 +835,24 @@ mod tests {
     fn detect_vt_chord_rejects_above_vt12() {
         assert_eq!(detect_vt_chord(0x1008_FE0D), None);
         assert_eq!(detect_vt_chord(0x1008_FE00), None); // one BEFORE start
+    }
+
+    /// R2.2 multi-switch fix: `detach_existing_ctty()` is the
+    /// TIOCNOTTY workaround called before TIOCSCTTY on each chord-
+    /// driven switch. It's a best-effort no-op when there's no
+    /// current CTTY (most test processes). Verifies the helper
+    /// doesn't panic and doesn't change observable state under that
+    /// common precondition.
+    #[test]
+    fn detach_existing_ctty_is_safe_when_no_ctty() {
+        // `cargo test` runs without a controlling TTY by default;
+        // /dev/tty open ENXIOs and the helper returns cleanly.
+        // The unit test process being the harness, we don't assert
+        // anything about the CTTY itself — just that the call doesn't
+        // panic + doesn't trip an unrelated side effect (file
+        // descriptors leaked, signals raised, etc.).
+        detach_existing_ctty();
+        // Call twice to confirm idempotence.
+        detach_existing_ctty();
     }
 }

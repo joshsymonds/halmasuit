@@ -568,6 +568,52 @@ where
 }
 
 impl DrmBackend {
+    /// Epic #71 R2.2: release DRM master so another VT (text console
+    /// fbcon, or another seat compositor) can take over the display
+    /// while halmasuit is hidden. Called from `VtSwitcher`'s
+    /// `before_drop_master` hook BEFORE the kernel switches away.
+    ///
+    /// Idempotent (the underlying DROP_MASTER ioctl is no-op if we
+    /// already don't hold master). Does NOT tear down the
+    /// `DrmCompositor` — its CRTC / framebuffer state is preserved
+    /// in our address space; only the kernel-side master designation
+    /// is released. `resume()` reacquires.
+    ///
+    /// Note: pageflip attempts that race the master drop will EACCES.
+    /// The render loop's existing DRM-error path swallows transient
+    /// EACCES; the wallpaper-tick timer keeps polling so the next
+    /// successful frame after `resume()` re-paints.
+    ///
+    /// # Errors
+    /// Bubbles DROP_MASTER ioctl errno. Caller (R2.2 hook) logs and
+    /// continues — the VT switch proceeds regardless.
+    pub fn pause(&self) -> io::Result<()> {
+        self.compositor
+            .surface()
+            .device_fd()
+            .release_master_lock()
+            .map_err(|e| io::Error::other(format!("DRM DROP_MASTER: {e}")))?;
+        Ok(())
+    }
+
+    /// Epic #71 R2.2: re-acquire DRM master after returning from a
+    /// VT switch (e.g. user pressed Ctrl+Alt+F<halmasuit's VT> to
+    /// come back). Idempotent. Called from `VtSwitcher`'s
+    /// `on_activated` hook after the kernel has switched TO us.
+    ///
+    /// # Errors
+    /// Bubbles SET_MASTER ioctl errno. If this fails the display
+    /// stays blank — the caller (R2.x signalfd handler) should log
+    /// loudly. The user can press Ctrl+Alt+F<other> + back to retry.
+    pub fn resume(&self) -> io::Result<()> {
+        self.compositor
+            .surface()
+            .device_fd()
+            .acquire_master_lock()
+            .map_err(|e| io::Error::other(format!("DRM SET_MASTER: {e}")))?;
+        Ok(())
+    }
+
     /// R8b-render: install the latest `CursorImageStatus` from the
     /// focused client (or halmasuit's own default). When the status
     /// transitions to a new Named icon, drop the cached buffer so

@@ -529,10 +529,10 @@ impl HalmasuitState {
     /// user-triggered transient requests. Documented in
     /// `vt_switch.rs`'s module doc.
     ///
-    /// R2.1 uses NO-OP hooks for `before_drop_master` /
-    /// `after_drop_master` / `on_activated`. R2.2 plugs in real
-    /// DRM pause/resume through the same `VtSwitchHooks` seam
-    /// without reshaping this method.
+    /// R2.2: `before_drop_master` drops DRM master via
+    /// `DrmBackend::pause()`; `on_activated` reacquires via
+    /// `DrmBackend::resume()`. On the headless-VM-test path where
+    /// `drm_backend` is `None`, both hooks no-op cleanly.
     ///
     /// On any failure (broker rejected, IPC error), the chord is
     /// effectively a no-op from the user's perspective and the
@@ -540,18 +540,28 @@ impl HalmasuitState {
     /// failed switch — the user can press the chord again.
     #[allow(
         clippy::needless_pass_by_ref_mut,
-        reason = "R2.x will mutate self (retain vt_fd for the per-VT signalfd loop, update DRM master state); &mut now keeps the signature stable across the next R2 sub-task"
+        reason = "R2.x will mutate self (retain vt_fd for the per-VT signalfd loop); &mut now keeps the signature stable across the next R2 sub-task"
     )]
     fn trigger_vt_switch(&mut self, target_vt: u8) {
-        let no_op_drop = || Ok(());
-        let no_op_activated = |_fd: std::os::fd::BorrowedFd<'_>| Ok(());
+        let broker_path = self.broker_socket.clone();
+        let drm = self.drm_backend.as_ref();
+
+        // R2.2 DRM coordination: drop master BEFORE the broker fires
+        // VT_ACTIVATE so the kernel can hand display ownership to
+        // the target VT cleanly; reacquire AFTER we're back. On the
+        // headless VM-test path `drm` is None and both hooks no-op.
+        let pause_drm = || drm.map_or(Ok(()), drm::DrmBackend::pause);
+        let resume_drm =
+            |_fd: std::os::fd::BorrowedFd<'_>| drm.map_or(Ok(()), drm::DrmBackend::resume);
+        let no_op = || Ok(());
+
         let hooks = vt_switch::VtSwitchHooks {
-            before_drop_master: &no_op_drop,
-            after_drop_master: &no_op_drop,
-            on_activated: &no_op_activated,
+            before_drop_master: &pause_drm,
+            after_drop_master: &no_op,
+            on_activated: &resume_drm,
         };
 
-        let switcher = vt_switch::VtSwitcher::new(self.broker_socket.clone());
+        let switcher = vt_switch::VtSwitcher::new(broker_path);
         match switcher.request_switch(target_vt, &hooks, &vt_switch::RealVtFdSetup) {
             Ok(vt_switch::VtSwitchOutcome::Activated { vt_fd }) => {
                 tracing::info!(
@@ -559,10 +569,10 @@ impl HalmasuitState {
                     "VT switch activated; kernel switched to tty{target_vt}",
                 );
                 // R2.x will retain this fd to drive the per-VT
-                // signalfd loop. For R2.1 we drop it — the kernel
-                // switch already happened; subsequent signals are
-                // sigprocmask-blocked at startup so the compositor
-                // stays alive without VT_RELDISP acks.
+                // signalfd loop. For R2.2 we drop it — DRM master
+                // is back, render loop continues naturally; signals
+                // on this fd are caught by the global calloop
+                // Signals source (sigprocmask-blocked).
                 drop(vt_fd);
             }
             Ok(vt_switch::VtSwitchOutcome::Rejected { reason }) => {
