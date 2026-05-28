@@ -347,6 +347,25 @@ in
       '';
     };
 
+    homeVt = lib.mkOption {
+      type        = lib.types.nullOr (lib.types.ints.between 1 63);
+      default     = null;
+      example     = 8;
+      description = ''
+        The virtual terminal halmasuit owns as its "home" VT. When set,
+        halmasuit opens `/dev/tty''${homeVt}` in its root startup window,
+        becomes its `VT_PROCESS` controller, and brings it to the
+        foreground; cooperative VT switching (Ctrl+Alt+F<n> to a text
+        console and back) is then enabled via the kernel's relsig/acqsig
+        handshake. When null, VT switching is disabled.
+
+        The operator MUST ensure no getty runs on the home VT — it is
+        halmasuit's, the way greetd owns its VT. The simplest way is to
+        pick a VT outside logind's autovt range (`NAutoVTs`, default 6),
+        e.g. tty8, which never gets a getty.
+      '';
+    };
+
     installPamConfig = lib.mkOption {
       type        = lib.types.bool;
       default     = true;
@@ -740,6 +759,10 @@ in
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.
         HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
+      } // lib.optionalAttrs (cfg.homeVt != null) {
+        # Epic #71 R-honest.7: the VT halmasuit owns as VT_PROCESS
+        # controller for cooperative switching. See `homeVt`.
+        HALMASUIT_HOME_VT = toString cfg.homeVt;
       } // wallpaperEnv;
     };
    })

@@ -269,35 +269,6 @@
             cargoBuildFlags = old.cargoBuildFlags ++ [ "--features" "frame_audit" ];
           });
 
-          # halmasuit-vm-client — tiny greetd-protocol test client.
-          # Shipped as a separate Nix package so VM tests can install
-          # it via environment.systemPackages and drive halmasuit's
-          # halmasuit-vt-test-client — Epic #71 R1.4 VM-test client
-          # for the broker↔compositor VT-switching IPC dance. Built
-          # with the pinned `rustPlatform` (1.95) because it depends
-          # on `halmasuit-session-ipc` which uses the workspace MSRV.
-          # Same pattern as `halmasuit-vm-client` (the greetd VM
-          # client) — both are test-only binaries staged here so
-          # tests/*.nix consume a prebuilt package, not their own
-          # rustPlatform derivation (nixpkgs's default rustc is below
-          # the workspace MSRV).
-          halmasuit-vt-test-client = rustPlatform.buildRustPackage {
-            pname   = "halmasuit-vt-test-client";
-            version = "0.1.0";
-            src     = ./.;
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-              allowBuiltinFetchGit = true;
-            };
-            cargoBuildFlags = [ "-p" "halmasuit-vt-test-client" ];
-            doCheck = false;
-            meta = {
-              description = "halmasuit Epic #71 R1.4 VT-switching VM test client";
-              license     = pkgs.lib.licenses.asl20;
-              mainProgram = "halmasuit-vt-test-client";
-            };
-          };
-
           # greetd socket from the testScript.
           halmasuit-vm-client = rustPlatform.buildRustPackage {
             pname   = "halmasuit-vm-client";
@@ -799,18 +770,6 @@
           system = "x86_64-linux";
           inherit nixpkgs;
         };
-        # Epic #71 R1.4: end-to-end VT-switching round-trip. Drives
-        # the full broker↔compositor IPC dance against the real
-        # halmasuit-session broker + live kernel VT subsystem.
-        # Asserts kernel /sys/class/tty/tty0/active actually changed
-        # (not just the protocol completing).
-        vt-switch-roundtrip = import ./tests/vt-switch-roundtrip.nix {
-          system = "x86_64-linux";
-          inherit nixpkgs;
-          halmasuit                = self.packages.x86_64-linux.halmasuit;
-          halmasuit-session        = self.packages.x86_64-linux.halmasuit-session;
-          halmasuit-vt-test-client = self.packages.x86_64-linux.halmasuit-vt-test-client;
-        };
         # Epic #71 R-honest.1: org.halmasuit.Compositor1 live-value
         # gate. Asserts GetFrameCounter strictly increases over DBus
         # (render path feeds the same Arc the surface reads) — the
@@ -833,17 +792,14 @@
           halmasuit         = self.packages.x86_64-linux.halmasuit;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
         };
-        # Epic #71 R1.4: master-drop timeout invariant (systemd
-        # #21388 regression gate). Broker MUST FAIL the request on
-        # the 5s watchdog and MUST NOT fire VT_ACTIVATE. Asserted
-        # at kernel-state level: /sys/class/tty/tty0/active stays
-        # on tty1 even after the protocol reports Rejected.
-        vt-switch-master-drop-timeout = import ./tests/vt-switch-master-drop-timeout.nix {
+        # Epic #71 R-honest.7: real-compositor cooperative VT-switch
+        # round-trip. Chord switch → retain fd → relsig/acqsig
+        # VT_RELDISP handshake across a tty1→tty2→tty1→tty2 cycle.
+        vt-cooperative-switch = import ./tests/vt-cooperative-switch.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
-          halmasuit                = self.packages.x86_64-linux.halmasuit;
-          halmasuit-session        = self.packages.x86_64-linux.halmasuit-session;
-          halmasuit-vt-test-client = self.packages.x86_64-linux.halmasuit-vt-test-client;
+          halmasuit         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
         };
         # Phase B (initramfs survival): real halmasuit binary in
         # boot.initrd.systemd.services with SurviveFinalKillSignal=yes,

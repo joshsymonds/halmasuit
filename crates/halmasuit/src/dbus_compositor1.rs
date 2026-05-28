@@ -41,7 +41,7 @@ use halmasuit_introspect::Phase;
 ///
 /// The compositor talks to the privileged `halmasuit-session` broker
 /// over TRANSIENT connections (one per greeter episode, plus one-shot
-/// RequestRootFd / SpawnGreeter / RequestVtSwitch). There is no
+/// RequestRootFd / SpawnGreeter). There is no
 /// persistent held connection, so "state" means: did the most recent
 /// `connect_broker` attempt succeed or fail? `Connected` therefore
 /// reads as "the broker socket was reachable on the last attempt"

@@ -20,11 +20,8 @@
 //!   `unsafe { … }` call site against `pam_sys`'s declarations.
 //! - `worker` — unsafe surface #3: the ephemeral `fork`/pidfd auth
 //!   child (Epic R4).
-//! - `vt_sys` — unsafe surface #4: the `VT_ACTIVATE` ioctl wrapper
-//!   for Epic #71 R1 VT switching. nix doesn't expose VT ioctls in
-//!   its safe layer; quarantined here the same way `pam_sys` is.
 //!
-//! The FOUR unsafe modules (`pam_sys`, `pam_ffi`, `worker`, `vt_sys`)
+//! The THREE unsafe modules (`pam_sys`, `pam_ffi`, `worker`)
 //! carry NO module `#![forbid]`; every `unsafe` (extern block or
 //! call site) has `#[expect(unsafe_code, reason = "…")]`, so the
 //! workspace `unsafe_code = "warn"` lint (denied under
@@ -42,7 +39,6 @@ pub mod session;
 pub mod session_leader;
 pub mod slot;
 pub mod transport;
-pub mod vt_sys;
 pub mod worker;
 
 pub use auth::{AuthError, ResolvedIdentity, run_pam_auth};

@@ -12,61 +12,9 @@
 //! here and pinned by the `wire_format_*` drift tests, so an accidental
 //! change to the contract fails CI.
 //!
-//! ## VT-switching message sequence (Epic #71)
-//!
-//! Per Phase 0's verdict (`crates/halmasuit-vt-probe/README.md`), the
-//! broker-passes-fd model is viable: the compositor handles the entire
-//! cooperative-switching state machine, the broker only opens the fd and
-//! calls `VT_ACTIVATE`. The on-wire choreography:
-//!
-//! ```text
-//! C → B  RequestVtSwitch { target_vt }
-//!        │
-//!        │ broker validates: rate-limit, VT range, peer-cred
-//!        │
-//!        ├─ ✗  →  VtSwitchRejected { reason }    END
-//!        │
-//!        ├─ ✓  broker opens /dev/tty<N>
-//!        │
-//! B → C  │  VtSwitchPrepare           (fd via SCM_RIGHTS auxdata)
-//!        │
-//!        │ compositor: setsid? + TIOCSCTTY + VT_SETMODE PROCESS
-//!        │ compositor: drop DRM master, pause render
-//!        │
-//! C → B  │  VtSwitchMasterDropped
-//!        │
-//!        │ broker waits ≤5s for this ack
-//!        │
-//!        ├─ timeout  → VtSwitchRejected { MasterDropTimeout }   END
-//!        │            (broker MUST NOT fire VT_ACTIVATE on timeout —
-//!        │             systemd #21388 lesson: never bypass safety to
-//!        │             "make the request go through anyway")
-//!        │
-//!        │ broker: VT_ACTIVATE(target_vt)
-//!        │
-//! B → C  │  VtSwitchActivated
-//!        ↓
-//!        kernel signals (SIGUSR2 then later SIGUSR1) drive the
-//!        compositor's signalfd loop; broker is out of the picture
-//!        until the next RequestVtSwitch.
-//! ```
-//!
-//! Invariants encoded in the protocol:
-//!
-//! - **Broker NEVER fires `VT_ACTIVATE` without `VtSwitchMasterDropped`
-//!   ack.** On timeout it MUST emit `VtSwitchRejected{MasterDropTimeout}`,
-//!   never fire the ioctl anyway. This is the load-bearing safety
-//!   property; it lives at the broker but is encoded in the wire shape
-//!   by the explicit ack message.
-//! - **`VtSwitchPrepare` is the ONLY frame that carries a VT fd.** The
-//!   broker never re-passes the fd; the compositor owns it for the
-//!   duration of the switch. Same one-OwnedFd-per-episode discipline
-//!   as the PAM relay socket (CLAUDE.md hard rule).
-//! - **The compositor calls `VT_SETMODE PROCESS`, not the broker.** This
-//!   is Phase 0's verdict: the kernel records the calling pid as the
-//!   VT_PROCESS controller, and we want signals to reach the compositor
-//!   directly. Pre-Phase-0 designs had the broker call VT_SETMODE; that
-//!   model required an extra relay path for kernel signals.
+//! VT switching is NOT on this wire: halmasuit owns its home VT directly
+//! (opened in its root startup window, the home-VT model in
+//! `halmasuit/src/vt_switch.rs`), so the broker has no VT role.
 
 #![forbid(unsafe_code)]
 
@@ -210,43 +158,6 @@ pub enum CompositorToBroker {
     /// auth/session-lifecycle frames (CLAUDE.md hard rule: one
     /// OwnedFd per episode, no sharing).
     SpawnGreeter,
-    /// Epic #71 R1: request the broker to switch the active VT to
-    /// `target_vt`. The broker validates the request (rate-limit,
-    /// VT range, peer-credential gate), opens `/dev/tty<N>`, and
-    /// responds with [`BrokerToCompositor::VtSwitchPrepare`]
-    /// carrying the fd as SCM_RIGHTS auxdata. Or
-    /// [`BrokerToCompositor::VtSwitchRejected`] if validation
-    /// fails.
-    ///
-    /// Per Epic #71 Phase 0's verdict: the broker does NOT call
-    /// `VT_SETMODE PROCESS` on the fd before passing it. The
-    /// compositor calls `VT_SETMODE PROCESS` itself, after
-    /// `TIOCSCTTY`-ing the inherited fd, so the kernel records
-    /// the COMPOSITOR's pid as the VT_PROCESS controller. (If the
-    /// broker called VT_SETMODE, signals would go to the broker
-    /// and have to be relayed — extra round trips, extra failure
-    /// modes.) This is documented in
-    /// `crates/halmasuit-vt-probe/README.md`.
-    ///
-    /// `target_vt` is the VT number (1-12 typical; the broker may
-    /// reject values outside its configured range). The kernel's
-    /// `VT_ACTIVATE` accepts a `u32`, but values >12 are vanishingly
-    /// rare in practice and `u8` keeps the wire shape tight.
-    RequestVtSwitch { target_vt: u8 },
-    /// Epic #71 R1: ack from the compositor that it has dropped
-    /// DRM master and paused render, in response to the broker's
-    /// preceding [`BrokerToCompositor::VtSwitchPrepare`]. The
-    /// broker MAY now perform `VT_ACTIVATE(target)` to complete
-    /// the switch.
-    ///
-    /// CRITICAL invariant (systemd #21388 lesson): the broker MUST
-    /// wait for this ack with a finite timeout (~5s) and on
-    /// timeout MUST emit [`BrokerToCompositor::VtSwitchRejected`]
-    /// with [`VtSwitchRejectReason::MasterDropTimeout`] — it must
-    /// NOT fire `VT_ACTIVATE` anyway. Firing the ioctl without the
-    /// ack races the kernel's switch against the compositor's
-    /// drop, exactly the bug logind originally shipped.
-    VtSwitchMasterDropped,
 }
 
 /// How a launched user session ended (Amendment A5.2).
@@ -324,78 +235,6 @@ pub enum BrokerToCompositor {
     /// "no raw leader pid" rule (CLAUDE.md hard rule); the pid is
     /// informational, the pidfd is authority.
     GreeterSpawned { pid: i32 },
-    /// Epic #71 R1: response to
-    /// [`CompositorToBroker::RequestVtSwitch`] when the broker has
-    /// opened `/dev/tty<target>`. The fd is attached as SCM_RIGHTS
-    /// ancillary data on this frame — identical recvmsg shape as
-    /// [`Self::RootFd`] and [`Self::GreeterSpawned`]. The
-    /// compositor extracts the fd via `recvmsg` with a cmsg buffer.
-    ///
-    /// On receiving this, the compositor:
-    /// 1. Calls `setsid()` if it isn't already a session leader.
-    /// 2. Calls `TIOCSCTTY(fd, 0)` — makes the inherited fd its
-    ///    controlling TTY (satisfies kernel `perm` for VT_RELDISP /
-    ///    VT_SETMODE later, without `CAP_SYS_TTY_CONFIG`).
-    /// 3. Calls `VT_SETMODE PROCESS` with `relsig=SIGUSR1`,
-    ///    `acqsig=SIGUSR2`. The compositor's pid is recorded as
-    ///    the kernel's VT_PROCESS controller — kernel signals reach
-    ///    it directly, no broker relay needed.
-    /// 4. Drops DRM master, pauses the render loop.
-    /// 5. Sends [`CompositorToBroker::VtSwitchMasterDropped`] back
-    ///    to the broker.
-    ///
-    /// Carries no `target_vt`: the compositor knows it from its own
-    /// outstanding request. Same payload-minimization stance as the
-    /// other broker→compositor responses.
-    VtSwitchPrepare,
-    /// Epic #71 R1: the broker has performed `VT_ACTIVATE(target)`
-    /// and the kernel switched. The compositor now drives the
-    /// cooperative-switching state machine entirely on its own —
-    /// signalfd loop, `VT_RELDISP` acks, eventual `drm.resume()`
-    /// on the acquire half if it owns multiple VTs. The broker is
-    /// out of the picture until the next `RequestVtSwitch`.
-    VtSwitchActivated,
-    /// Epic #71 R1: the broker refused the switch request, with a
-    /// structured reason. See [`VtSwitchRejectReason`] for the
-    /// catalog.
-    VtSwitchRejected { reason: VtSwitchRejectReason },
-}
-
-/// Why the broker refused a [`CompositorToBroker::RequestVtSwitch`].
-///
-/// Catalog kept tight: each variant maps to a specific broker-side
-/// decision the compositor should react to differently (log + back
-/// off vs log + escalate vs surface to user). The broker logs the
-/// finer-grained underlying error (errno, specific check that
-/// failed) at its own tracing level; the compositor only needs the
-/// category.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VtSwitchRejectReason {
-    /// The broker is rate-limiting VT switches. A second switch
-    /// arrived within the broker's configured cooldown window
-    /// (default ~1s). Compositor should back off; the user
-    /// triggered chord N times too quickly.
-    RateLimited,
-    /// `target_vt` is outside the broker's allowed range (default
-    /// 1..=12). Defensive — kernel itself accepts up to 63 but
-    /// halmasuit's keymap reserves only F1..F12, and a hostile
-    /// caller asking for VT 0 or VT 999 should be visibly
-    /// rejected.
-    InvalidVtNumber,
-    /// The broker waited the configured timeout (~5s) for
-    /// [`CompositorToBroker::VtSwitchMasterDropped`] after sending
-    /// [`BrokerToCompositor::VtSwitchPrepare`], and the ack didn't
-    /// arrive. The broker FAILED the request rather than firing
-    /// `VT_ACTIVATE` anyway. Compositor logs + watches for its own
-    /// hung state. systemd #21388 lesson encoded.
-    MasterDropTimeout,
-    /// The broker hit an unexpected internal error: open(2) on
-    /// `/dev/tty<N>` failed, fd-passing setup failed, etc. The
-    /// broker logs the specifics; the compositor sees only the
-    /// category. Distinct from `InvalidVtNumber` because this
-    /// represents a system-state problem, not a caller error.
-    BrokerInternal,
 }
 
 /// Hard ceiling on a single framed message. Mirrors `halmasuit-greetd`'s
@@ -768,82 +607,6 @@ mod tests {
     }
 
     #[test]
-    fn wire_format_request_vt_switch() {
-        // Epic #71 R1: C→B request to switch VTs. `target_vt` is a
-        // bare u8 — the broker validates the range. Wire tag is
-        // disjoint from every other CompositorToBroker tag.
-        let json = r#"{"type":"request_vt_switch","target_vt":2}"#;
-        let parsed: CompositorToBroker = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed, CompositorToBroker::RequestVtSwitch { target_vt: 2 });
-        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
-    }
-
-    #[test]
-    fn wire_format_vt_switch_master_dropped() {
-        // Epic #71 R1: C→B ack that DRM master has been dropped and
-        // render is paused. The broker may now perform VT_ACTIVATE.
-        // Empty body: ack-only message, the broker correlates with
-        // its outstanding switch request.
-        let json = r#"{"type":"vt_switch_master_dropped"}"#;
-        let parsed: CompositorToBroker = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed, CompositorToBroker::VtSwitchMasterDropped);
-        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
-    }
-
-    #[test]
-    fn wire_format_vt_switch_prepare() {
-        // Epic #71 R1: B→C reply that the broker has opened the VT
-        // and attached the fd as SCM_RIGHTS auxdata. Empty body: the
-        // fd IS the payload (recvmsg cmsg), this frame just carries
-        // the tag for the decode path. Same shape as RootFd.
-        let json = r#"{"type":"vt_switch_prepare"}"#;
-        let parsed: BrokerToCompositor = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed, BrokerToCompositor::VtSwitchPrepare);
-        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
-    }
-
-    #[test]
-    fn wire_format_vt_switch_activated() {
-        // Epic #71 R1: B→C reply that VT_ACTIVATE succeeded. The
-        // kernel has switched; the compositor's signalfd loop takes
-        // over from here.
-        let json = r#"{"type":"vt_switch_activated"}"#;
-        let parsed: BrokerToCompositor = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed, BrokerToCompositor::VtSwitchActivated);
-        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
-    }
-
-    #[test]
-    fn wire_format_vt_switch_rejected_all_reasons() {
-        // Epic #71 R1: B→C reply when the broker refused the switch.
-        // Pin the canonical JSON shape for each rejection reason so
-        // an accidental rename or rejection-catalog growth fails CI.
-        let cases = [
-            (
-                r#"{"type":"vt_switch_rejected","reason":"rate_limited"}"#,
-                VtSwitchRejectReason::RateLimited,
-            ),
-            (
-                r#"{"type":"vt_switch_rejected","reason":"invalid_vt_number"}"#,
-                VtSwitchRejectReason::InvalidVtNumber,
-            ),
-            (
-                r#"{"type":"vt_switch_rejected","reason":"master_drop_timeout"}"#,
-                VtSwitchRejectReason::MasterDropTimeout,
-            ),
-            (
-                r#"{"type":"vt_switch_rejected","reason":"broker_internal"}"#,
-                VtSwitchRejectReason::BrokerInternal,
-            ),
-        ];
-        for (json, reason) in cases {
-            let parsed: BrokerToCompositor = serde_json::from_str(json).unwrap();
-            assert_eq!(parsed, BrokerToCompositor::VtSwitchRejected { reason });
-            assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
-        }
-    }
-
-    #[test]
     fn broker_to_compositor_only_frames_do_not_cross_decode_as_compositor_to_broker() {
         // Structural anti-forge guarantee: frames the unprivileged
         // compositor must NEVER be able to forge MUST NOT decode as
@@ -875,11 +638,6 @@ mod tests {
             },
             BrokerToCompositor::RootFd,
             BrokerToCompositor::GreeterSpawned { pid: 4242 },
-            BrokerToCompositor::VtSwitchPrepare,
-            BrokerToCompositor::VtSwitchActivated,
-            BrokerToCompositor::VtSwitchRejected {
-                reason: VtSwitchRejectReason::RateLimited,
-            },
         ] {
             let bytes = encode(&frame).unwrap();
             let as_c2b: Result<Option<(CompositorToBroker, usize)>, _> = try_decode(&bytes);
@@ -910,8 +668,6 @@ mod tests {
             CompositorToBroker::Cancel,
             CompositorToBroker::RequestRootFd,
             CompositorToBroker::SpawnGreeter,
-            CompositorToBroker::RequestVtSwitch { target_vt: 2 },
-            CompositorToBroker::VtSwitchMasterDropped,
         ] {
             let bytes = encode(&msg).unwrap();
             let (decoded, consumed): (CompositorToBroker, usize) =
@@ -945,11 +701,6 @@ mod tests {
             },
             BrokerToCompositor::RootFd,
             BrokerToCompositor::GreeterSpawned { pid: 9876 },
-            BrokerToCompositor::VtSwitchPrepare,
-            BrokerToCompositor::VtSwitchActivated,
-            BrokerToCompositor::VtSwitchRejected {
-                reason: VtSwitchRejectReason::MasterDropTimeout,
-            },
         ] {
             let bytes = encode(&msg).unwrap();
             let (decoded, consumed): (BrokerToCompositor, usize) =

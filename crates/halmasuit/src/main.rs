@@ -379,6 +379,12 @@ struct HalmasuitState {
     /// re-renders. `None` only if the channel failed to register
     /// (the overlay then shows an empty journal section).
     journal_tx: Option<calloop::channel::Sender<String>>,
+    /// Epic #71 R-honest.7: the VT fd the compositor became the
+    /// `VT_PROCESS` controller of via the last successful VT switch.
+    /// Retained (NOT dropped) so the SIGUSR1 (relsig) / SIGUSR2
+    /// (acqsig) handlers can `VT_RELDISP` the cooperative-switch
+    /// handshake against it. `None` until the first switch activates.
+    vt_fd: Option<std::os::fd::OwnedFd>,
     /// Epic #71 R3.3: state shared with the Compositor1 DBus server
     /// thread. Holds the startup `Instant` (for `GetUptime`) and
     /// an `Arc<AtomicU64>` frame counter (R3.x will wire the
@@ -691,77 +697,76 @@ impl HalmasuitState {
     }
 
     /// Epic #71 R2.1: drive the broker-mediated VT-switching IPC
-    /// dance for `target_vt`. Called from `dispatch_libinput`'s
-    /// keyboard filter when `Ctrl+Alt+F<target_vt>` is pressed.
+    /// Epic #71 R-honest.7 (home-VT model): request a switch to
+    /// `target_vt`. Called from `dispatch_libinput`'s keyboard filter
+    /// on `Ctrl+Alt+F<target_vt>`.
     ///
-    /// Runs synchronously on the calloop thread. The transient-
-    /// one-shot pattern is the same as `broker_spawn_greeter` and
-    /// the cross-pivot `RequestRootFd` retry path; the
-    /// "compositor never blocks the calloop thread on broker IPC"
-    /// rule applies to the long-lived relay, NOT to discrete
-    /// user-triggered transient requests. Documented in
-    /// `vt_switch.rs`'s module doc.
-    ///
-    /// R2.2: `before_drop_master` drops DRM master via
-    /// `DrmBackend::pause()`; `on_activated` reacquires via
-    /// `DrmBackend::resume()`. On the headless-VM-test path where
-    /// `drm_backend` is `None`, both hooks no-op cleanly.
-    ///
-    /// On any failure (broker rejected, IPC error), the chord is
-    /// effectively a no-op from the user's perspective and the
-    /// reason is logged. We do NOT panic the compositor over a
-    /// failed switch — the user can press the chord again.
-    #[allow(
-        clippy::needless_pass_by_ref_mut,
-        reason = "R2.x will mutate self (retain vt_fd for the per-VT signalfd loop); &mut now keeps the signature stable across the next R2 sub-task"
-    )]
-    fn trigger_vt_switch(&mut self, target_vt: u8) {
-        let broker_path = self.broker_socket.clone();
-        let drm = self.drm_backend.as_ref();
-
-        // R2.2 DRM coordination: drop master BEFORE the broker fires
-        // VT_ACTIVATE so the kernel can hand display ownership to
-        // the target VT cleanly; reacquire AFTER we're back. On the
-        // headless VM-test path `drm` is None and both hooks no-op.
-        let pause_drm = || drm.map_or(Ok(()), drm::DrmBackend::pause);
-        let resume_drm =
-            |_fd: std::os::fd::BorrowedFd<'_>| drm.map_or(Ok(()), drm::DrmBackend::resume);
-        let no_op = || Ok(());
-
-        let hooks = vt_switch::VtSwitchHooks {
-            before_drop_master: &pause_drm,
-            after_drop_master: &no_op,
-            on_activated: &resume_drm,
+    /// halmasuit owns its HOME vt as the `VT_PROCESS` controller (set up
+    /// once at startup), so a switch is a plain `VT_ACTIVATE(target_vt)`
+    /// on that controlling-tty fd — NOT a grab of the target VT. The
+    /// kernel, seeing the home VT is `VT_PROCESS`, sends relsig to us;
+    /// `handle_vt_relsig` drops DRM master + `VT_RELDISP(release)` and
+    /// the kernel then completes the switch to `target_vt` (a getty /
+    /// the recovery console). Switching back fires acqsig →
+    /// `handle_vt_acqsig`. `VT_ACTIVATE` returns immediately; the
+    /// release/acquire is async on the VT signalfd, so this never blocks
+    /// the calloop thread. No-op (logged) if no home VT is configured.
+    fn trigger_vt_switch(&self, target_vt: u8) {
+        use std::os::fd::AsFd as _;
+        let Some(vt_fd) = self.vt_fd.as_ref() else {
+            tracing::warn!(target_vt, "VT switch chord ignored: no home VT configured");
+            return;
         };
+        match vt_switch::vt_activate(vt_fd.as_fd(), target_vt) {
+            Ok(()) => tracing::info!(
+                target_vt,
+                "VT_ACTIVATE requested; switching to tty{target_vt}"
+            ),
+            Err(e) => tracing::warn!(target_vt, error = %e, "VT_ACTIVATE failed"),
+        }
+    }
 
-        let switcher = vt_switch::VtSwitcher::new(broker_path);
-        match switcher.request_switch(target_vt, &hooks, &vt_switch::RealVtFdSetup) {
-            Ok(vt_switch::VtSwitchOutcome::Activated { vt_fd }) => {
-                tracing::info!(
-                    target_vt = target_vt,
-                    "VT switch activated; kernel switched to tty{target_vt}",
-                );
-                // R2.x will retain this fd to drive the per-VT
-                // signalfd loop. For R2.2 we drop it — DRM master
-                // is back, render loop continues naturally; signals
-                // on this fd are caught by the global calloop
-                // Signals source (sigprocmask-blocked).
-                drop(vt_fd);
-            }
-            Ok(vt_switch::VtSwitchOutcome::Rejected { reason }) => {
-                tracing::warn!(
-                    target_vt = target_vt,
-                    reason = ?reason,
-                    "VT switch rejected by broker",
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target_vt = target_vt,
-                    error = %e,
-                    "VT switch IPC failed",
-                );
-            }
+    /// Epic #71 R-honest.7: handle the kernel's VT relsig (SIGUSR1) —
+    /// "release your VT, someone's switching away". Per the systemd
+    /// #21388 ordering, drop DRM master FIRST, then `VT_RELDISP` with
+    /// the RELEASE arg so the kernel completes the switch to the
+    /// incoming VT. No-ops with a log if we hold no VT controller fd.
+    fn handle_vt_relsig(&self) {
+        use std::os::fd::AsFd as _;
+        let Some(vt_fd) = self.vt_fd.as_ref() else {
+            tracing::warn!("VT relsig with no home VT fd; ignoring");
+            return;
+        };
+        let fd = vt_fd.as_fd();
+        if let Some(backend) = self.drm_backend.as_ref()
+            && let Err(e) = backend.pause()
+        {
+            tracing::warn!(error = %e, "DRM pause on VT relsig failed");
+        }
+        match vt_switch::vt_reldisp(fd, vt_switch::VT_RELDISP_RELEASE) {
+            Ok(()) => tracing::info!("VT_RELSIG_HANDLED: DRM paused + VT_RELDISP(release)"),
+            Err(e) => tracing::warn!(error = %e, "VT_RELDISP(release) failed"),
+        }
+    }
+
+    /// Epic #71 R-honest.7: handle the kernel's VT acqsig (SIGUSR2) —
+    /// "your VT is active again". Reacquire DRM master, then
+    /// `VT_RELDISP` with the ACKACQ arg to confirm the acquire.
+    fn handle_vt_acqsig(&self) {
+        use std::os::fd::AsFd as _;
+        let Some(vt_fd) = self.vt_fd.as_ref() else {
+            tracing::warn!("VT acqsig with no home VT fd; ignoring");
+            return;
+        };
+        let fd = vt_fd.as_fd();
+        if let Some(backend) = self.drm_backend.as_ref()
+            && let Err(e) = backend.resume()
+        {
+            tracing::warn!(error = %e, "DRM resume on VT acqsig failed");
+        }
+        match vt_switch::vt_reldisp(fd, vt_switch::VT_RELDISP_ACKACQ) {
+            Ok(()) => tracing::info!("VT_ACQSIG_HANDLED: DRM resumed + VT_RELDISP(ackacq)"),
+            Err(e) => tracing::warn!(error = %e, "VT_RELDISP(ackacq) failed"),
         }
     }
 
@@ -3048,6 +3053,50 @@ fn broker_socket_path_from_env() -> PathBuf {
     )
 }
 
+/// The VT number halmasuit owns as its HOME vt (`HALMASUIT_HOME_VT`),
+/// if configured. When set, halmasuit becomes that VT's `VT_PROCESS`
+/// controller at startup and cooperative VT switching (Ctrl+Alt+F<n>)
+/// is enabled; unset → VT switching is disabled (the chord no-ops with
+/// a log). The deployment MUST disable any getty on the home VT — it is
+/// halmasuit's, the way greetd owns its VT.
+fn home_vt_from_env() -> Option<u8> {
+    std::env::var("HALMASUIT_HOME_VT")
+        .ok()
+        .and_then(|s| s.parse::<u8>().ok())
+        .filter(|&n| n >= 1)
+}
+
+/// Open `/dev/tty<vt>` in halmasuit's root startup window (the same
+/// window that opens the DRM master fd) and make it the compositor's
+/// `VT_PROCESS`-mode controlling terminal via
+/// [`vt_switch::setup_home_vt_controller`]. The returned fd is retained
+/// for the compositor's lifetime: the kernel routes relsig/acqsig to
+/// whoever holds the `VT_SETMODE` registration, and the
+/// controlling-tty designation survives the later privilege drop, so
+/// `VT_ACTIVATE` / `VT_RELDISP` keep working as the unprivileged
+/// compositor (Phase 0 verdict).
+///
+/// # Errors
+/// `io::Error` from the open or the `setsid`/`TIOCSCTTY`/`VT_SETMODE`
+/// setup.
+fn open_home_vt(vt: u8) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::AsFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let path = format!("/dev/tty{vt}");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(&path)?;
+    vt_switch::setup_home_vt_controller(file.as_fd())?;
+    // Bring the home VT to the foreground so halmasuit receives input
+    // and the cooperative relsig fires on a later switch-away. No-op if
+    // it is already the active VT; otherwise the kernel switches to it
+    // and sends us acqsig (handled once the event loop starts).
+    vt_switch::vt_activate(file.as_fd(), vt)?;
+    Ok(std::os::fd::OwnedFd::from(file))
+}
+
 /// The transient GL clear color in XRGB8888 little-endian, derived
 /// from [`drm::CLEAR_RGB`]. Under epic amendment G1/R6 it is never
 /// visible: the wallpaper plane covers the entire output on every
@@ -4134,6 +4183,45 @@ fn main() -> io::Result<()> {
         version: env!("CARGO_PKG_VERSION"),
     });
 
+    // Block the calloop-consumed signals process-wide BEFORE anything
+    // spawns a thread (Mesa/EGL driver threads start during DRM init;
+    // the DBus + journal + watcher threads later). New threads inherit
+    // this mask, so the kernel can only deliver these process-directed
+    // signals to the main thread's signalfd — never to a worker thread
+    // that would default-terminate the compositor. calloop's `Signals`
+    // source re-blocks + owns the signalfd; this just guarantees the
+    // block predates every thread.
+    {
+        use nix::sys::signal::{SigSet, Signal};
+        let mut mask = SigSet::empty();
+        for sig in [
+            Signal::SIGTERM,
+            Signal::SIGINT,
+            Signal::SIGCHLD,
+            Signal::SIGHUP,
+        ] {
+            mask.add(sig);
+        }
+        if let Err(e) = mask.thread_block() {
+            tracing::warn!(error = %e, "pre-block of calloop signals failed");
+        }
+    }
+
+    // Epic #71 R-honest.7: the cooperative VT-switch signals
+    // (relsig/acqsig) are REALTIME signals (SIGRTMIN+n), not SIGUSR1/2.
+    // They are process-directed (kernel kill_pid → group_send_sig_info),
+    // so the kernel delivers them to ANY thread that hasn't blocked
+    // them; SIGUSR1/2 are in the namespace libraries grab (Mesa/EGL
+    // workers, glibc helpers; SIGUSR1 is an X server's parent-readiness
+    // signal — freedesktop #87322), so a worker thread silently
+    // swallowed them. A realtime signal is a private number no library
+    // touches; blocking it here (before any thread spawns) keeps it
+    // pending for the dedicated VT signalfd registered below. nix's
+    // SigSet can't represent RT signals, so this goes through raw libc.
+    if let Err(e) = vt_switch::block_vt_signals() {
+        tracing::warn!(error = %e, "pre-block of VT realtime signals failed");
+    }
+
     // Phase B (boot-from-initrd) runtime detection. `/etc/initrd-release`
     // is the systemd-canonical signal that we're in the initramfs
     // (INITRD_INTERFACE spec); the rootfs filesystem doesn't ship the
@@ -4504,47 +4592,30 @@ fn main() -> io::Result<()> {
     // true thereafter. In rootfs-only (`services.halmasuit.enable=
     // true`) mode the flag starts true at construction — no boot
     // pivot to survive.
-    // Epic #71 R2.1: SIGUSR1/SIGUSR2 are the kernel's cooperative VT-
-    // switching signals (relsig/acqsig). Once the compositor has done
-    // VT_SETMODE PROCESS on a VT fd (in `trigger_vt_switch`), the
-    // kernel can deliver these signals at any moment when a VT switch
-    // happens. Without them being signalfd-routed here, the default
-    // disposition is termination — Phase 0's probe + R1.4's VM test
-    // both document this. Adding them to the calloop `Signals` source
-    // sigprocmask-blocks them AND routes them to this handler. R2.1's
-    // handler is a no-op (just logs); the kernel-level switch
-    // completes anyway (kernel doesn't wait on VT_RELDISP-ACKACQ for
-    // the acquired side). R2.x will plug in real VT_RELDISP handling
-    // here for the cooperative drop-master/reacquire dance.
+    //
+    // The cooperative VT-switch signals (relsig/acqsig) are NOT here —
+    // they are realtime signals on a dedicated signalfd registered
+    // below (calloop's `Signals` is standard-signal-only).
     let signals = Signals::new(&[
         Signal::SIGTERM,
         Signal::SIGINT,
         Signal::SIGCHLD,
-        Signal::SIGUSR1,
-        Signal::SIGUSR2,
+        Signal::SIGHUP,
     ])?;
     loop_handle
         .insert_source(
             signals,
             move |event, (), state: &mut HalmasuitState| match event.signal() {
                 Signal::SIGCHLD => reap_zombie_children(state),
-                Signal::SIGUSR1 => {
-                    // VT relsig: kernel asks us to release our VT
-                    // (we're switching away). R2.x will drop DRM
-                    // master + VT_RELDISP(1) here. For R2.1 we log
-                    // and let the kernel continue — without
-                    // VT_RELDISP the kernel may stall the switch
-                    // until something resolves it, but for the
-                    // current R2.1 protocol (compositor TIOCSCTTYs
-                    // into the NEW vt, not its old one) we never
-                    // hit this path in practice.
-                    tracing::info!("received SIGUSR1 (VT relsig); R2.x will handle");
-                }
-                Signal::SIGUSR2 => {
-                    // VT acqsig: kernel notifying us that we've
-                    // become the active VT. R2.x will reacquire
-                    // DRM master here. For R2.1 we log.
-                    tracing::info!("received SIGUSR2 (VT acqsig); R2.x will handle");
+                // R-honest.7 probe + fix: halmasuit TIOCSCTTYs the VT it
+                // switches to, so it becomes subject to controlling-tty
+                // job-control signals. A getty grabbing that VT (vhangup)
+                // or the switch itself can deliver SIGHUP; the default
+                // disposition terminates the long-lived display server.
+                // Ignore it — halmasuit's lifetime is graphical.target →
+                // shutdown, not tied to any one VT's hangup.
+                Signal::SIGHUP => {
+                    tracing::warn!("VT_SIGHUP_received (ignored)");
                 }
                 Signal::SIGTERM if !state.shutdown_armed => {
                     tracing::info!("SIGTERM ignored (shutdown_armed=false, boot pivot in flight)");
@@ -4557,6 +4628,29 @@ fn main() -> io::Result<()> {
                     };
                     graceful_shutdown(state, reason);
                 }
+            },
+        )
+        .map_err(io::Error::other)?;
+
+    // Epic #71 R-honest.7: dedicated signalfd for the cooperative
+    // VT-switch realtime signals (relsig/acqsig — SIGRTMIN+n, blocked
+    // process-wide above). On relsig the compositor drops DRM master +
+    // VT_RELDISP(release); on acqsig it reacquires master +
+    // VT_RELDISP(ackacq). Both act on the retained `vt_fd`; no-op
+    // (logged) if we hold no VT.
+    let vt_signalfd = vt_switch::create_vt_signalfd()?;
+    loop_handle
+        .insert_source(
+            Generic::new(vt_signalfd, Interest::READ, CalloopMode::Level),
+            move |_readiness, fd, state: &mut HalmasuitState| {
+                use std::os::fd::AsFd as _;
+                for sig in vt_switch::read_vt_signals(fd.as_fd())? {
+                    match sig {
+                        vt_switch::VtSignal::Release => state.handle_vt_relsig(),
+                        vt_switch::VtSignal::Acquire => state.handle_vt_acqsig(),
+                    }
+                }
+                Ok(PostAction::Continue)
             },
         )
         .map_err(io::Error::other)?;
@@ -4726,6 +4820,29 @@ fn main() -> io::Result<()> {
                 .expect("refresh clamped to >=1"),
     );
 
+    // Epic #71 R-honest.7 (home-VT model): open our home VT and become
+    // its VT_PROCESS controller while still root (mirrors the DRM
+    // master open). No home VT configured → cooperative VT switching is
+    // disabled. Failure is non-fatal: the compositor still comes up; the
+    // chord just no-ops.
+    let home_vt_fd = home_vt_from_env().and_then(|vt| match open_home_vt(vt) {
+        Ok(fd) => {
+            tracing::info!(
+                home_vt = vt,
+                "home VT opened; halmasuit is its VT_PROCESS controller"
+            );
+            Some(fd)
+        }
+        Err(e) => {
+            tracing::warn!(
+                home_vt = vt,
+                error = %e,
+                "home VT setup failed; cooperative VT switching disabled"
+            );
+            None
+        }
+    });
+
     let mut state = HalmasuitState {
         display_handle,
         compositor_state,
@@ -4782,6 +4899,9 @@ fn main() -> io::Result<()> {
         // Epic #71 R-honest.6: overlay journal cache + channel sender.
         overlay_journal: String::new(),
         journal_tx,
+        // Epic #71 R-honest.7: our home VT fd (VT_PROCESS controller),
+        // opened in the root window above; None if not configured.
+        vt_fd: home_vt_fd,
         // Epic #71 R3.3: DBus state anchored at startup; the
         // background thread reads from this via Arc clone.
         dbus_state: dbus_compositor1::CompositorObservability::new(),

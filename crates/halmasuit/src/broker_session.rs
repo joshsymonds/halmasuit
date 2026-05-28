@@ -318,7 +318,7 @@ impl AsFd for SeqpacketChannel {
 ///
 /// Epic #71 R-honest.3: this is the single chokepoint every broker
 /// connection flows through (per-greeter episode + one-shot
-/// RequestRootFd / SpawnGreeter / RequestVtSwitch), so it records the
+/// RequestRootFd / SpawnGreeter), so it records the
 /// compositor's broker-reachability state for the
 /// `org.halmasuit.Compositor1` `GetBrokerStatus` surface:
 /// `Connecting` on entry, `Connected`/`Failed` on the result.
