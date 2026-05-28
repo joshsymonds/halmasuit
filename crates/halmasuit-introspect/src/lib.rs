@@ -371,6 +371,64 @@ pub enum Phase {
     RootfsReady,
 }
 
+impl Phase {
+    /// Stable discriminant for storing the current phase in an
+    /// `AtomicU32` (Epic #71 R-honest.2: the `org.halmasuit.Compositor1`
+    /// `GetPhase` surface + the diagnostic overlay read one global
+    /// phase store). The numbers are a frozen wire contract — append
+    /// new variants with new numbers; never renumber.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        match self {
+            Self::Init => 0,
+            Self::WaylandReady => 1,
+            Self::GreetdReady => 2,
+            Self::Deprivileged => 3,
+            Self::DrmMasterAcquired => 4,
+            Self::ScanoutActive => 5,
+            Self::InitramfsInit => 6,
+            Self::RootfsReady => 7,
+        }
+    }
+
+    /// Inverse of [`Phase::as_u32`]. `None` for an unknown
+    /// discriminant (forward-compat: a reader on an older binary
+    /// seeing a newer phase number reports "unknown" rather than
+    /// guessing).
+    #[must_use]
+    pub const fn from_u32(v: u32) -> Option<Self> {
+        Some(match v {
+            0 => Self::Init,
+            1 => Self::WaylandReady,
+            2 => Self::GreetdReady,
+            3 => Self::Deprivileged,
+            4 => Self::DrmMasterAcquired,
+            5 => Self::ScanoutActive,
+            6 => Self::InitramfsInit,
+            7 => Self::RootfsReady,
+            _ => return None,
+        })
+    }
+
+    /// Stable snake_case name — MATCHES the `#[serde(rename_all =
+    /// "snake_case")]` JSON the `phase_entered` event already emits,
+    /// so the DBus `GetPhase` string, the introspection stream, and
+    /// the overlay all speak one vocabulary.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Init => "init",
+            Self::WaylandReady => "wayland_ready",
+            Self::GreetdReady => "greetd_ready",
+            Self::Deprivileged => "deprivileged",
+            Self::DrmMasterAcquired => "drm_master_acquired",
+            Self::ScanoutActive => "scanout_active",
+            Self::InitramfsInit => "initramfs_init",
+            Self::RootfsReady => "rootfs_ready",
+        }
+    }
+}
+
 /// Reason a clean shutdown was initiated.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -499,6 +557,50 @@ mod tests {
         });
         assert_eq!(v["event"], "phase_entered");
         assert_eq!(v["phase"], "rootfs_ready");
+    }
+
+    /// R-honest.2: the `as_u32`/`from_u32` discriminant mapping the
+    /// Compositor1 phase store relies on MUST roundtrip for every
+    /// variant, and `name()` MUST match the serde snake_case JSON the
+    /// `phase_entered` event emits (one vocabulary across the
+    /// introspect stream, DBus GetPhase, and the overlay).
+    #[test]
+    fn phase_discriminant_roundtrips_and_name_matches_serde() {
+        let all = [
+            Phase::Init,
+            Phase::WaylandReady,
+            Phase::GreetdReady,
+            Phase::Deprivileged,
+            Phase::DrmMasterAcquired,
+            Phase::ScanoutActive,
+            Phase::InitramfsInit,
+            Phase::RootfsReady,
+        ];
+        let mut seen_discriminants = std::collections::HashSet::new();
+        let mut seen_names = std::collections::HashSet::new();
+        for p in all {
+            // Roundtrip discriminant.
+            let n = p.as_u32();
+            assert_eq!(
+                Phase::from_u32(n).map(Phase::as_u32),
+                Some(n),
+                "{p:?} discriminant {n} must roundtrip",
+            );
+            // Discriminants are unique.
+            assert!(
+                seen_discriminants.insert(n),
+                "duplicate discriminant {n} for {p:?}",
+            );
+            // name() matches the serde snake_case rendering.
+            let serde_name = round_trip(&Event::PhaseEntered { phase: p })["phase"]
+                .as_str()
+                .expect("phase serializes to a string")
+                .to_owned();
+            assert_eq!(p.name(), serde_name, "{p:?} name() must match serde JSON");
+            assert!(seen_names.insert(p.name()), "duplicate name for {p:?}");
+        }
+        // Unknown discriminant → None (forward-compat).
+        assert!(Phase::from_u32(9999).is_none());
     }
 
     #[test]

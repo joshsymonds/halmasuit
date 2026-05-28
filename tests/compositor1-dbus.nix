@@ -115,6 +115,21 @@ pkgs.testers.runNixOSTest {
         assert m, f"could not parse {method} reply: {out!r}"
         return int(m.group(1))
 
+    def compositor1_str(method):
+        """Call a Compositor1 method returning a string; return it.
+
+        gdbus prints e.g. "('scanout_active',)" — extract the
+        single-quoted payload.
+        """
+        out = machine.succeed(
+            f"gdbus call --system --dest org.halmasuit.Compositor1 "
+            f"--object-path /org/halmasuit/Compositor1 "
+            f"--method org.halmasuit.Compositor1.{method}"
+        ).strip()
+        m = re.search(r"'([^']*)'", out)
+        assert m, f"could not parse {method} reply: {out!r}"
+        return m.group(1)
+
     machine.start()
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_unit("halmasuit.service")
@@ -153,6 +168,54 @@ pkgs.testers.runNixOSTest {
         f"surface reads."
     )
 
+    # ── Assertion 1b: GetPhase is a REAL lifecycle phase ──
+    # The R3.3 stub returned the literal "Running". The phase store is
+    # updated at every PhaseEntered transition via main's emit_phase
+    # chokepoint. By steady state (greeter spawned, render loop up) a
+    # rootfs-only halmasuit has reached a real phase — assert it's one
+    # of the known snake_case names and explicitly NOT the dead stub.
+    KNOWN_PHASES = {
+        "init", "wayland_ready", "greetd_ready", "deprivileged",
+        "drm_master_acquired", "scanout_active", "initramfs_init",
+        "rootfs_ready",
+    }
+    phase = compositor1_str("GetPhase")
+    print(f"GetPhase: {phase}")
+    assert phase != "Running", (
+        "GetPhase returned the removed R3.3 stub literal 'Running' — "
+        "the phase store is not wired to the emit_phase chokepoint."
+    )
+    assert phase in KNOWN_PHASES, (
+        f"GetPhase returned {phase!r}, not a known lifecycle phase. "
+        f"Expected one of {sorted(KNOWN_PHASES)}."
+    )
+    # Cross-check: the live phase must agree with the LAST phase_entered
+    # event in the journal (the introspection stream and the DBus store
+    # share the emit_phase chokepoint, so they cannot diverge). The
+    # phase name is escaped inside the tracing `json` field
+    # (\"phase\":\"...\"), so parse permissively in Python rather than
+    # fighting shell quoting. In rootfs-only steady state the terminal
+    # phase is reached once and never changes, so the two reads are
+    # stable (no transition can race between them).
+    journal = machine.succeed("journalctl -u halmasuit -o cat")
+    phase_events = re.findall(r'phase[\\":]+([a-z_]+)', journal)
+    # Filter to known phase names (the regex also catches the literal
+    # token "phase_entered"'s tail in some encodings; intersect with
+    # the known set to be safe).
+    phase_events = [p for p in phase_events if p in KNOWN_PHASES]
+    assert phase_events, (
+        f"no phase_entered events found in journal; cannot cross-check. "
+        f"journal tail:\n{journal[-2000:]}"
+    )
+    last_journal_phase = phase_events[-1]
+    print(f"last phase_entered in journal: {last_journal_phase}")
+    assert phase == last_journal_phase, (
+        f"GetPhase ({phase!r}) must match the last phase_entered "
+        f"journal event ({last_journal_phase!r}) — the DBus store and "
+        f"the introspection stream share the emit_phase chokepoint and "
+        f"must not diverge."
+    )
+
     # ── Assertion 2: GetUptime returns LIVE values (not a frozen
     # construction-time snapshot) ── deterministic, independent of
     # render/vblank/damage. State-based poll (not a bare sleep, per
@@ -180,8 +243,9 @@ pkgs.testers.runNixOSTest {
     print("=" * 70)
     print("PASS: org.halmasuit.Compositor1 returns REAL, LIVE values.")
     print(f"      GetFrameCounter={frames} (>0 → render feeds the shared")
-    print(f"      Arc, not the 0 stub); GetUptime {uptime_first}→"
-          f"{uptime_second} (live, not frozen).")
+    print(f"      Arc, not the 0 stub); GetPhase={phase!r} (real phase,")
+    print(f"      matches journal, not the 'Running' stub); GetUptime "
+          f"{uptime_first}→{uptime_second} (live, not frozen).")
     print("=" * 70)
   '';
 }

@@ -2554,9 +2554,7 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
                      prior step errors: {step_errors:?}"
                 )));
             }
-            emit(&Event::PhaseEntered {
-                phase: Phase::Deprivileged,
-            });
+            emit_phase(Phase::Deprivileged);
         }
         None if nix::unistd::geteuid().is_root() => {
             return Err(io::Error::other(format!(
@@ -2852,9 +2850,7 @@ fn setup_greetd_listener(
         )
         .map_err(io::Error::other)?;
 
-    emit(&Event::PhaseEntered {
-        phase: Phase::GreetdReady,
-    });
+    emit_phase(Phase::GreetdReady);
 
     Ok((token, greeter_uid, pam_service))
 }
@@ -2876,6 +2872,18 @@ fn greetd_socket_path_from_env() -> PathBuf {
 
 fn pam_service_from_env() -> String {
     std::env::var("HALMASUIT_PAM_SERVICE").unwrap_or_else(|_| "halmasuit".into())
+}
+
+/// Epic #71 R-honest.2: the single chokepoint for compositor phase
+/// transitions. Records the phase into the global Compositor1 store
+/// (so `GetPhase` + the diagnostic overlay report the live phase)
+/// AND emits the introspection `PhaseEntered` event. Every phase
+/// transition goes through here — there is no bare
+/// `emit(&Event::PhaseEntered{…})` left, so the DBus store can never
+/// drift from the introspection stream.
+fn emit_phase(phase: Phase) {
+    dbus_compositor1::record_phase(phase);
+    emit(&Event::PhaseEntered { phase });
 }
 
 /// Path of the privileged `halmasuit-session` broker `SOCK_SEQPACKET`
@@ -3932,9 +3940,7 @@ fn main() -> io::Result<()> {
     let in_initramfs = context::is_initramfs();
     if in_initramfs {
         context::set_argv0_marker();
-        emit(&Event::PhaseEntered {
-            phase: Phase::InitramfsInit,
-        });
+        emit_phase(Phase::InitramfsInit);
     }
 
     // Resolve the DRM device path before anything else (the path may
@@ -4014,9 +4020,7 @@ fn main() -> io::Result<()> {
         let (backend, token, real_output) =
             drm::setup_drm_direct(path, &loop_handle, handle_drm_event, wallpaper_config)?;
         real_output.create_global::<HalmasuitState>(&display_handle);
-        emit(&Event::PhaseEntered {
-            phase: Phase::DrmMasterAcquired,
-        });
+        emit_phase(Phase::DrmMasterAcquired);
         // Rootfs deployment: enumerate input here. Initramfs deployment:
         // `setup_post_pivot_input` runs the same `setup_libinput_direct`
         // call post-pivot. Either way, no libseat: each `/dev/input/
@@ -4337,10 +4341,8 @@ fn main() -> io::Result<()> {
         )
         .map_err(io::Error::other)?;
 
-    emit(&Event::PhaseEntered { phase: Phase::Init });
-    emit(&Event::PhaseEntered {
-        phase: Phase::WaylandReady,
-    });
+    emit_phase(Phase::Init);
+    emit_phase(Phase::WaylandReady);
 
     // Wrap the Display as a calloop Generic source so client fd
     // activity (new requests on connected clients) wakes the event
@@ -4609,9 +4611,7 @@ fn main() -> io::Result<()> {
     if let Some(backend) = state.drm_backend.as_mut() {
         let queued = backend.render_one_frame(&state.output, HALMASUIT_BRAND_CLEAR)?;
         if queued {
-            emit(&Event::PhaseEntered {
-                phase: Phase::ScanoutActive,
-            });
+            emit_phase(Phase::ScanoutActive);
         } else {
             tracing::warn!(
                 "initial render_frame produced no damage; ScanoutActive deferred until next vblank"
@@ -4746,9 +4746,7 @@ fn main() -> io::Result<()> {
         match compositor_uid_from_env()? {
             Some(uid) => {
                 drop_privileges(uid)?;
-                emit(&Event::PhaseEntered {
-                    phase: Phase::Deprivileged,
-                });
+                emit_phase(Phase::Deprivileged);
             }
             None if nix::unistd::geteuid().is_root() => {
                 return Err(io::Error::other(
@@ -4830,9 +4828,7 @@ fn main() -> io::Result<()> {
                         if context::is_initramfs() {
                             TimeoutAction::ToDuration(Duration::from_secs(1))
                         } else {
-                            emit(&Event::PhaseEntered {
-                                phase: Phase::RootfsReady,
-                            });
+                            emit_phase(Phase::RootfsReady);
                             // Epic #47 R2.1: the boot pivot is complete.
                             // A SIGTERM from this point is the real
                             // shutdown signal, not the boot kill spree.

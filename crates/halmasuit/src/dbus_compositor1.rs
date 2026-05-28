@@ -31,8 +31,41 @@
 //! names from the same process).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
+
+use halmasuit_introspect::Phase;
+
+/// Epic #71 R-honest.2: the single global current-phase store.
+///
+/// Phase has no single natural owner — it's emitted from ~9 call
+/// sites across early-boot helpers AND the main loop (some before
+/// `HalmasuitState` even exists). A process-global atomic is the
+/// truthful reflection of that: ONE store, written by every phase
+/// transition via [`record_phase`] (called from `main`'s
+/// `emit_phase` chokepoint alongside the introspection emit) and
+/// read by the Compositor1 `GetPhase` surface here + (R3.x) the
+/// diagnostic overlay. Single source of truth; no second copy.
+///
+/// Initialized to `Phase::Init`'s discriminant (0).
+static CURRENT_PHASE: AtomicU32 = AtomicU32::new(0);
+
+/// Record the compositor's current lifecycle phase. Called from
+/// `main`'s `emit_phase` helper at every `PhaseEntered` transition.
+/// Relaxed: one-way value flow, no happens-before dependency on
+/// other observability fields (same posture as the frame counter).
+pub fn record_phase(phase: Phase) {
+    CURRENT_PHASE.store(phase.as_u32(), Ordering::Relaxed);
+}
+
+/// The current phase as a stable snake_case name (e.g.
+/// `"scanout_active"`), or `"unknown"` if the stored discriminant
+/// doesn't map to a known variant (forward-compat). Read by
+/// `GetPhase` and the overlay.
+#[must_use]
+pub fn current_phase_name() -> &'static str {
+    Phase::from_u32(CURRENT_PHASE.load(Ordering::Relaxed)).map_or("unknown", Phase::name)
+}
 
 /// The single source of truth for compositor observability state,
 /// written by the calloop thread and read by BOTH the Compositor1
@@ -85,16 +118,17 @@ impl Compositor1 {
 
 #[zbus::interface(name = "org.halmasuit.Compositor1")]
 impl Compositor1 {
-    /// Return the compositor's current high-level lifecycle phase.
-    ///
-    /// R3.3 stub returns `"Running"` unconditionally. R3.x will wire
-    /// this to the real phase tracker once main.rs exposes one.
+    /// Return the compositor's current lifecycle phase as a stable
+    /// snake_case name (e.g. `"scanout_active"`) — the live value
+    /// from the global phase store, updated at every `PhaseEntered`
+    /// transition (R-honest.2). `"unknown"` only if the stored
+    /// discriminant is unmappable (never, on a matched binary).
     #[allow(
         clippy::unused_self,
-        reason = "trivial stub; R3.x will read self.state"
+        reason = "reads the global CURRENT_PHASE store; &self for the zbus interface signature"
     )]
     fn get_phase(&self) -> String {
-        "Running".to_owned()
+        current_phase_name().to_owned()
     }
 
     /// Seconds since compositor start. Anchored at `CompositorObservability`
@@ -230,14 +264,33 @@ mod tests {
         let state = CompositorObservability::new();
         let comp = Compositor1::new(state);
 
-        // Stage 2: methods exist as expected. The interface is
-        // mostly stub data; this test ensures the wiring compiles
-        // and the data shapes line up.
-        assert_eq!(comp.get_phase(), "Running");
+        // Stage 2: methods exist and return the right shapes. GetPhase
+        // reads the global phase store; the remaining stubs
+        // (broker/windows) get wired in later R-honest sub-tasks.
+        let _ = comp.get_phase(); // a real phase name (see record_phase test)
         let _ = comp.get_uptime(); // any u64 is fine
         assert_eq!(comp.get_frame_counter(), 0);
         assert!(comp.list_windows().is_empty());
         assert_eq!(comp.get_broker_status(), "Unknown");
+    }
+
+    /// R-honest.2: `record_phase` updates the global store and
+    /// `get_phase` reads it back as the matching snake_case name —
+    /// proving the DBus surface reports the LIVE phase, not the
+    /// removed `"Running"` stub. (nextest runs each test in its own
+    /// process, so the global `CURRENT_PHASE` is isolated per test.)
+    #[test]
+    fn get_phase_reflects_recorded_phase() {
+        let comp = Compositor1::new(CompositorObservability::new());
+        // Default (Init) before any transition.
+        assert_eq!(comp.get_phase(), "init");
+        // A transition is reflected immediately.
+        record_phase(Phase::ScanoutActive);
+        assert_eq!(comp.get_phase(), "scanout_active");
+        record_phase(Phase::GreetdReady);
+        assert_eq!(comp.get_phase(), "greetd_ready");
+        // Never the removed stub.
+        assert_ne!(comp.get_phase(), "Running");
     }
 
     /// `CompositorObservability::frame_counter` is shared via Arc with the
