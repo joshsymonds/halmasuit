@@ -869,6 +869,20 @@
           halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # H5 — virtio-gpu-gl substrate variant of the side-shader
+        # cell. Tier between "software" (LIBGL_ALWAYS_SOFTWARE=1)
+        # and "real hardware" (deploy-time on gnomon). Requires the
+        # test runner to expose /dev/dri/renderD128 — NOT in the
+        # default test-vm sweep; opt-in via `just test-vm-virtio-gpu-gl`.
+        visual-phase-b-side-shader-gl = import ./tests/visual-phase-b-side-shader-gl.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs niri-flake dms;
+          halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # Epic #35 cell (side, video): same shape, real h264 (ffmpeg-built
         # testsrc), looping, with a PNG fallback. Exercises the
         # halmasuit-decoder sandbox + DecoderRelay through the fromInitrd

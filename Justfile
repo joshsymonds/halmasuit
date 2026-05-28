@@ -331,6 +331,16 @@ check-nspawn-pam-auth:
     sudo ./tests/lib/nspawn-rig.sh run-pam-auth "$toplevel" \
         "$toplevel/etc/run-pam-auth-test.sh"
 
+# Hardware-accelerated virtio-gpu-gl variant of the Phase B
+# side-shader cell. Tier between "software" (default test matrix)
+# and "real hardware" (deploy-time on gnomon). Requires the test
+# runner to expose /dev/dri/renderD128 — NOT in the default
+# `just test-vm` sweep because gnomon's render node is held by
+# halmasuit (the host compositor) and other CI runners may not
+# have one. Run explicitly when a free render node is available.
+test-vm-virtio-gpu-gl:
+    nix build .#checks.x86_64-linux.visual-phase-b-side-shader-gl -L --print-build-logs --no-link
+
 # Phase B hard gate: full LUKS-backed boot + survival + chroot +
 # greeter spawn + PAM auth → SessionOpened end-to-end.
 test-vm-full-boot-flash:
