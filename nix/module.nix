@@ -167,35 +167,65 @@ let
   # `mknod` invocation fails when copied to initramfs).
   nvidiaDevnodesScript = pkgs.writeShellScript "halmasuit-nvidia-devnodes" ''
     set -e
+    echo "halmasuit-nvidia-devnodes: starting"
+
     # /dev/nvidiactl — driver-wide control device. Fixed major 195,
     # minor 255.
-    [ -e /dev/nvidiactl ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidiactl c 195 255
+    if [ ! -e /dev/nvidiactl ]; then
+      ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidiactl c 195 255
+      echo "halmasuit-nvidia-devnodes: created /dev/nvidiactl"
+    fi
 
     # /dev/nvidia0..N — per-GPU compute. Minor numbers come from
     # /proc/driver/nvidia/gpus/*/information after nvidia.ko
-    # enumeration. Major is 195.
+    # enumeration. The file has the shape `Device Minor: <whitespace>
+    # <minor>`; field-4-after-space-split on that line gives the
+    # number (NixOS's rootfs nvidia.rules uses the same approach).
+    # Major is 195.
     for info in /proc/driver/nvidia/gpus/*/information; do
-      minor=$(${pkgs.gnugrep}/bin/grep '^Minor' "$info" \
+      [ -f "$info" ] || continue
+      minor=$(${pkgs.gnugrep}/bin/grep 'Device Minor' "$info" \
         | ${pkgs.coreutils}/bin/cut -d' ' -f4 \
         | ${pkgs.coreutils}/bin/tr -d '[:space:]')
       if [ -n "$minor" ]; then
-        [ -e /dev/nvidia$minor ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia$minor c 195 $minor
+        if [ ! -e /dev/nvidia$minor ]; then
+          ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia$minor c 195 $minor
+          echo "halmasuit-nvidia-devnodes: created /dev/nvidia$minor"
+        fi
+      else
+        echo "halmasuit-nvidia-devnodes: WARN: could not parse minor from $info"
       fi
     done
 
     # /dev/nvidia-modeset — modeset kernel module. Fixed major 195,
     # minor 254.
-    [ -e /dev/nvidia-modeset ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia-modeset c 195 254
+    if [ ! -e /dev/nvidia-modeset ]; then
+      ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia-modeset c 195 254
+      echo "halmasuit-nvidia-devnodes: created /dev/nvidia-modeset"
+    fi
 
     # /dev/nvidia-uvm + nvidia-uvm-tools — UVM (CUDA unified memory).
-    # Dynamic major; read from /proc/devices.
+    # Dynamic major; read from /proc/devices. Pattern matches lines
+    # like `235 nvidia-uvm` — leading whitespace + major + tab/space +
+    # name + end-of-line.
     uvm_major=$(${pkgs.gnugrep}/bin/grep ' nvidia-uvm$' /proc/devices \
       | ${pkgs.coreutils}/bin/cut -d' ' -f1 \
       | ${pkgs.coreutils}/bin/tr -d '[:space:]')
     if [ -n "$uvm_major" ]; then
-      [ -e /dev/nvidia-uvm ]       || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia-uvm       c "$uvm_major" 0
-      [ -e /dev/nvidia-uvm-tools ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia-uvm-tools c "$uvm_major" 1
+      if [ ! -e /dev/nvidia-uvm ]; then
+        ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia-uvm c "$uvm_major" 0
+        echo "halmasuit-nvidia-devnodes: created /dev/nvidia-uvm (major $uvm_major)"
+      fi
+      if [ ! -e /dev/nvidia-uvm-tools ]; then
+        ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia-uvm-tools c "$uvm_major" 1
+        echo "halmasuit-nvidia-devnodes: created /dev/nvidia-uvm-tools (major $uvm_major)"
+      fi
+    else
+      echo "halmasuit-nvidia-devnodes: WARN: no nvidia-uvm in /proc/devices"
     fi
+
+    echo "halmasuit-nvidia-devnodes: done; /dev/nvidia* state:"
+    ${pkgs.coreutils}/bin/ls -la /dev/nvidia* /dev/nvidiactl 2>&1 || true
   '';
 in
 {
