@@ -757,18 +757,36 @@ where
     drm.acquire_master_lock()
         .map_err(|e| io::Error::other(format!("DRM SET_MASTER: {e}")))?;
 
-    // Pick connector + mode + CRTC. Same shape as the B.1 slice; the
-    // resource-handle enumeration goes through drm-rs (re-exposed via
-    // smithay's `DrmDevice` deref).
+    // Pick connector(s) + mode + CRTC. Multi-monitor support is via
+    // DRM-atomic kernel-side scanout cloning: ALL connected
+    // connectors that share a common mode get bound to a single
+    // CRTC's surface, and the kernel drives all of them from one
+    // framebuffer. Single-connector substrates (the headless VM test
+    // matrix, single-monitor laptops) degrade naturally to the
+    // 1-connector case. The "primary" connector is just the first
+    // in the enumeration order — its first mode becomes the canonical
+    // mode, and other connectors must support it to join the clone.
+    //
+    // Trade-off vs the per-output `Vec<OutputState>` refactor: kernel
+    // clone gives identical pixels on every monitor (mirror), no
+    // per-output workspaces, no `primaryOutput` config knob — but
+    // the change is local to this function instead of a multi-file
+    // refactor. For Phase B's "show login UI on every monitor"
+    // requirement that's enough; niri handles its own per-output
+    // independence post-auth.
     let res = drm
         .resource_handles()
         .map_err(|e| io::Error::other(format!("resource_handles: {e}")))?;
 
-    let connector_info = res
+    let connected: Vec<_> = res
         .connectors()
         .iter()
         .filter_map(|&h| drm.get_connector(h, true).ok())
-        .find(|info| info.state() == connector::State::Connected)
+        .filter(|info| info.state() == connector::State::Connected)
+        .collect();
+
+    let connector_info = connected
+        .first()
         .ok_or_else(|| io::Error::other("no connected DRM connector"))?;
 
     let mode = *connector_info
@@ -777,16 +795,55 @@ where
         .ok_or_else(|| io::Error::other("connected DRM connector has no modes"))?;
     let (w, h) = mode.size();
 
+    // Filter to connectors that support the canonical mode (size +
+    // vrefresh). Connectors that don't are silently skipped — the
+    // kernel would reject an atomic commit that included them, and
+    // we prefer to clone fewer than blow up the boot.
+    let cloned_handles: Vec<_> = connected
+        .iter()
+        .filter(|info| {
+            info.modes()
+                .iter()
+                .any(|m| m.size() == mode.size() && m.vrefresh() == mode.vrefresh())
+        })
+        .map(smithay::reexports::drm::control::connector::Info::handle)
+        .collect();
+
+    tracing::info!(
+        target: "halmasuit",
+        total_connectors = connected.len(),
+        cloned_connectors = cloned_handles.len(),
+        mode_w = mode.size().0,
+        mode_h = mode.size().1,
+        mode_hz = mode.vrefresh(),
+        "DRM scanout: binding connectors to single CRTC for kernel-clone"
+    );
+
     let &crtc_handle = res
         .crtcs()
         .first()
         .ok_or_else(|| io::Error::other("no DRM CRTCs available"))?;
 
-    // Create the DRM surface — smithay's higher-level wrapper above
-    // `drmModeSetCrtc`.
-    let surface: DrmSurface = drm
-        .create_surface(crtc_handle, mode, &[connector_info.handle()])
-        .map_err(|e| io::Error::other(format!("DrmDevice::create_surface: {e}")))?;
+    // Try the multi-connector clone. If the kernel rejects it (e.g.,
+    // a connector's possible_crtcs mask doesn't include this CRTC,
+    // or shared-mode constraints aren't actually met by the
+    // hardware), fall back to driving just the primary connector.
+    // Boot still succeeds; one monitor lights up instead of zero.
+    let surface: DrmSurface = match drm.create_surface(crtc_handle, mode, &cloned_handles) {
+        Ok(s) => s,
+        Err(e) if cloned_handles.len() > 1 => {
+            tracing::warn!(
+                target: "halmasuit",
+                error = %e,
+                "multi-connector clone rejected by kernel; falling back to primary connector only"
+            );
+            drm.create_surface(crtc_handle, mode, &[connector_info.handle()])
+                .map_err(|e| {
+                    io::Error::other(format!("DrmDevice::create_surface (fallback): {e}"))
+                })?
+        }
+        Err(e) => return Err(io::Error::other(format!("DrmDevice::create_surface: {e}"))),
+    };
 
     // GBM device on the same fd. Allocator pulls SCANOUT-capable
     // buffers from this device; the framebuffer exporter wraps the
