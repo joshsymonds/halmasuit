@@ -722,6 +722,45 @@
           halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-vm-client  = self.packages.x86_64-linux.halmasuit-vm-client;
         };
+        # Multi-DRM-device regression gate (Epic: halmasuit multi-DRM-
+        # device support, DRM4). Two virtio-gpu-pci devices at pinned
+        # BDFs (0000:00:05.0, 0000:00:06.0 → card0, card1); three
+        # checks exercise Auto / Path / Pci modes and assert halmasuit
+        # opens the configured card. Catches the class of bug we hit
+        # on gnomon where blindly opening card0 hits the wrong GPU.
+        halmasuit-multi-drm-path = import ./tests/halmasuit-multi-drm.nix {
+          system    = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit            = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client  = self.packages.x86_64-linux.halmasuit-vm-client;
+          drmDevice    = "/dev/dri/card1";
+          expectedPath = "/dev/dri/card1";
+          testName     = "path";
+        };
+        halmasuit-multi-drm-pci = import ./tests/halmasuit-multi-drm.nix {
+          system    = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit            = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client  = self.packages.x86_64-linux.halmasuit-vm-client;
+          drmDevice    = "pci:0000:00:0f.0";  # → /dev/dri/card1
+          expectedPath = "/dev/dri/card1";
+          testName     = "pci";
+        };
+        halmasuit-multi-drm-auto = import ./tests/halmasuit-multi-drm.nix {
+          system    = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit            = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client  = self.packages.x86_64-linux.halmasuit-vm-client;
+          drmDevice    = null;
+          # Auto-discover iterates /dev/dri/card* in sorted order and
+          # picks the first with a connected connector. Both virtio-gpus
+          # report connected; sort puts card0 first.
+          expectedPath = "/dev/dri/card0";
+          testName     = "auto";
+        };
         # Epic #1 R12: first real-PAM gate. run_pam_auth against the
         # real libpam stack with the real test user — NO mock.
         run-pam-auth = import ./tests/run-pam-auth.nix {
