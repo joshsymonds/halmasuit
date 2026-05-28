@@ -102,14 +102,27 @@ nspawn_pid=$!
 # `wait` semantic isn't quite right (it waits for the unit lifecycle,
 # not for "userspace booted"); we poll for the container's PID 1
 # answering systemd-style.
-boot_deadline=$(( $(date +%s) + 60 ))
+#
+# Retry-counter rather than wall-clock deadline (review Q-3): under
+# load the `machinectl shell ...` round-trip can exceed the 0.5s
+# poll cadence, biasing a wall-clock deadline. A fixed attempt count
+# bounds total iterations rather than wall time. 120 attempts × 0.5s
+# inter-attempt sleep ≈ ≥60s wall time on a quiet host; on a busy
+# host where each probe is slow, the cap grows in attempts not
+# seconds, which is more diagnostic.
+boot_attempt_max=120
+boot_attempts=0
 while true; do
-    if [ "$(date +%s)" -gt "$boot_deadline" ]; then
-        echo "ERROR: container did not reach running state within 60s." >&2
+    if [ "$boot_attempts" -ge "$boot_attempt_max" ]; then
+        echo "ERROR: container did not reach running state within $boot_attempt_max attempts." >&2
         echo "── boot.log ──" >&2
         cat "$runtime_dir/boot.log" >&2
-        exit 1
+        # Exit code 2 — distinguishes "rig couldn't reach
+        # multi-user.target" from "test asserted FAIL" (which exits
+        # whatever the in-container script returned, see below).
+        exit 2
     fi
+    boot_attempts=$(( boot_attempts + 1 ))
     state=$(machinectl show "$machine_name" --property=State --value 2>/dev/null || true)
     if [ "$state" = "running" ]; then
         # Also wait for multi-user.target to be active inside the container.
@@ -127,7 +140,10 @@ echo "── nspawn-rig: container reached multi-user.target; running test scrip
 echo "──"
 
 # Run the test script inside the container. machinectl shell streams
-# stdout/stderr back to the host; the exit code propagates.
+# stdout/stderr back to the host; the exit code propagates verbatim
+# (review Q-4) so downstream callers can distinguish "in-container
+# test asserted FAIL" (test script's chosen exit code, typically 1)
+# from "rig couldn't even reach multi-user.target" (exit 2 above).
 if machinectl shell "$machine_name" /bin/sh /tmp/run-test.sh; then
     echo "──"
     echo "── nspawn-rig: $test_name PASSED ──"
@@ -138,5 +154,5 @@ else
     echo "── nspawn-rig: $test_name FAILED (exit $rc) ──"
     echo "── container boot.log tail ──"
     tail -20 "$runtime_dir/boot.log" || true
-    exit 1
+    exit "$rc"
 fi

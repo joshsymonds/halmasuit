@@ -78,10 +78,12 @@ let
     ];
   };
 
-  # Threshold: measured baseline + ~20% headroom.
+  # Threshold: measured baseline + ~26% headroom.
   #
-  # MEASURED BASELINE (2026-05-28): 146213668 bytes.
-  # Threshold below carries that figure + 20% headroom.
+  # MEASURED BASELINE (2026-05-28): 146,213,668 bytes (139 MiB).
+  # Threshold below: 184,549,376 bytes (176 MiB) — rounded up to a
+  # clean MiB boundary, which gives 184549376 / 146213668 = 1.262×
+  # baseline = ~26% headroom.
   #
   # Bump deliberately when a legitimate closure addition lands;
   # document the WHY in the commit message bumping this value.

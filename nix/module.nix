@@ -34,6 +34,38 @@ let
   # reads via HALMASUIT_WALLPAPER_CONFIG. Computed once here so both
   # the env attrs AND the initramfs storePaths can reference the
   # same store path. `null` when `cfg.wallpaper == null`.
+  # Auto-wrap a bare Nix value into the `UniformBinding` discriminated-
+  # union shape `crates/halmasuit/src/wallpaper/config.rs` expects.
+  # Consumers may write `uniforms = { intensity = 1.0; colorPrimary = [
+  # 0.1 0.2 0.3 1.0 ]; };` and the JSON builder produces the tagged
+  # `{"kind": "static", "value": {"type": "float", "value": 1.0}}`
+  # shape — module-side ergonomics layer.
+  #
+  # Consumers who want non-Static bindings (AutoTime, EventValue, etc.)
+  # pass the full attrset shape (`{ kind = "auto_time"; }` or
+  # `{ kind = "event_time"; event = "..."; }`) and it is passed through
+  # untouched — the wrapper only kicks in for primitive Nix scalars/lists.
+  wrapUniformValue = v:
+    if builtins.isAttrs v then v
+    else if builtins.isFloat v || builtins.isInt v then {
+      kind  = "static";
+      value = if builtins.isInt v
+              then { type = "int";   value = v; }
+              else { type = "float"; value = v; };
+    } else if builtins.isBool v then {
+      kind  = "static";
+      value = { type = "bool"; value = v; };
+    } else if builtins.isList v then {
+      kind  = "static";
+      value = {
+        type  = if builtins.length v == 2 then "vec2"
+                else if builtins.length v == 3 then "vec3"
+                else if builtins.length v == 4 then "vec4"
+                else throw "wallpaper uniform list must have length 2, 3, or 4 (got ${toString (builtins.length v)})";
+        value = v;
+      };
+    } else throw "wallpaper uniform value must be a float/int/bool/list/attrs";
+
   wallpaperConfigFile =
     if cfg.wallpaper == null then null else
     let
@@ -45,7 +77,7 @@ let
         } else if wp.type == "shader" then {
           type     = "shader";
           source   = "${wp.source}";
-          uniforms = wp.uniforms;
+          uniforms = builtins.mapAttrs (_: wrapUniformValue) wp.uniforms;
         } else {
           type   = "video";
           source = "${wp.source}";
