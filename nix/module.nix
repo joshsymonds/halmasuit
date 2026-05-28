@@ -141,6 +141,62 @@ let
       # cardN segment. systemd's device-unit name escapes `/` as `-`.
       "dev-dri-${builtins.elemAt drmCardMatch 0}.device"
     ];
+
+  # NVIDIA Phase B device-node creation script. Bound here so both
+  # the ExecStartPre line (in the initramfs halmasuit.service) AND
+  # the `boot.initrd.systemd.storePaths` block reference the SAME
+  # store path — without that double reference the script lands in
+  # the unit file (which carries its absolute /nix/store path) but
+  # NOT in the initramfs filesystem, and systemd dies with
+  # `Failed at step EXEC … No such file or directory` (the gnomon
+  # 2026-05-28 gen-383 failure).
+  #
+  # NixOS's initramfs builder follows the closures of paths listed
+  # in `storePaths`, not arbitrary references from unit-file text —
+  # so a `writeShellScript` value used in a unit must be listed
+  # explicitly. The unit's transitive coreutils/gnugrep references
+  # (below) ARE pulled in correctly because they sit inside the
+  # script which IS in storePaths.
+  #
+  # The script itself: mknod the /dev/nvidia* nodes that NVIDIA's
+  # proprietary modules don't auto-create via devtmpfs (unlike
+  # nvidia-drm). Idempotent — every node guarded by `[ -e … ]`. All
+  # paths absolute /nix/store so the script's behavior is
+  # independent of $PATH (initramfs udev's $PATH doesn't include
+  # coreutils, which is why the NixOS rootfs udev rule's bare
+  # `mknod` invocation fails when copied to initramfs).
+  nvidiaDevnodesScript = pkgs.writeShellScript "halmasuit-nvidia-devnodes" ''
+    set -e
+    # /dev/nvidiactl — driver-wide control device. Fixed major 195,
+    # minor 255.
+    [ -e /dev/nvidiactl ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidiactl c 195 255
+
+    # /dev/nvidia0..N — per-GPU compute. Minor numbers come from
+    # /proc/driver/nvidia/gpus/*/information after nvidia.ko
+    # enumeration. Major is 195.
+    for info in /proc/driver/nvidia/gpus/*/information; do
+      minor=$(${pkgs.gnugrep}/bin/grep '^Minor' "$info" \
+        | ${pkgs.coreutils}/bin/cut -d' ' -f4 \
+        | ${pkgs.coreutils}/bin/tr -d '[:space:]')
+      if [ -n "$minor" ]; then
+        [ -e /dev/nvidia$minor ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia$minor c 195 $minor
+      fi
+    done
+
+    # /dev/nvidia-modeset — modeset kernel module. Fixed major 195,
+    # minor 254.
+    [ -e /dev/nvidia-modeset ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia-modeset c 195 254
+
+    # /dev/nvidia-uvm + nvidia-uvm-tools — UVM (CUDA unified memory).
+    # Dynamic major; read from /proc/devices.
+    uvm_major=$(${pkgs.gnugrep}/bin/grep ' nvidia-uvm$' /proc/devices \
+      | ${pkgs.coreutils}/bin/cut -d' ' -f1 \
+      | ${pkgs.coreutils}/bin/tr -d '[:space:]')
+    if [ -n "$uvm_major" ]; then
+      [ -e /dev/nvidia-uvm ]       || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia-uvm       c "$uvm_major" 0
+      [ -e /dev/nvidia-uvm-tools ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia-uvm-tools c "$uvm_major" 1
+    fi
+  '';
 in
 {
   imports = [
@@ -1319,14 +1375,16 @@ in
      ] ++ (if cfg.rendering.backend == "nvidia"
            then [
              "${cfg.rendering.nvidiaPackage}"
-             # The Phase B nvidia-devnode ExecStartPre script (defined
-             # below) calls into coreutils + gnugrep by absolute path.
-             # The unit file's reference would pull these transitively,
-             # but enumerate them here so the dependency is visible at
-             # the storePaths boundary and a future refactor can't
-             # accidentally drop them.
-             "${pkgs.coreutils}"
-             "${pkgs.gnugrep}"
+             # The Phase B nvidia-devnode ExecStartPre script itself.
+             # Listing the script's store path here makes NixOS's
+             # initrd-builder follow ITS transitive closure (which
+             # pulls in the coreutils + gnugrep binaries that the
+             # script references by absolute path). Without this entry,
+             # the unit file carries the script's /nix/store path
+             # but the script binary doesn't land in initramfs — gen
+             # 383 failed exactly here with `Failed at step EXEC …
+             # No such file or directory`.
+             "${nvidiaDevnodesScript}"
            ]
            else [ "${pkgs.mesa}" ])
        ++ cfg.rendering.extraInitrdStorePaths
@@ -1419,66 +1477,16 @@ in
              if cfg.rendering.backend == "nvidia"
              then "${cfg.rendering.nvidiaPackage}"
              else "${pkgs.mesa}";
-
-           # NVIDIA Phase B device-node creation. The NVIDIA proprietary
-           # kernel modules expose char devices at major 195 (control +
-           # per-GPU + modeset) and a dynamic major for UVM, but they do
-           # NOT auto-create the /dev nodes via devtmpfs (unlike DRM,
-           # which the kernel's drm core registers as a class so udev
-           # auto-mknods). On rootfs, NixOS ships `/etc/udev/rules.d`
-           # entries that mknod these nodes when the matching kernel
-           # uevent fires; in initramfs we have neither those rules nor
-           # the rootfs PATH that the bare `mknod` in those rules
-           # depends on (the rules invoke `bash -c 'mknod …'` with no
-           # absolute path, so PATH lookup fails initramfs-side even
-           # when the rules are present). libEGL_nvidia silently fails
-           # to register its EGL platform plugins when
-           # `/dev/nvidiactl` is missing — observed on gnomon 2026-05-28
-           # as "Skipping EGL platform … Missing extensions:
-           # \[\"EGL_KHR_platform_gbm\"\]" right after halmasuit's
-           # already-successful DRM master acquisition.
-           #
-           # Idempotent: every mknod is guarded by `[ -e … ]`, so reruns
-           # (e.g. systemd's restart loop) and post-pivot re-execs are
-           # no-ops. All paths are absolute /nix/store entries so the
-           # script's behavior is independent of $PATH.
-           nvidiaDevnodes = pkgs.writeShellScript "halmasuit-nvidia-devnodes" ''
-             set -e
-             # /dev/nvidiactl — driver-wide control device. Fixed major
-             # 195, minor 255.
-             [ -e /dev/nvidiactl ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidiactl c 195 255
-
-             # /dev/nvidia0..N — per-GPU compute. Minor numbers come
-             # from /proc/driver/nvidia/gpus/*/information after
-             # nvidia.ko enumeration. Major is 195.
-             for info in /proc/driver/nvidia/gpus/*/information; do
-               minor=$(${pkgs.gnugrep}/bin/grep '^Minor' "$info" \
-                 | ${pkgs.coreutils}/bin/cut -d' ' -f4 \
-                 | ${pkgs.coreutils}/bin/tr -d '[:space:]')
-               if [ -n "$minor" ]; then
-                 [ -e /dev/nvidia$minor ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia$minor c 195 $minor
-               fi
-             done
-
-             # /dev/nvidia-modeset — modeset kernel module. Fixed major
-             # 195, minor 254.
-             [ -e /dev/nvidia-modeset ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia-modeset c 195 254
-
-             # /dev/nvidia-uvm + nvidia-uvm-tools — UVM (CUDA unified
-             # memory). Dynamic major; read from /proc/devices.
-             uvm_major=$(${pkgs.gnugrep}/bin/grep ' nvidia-uvm$' /proc/devices \
-               | ${pkgs.coreutils}/bin/cut -d' ' -f1 \
-               | ${pkgs.coreutils}/bin/tr -d '[:space:]')
-             if [ -n "$uvm_major" ]; then
-               [ -e /dev/nvidia-uvm ]       || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia-uvm       c "$uvm_major" 0
-               [ -e /dev/nvidia-uvm-tools ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia-uvm-tools c "$uvm_major" 1
-             fi
-           '';
          in [
            "${pkgs.coreutils}/bin/ln -sfn ${glDriverTarget} /run/opengl-driver"
            "${pkgs.coreutils}/bin/mkdir -p /run/halmasuit"
          ] ++ lib.optionals (cfg.rendering.backend == "nvidia") [
-           "${nvidiaDevnodes}"
+           # Pre-create /dev/nvidia* nodes that nvidia's proprietary
+           # modules don't auto-create via devtmpfs. The script is
+           # also listed in `boot.initrd.systemd.storePaths` so it
+           # lands inside the initramfs filesystem (NixOS does NOT
+           # follow unit-text references into the closure).
+           "${nvidiaDevnodesScript}"
          ];
          ExecStart      = lib.getExe cfg.package;
          Restart        = "no";
