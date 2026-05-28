@@ -41,6 +41,7 @@ mod frame_audit;
 #[cfg(feature = "frame_audit")]
 mod offscreen;
 mod swap_gate;
+mod vt_switch;
 mod wallpaper;
 
 use std::collections::HashMap;
