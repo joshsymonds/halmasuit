@@ -100,6 +100,36 @@ let
     } // lib.optionalAttrs (cfg.wallpaper.type == "video") {
       HALMASUIT_DECODER_PATH = lib.getExe cfg.decoder.package;
     };
+
+  # DRM device wiring (see services.halmasuit.drmDevice option above).
+  # Computed once and spliced into both rootfs + initramfs units.
+  #
+  # `drmDeviceEnv` — attrset of env vars to merge into the unit's
+  # environment. Empty when drmDevice is null (binary auto-discovers).
+  #
+  # `drmDeviceUnitDeps` — list of systemd unit names to add to
+  # wants/after. Always includes `systemd-udev-settle.service` so the
+  # binary's `open()` happens AFTER udev's event queue is drained.
+  # Additionally includes `dev-dri-cardN.device` when drmDevice is a
+  # literal `/dev/dri/cardN` path, providing strict device-readiness
+  # ordering for the named card.
+  drmCardMatch =
+    if cfg.drmDevice == null
+    then null
+    else builtins.match "/dev/dri/(card[0-9]+)" cfg.drmDevice;
+
+  drmDeviceEnv =
+    if cfg.drmDevice == null
+    then {}
+    else { HALMASUIT_DRM_DEVICE = cfg.drmDevice; };
+
+  drmDeviceUnitDeps =
+    [ "systemd-udev-settle.service" ]
+    ++ lib.optionals (drmCardMatch != null) [
+      # `builtins.match` returns a list of captures; we grabbed the
+      # cardN segment. systemd's device-unit name escapes `/` as `-`.
+      "dev-dri-${builtins.elemAt drmCardMatch 0}.device"
+    ];
 in
 {
   imports = [
@@ -520,6 +550,36 @@ in
       };
     };
 
+    drmDevice = lib.mkOption {
+      type        = lib.types.nullOr lib.types.str;
+      default     = null;
+      example     = "pci:0000:01:00.0";
+      description = ''
+        Which DRM device halmasuit opens. Sets the
+        `HALMASUIT_DRM_DEVICE` env var the binary reads at startup.
+
+        Three modes:
+
+        * `null` (default) — auto-discover: halmasuit iterates
+          `/dev/dri/card*` and picks the first card with at least
+          one `Connection::Connected` connector.
+        * `"/dev/dri/cardN"` — use the exact path. The unit also
+          gains a `Wants=`/`After=` for the corresponding
+          `dev-dri-cardN.device` systemd unit, so systemd holds
+          halmasuit's start until udev creates the node.
+        * `"pci:DDDD:BB:DD.F"` — match by PCI BDF via
+          `/sys/class/drm/cardN/device`. Stable across reboots
+          regardless of kernel probe order (recommended for hosts
+          with multiple DRM devices like simpledrm + chipset DRM +
+          NVIDIA).
+
+        All three modes retry on ENOENT-class errors for up to 10s
+        inside halmasuit, absorbing the initramfs-side race where
+        `systemd-modules-load.service` deactivates before udev has
+        materialized the device node.
+      '';
+    };
+
     luks = {
       package = lib.mkOption {
         type        = lib.types.package;
@@ -667,7 +727,7 @@ in
         "basic.target"
         "local-fs.target"
         "halmasuit-session.socket"
-      ];
+      ] ++ drmDeviceUnitDeps;
       # `Wants` rather than `Requires`: required at boot for halmasuit
       # to function (some sysinit paths are mandatory), but `Requires`
       # causes systemd to cascade-stop halmasuit when sysinit.target
@@ -680,7 +740,14 @@ in
       # reachable), but with `DefaultDependencies=false` there is no
       # implicit `Conflicts=shutdown.target` so reaching shutdown.target
       # doesn't trigger halmasuit's stop.
-      wants       = [ "sysinit.target" ];
+      #
+      # `drmDeviceUnitDeps` adds `systemd-udev-settle.service` (and
+      # optionally `dev-dri-cardN.device` for Path mode) to BOTH
+      # `wants` and `after` so udev finishes materializing the DRM
+      # node before halmasuit's `open()`. `after =` alone wouldn't
+      # pull udev-settle into the boot sequence — that gap caused
+      # the gnomon failure where halmasuit raced nvidia_drm.
+      wants       = [ "sysinit.target" ] ++ drmDeviceUnitDeps;
       before      = [ "shutdown.target" ];
 
       unitConfig = {
@@ -844,7 +911,7 @@ in
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.
         HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
-      } // wallpaperEnv;
+      } // wallpaperEnv // drmDeviceEnv;
     };
    })
 
@@ -1242,7 +1309,18 @@ in
      boot.initrd.systemd.services.halmasuit = {
        description = "halmasuit (Phase B: initramfs survival)";
        wantedBy    = [ "initrd.target" ];
-       after       = [ "systemd-modules-load.service" "systemd-udev-settle.service" ];
+       # `wants =` includes systemd-modules-load + the DRM-device deps
+       # because `after =` alone doesn't pull a unit into the boot
+       # sequence — if nothing wants udev-settle, it never runs, and
+       # the `after =` ordering becomes a no-op. This was the exact
+       # gnomon-night failure: halmasuit raced `nvidia_drm` because
+       # udev-settle was `after`-ordered but never started.
+       wants       = [
+         "systemd-modules-load.service"
+       ] ++ drmDeviceUnitDeps;
+       after       = [
+         "systemd-modules-load.service"
+       ] ++ drmDeviceUnitDeps;
        # The pivot kill spree (systemd-shutdown's killall) runs
        # BEFORE initrd-switch-root.service. We must be wantedBy
        # initrd.target so we start before the pivot, AND we must be
@@ -1435,7 +1513,7 @@ in
        } // lib.optionalAttrs (cfg.greeterCommand != null) {
          # Greeter binary halmasuit fork+execs post-pivot.
          HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
-       } // wallpaperEnv;
+       } // wallpaperEnv // drmDeviceEnv;
      };
 
      # halmasuit-luks: the systemd password-agent Wayland client.
