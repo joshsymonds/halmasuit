@@ -533,10 +533,17 @@ in
         <busconfig>
           <policy user="root">
             <allow own="org.halmasuit"/>
+            <!-- Epic #71 R3.3: production observability surface. -->
+            <allow own="org.halmasuit.Compositor1"/>
           </policy>
           <policy context="default">
             <allow send_destination="org.halmasuit"/>
             <allow receive_sender="org.halmasuit"/>
+            <!-- Compositor1 read methods are unauthenticated per
+                 Epic #71 (no Set*/Force*/Inject*/Override*; the
+                 read/write split is enforced in code). -->
+            <allow send_destination="org.halmasuit.Compositor1"/>
+            <allow receive_sender="org.halmasuit.Compositor1"/>
           </policy>
         </busconfig>
       '')

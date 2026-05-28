@@ -35,6 +35,7 @@ mod context;
 mod cursor;
 #[cfg(feature = "frame_audit")]
 mod dbus;
+mod dbus_compositor1;
 mod diagnostic;
 mod drm;
 #[cfg(feature = "frame_audit")]
@@ -366,6 +367,13 @@ struct HalmasuitState {
     /// `Esc` while open closes it. R3.2 reads this flag in the
     /// render path to composite the overlay layer.
     diag_overlay_open: bool,
+    /// Epic #71 R3.3: state shared with the Compositor1 DBus server
+    /// thread. Holds the startup `Instant` (for `GetUptime`) and
+    /// an `Arc<AtomicU64>` frame counter (R3.x will wire the
+    /// render path to update it). Cloned into the DBus thread at
+    /// startup; subsequent writes from the calloop thread are
+    /// visible to DBus readers via atomic load.
+    dbus_state: dbus_compositor1::Compositor1State,
     /// Epic #47 R2.2: set by `graceful_shutdown` after the wallpaper-
     /// only recomposite. The render path observes this to keep the
     /// wallpaper plane composited (no greeter, no session toplevel)
@@ -4545,6 +4553,9 @@ fn main() -> io::Result<()> {
         shutdown_armed: !in_initramfs,
         // Epic #71 R3.1: overlay starts closed. Toggled by chord.
         diag_overlay_open: false,
+        // Epic #71 R3.3: DBus state anchored at startup; the
+        // background thread reads from this via Arc clone.
+        dbus_state: dbus_compositor1::Compositor1State::new(),
         shutting_down: false,
         greetd_listener_token,
         drm_backend,
@@ -4597,6 +4608,17 @@ fn main() -> io::Result<()> {
             );
         }
     }
+
+    // Epic #71 R3.3: start the production observability D-Bus
+    // server (`org.halmasuit.Compositor1`). Read-only by design —
+    // no Set*, Force*, Inject*, or Override* methods. Always on
+    // (NOT feature-gated) so the production binary exposes its
+    // observability surface to the `halmasuit` CLI tool. Started
+    // before the privilege drop so the bus connection
+    // authenticates as the pre-drop euid (root) and the connection
+    // persists across the subsequent setresuid. Best-effort —
+    // `serve` logs and the thread exits if the bus is unreachable.
+    dbus_compositor1::serve(state.dbus_state.clone());
 
     // frame_audit only: start the D-Bus `Snapshot()` server, handing
     // it a clone of the render loop's snapshot slot. Started before
