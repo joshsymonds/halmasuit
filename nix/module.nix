@@ -649,6 +649,25 @@ in
           runtime deps not covered by the chosen `backend`.
         '';
       };
+
+      debugStrace = lib.mkOption {
+        type        = lib.types.bool;
+        default     = false;
+        description = ''
+          DIAGNOSTIC ONLY. When true, the Phase B (`fromInitrd`)
+          halmasuit ExecStart is wrapped in `strace -f -y` tracing
+          file + ioctl syscalls, with output written to
+          `/run/halmasuit/egl-strace.log`. systemd preserves
+          `/run` across switch_root, so the trace is readable on
+          the booted rootfs even though halmasuit ran (and, when
+          debugging, died) in the initramfs. Exists to diagnose the
+          NVIDIA-EGL-in-initramfs platform-registration failure that
+          does not reproduce on rootfs. Adds `pkgs.strace` to the
+          initramfs closure. Leave false in production — strace's
+          ptrace would interfere with the cross-pivot survival of a
+          healthy halmasuit.
+        '';
+      };
     };
 
     drmDevice = lib.mkOption {
@@ -1423,6 +1442,11 @@ in
              "${pkgs.bash}"
            ]
            else [ "${pkgs.mesa}" ])
+       ++ lib.optionals cfg.rendering.debugStrace [
+         # DIAGNOSTIC: strace for the wrapped ExecStart above. ELF
+         # binary, so make-initrd-ng follows its own RUNPATH closure.
+         "${pkgs.strace}"
+       ]
        ++ cfg.rendering.extraInitrdStorePaths
        ++ lib.optionals (cfg.wallpaper != null) [
        # Wallpaper assets must be in the initramfs closure so the
@@ -1524,7 +1548,21 @@ in
            # follow unit-text references into the closure).
            "${nvidiaDevnodesScript}"
          ];
-         ExecStart      = lib.getExe cfg.package;
+         # ExecStart: normally just the binary. When
+         # `rendering.debugStrace` is set, wrap in strace -f -y
+         # tracing file+ioctl syscalls to /run/halmasuit/egl-strace.log
+         # (preserved across switch_root). DIAGNOSTIC ONLY — see the
+         # option docs. -e trace selects the syscalls that reveal
+         # which file/ioctl libEGL_nvidia trips on while registering
+         # the GBM external platform; -y annotates fds with their
+         # paths so openat/ioctl lines name the device/file.
+         ExecStart =
+           if cfg.rendering.debugStrace
+           then "${pkgs.strace}/bin/strace -f -y -tt "
+                + "-e trace=openat,open,ioctl,read,access,stat,statx,newfstatat "
+                + "-o /run/halmasuit/egl-strace.log "
+                + "${lib.getExe cfg.package}"
+           else lib.getExe cfg.package;
          Restart        = "no";
          # `file:/dev/kmsg` for the same shutdown-liveness reason as
          # the rootfs unit (see the long comment in the `enable`
