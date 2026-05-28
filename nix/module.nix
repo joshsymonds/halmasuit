@@ -366,6 +366,21 @@ in
       '';
     };
 
+    watchdogSec = lib.mkOption {
+      type        = lib.types.str;
+      default     = "30s";
+      example     = "15s";
+      description = ''
+        `WatchdogSec` for halmasuit's systemd unit (Epic #71 R-honest.8).
+        halmasuit pings `WATCHDOG=1` from its calloop loop at half this
+        interval; if the event loop hangs, systemd SIGKILLs it, the
+        kernel reverts its home VT to VT_AUTO (VT switching recovers),
+        and `Restart=on-failure` brings it back. Must exceed halmasuit's
+        cold-start DRM/EGL bring-up (>10s in a VM) so a healthy startup
+        is never killed. Set `"0"`/`"infinity"` to disable.
+      '';
+    };
+
     installPamConfig = lib.mkOption {
       type        = lib.types.bool;
       default     = true;
@@ -642,6 +657,28 @@ in
         # to recover from.
         Restart        = "on-failure";
         RestartSec     = "1s";
+        # Epic #71 R-honest.8: systemd watchdog. halmasuit pings
+        # WATCHDOG=1 from its calloop loop at WatchdogSec/2; if the
+        # event loop hangs, the pings stop, systemd SIGKILLs halmasuit,
+        # the kernel's reset_vc reverts its home VT to VT_AUTO (VT
+        # switching recovers), and Restart=on-failure brings it back.
+        # This is the recovery complement that makes compositor-owned
+        # VT_PROCESS safe (a DEAD controller is already safe via
+        # reset_vc; only a HUNG-but-alive one needs this).
+        #
+        # The default (`watchdogSec` = 30s) is generous: halmasuit's
+        # DRM/EGL/GBM bring-up before the event loop's first ping can
+        # take >10s in a cold VM. It pings once very early in main() too,
+        # so the clock resets near exec.
+        #
+        # NotifyAccess=main guarantees $NOTIFY_SOCKET is provided to the
+        # main process under Type=simple (no Type=notify readiness
+        # gating, which would change boot ordering). The ping is
+        # loop-driven and continues through the shutdown wallpaper-paint
+        # loop, so SurviveFinalKillSignal's survival window is intact:
+        # halmasuit keeps pinging while it keeps painting.
+        WatchdogSec    = cfg.watchdogSec;
+        NotifyAccess   = "main";
         # Epic #47 R2.2: `KillMode=process` confines `systemctl stop
         # halmasuit.service` (dev workflow) to signaling halmasuit's
         # main PID only, leaving any child trees alone. Paired with

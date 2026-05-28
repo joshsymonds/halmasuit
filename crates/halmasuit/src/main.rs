@@ -3053,6 +3053,42 @@ fn broker_socket_path_from_env() -> PathBuf {
     )
 }
 
+/// Send `WATCHDOG=1` to systemd's notify socket (`$NOTIFY_SOCKET`),
+/// Epic #71 R-honest.8. Best-effort: a missing env var (watchdog not
+/// configured) or a socket error (systemd-shutdown tore the socket down
+/// mid-pivot) is swallowed — if we genuinely cannot reach systemd the
+/// correct outcome IS the watchdog firing. Hand-rolled (no libsystemd):
+/// a single datagram to the path-or-abstract `$NOTIFY_SOCKET`.
+fn notify_systemd_watchdog() {
+    let Some(sock) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let sock = sock.to_string_lossy();
+    let Ok(dgram) = std::os::unix::net::UnixDatagram::unbound() else {
+        return;
+    };
+    let connected = sock.strip_prefix('@').map_or_else(
+        || dgram.connect(&*sock),
+        |rest| {
+            // Abstract namespace ('@' → leading NUL), per sd_notify(3).
+            use std::os::linux::net::SocketAddrExt as _;
+            std::os::unix::net::SocketAddr::from_abstract_name(rest.as_bytes())
+                .and_then(|addr| dgram.connect_addr(&addr))
+        },
+    );
+    if connected.is_ok() {
+        let _ = dgram.send(b"WATCHDOG=1");
+    }
+}
+
+/// The watchdog ping interval: half of `$WATCHDOG_USEC` (systemd sets it
+/// when `WatchdogSec=` is configured), per systemd's recommendation.
+/// `None` when the watchdog is disabled (env unset / zero).
+fn watchdog_interval() -> Option<Duration> {
+    let usec: u64 = std::env::var("WATCHDOG_USEC").ok()?.parse().ok()?;
+    (usec > 0).then(|| Duration::from_micros(usec / 2))
+}
+
 /// The VT number halmasuit owns as its HOME vt (`HALMASUIT_HOME_VT`),
 /// if configured. When set, halmasuit becomes that VT's `VT_PROCESS`
 /// controller at startup and cooperative VT switching (Ctrl+Alt+F<n>)
@@ -4222,6 +4258,12 @@ fn main() -> io::Result<()> {
         tracing::warn!(error = %e, "pre-block of VT realtime signals failed");
     }
 
+    // Epic #71 R-honest.8: reset the systemd watchdog clock as early as
+    // possible (the watchdog starts counting at exec, but DRM/EGL/GBM
+    // bring-up before the event loop's first ping can take >10s). The
+    // loop-driven timer below takes over once we're running.
+    notify_systemd_watchdog();
+
     // Phase B (boot-from-initrd) runtime detection. `/etc/initrd-release`
     // is the systemd-canonical signal that we're in the initramfs
     // (INITRD_INTERFACE spec); the rootfs filesystem doesn't ship the
@@ -5063,6 +5105,27 @@ fn main() -> io::Result<()> {
                 },
             )
             .map_err(|e| io::Error::other(format!("insert wallpaper tick timer: {e}")))?;
+    }
+
+    // Epic #71 R-honest.8: systemd watchdog ping, driven by the calloop
+    // loop at WatchdogSec/2. Loop-driven on purpose — if the event loop
+    // hangs, the pings stop, systemd SIGKILLs us, the kernel's reset_vc
+    // reverts our home VT to VT_AUTO (VT switching recovers), and
+    // Restart=on-failure brings us back. Disabled (no timer) when the
+    // unit sets no WatchdogSec. The ping keeps firing through the
+    // post-SIGTERM wallpaper-paint loop, so SurviveFinalKillSignal's
+    // survival window is unaffected (we're alive + painting → we ping).
+    if let Some(interval) = watchdog_interval() {
+        let watchdog_tick = calloop::timer::Timer::immediate();
+        loop_handle
+            .insert_source(
+                watchdog_tick,
+                move |_deadline, &mut (), _state: &mut HalmasuitState| {
+                    notify_systemd_watchdog();
+                    calloop::timer::TimeoutAction::ToDuration(interval)
+                },
+            )
+            .map_err(|e| io::Error::other(format!("insert watchdog tick timer: {e}")))?;
     }
 
     // Privilege drop. The DRM master FD and both Unix sockets are

@@ -801,6 +801,15 @@
           halmasuit         = self.packages.x86_64-linux.halmasuit;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
         };
+        # Epic #71 R-honest.8: systemd watchdog recovery. A SIGSTOP-frozen
+        # compositor stops pinging WATCHDOG=1 → systemd kills it → kernel
+        # reset_vc reverts the home VT → Restart=on-failure recovers.
+        vt-watchdog = import ./tests/vt-watchdog.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+        };
         # Phase B (initramfs survival): real halmasuit binary in
         # boot.initrd.systemd.services with SurviveFinalKillSignal=yes,
         # asserts PID + DRM-master + Wayland-socket continuity across
