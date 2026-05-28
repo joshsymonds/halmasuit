@@ -281,9 +281,6 @@
             cargoBuildFlags = old.cargoBuildFlags ++ [ "--features" "frame_audit" ];
           });
 
-          # halmasuit-vm-client — tiny greetd-protocol test client.
-          # Shipped as a separate Nix package so VM tests can install
-          # it via environment.systemPackages and drive halmasuit's
           # greetd socket from the testScript.
           halmasuit-vm-client = rustPlatform.buildRustPackage {
             pname   = "halmasuit-vm-client";
@@ -867,6 +864,56 @@
           inherit nixpkgs;
           halmasuit         = self.packages.x86_64-linux.halmasuit;
           halmasuit-luks    = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+        };
+        # Epic #71 Phase 0 probe: validate that an unprivileged process
+        # can call TIOCSCTTY + VT_RELDISP on a VT fd without holding
+        # CAP_SYS_TTY_CONFIG. This is the empirical foundation the
+        # home-VT model relies on — halmasuit owns its home VT directly
+        # and drives the cooperative handshake as the unprivileged
+        # compositor (R-honest.7).
+        vt-probe-phase0 = import ./tests/vt-probe-phase0.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+        };
+        # Epic #71 R-honest.1: org.halmasuit.Compositor1 live-value
+        # gate. Asserts GetFrameCounter strictly increases over DBus
+        # (render path feeds the same Arc the surface reads) — the
+        # regression gate against the R3.3 "always 0" stub.
+        compositor1-dbus = import ./tests/compositor1-dbus.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-toplevel-test-client =
+            self.packages.x86_64-linux.halmasuit-toplevel-test-client;
+        };
+        # Epic #71 R3.1/R3.2/R-honest.6: diagnostic-overlay SAK chord
+        # + content gate. Ctrl+Alt+Shift+Esc (real evdev → libinput)
+        # opens the overlay with real composed content; Esc closes it.
+        # Asserts journal markers (headless pixels are black).
+        diagnostic-overlay = import ./tests/diagnostic-overlay.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+        };
+        # Epic #71 R-honest.7: real-compositor cooperative VT-switch
+        # round-trip. Chord switch → retain fd → relsig/acqsig
+        # VT_RELDISP handshake across a tty1→tty2→tty1→tty2 cycle.
+        vt-cooperative-switch = import ./tests/vt-cooperative-switch.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+        };
+        # Epic #71 R-honest.8: systemd watchdog recovery. A SIGSTOP-frozen
+        # compositor stops pinging WATCHDOG=1 → systemd kills it → kernel
+        # reset_vc reverts the home VT → Restart=on-failure recovers.
+        vt-watchdog = import ./tests/vt-watchdog.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
         };
         # Phase B (initramfs survival): real halmasuit binary in

@@ -873,9 +873,21 @@ Inbound consumption (halmasuit-as-client):
 Outbound service (halmasuit-as-server):
 
 - `org.halmasuit.Compositor1` bus name on the system bus.
-- Methods: `Lock()`, `Unlock()`, `RestartInnerWM()`, `Status() → JSON`.
-- Authorization via polkit. Default policy: `Lock` is anyone; the rest
-  require `wheel` group or interactive auth.
+- **As-built (Epic #71): a read-only observability surface** —
+  `GetPhase`, `GetUptime`, `GetFrameCounter`, `ListWindows`,
+  `GetBrokerStatus`. There are NO mutating or state-injection methods:
+  a diagnostic surface that can be driven to report false state is a
+  security anti-pattern, so the read-only contract is pinned by a unit
+  test that parses the generated introspection XML and asserts exactly
+  those five methods. Readable by any local client — this is a
+  single-seat system compositor and the data is pure observability;
+  every reported window PID is `SO_PEERCRED`-attested, never
+  client-asserted. The `halmasuit` CLI (see IPC layer) is the
+  first-class consumer.
+- **Planned (v2+): mutating control** — `Lock()`, `Unlock()`,
+  `RestartInnerWM()` behind polkit (`Lock` for anyone; the rest
+  `wheel`/interactive auth). Not yet implemented; lands with the
+  lock-screen + inner-WM-restart milestones.
 
 D-Bus libraries: `zbus` (5.x), async, native Rust, no glib dependency.
 
@@ -883,21 +895,21 @@ D-Bus libraries: `zbus` (5.x), async, native Rust, no glib dependency.
 
 ## IPC layer
 
-Local control plane is JSON-RPC 2.0 over a Unix socket at
-`/run/halmasuit/control.sock`, mode 0660 owned by the `wheel` group.
+**As-built (Epic #71): the `halmasuit` CLI** is a thin unprivileged
+client of the read-only `org.halmasuit.Compositor1` D-Bus surface — no
+separate control socket:
 
-CLI client: `halmasuit msg <command>` — modelled on `niri msg`.
+- `halmasuit status` — phase, uptime, frame counter, broker connection
+  state
+- `halmasuit windows` — the nested-surface list (pid, app_id, title)
+- `halmasuit logs [-f]` — the compositor's journal
 
-Commands:
-- `status` — current phase (greeter/session/locked), uptime, current user
-- `lock` — initiate lock-screen flow
-- `unlock` — release lock (requires re-auth)
-- `restart-wm` — kill and respawn the inner WM (clients die in v1)
-- `recovery` — show the in-compositor recovery overlay
-- `version`
-
-The same surface is exposed via D-Bus (a subset) for desktop-environment
-integration; the rest stays local-only.
+**Planned (v2+): a mutating local control plane** — JSON-RPC 2.0 over a
+`wheel`-owned Unix socket at `/run/halmasuit/control.sock`, fronted by
+`halmasuit msg <command>` (modelled on `niri msg`), for `lock` /
+`unlock` / `restart-wm` / `recovery`. Deferred until the corresponding
+mutating `Compositor1` methods (above) land; the observability subset
+stays available over D-Bus regardless.
 
 ---
 
@@ -917,6 +929,71 @@ Logging and tracing via the `tracing` ecosystem:
 **Not in v1:** `tracing-opentelemetry` for OTLP export. Trivial to add
 later (one `.with()` call on the subscriber); deferred because we have
 no spans worth exporting until v2 compositor code lands.
+
+---
+
+## Recovery and diagnostic surfaces (as-built, Epic #71)
+
+When halmasuit owns the GPU for the machine's whole graphical life,
+"drop to a text console and read the logs" can no longer be taken for
+granted — it has to be a designed-in surface. Three landed:
+
+### VT switching — the home-VT model
+
+halmasuit is the singular long-lived display server, so it owns its own
+**home VT** as the kernel's `VT_PROCESS` controller rather than grabbing
+a target VT per switch. The home VT (`services.halmasuit.homeVt`, e.g.
+tty8 — it MUST be getty-free, the way greetd owns its VT) is opened in
+halmasuit's root startup window alongside the DRM master fd, made the
+controlling TTY (`setsid` + `TIOCSCTTY` + `VT_SETMODE(VT_PROCESS)`), and
+brought to the foreground. The broker has **no VT role**.
+
+`Ctrl+Alt+F<n>` is a local `VT_ACTIVATE(n)` on that fd; the kernel sends
+the cooperative **relsig** to halmasuit, which drops DRM master and
+`VT_RELDISP`-releases so the target (a getty — the recovery console)
+comes up untouched. Switching back fires **acqsig** → reacquire master +
+`VT_RELDISP(VT_ACKACQ)`. relsig/acqsig are **realtime signals**
+(`SIGRTMIN+4/+5`) on a dedicated `signalfd`, NOT `SIGUSR1`/`SIGUSR2` —
+those are process-directed and get stolen by Mesa/EGL worker threads
+(freedesktop #87322). `SIGHUP` is ignored (a getty's `vhangup()` on its
+VT would otherwise terminate the display server). The empirical
+foundation — an unprivileged process can drive these ioctls on its
+controlling-TTY fd without `CAP_SYS_TTY_CONFIG` — is the `vt-probe`
+Phase 0 result.
+
+Owning VT_PROCESS in the compositor (not a seat manager) is correct
+*here* because halmasuit IS the seat: it's singular and long-lived,
+whereas the broker is ephemeral and idle-exits. The robustness a seat
+manager normally provides is covered by the kernel's `reset_vc` (a dead
+controller reverts to `VT_AUTO`) plus the watchdog below (the
+hung-but-alive case).
+
+### Diagnostic overlay
+
+`Ctrl+Alt+Shift+Esc` (the Linux SAK chord) toggles an in-compositor
+diagnostic overlay; `Esc` dismisses it. It renders four live fields —
+current phase, broker connection state, the nested-window list, and the
+last lines of halmasuit's journal — as text through an embedded ~KB
+public-domain bitmap console font (no heavy font stack). The phase /
+broker / window data is read from the same `Arc<CompositorObservability>`
+the `Compositor1` surface exposes (one source of truth, the overlay and
+`halmasuit status` can never disagree); the journal tail is fetched by a
+one-shot worker thread on open, never on the render/calloop thread.
+
+### Liveness watchdog (systemd-owned)
+
+The unit sets `WatchdogSec` (`services.halmasuit.watchdogSec`, default
+30s) and halmasuit pumps `WATCHDOG=1` to `$NOTIFY_SOCKET` from its
+calloop loop at half that interval (hand-rolled `sd_notify`, no
+libsystemd). The ping is loop-driven on purpose: a wedged event loop —
+e.g. a hung cooperative-switch handler — stops pinging, systemd SIGKILLs
+the unit, the kernel's `reset_vc` reverts the home VT to `VT_AUTO` (VT
+switching recovers), and `Restart=on-failure` brings halmasuit back. The
+broker is not involved (no broker-side kill handle — that would violate
+the one-way lifecycle and reintroduce a pid-reuse DoS). This is the
+recovery complement that makes compositor-owned `VT_PROCESS` safe: a
+crashed controller is handled by the kernel for free, and the watchdog
+converts the only remaining case — hung-but-alive — into a crash.
 
 ---
 
@@ -1489,9 +1566,14 @@ These are explicit "we know this needs deciding, just not yet":
 5. **OCR in test pipeline.** May defer text-leak detection to v1.5
    if tesseract bindings prove fiddly; current tests ship with
    black-frame and DSSIM-jump detection only.
-6. **D-Bus surface details.** The method list above is a starting set;
-   final surface depends on what desktop-environment integration
-   requires in practice.
+6. ~~**D-Bus surface details.**~~ **RESOLVED (Epic #71): the as-built
+   `org.halmasuit.Compositor1` surface is read-only observability** —
+   `GetPhase`, `GetUptime`, `GetFrameCounter`, `ListWindows`,
+   `GetBrokerStatus` (no mutating/state-injection methods; pinned
+   read-only by an introspection-XML unit test). The mutating methods
+   (`Lock`/`Unlock`/`RestartInnerWM`, polkit-gated) remain deferred to
+   the v2+ lock-screen / inner-WM-restart milestones — see the "D-Bus
+   integration" + "Recovery and diagnostic surfaces" sections.
 7. **`halmasuit-luks` UI form.** During `INITRAMFS_SPLASH` the screen
    shows the splash; when cryptsetup needs a passphrase, do we
    (a) replace the splash with `halmasuit-luks` as foreground, or

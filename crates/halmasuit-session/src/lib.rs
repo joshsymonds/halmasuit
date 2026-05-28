@@ -21,13 +21,13 @@
 //! - `worker` — unsafe surface #3: the ephemeral `fork`/pidfd auth
 //!   child (Epic R4).
 //!
-//! The THREE unsafe modules (`pam_sys`, `pam_ffi`, `worker`) carry NO
-//! module `#![forbid]`; every `unsafe` (extern block or call site) has
-//! `#[expect(unsafe_code, reason = "…")]`, so the workspace
-//! `unsafe_code = "warn"` lint (denied under `clippy -D warnings`)
-//! flags any stray or unjustified `unsafe` anywhere in the crate —
-//! the same quarantine idiom as `halmasuit-pam`. Everything else
-//! stays hard-`forbid`.
+//! The THREE unsafe modules (`pam_sys`, `pam_ffi`, `worker`)
+//! carry NO module `#![forbid]`; every `unsafe` (extern block or
+//! call site) has `#[expect(unsafe_code, reason = "…")]`, so the
+//! workspace `unsafe_code = "warn"` lint (denied under
+//! `clippy -D warnings`) flags any stray or unjustified `unsafe`
+//! anywhere in the crate — the same quarantine idiom as
+//! `halmasuit-pam`. Everything else stays hard-`forbid`.
 
 pub mod auth;
 pub mod broker;

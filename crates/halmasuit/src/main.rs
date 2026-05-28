@@ -31,16 +31,20 @@
 
 mod broker_relay;
 mod broker_session;
+mod console_font;
 mod context;
 mod cursor;
 #[cfg(feature = "frame_audit")]
 mod dbus;
+mod dbus_compositor1;
+mod diagnostic;
 mod drm;
 #[cfg(feature = "frame_audit")]
 mod frame_audit;
 #[cfg(feature = "frame_audit")]
 mod offscreen;
 mod swap_gate;
+mod vt_switch;
 mod wallpaper;
 
 use std::collections::HashMap;
@@ -359,6 +363,35 @@ struct HalmasuitState {
     /// fromInitrd), the flag flips true at startup completion — there's
     /// no boot pivot to ignore.
     shutdown_armed: bool,
+    /// Epic #71 R3.1: diagnostic overlay open/closed state.
+    /// Toggled by `Ctrl+Alt+Shift+Esc` (the Linux SAK chord). Bare
+    /// `Esc` while open closes it. R3.2 reads this flag in the
+    /// render path to composite the overlay layer.
+    diag_overlay_open: bool,
+    /// Epic #71 R-honest.6: last journal tail fetched off-thread for
+    /// the diagnostic overlay (the last 20 `halmasuit.service` lines).
+    /// Populated by the overlay-journal calloop channel; read by
+    /// `compose_overlay_text`. Empty until the first fetch lands.
+    overlay_journal: String,
+    /// Epic #71 R-honest.6: sender for the overlay-journal calloop
+    /// channel. On overlay-open, a detached worker runs `journalctl`
+    /// and sends the tail here; the channel handler recomposes +
+    /// re-renders. `None` only if the channel failed to register
+    /// (the overlay then shows an empty journal section).
+    journal_tx: Option<calloop::channel::Sender<String>>,
+    /// Epic #71 R-honest.7: the compositor's HOME vt fd — opened in the
+    /// root startup window and made the `VT_PROCESS` controller. Retained
+    /// for the process lifetime so the relsig / acqsig handlers can
+    /// `VT_RELDISP` the cooperative-switch handshake against it. `None`
+    /// when no home VT is configured (`HALMASUIT_HOME_VT` unset).
+    vt_fd: Option<std::os::fd::OwnedFd>,
+    /// Epic #71 R3.3: state shared with the Compositor1 DBus server
+    /// thread. Holds the startup `Instant` (for `GetUptime`) and
+    /// an `Arc<AtomicU64>` frame counter (R3.x will wire the
+    /// render path to update it). Cloned into the DBus thread at
+    /// startup; subsequent writes from the calloop thread are
+    /// visible to DBus readers via atomic load.
+    dbus_state: dbus_compositor1::CompositorObservability,
     /// Epic #47 R2.2: set by `graceful_shutdown` after the wallpaper-
     /// only recomposite. The render path observes this to keep the
     /// wallpaper plane composited (no greeter, no session toplevel)
@@ -456,6 +489,11 @@ struct ClientState {
     /// authority (R8), but it IS how the compositor knows whose pixels
     /// just arrived.
     uid: u32,
+    /// SO_PEERCRED pid of the connecting peer, captured at accept
+    /// (Epic #71 R-honest.4). Surfaced via the `Compositor1`
+    /// `ListWindows` snapshot — kernel-attested, NEVER client-asserted
+    /// (CLAUDE.md "always SO_PEERCRED on the socket").
+    pid: u32,
 }
 
 impl ClientData for ClientState {
@@ -480,9 +518,50 @@ impl HalmasuitState {
                 let time = event.time_msec();
                 let code = event.key_code();
                 let key_state = event.state();
-                keyboard.input::<(), _>(self, code, key_state, serial, time, |_, _, _| {
-                    FilterResult::Forward
-                });
+                // Epic #71 system chords: intercept BEFORE forwarding
+                // to the focused client.
+                //
+                //   R2.1: Ctrl+Alt+F1..F12 → VT switch. xkb resolves
+                //         the modifier+F-key combination to a unique
+                //         XF86Switch_VT_<N> keysym so the modifier
+                //         check is structurally embedded in the keysym.
+                //   R3.1: Ctrl+Alt+Shift+Esc (Linux SAK) → toggle the
+                //         diagnostic overlay. Plain Esc resolves to
+                //         XK_Escape regardless of modifiers; we must
+                //         inspect ModifiersState explicitly.
+                //   R3.1: bare Esc while the overlay is open → close
+                //         the overlay.
+                //
+                // System chords are HARDCODED per Epic #71's anti-
+                // patterns — never user-configurable.
+                let chord_press = matches!(key_state, smithay::backend::input::KeyState::Pressed);
+                let action: Option<ChordAction> = keyboard.input::<ChordAction, _>(
+                    self,
+                    code,
+                    key_state,
+                    serial,
+                    time,
+                    |state, mods, handle| {
+                        if !chord_press {
+                            return FilterResult::Forward;
+                        }
+                        let keysym = handle.modified_sym().raw();
+                        if let Some(vt) = vt_switch::detect_vt_chord(keysym) {
+                            return FilterResult::Intercept(ChordAction::VtSwitch(vt));
+                        }
+                        if diagnostic::detect_overlay_chord(keysym, mods.ctrl, mods.alt, mods.shift)
+                        {
+                            return FilterResult::Intercept(ChordAction::OverlayToggle);
+                        }
+                        if state.diag_overlay_open && diagnostic::is_dismiss_key(keysym) {
+                            return FilterResult::Intercept(ChordAction::OverlayDismiss);
+                        }
+                        FilterResult::Forward
+                    },
+                );
+                if let Some(action) = action {
+                    self.handle_chord_action(action);
+                }
             }
             InputEvent::PointerMotion { event } => self.on_pointer_relative_motion(&event),
             InputEvent::PointerMotionAbsolute { event } => {
@@ -498,6 +577,196 @@ impl HalmasuitState {
             _ => {
                 // Tablet, switch — not in v1 scope. Future epics.
             }
+        }
+    }
+}
+
+/// Epic #71 system-chord action dispatched by `dispatch_libinput`'s
+/// keyboard filter. The filter inspects keysym+modifiers and emits
+/// the matching variant; the caller (`handle_chord_action`) acts on
+/// it with `&mut self` access to the state.
+#[derive(Debug, Clone, Copy)]
+enum ChordAction {
+    /// R2.1 Ctrl+Alt+F<N> → switch to VT N.
+    VtSwitch(u8),
+    /// R3.1 Ctrl+Alt+Shift+Esc → toggle the diagnostic overlay.
+    OverlayToggle,
+    /// R3.1 bare Esc while overlay is open → close the overlay.
+    OverlayDismiss,
+}
+
+impl HalmasuitState {
+    /// Dispatch a system-chord action detected by the keyboard
+    /// filter in `dispatch_libinput`. One method so the filter
+    /// closure stays small + each action's implementation can
+    /// borrow `&mut self` cleanly.
+    fn handle_chord_action(&mut self, action: ChordAction) {
+        match action {
+            ChordAction::VtSwitch(vt) => self.trigger_vt_switch(vt),
+            ChordAction::OverlayToggle => {
+                self.diag_overlay_open = !self.diag_overlay_open;
+                tracing::info!(open = self.diag_overlay_open, "diagnostic overlay toggled",);
+                self.apply_overlay_state();
+            }
+            ChordAction::OverlayDismiss => {
+                self.diag_overlay_open = false;
+                tracing::info!("diagnostic overlay dismissed via Esc");
+                self.apply_overlay_state();
+            }
+        }
+    }
+
+    /// Epic #71 R3.2/R-honest.6: apply the current `diag_overlay_open`
+    /// state to the DRM backend and render immediately so the overlay
+    /// appears/disappears without waiting for a natural commit.
+    ///
+    /// On open: compose the diagnostic text (phase / broker / window
+    /// list, read from the SAME observability store the Compositor1
+    /// DBus surface reads, plus the last-known journal tail), push it
+    /// to the backend, make the overlay visible, and kick an
+    /// off-thread `journalctl` fetch that recomposes + re-renders when
+    /// it lands (so the journal tail is never read on the render
+    /// thread). On close: hide the overlay. No-ops cleanly when the
+    /// headless test path has no DRM backend.
+    fn apply_overlay_state(&mut self) {
+        if self.diag_overlay_open {
+            let text = self.compose_overlay_text();
+            // Marker for the VM test: headless renders black, so the
+            // gate asserts THIS (overlay opened + real content built),
+            // not pixels. `content_len` proves the composer ran with
+            // real data, not an empty stub.
+            tracing::info!(
+                content_len = text.len(),
+                "OVERLAY_OPEN: diagnostic content composed"
+            );
+            if let Some(backend) = self.drm_backend.as_mut() {
+                backend.set_overlay_text(text);
+                backend.set_overlay_visible(true);
+            }
+            // Off-thread journal fetch; its calloop-channel handler
+            // recomposes + re-renders with the journal tail.
+            if let Some(tx) = self.journal_tx.clone() {
+                spawn_overlay_journal_fetch(tx);
+            }
+        } else {
+            tracing::info!("OVERLAY_CLOSE: diagnostic overlay hidden");
+            if let Some(backend) = self.drm_backend.as_mut() {
+                backend.set_overlay_visible(false);
+            }
+        }
+        let fg = self
+            .foreground_toplevel
+            .as_ref()
+            .map(|t| t.wl_surface().clone());
+        if let Some(backend) = self.drm_backend.as_mut()
+            && let Err(e) =
+                backend.render_layer_elements(&self.output, fg.as_ref(), HALMASUIT_BRAND_CLEAR)
+        {
+            tracing::warn!(error = %e, "render_layer_elements on overlay toggle failed");
+        }
+    }
+
+    /// Epic #71 R-honest.6: compose the diagnostic-overlay text from
+    /// the live observability store (phase / broker / windows — the
+    /// SAME values `org.halmasuit.Compositor1` exposes, so the overlay
+    /// and `halmasuit status` can never disagree) plus the last-known
+    /// journal tail fetched off-thread. Pure read; no IO.
+    fn compose_overlay_text(&self) -> String {
+        use std::fmt::Write as _;
+        let phase = dbus_compositor1::current_phase_name();
+        let broker = dbus_compositor1::broker_state_name();
+        let windows = self
+            .dbus_state
+            .windows
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
+        let mut s = String::new();
+        s.push_str("halmasuit diagnostic overlay\n");
+        s.push_str("(esc to close)\n\n");
+        let _ = writeln!(s, "phase:  {phase}");
+        let _ = writeln!(s, "broker: {broker}");
+        let _ = writeln!(s, "windows: {}", windows.len());
+        for (pid, app_id, title) in &windows {
+            let _ = writeln!(s, "  [{pid}] {app_id} {title}");
+        }
+        s.push_str("\n--- journal (last 20) ---\n");
+        s.push_str(&self.overlay_journal);
+        s
+    }
+
+    /// Epic #71 R2.1: drive the broker-mediated VT-switching IPC
+    /// Epic #71 R-honest.7 (home-VT model): request a switch to
+    /// `target_vt`. Called from `dispatch_libinput`'s keyboard filter
+    /// on `Ctrl+Alt+F<target_vt>`.
+    ///
+    /// halmasuit owns its HOME vt as the `VT_PROCESS` controller (set up
+    /// once at startup), so a switch is a plain `VT_ACTIVATE(target_vt)`
+    /// on that controlling-tty fd — NOT a grab of the target VT. The
+    /// kernel, seeing the home VT is `VT_PROCESS`, sends relsig to us;
+    /// `handle_vt_relsig` drops DRM master + `VT_RELDISP(release)` and
+    /// the kernel then completes the switch to `target_vt` (a getty /
+    /// the recovery console). Switching back fires acqsig →
+    /// `handle_vt_acqsig`. `VT_ACTIVATE` returns immediately; the
+    /// release/acquire is async on the VT signalfd, so this never blocks
+    /// the calloop thread. No-op (logged) if no home VT is configured.
+    fn trigger_vt_switch(&self, target_vt: u8) {
+        use std::os::fd::AsFd as _;
+        let Some(vt_fd) = self.vt_fd.as_ref() else {
+            tracing::warn!(target_vt, "VT switch chord ignored: no home VT configured");
+            return;
+        };
+        match vt_switch::vt_activate(vt_fd.as_fd(), target_vt) {
+            Ok(()) => tracing::info!(
+                target_vt,
+                "VT_ACTIVATE requested; switching to tty{target_vt}"
+            ),
+            Err(e) => tracing::warn!(target_vt, error = %e, "VT_ACTIVATE failed"),
+        }
+    }
+
+    /// Epic #71 R-honest.7: handle the kernel's VT relsig —
+    /// "release your VT, someone's switching away". Per the systemd
+    /// #21388 ordering, drop DRM master FIRST, then `VT_RELDISP` with
+    /// the RELEASE arg so the kernel completes the switch to the
+    /// incoming VT. No-ops with a log if we hold no VT controller fd.
+    fn handle_vt_relsig(&self) {
+        use std::os::fd::AsFd as _;
+        let Some(vt_fd) = self.vt_fd.as_ref() else {
+            tracing::warn!("VT relsig with no home VT fd; ignoring");
+            return;
+        };
+        let fd = vt_fd.as_fd();
+        if let Some(backend) = self.drm_backend.as_ref()
+            && let Err(e) = backend.pause()
+        {
+            tracing::warn!(error = %e, "DRM pause on VT relsig failed");
+        }
+        match vt_switch::vt_reldisp(fd, vt_switch::VT_RELDISP_RELEASE) {
+            Ok(()) => tracing::info!("VT_RELSIG_HANDLED: DRM paused + VT_RELDISP(release)"),
+            Err(e) => tracing::warn!(error = %e, "VT_RELDISP(release) failed"),
+        }
+    }
+
+    /// Epic #71 R-honest.7: handle the kernel's VT acqsig —
+    /// "your VT is active again". Reacquire DRM master, then
+    /// `VT_RELDISP` with the ACKACQ arg to confirm the acquire.
+    fn handle_vt_acqsig(&self) {
+        use std::os::fd::AsFd as _;
+        let Some(vt_fd) = self.vt_fd.as_ref() else {
+            tracing::warn!("VT acqsig with no home VT fd; ignoring");
+            return;
+        };
+        let fd = vt_fd.as_fd();
+        if let Some(backend) = self.drm_backend.as_ref()
+            && let Err(e) = backend.resume()
+        {
+            tracing::warn!(error = %e, "DRM resume on VT acqsig failed");
+        }
+        match vt_switch::vt_reldisp(fd, vt_switch::VT_RELDISP_ACKACQ) {
+            Ok(()) => tracing::info!("VT_ACQSIG_HANDLED: DRM resumed + VT_RELDISP(ackacq)"),
+            Err(e) => tracing::warn!(error = %e, "VT_RELDISP(ackacq) failed"),
         }
     }
 
@@ -1082,6 +1351,67 @@ impl HalmasuitState {
                 tracing::info!("FOREGROUND_TOPLEVEL_KEYBOARD_FOCUSED");
             }
             self.set_keyboard_focus(Some(surface.clone()));
+            // A toplevel with a buffer + foreground focus has set its
+            // title/app_id by now (clients set those before their
+            // first commit). Refresh the window snapshot so
+            // Compositor1.ListWindows reflects the live metadata.
+            self.refresh_window_snapshot();
+        }
+    }
+
+    /// Epic #71 R-honest.4: snapshot the current nested-compositor
+    /// windows (xdg toplevels + layer-shell surfaces) into the shared
+    /// `Compositor1` observability store. Runs on the calloop thread
+    /// because the surface handles are `!Send` — the DBus thread only
+    /// ever reads the resulting plain `Vec`. pid is the SO_PEERCRED
+    /// pid captured at client-accept (`ClientState::pid`), never
+    /// client-asserted. Called on every window-set change
+    /// (toplevel mapped/focused/destroyed, layer mapped/destroyed).
+    fn refresh_window_snapshot(&self) {
+        use smithay::wayland::compositor::with_states;
+        use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+
+        let surface_pid = |surface: &WlSurface| -> u32 {
+            surface
+                .client()
+                .and_then(|c| c.get_data::<ClientState>().map(|cs| cs.pid))
+                .unwrap_or(0)
+        };
+
+        let mut windows: Vec<(u32, String, String)> = Vec::new();
+
+        for toplevel in self.xdg_shell_state.toplevel_surfaces() {
+            let surface = toplevel.wl_surface();
+            let (app_id, title) = with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .map(|d| {
+                        let d = d.lock().unwrap();
+                        (
+                            d.app_id.clone().unwrap_or_default(),
+                            d.title.clone().unwrap_or_default(),
+                        )
+                    })
+                    .unwrap_or_default()
+            });
+            windows.push((surface_pid(surface), app_id, title));
+        }
+
+        // Layer-shell surfaces have no title/app_id — their namespace
+        // is the closest identity. Reported as app_id with empty title.
+        let map = layer_map_for_output(&self.output);
+        for layer in map.layers() {
+            windows.push((
+                surface_pid(layer.wl_surface()),
+                layer.namespace().to_owned(),
+                String::new(),
+            ));
+        }
+        drop(map);
+
+        if let Ok(mut slot) = self.dbus_state.windows.lock() {
+            *slot = windows;
         }
     }
 
@@ -1152,6 +1482,10 @@ impl WlrLayerShellHandler for HalmasuitState {
         if let Err(e) = map.map_layer(&desktop_surface) {
             tracing::warn!(error = ?e, "failed to map layer surface");
         }
+        // R-honest.4: refresh AFTER dropping the LayerMap lock —
+        // refresh_window_snapshot re-locks it.
+        drop(map);
+        self.refresh_window_snapshot();
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
@@ -1185,6 +1519,8 @@ impl WlrLayerShellHandler for HalmasuitState {
         {
             tracing::warn!(error = %e, "render_layer_elements on layer_destroyed failed");
         }
+        // R-honest.4: a layer surface left the map.
+        self.refresh_window_snapshot();
     }
 }
 smithay::delegate_layer_shell!(HalmasuitState);
@@ -1223,6 +1559,10 @@ impl XdgShellHandler for HalmasuitState {
         self.output.enter(surface.wl_surface());
         tracing::info!(w, h, "xdg_toplevel mapped as fullscreen foreground");
         self.foreground_toplevel = Some(surface);
+        // R-honest.4: a new toplevel exists (title/app_id may still be
+        // unset until first commit; the focus path re-snapshots once
+        // the buffer + metadata arrive).
+        self.refresh_window_snapshot();
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -1268,6 +1608,9 @@ impl XdgShellHandler for HalmasuitState {
                 self.apply_swap_action(a);
             }
         }
+        // R-honest.4: toplevel gone — refresh regardless of whether it
+        // was the foreground (it left `toplevel_surfaces()`).
+        self.refresh_window_snapshot();
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
@@ -2366,9 +2709,7 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
                      prior step errors: {step_errors:?}"
                 )));
             }
-            emit(&Event::PhaseEntered {
-                phase: Phase::Deprivileged,
-            });
+            emit_phase(Phase::Deprivileged);
         }
         None if nix::unistd::geteuid().is_root() => {
             return Err(io::Error::other(format!(
@@ -2664,9 +3005,7 @@ fn setup_greetd_listener(
         )
         .map_err(io::Error::other)?;
 
-    emit(&Event::PhaseEntered {
-        phase: Phase::GreetdReady,
-    });
+    emit_phase(Phase::GreetdReady);
 
     Ok((token, greeter_uid, pam_service))
 }
@@ -2690,6 +3029,18 @@ fn pam_service_from_env() -> String {
     std::env::var("HALMASUIT_PAM_SERVICE").unwrap_or_else(|_| "halmasuit".into())
 }
 
+/// Epic #71 R-honest.2: the single chokepoint for compositor phase
+/// transitions. Records the phase into the global Compositor1 store
+/// (so `GetPhase` + the diagnostic overlay report the live phase)
+/// AND emits the introspection `PhaseEntered` event. Every phase
+/// transition goes through here — there is no bare
+/// `emit(&Event::PhaseEntered{…})` left, so the DBus store can never
+/// drift from the introspection stream.
+fn emit_phase(phase: Phase) {
+    dbus_compositor1::record_phase(phase);
+    emit(&Event::PhaseEntered { phase });
+}
+
 /// Path of the privileged `halmasuit-session` broker `SOCK_SEQPACKET`
 /// socket. Defaults to `/run/halmasuit-session.sock` — the
 /// `ListenSequentialPacket` the socket-activated unit binds
@@ -2700,6 +3051,86 @@ fn broker_socket_path_from_env() -> PathBuf {
         || PathBuf::from("/run/halmasuit-session.sock"),
         PathBuf::from,
     )
+}
+
+/// Send `WATCHDOG=1` to systemd's notify socket (`$NOTIFY_SOCKET`),
+/// Epic #71 R-honest.8. Best-effort: a missing env var (watchdog not
+/// configured) or a socket error (systemd-shutdown tore the socket down
+/// mid-pivot) is swallowed — if we genuinely cannot reach systemd the
+/// correct outcome IS the watchdog firing. Hand-rolled (no libsystemd):
+/// a single datagram to the path-or-abstract `$NOTIFY_SOCKET`.
+fn notify_systemd_watchdog() {
+    let Some(sock) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let sock = sock.to_string_lossy();
+    let Ok(dgram) = std::os::unix::net::UnixDatagram::unbound() else {
+        return;
+    };
+    let connected = sock.strip_prefix('@').map_or_else(
+        || dgram.connect(&*sock),
+        |rest| {
+            // Abstract namespace ('@' → leading NUL), per sd_notify(3).
+            use std::os::linux::net::SocketAddrExt as _;
+            std::os::unix::net::SocketAddr::from_abstract_name(rest.as_bytes())
+                .and_then(|addr| dgram.connect_addr(&addr))
+        },
+    );
+    if connected.is_ok() {
+        let _ = dgram.send(b"WATCHDOG=1");
+    }
+}
+
+/// The watchdog ping interval: half of `$WATCHDOG_USEC` (systemd sets it
+/// when `WatchdogSec=` is configured), per systemd's recommendation.
+/// `None` when the watchdog is disabled (env unset / zero).
+fn watchdog_interval() -> Option<Duration> {
+    let usec: u64 = std::env::var("WATCHDOG_USEC").ok()?.parse().ok()?;
+    (usec > 0).then(|| Duration::from_micros(usec / 2))
+}
+
+/// The VT number halmasuit owns as its HOME vt (`HALMASUIT_HOME_VT`),
+/// if configured. When set, halmasuit becomes that VT's `VT_PROCESS`
+/// controller at startup and cooperative VT switching (Ctrl+Alt+F<n>)
+/// is enabled; unset → VT switching is disabled (the chord no-ops with
+/// a log). The deployment MUST disable any getty on the home VT — it is
+/// halmasuit's, the way greetd owns its VT.
+fn home_vt_from_env() -> Option<u8> {
+    std::env::var("HALMASUIT_HOME_VT")
+        .ok()
+        .and_then(|s| s.parse::<u8>().ok())
+        .filter(|&n| n >= 1)
+}
+
+/// Open `/dev/tty<vt>` in halmasuit's root startup window (the same
+/// window that opens the DRM master fd) and make it the compositor's
+/// `VT_PROCESS`-mode controlling terminal via
+/// [`vt_switch::setup_home_vt_controller`]. The returned fd is retained
+/// for the compositor's lifetime: the kernel routes relsig/acqsig to
+/// whoever holds the `VT_SETMODE` registration, and the
+/// controlling-tty designation survives the later privilege drop, so
+/// `VT_ACTIVATE` / `VT_RELDISP` keep working as the unprivileged
+/// compositor (Phase 0 verdict).
+///
+/// # Errors
+/// `io::Error` from the open or the `setsid`/`TIOCSCTTY`/`VT_SETMODE`
+/// setup.
+fn open_home_vt(vt: u8) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::AsFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let path = format!("/dev/tty{vt}");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(&path)?;
+    vt_switch::setup_home_vt_controller(file.as_fd())?;
+    // Bring the home VT to the foreground so halmasuit receives input
+    // and the cooperative relsig fires on a later switch-away. No-op if
+    // it is already the active VT; otherwise the kernel switches to it
+    // and sends us acqsig (handled once the event loop starts).
+    vt_switch::vt_activate(file.as_fd(), vt)?;
+    Ok(std::os::fd::OwnedFd::from(file))
 }
 
 /// The transient GL clear color in XRGB8888 little-endian, derived
@@ -3175,6 +3606,75 @@ fn write_kmsg(line: &str) {
 /// engages. SIGTERM-driven paths (visual-shutdown-tear-down's `kill
 /// -TERM` test posture, and any operator-issued `systemctl stop`) are
 /// unaffected.
+/// Epic #71 R-honest.6: register the overlay-journal calloop channel.
+/// A detached `journalctl` worker (spawned on overlay-open) sends the
+/// last-20-lines tail here; the handler stores it and — if the
+/// overlay is still open — recomposes the diagnostic text and
+/// re-renders. Keeps the `journalctl` shell-out OFF the render/calloop
+/// thread (the worker runs it; the handler only stores the result).
+/// Returns the `Sender` to stash on `HalmasuitState`, or `None` if
+/// registration failed.
+fn setup_overlay_journal_channel(
+    loop_handle: &LoopHandle<'static, HalmasuitState>,
+) -> Option<calloop::channel::Sender<String>> {
+    let (tx, channel) = calloop::channel::channel::<String>();
+    if let Err(e) = loop_handle.insert_source(channel, |event, (), state: &mut HalmasuitState| {
+        let calloop::channel::Event::Msg(journal) = event else {
+            return;
+        };
+        state.overlay_journal = journal;
+        if !state.diag_overlay_open {
+            return; // overlay closed before the fetch landed; just cache.
+        }
+        let text = state.compose_overlay_text();
+        let fg = state
+            .foreground_toplevel
+            .as_ref()
+            .map(|t| t.wl_surface().clone());
+        if let Some(backend) = state.drm_backend.as_mut() {
+            backend.set_overlay_text(text);
+            if let Err(e) =
+                backend.render_layer_elements(&state.output, fg.as_ref(), HALMASUIT_BRAND_CLEAR)
+            {
+                tracing::warn!(error = %e, "render on overlay-journal update failed");
+            }
+        }
+    }) {
+        tracing::error!(error = %e, "insert overlay-journal calloop channel failed");
+        return None;
+    }
+    Some(tx)
+}
+
+/// Epic #71 R-honest.6: detached worker that fetches the last 20
+/// `halmasuit.service` journal lines and posts them to the overlay-
+/// journal channel. Runs `journalctl` on its OWN thread so the
+/// render/calloop thread never blocks on the shell-out. One-shot:
+/// spawned per overlay-open, exits after sending.
+fn spawn_overlay_journal_fetch(tx: calloop::channel::Sender<String>) {
+    let spawn = std::thread::Builder::new()
+        .name("overlay-journal".to_owned())
+        .spawn(move || {
+            let text = match std::process::Command::new("journalctl")
+                .args(["-u", "halmasuit", "-n", "20", "--output=cat"])
+                .output()
+            {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+                Ok(o) => format!(
+                    "(journalctl exited {}): {}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+                Err(e) => format!("(journalctl failed: {e})"),
+            };
+            // Receiver gone (compositor shutting down) → drop silently.
+            let _ = tx.send(text);
+        });
+    if let Err(e) = spawn {
+        tracing::warn!(error = %e, "spawn overlay-journal worker failed");
+    }
+}
+
 fn spawn_prepare_for_shutdown_watcher(loop_handle: &LoopHandle<'static, HalmasuitState>) {
     let (tx, channel) = calloop::channel::channel::<bool>();
     if let Err(e) = loop_handle.insert_source(channel, |event, (), state: &mut HalmasuitState| {
@@ -3748,6 +4248,51 @@ fn main() -> io::Result<()> {
         version: env!("CARGO_PKG_VERSION"),
     });
 
+    // Block the calloop-consumed signals process-wide BEFORE anything
+    // spawns a thread (Mesa/EGL driver threads start during DRM init;
+    // the DBus + journal + watcher threads later). New threads inherit
+    // this mask, so the kernel can only deliver these process-directed
+    // signals to the main thread's signalfd — never to a worker thread
+    // that would default-terminate the compositor. calloop's `Signals`
+    // source re-blocks + owns the signalfd; this just guarantees the
+    // block predates every thread.
+    {
+        use nix::sys::signal::{SigSet, Signal};
+        let mut mask = SigSet::empty();
+        for sig in [
+            Signal::SIGTERM,
+            Signal::SIGINT,
+            Signal::SIGCHLD,
+            Signal::SIGHUP,
+        ] {
+            mask.add(sig);
+        }
+        if let Err(e) = mask.thread_block() {
+            tracing::warn!(error = %e, "pre-block of calloop signals failed");
+        }
+    }
+
+    // Epic #71 R-honest.7: the cooperative VT-switch signals
+    // (relsig/acqsig) are REALTIME signals (SIGRTMIN+n), not SIGUSR1/2.
+    // They are process-directed (kernel kill_pid → group_send_sig_info),
+    // so the kernel delivers them to ANY thread that hasn't blocked
+    // them; SIGUSR1/2 are in the namespace libraries grab (Mesa/EGL
+    // workers, glibc helpers; SIGUSR1 is an X server's parent-readiness
+    // signal — freedesktop #87322), so a worker thread silently
+    // swallowed them. A realtime signal is a private number no library
+    // touches; blocking it here (before any thread spawns) keeps it
+    // pending for the dedicated VT signalfd registered below. nix's
+    // SigSet can't represent RT signals, so this goes through raw libc.
+    if let Err(e) = vt_switch::block_vt_signals() {
+        tracing::warn!(error = %e, "pre-block of VT realtime signals failed");
+    }
+
+    // Epic #71 R-honest.8: reset the systemd watchdog clock as early as
+    // possible (the watchdog starts counting at exec, but DRM/EGL/GBM
+    // bring-up before the event loop's first ping can take >10s). The
+    // loop-driven timer below takes over once we're running.
+    notify_systemd_watchdog();
+
     // Phase B (boot-from-initrd) runtime detection. `/etc/initrd-release`
     // is the systemd-canonical signal that we're in the initramfs
     // (INITRD_INTERFACE spec); the rootfs filesystem doesn't ship the
@@ -3773,9 +4318,7 @@ fn main() -> io::Result<()> {
     let in_initramfs = context::is_initramfs();
     if in_initramfs {
         context::set_argv0_marker();
-        emit(&Event::PhaseEntered {
-            phase: Phase::InitramfsInit,
-        });
+        emit_phase(Phase::InitramfsInit);
     }
 
     // Resolve the DRM device path before anything else (the path may
@@ -3857,9 +4400,7 @@ fn main() -> io::Result<()> {
         let (backend, token, real_output) =
             drm::setup_drm_direct(path, &loop_handle, handle_drm_event, wallpaper_config)?;
         real_output.create_global::<HalmasuitState>(&display_handle);
-        emit(&Event::PhaseEntered {
-            phase: Phase::DrmMasterAcquired,
-        });
+        emit_phase(Phase::DrmMasterAcquired);
         // Rootfs deployment: enumerate input here. Initramfs deployment:
         // `setup_post_pivot_input` runs the same `setup_libinput_direct`
         // call post-pivot. Either way, no libseat: each `/dev/input/
@@ -4094,6 +4635,7 @@ fn main() -> io::Result<()> {
             let client_data = Arc::new(ClientState {
                 compositor_state: CompositorClientState::default(),
                 uid: creds.uid,
+                pid: creds.pid,
             });
             match state.display_handle.insert_client(stream, client_data) {
                 Ok(_client) => tracing::debug!("new wl_client accepted"),
@@ -4123,12 +4665,31 @@ fn main() -> io::Result<()> {
     // true thereafter. In rootfs-only (`services.halmasuit.enable=
     // true`) mode the flag starts true at construction — no boot
     // pivot to survive.
-    let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT, Signal::SIGCHLD])?;
+    //
+    // The cooperative VT-switch signals (relsig/acqsig) are NOT here —
+    // they are realtime signals on a dedicated signalfd registered
+    // below (calloop's `Signals` is standard-signal-only).
+    let signals = Signals::new(&[
+        Signal::SIGTERM,
+        Signal::SIGINT,
+        Signal::SIGCHLD,
+        Signal::SIGHUP,
+    ])?;
     loop_handle
         .insert_source(
             signals,
             move |event, (), state: &mut HalmasuitState| match event.signal() {
                 Signal::SIGCHLD => reap_zombie_children(state),
+                // R-honest.7 probe + fix: halmasuit TIOCSCTTYs the VT it
+                // switches to, so it becomes subject to controlling-tty
+                // job-control signals. A getty grabbing that VT (vhangup)
+                // or the switch itself can deliver SIGHUP; the default
+                // disposition terminates the long-lived display server.
+                // Ignore it — halmasuit's lifetime is graphical.target →
+                // shutdown, not tied to any one VT's hangup.
+                Signal::SIGHUP => {
+                    tracing::warn!("VT_SIGHUP_received (ignored)");
+                }
                 Signal::SIGTERM if !state.shutdown_armed => {
                     tracing::info!("SIGTERM ignored (shutdown_armed=false, boot pivot in flight)");
                 }
@@ -4144,10 +4705,31 @@ fn main() -> io::Result<()> {
         )
         .map_err(io::Error::other)?;
 
-    emit(&Event::PhaseEntered { phase: Phase::Init });
-    emit(&Event::PhaseEntered {
-        phase: Phase::WaylandReady,
-    });
+    // Epic #71 R-honest.7: dedicated signalfd for the cooperative
+    // VT-switch realtime signals (relsig/acqsig — SIGRTMIN+n, blocked
+    // process-wide above). On relsig the compositor drops DRM master +
+    // VT_RELDISP(release); on acqsig it reacquires master +
+    // VT_RELDISP(ackacq). Both act on the retained `vt_fd`; no-op
+    // (logged) if we hold no VT.
+    let vt_signalfd = vt_switch::create_vt_signalfd()?;
+    loop_handle
+        .insert_source(
+            Generic::new(vt_signalfd, Interest::READ, CalloopMode::Level),
+            move |_readiness, fd, state: &mut HalmasuitState| {
+                use std::os::fd::AsFd as _;
+                for sig in vt_switch::read_vt_signals(fd.as_fd())? {
+                    match sig {
+                        vt_switch::VtSignal::Release => state.handle_vt_relsig(),
+                        vt_switch::VtSignal::Acquire => state.handle_vt_acqsig(),
+                    }
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(io::Error::other)?;
+
+    emit_phase(Phase::Init);
+    emit_phase(Phase::WaylandReady);
 
     // Wrap the Display as a calloop Generic source so client fd
     // activity (new requests on connected clients) wakes the event
@@ -4244,6 +4826,10 @@ fn main() -> io::Result<()> {
     // and the rest of the wallpaper-only paint-until-halt path.
     spawn_prepare_for_shutdown_watcher(&loop_handle);
 
+    // Epic #71 R-honest.6: overlay-journal channel (registered before
+    // state construction; the Sender is stashed on HalmasuitState).
+    let journal_tx = setup_overlay_journal_channel(&loop_handle);
+
     // greetd socket setup. Production: NixOS module sets
     // HALMASUIT_GREETD_SOCKET to `/run/halmasuit/greetd.sock` and
     // HALMASUIT_GREETER_UID to the greeter system user's uid.
@@ -4307,6 +4893,29 @@ fn main() -> io::Result<()> {
                 .expect("refresh clamped to >=1"),
     );
 
+    // Epic #71 R-honest.7 (home-VT model): open our home VT and become
+    // its VT_PROCESS controller while still root (mirrors the DRM
+    // master open). No home VT configured → cooperative VT switching is
+    // disabled. Failure is non-fatal: the compositor still comes up; the
+    // chord just no-ops.
+    let home_vt_fd = home_vt_from_env().and_then(|vt| match open_home_vt(vt) {
+        Ok(fd) => {
+            tracing::info!(
+                home_vt = vt,
+                "home VT opened; halmasuit is its VT_PROCESS controller"
+            );
+            Some(fd)
+        }
+        Err(e) => {
+            tracing::warn!(
+                home_vt = vt,
+                error = %e,
+                "home VT setup failed; cooperative VT switching disabled"
+            );
+            None
+        }
+    });
+
     let mut state = HalmasuitState {
         display_handle,
         compositor_state,
@@ -4358,6 +4967,17 @@ fn main() -> io::Result<()> {
         // this true on `Phase::RootfsReady` — before that, SIGTERM is
         // the boot kill spree and stays ignored.
         shutdown_armed: !in_initramfs,
+        // Epic #71 R3.1: overlay starts closed. Toggled by chord.
+        diag_overlay_open: false,
+        // Epic #71 R-honest.6: overlay journal cache + channel sender.
+        overlay_journal: String::new(),
+        journal_tx,
+        // Epic #71 R-honest.7: our home VT fd (VT_PROCESS controller),
+        // opened in the root window above; None if not configured.
+        vt_fd: home_vt_fd,
+        // Epic #71 R3.3: DBus state anchored at startup; the
+        // background thread reads from this via Arc clone.
+        dbus_state: dbus_compositor1::CompositorObservability::new(),
         shutting_down: false,
         greetd_listener_token,
         drm_backend,
@@ -4368,6 +4988,16 @@ fn main() -> io::Result<()> {
         session_first_frame_emitted: false,
         start_time: std::time::Instant::now(),
     };
+
+    // Epic #71 R-honest.1: share the Compositor1 observability frame
+    // counter into the render backend so `GetFrameCounter` (DBus) and
+    // the diagnostic overlay observe the LIVE render count — one Arc,
+    // no second copy. Done here (after state construction, before the
+    // initial render below) so the backend's own bootstrap counter is
+    // never incremented.
+    if let Some(backend) = state.drm_backend.as_mut() {
+        backend.set_frame_counter(state.dbus_state.frame_counter.clone());
+    }
 
     // The wallpaper plane is composited from frame 0 (epic G1/R3/R6):
     // emit the `Wallpaper` first-frame anchor BEFORE the initial
@@ -4401,15 +5031,24 @@ fn main() -> io::Result<()> {
     if let Some(backend) = state.drm_backend.as_mut() {
         let queued = backend.render_one_frame(&state.output, HALMASUIT_BRAND_CLEAR)?;
         if queued {
-            emit(&Event::PhaseEntered {
-                phase: Phase::ScanoutActive,
-            });
+            emit_phase(Phase::ScanoutActive);
         } else {
             tracing::warn!(
                 "initial render_frame produced no damage; ScanoutActive deferred until next vblank"
             );
         }
     }
+
+    // Epic #71 R3.3: start the production observability D-Bus
+    // server (`org.halmasuit.Compositor1`). Read-only by design —
+    // no Set*, Force*, Inject*, or Override* methods. Always on
+    // (NOT feature-gated) so the production binary exposes its
+    // observability surface to the `halmasuit` CLI tool. Started
+    // before the privilege drop so the bus connection
+    // authenticates as the pre-drop euid (root) and the connection
+    // persists across the subsequent setresuid. Best-effort —
+    // `serve` logs and the thread exits if the bus is unreachable.
+    dbus_compositor1::serve(state.dbus_state.clone());
 
     // frame_audit only: start the D-Bus `Snapshot()` server, handing
     // it a clone of the render loop's snapshot slot. Started before
@@ -4499,6 +5138,27 @@ fn main() -> io::Result<()> {
             .map_err(|e| io::Error::other(format!("insert wallpaper tick timer: {e}")))?;
     }
 
+    // Epic #71 R-honest.8: systemd watchdog ping, driven by the calloop
+    // loop at WatchdogSec/2. Loop-driven on purpose — if the event loop
+    // hangs, the pings stop, systemd SIGKILLs us, the kernel's reset_vc
+    // reverts our home VT to VT_AUTO (VT switching recovers), and
+    // Restart=on-failure brings us back. Disabled (no timer) when the
+    // unit sets no WatchdogSec. The ping keeps firing through the
+    // post-SIGTERM wallpaper-paint loop, so SurviveFinalKillSignal's
+    // survival window is unaffected (we're alive + painting → we ping).
+    if let Some(interval) = watchdog_interval() {
+        let watchdog_tick = calloop::timer::Timer::immediate();
+        loop_handle
+            .insert_source(
+                watchdog_tick,
+                move |_deadline, &mut (), _state: &mut HalmasuitState| {
+                    notify_systemd_watchdog();
+                    calloop::timer::TimeoutAction::ToDuration(interval)
+                },
+            )
+            .map_err(|e| io::Error::other(format!("insert watchdog tick timer: {e}")))?;
+    }
+
     // Privilege drop. The DRM master FD and both Unix sockets are
     // acquired above while we still have euid==0; everything from
     // here onwards runs as the configured compositor system user with
@@ -4527,9 +5187,7 @@ fn main() -> io::Result<()> {
         match compositor_uid_from_env()? {
             Some(uid) => {
                 drop_privileges(uid)?;
-                emit(&Event::PhaseEntered {
-                    phase: Phase::Deprivileged,
-                });
+                emit_phase(Phase::Deprivileged);
             }
             None if nix::unistd::geteuid().is_root() => {
                 return Err(io::Error::other(
@@ -4611,9 +5269,7 @@ fn main() -> io::Result<()> {
                         if context::is_initramfs() {
                             TimeoutAction::ToDuration(Duration::from_secs(1))
                         } else {
-                            emit(&Event::PhaseEntered {
-                                phase: Phase::RootfsReady,
-                            });
+                            emit_phase(Phase::RootfsReady);
                             // Epic #47 R2.1: the boot pivot is complete.
                             // A SIGTERM from this point is the real
                             // shutdown signal, not the boot kill spree.

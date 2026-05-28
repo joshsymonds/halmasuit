@@ -506,6 +506,40 @@ in
       '';
     };
 
+    homeVt = lib.mkOption {
+      type        = lib.types.nullOr (lib.types.ints.between 1 63);
+      default     = null;
+      example     = 8;
+      description = ''
+        The virtual terminal halmasuit owns as its "home" VT. When set,
+        halmasuit opens `/dev/tty''${homeVt}` in its root startup window,
+        becomes its `VT_PROCESS` controller, and brings it to the
+        foreground; cooperative VT switching (Ctrl+Alt+F<n> to a text
+        console and back) is then enabled via the kernel's relsig/acqsig
+        handshake. When null, VT switching is disabled.
+
+        The operator MUST ensure no getty runs on the home VT — it is
+        halmasuit's, the way greetd owns its VT. The simplest way is to
+        pick a VT outside logind's autovt range (`NAutoVTs`, default 6),
+        e.g. tty8, which never gets a getty.
+      '';
+    };
+
+    watchdogSec = lib.mkOption {
+      type        = lib.types.str;
+      default     = "30s";
+      example     = "15s";
+      description = ''
+        `WatchdogSec` for halmasuit's systemd unit (Epic #71 R-honest.8).
+        halmasuit pings `WATCHDOG=1` from its calloop loop at half this
+        interval; if the event loop hangs, systemd SIGKILLs it, the
+        kernel reverts its home VT to VT_AUTO (VT switching recovers),
+        and `Restart=on-failure` brings it back. Must exceed halmasuit's
+        cold-start DRM/EGL bring-up (>10s in a VM) so a healthy startup
+        is never killed. Set `"0"`/`"infinity"` to disable.
+      '';
+    };
+
     installPamConfig = lib.mkOption {
       type        = lib.types.bool;
       default     = true;
@@ -843,10 +877,17 @@ in
         <busconfig>
           <policy user="root">
             <allow own="org.halmasuit"/>
+            <!-- Epic #71 R3.3: production observability surface. -->
+            <allow own="org.halmasuit.Compositor1"/>
           </policy>
           <policy context="default">
             <allow send_destination="org.halmasuit"/>
             <allow receive_sender="org.halmasuit"/>
+            <!-- Compositor1 read methods are unauthenticated per
+                 Epic #71 (no Set*/Force*/Inject*/Override*; the
+                 read/write split is enforced in code). -->
+            <allow send_destination="org.halmasuit.Compositor1"/>
+            <allow receive_sender="org.halmasuit.Compositor1"/>
           </policy>
         </busconfig>
       '')
@@ -933,6 +974,28 @@ in
         # to recover from.
         Restart        = "on-failure";
         RestartSec     = "1s";
+        # Epic #71 R-honest.8: systemd watchdog. halmasuit pings
+        # WATCHDOG=1 from its calloop loop at WatchdogSec/2; if the
+        # event loop hangs, the pings stop, systemd SIGKILLs halmasuit,
+        # the kernel's reset_vc reverts its home VT to VT_AUTO (VT
+        # switching recovers), and Restart=on-failure brings it back.
+        # This is the recovery complement that makes compositor-owned
+        # VT_PROCESS safe (a DEAD controller is already safe via
+        # reset_vc; only a HUNG-but-alive one needs this).
+        #
+        # The default (`watchdogSec` = 30s) is generous: halmasuit's
+        # DRM/EGL/GBM bring-up before the event loop's first ping can
+        # take >10s in a cold VM. It pings once very early in main() too,
+        # so the clock resets near exec.
+        #
+        # NotifyAccess=main guarantees $NOTIFY_SOCKET is provided to the
+        # main process under Type=simple (no Type=notify readiness
+        # gating, which would change boot ordering). The ping is
+        # loop-driven and continues through the shutdown wallpaper-paint
+        # loop, so SurviveFinalKillSignal's survival window is intact:
+        # halmasuit keeps pinging while it keeps painting.
+        WatchdogSec    = cfg.watchdogSec;
+        NotifyAccess   = "main";
         # Epic #47 R2.2: `KillMode=process` confines `systemctl stop
         # halmasuit.service` (dev workflow) to signaling halmasuit's
         # main PID only, leaving any child trees alone. Paired with
@@ -1089,7 +1152,12 @@ in
         # — its mode becomes the canonical cloned mode. See
         # `services.halmasuit.rendering.primaryOutput`.
         HALMASUIT_PRIMARY_OUTPUT = cfg.rendering.primaryOutput;
+      } // lib.optionalAttrs (cfg.homeVt != null) {
+        # Epic #71 R-honest.7: the VT halmasuit owns as VT_PROCESS
+        # controller for cooperative switching. See `homeVt`.
+        HALMASUIT_HOME_VT = toString cfg.homeVt;
       } // wallpaperEnv // drmDeviceEnv;
+
     };
    })
 
@@ -1301,6 +1369,15 @@ in
          # /etc/shadow in-process rather than forking the setuid
          # unix_chkpwd helper — the fork path is fragile under any
          # sandboxed parent (memory project-pam-unix-shadow-group).
+         #
+         # Capabilities the broker uses (all implicit via root —
+         # there is NO `CapabilityBoundingSet=` / `AmbientCapabilities=`
+         # restriction, this is documentation of the surface):
+         #   CAP_SYS_ADMIN     pam_namespace, pam_loginuid, fork+exec
+         #   CAP_DAC_READ_SEARCH  /etc/shadow read via shadow group
+         #   CAP_SYS_PTRACE    pam_keyinit edge cases
+         # (The broker has NO VT role: halmasuit owns its home VT
+         # directly — Epic #71 R-honest.7 home-VT model.)
          SupplementaryGroups = [ "shadow" ];
          # Generous backstop ONLY (a wedged module is bounded by the
          # broker's per-worker RLIMIT_CPU + SIGKILL-anytime + idle

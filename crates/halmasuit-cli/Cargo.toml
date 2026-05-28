@@ -1,6 +1,6 @@
 [package]
 name        = "halmasuit-cli"
-description = "Command-line client for the halmasuit compositor (the `halmasuit msg` binary)."
+description = "Command-line clients for halmasuit. Hosts `halmasuit-msg` (v2 control-plane placeholder) AND `halmasuit` (Epic #71 R3.4 observability CLI — connects to org.halmasuit.Compositor1 on the system bus, prints state)."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -12,7 +12,15 @@ authors.workspace      = true
 name = "halmasuit-msg"
 path = "src/main.rs"
 
+[[bin]]
+name = "halmasuit"
+path = "src/halmasuit.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
+# Epic #71 R3.4: zbus client for Compositor1 method calls. Same
+# 5.x line halmasuit and halmasuit-session already pin.
+zbus      = { workspace = true }
+anyhow    = "1"

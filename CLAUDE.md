@@ -219,8 +219,12 @@ deliberately not.
 Listed in `ARCHITECTURE.md` § "Open decisions"; the still-open ones:
 
 1. smithay revision pin (see Ecosystem caveats above).
-2. Final `org.halmasuit.Compositor1` D-Bus surface.
-3. OCR for text-leak detection in frame-capture (tesseract).
+2. OCR for text-leak detection in frame-capture (tesseract).
+
+The `org.halmasuit.Compositor1` D-Bus surface is RESOLVED (Epic #71):
+the as-built surface is read-only observability (`GetPhase`,
+`GetUptime`, `GetFrameCounter`, `ListWindows`, `GetBrokerStatus`);
+mutating control (`Lock`/`Unlock`/`RestartInnerWM`) is deferred to v2+.
 
 Don't invent answers; flag the decision when the relevant code lands.
 

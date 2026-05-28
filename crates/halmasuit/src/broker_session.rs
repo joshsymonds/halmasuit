@@ -315,7 +315,26 @@ impl AsFd for SeqpacketChannel {
 ///
 /// # Errors
 /// [`WireError::Io`] if `socket`/`connect` fails.
+///
+/// Epic #71 R-honest.3: this is the single chokepoint every broker
+/// connection flows through (per-greeter episode + one-shot
+/// RequestRootFd / SpawnGreeter), so it records the
+/// compositor's broker-reachability state for the
+/// `org.halmasuit.Compositor1` `GetBrokerStatus` surface:
+/// `Connecting` on entry, `Connected`/`Failed` on the result.
 pub fn connect_broker(sock_path: &Path) -> Result<SeqpacketChannel, WireError> {
+    use crate::dbus_compositor1::{BrokerConnectionState, record_broker_state};
+    record_broker_state(BrokerConnectionState::Connecting);
+    let result = connect_broker_inner(sock_path);
+    record_broker_state(if result.is_ok() {
+        BrokerConnectionState::Connected
+    } else {
+        BrokerConnectionState::Failed
+    });
+    result
+}
+
+fn connect_broker_inner(sock_path: &Path) -> Result<SeqpacketChannel, WireError> {
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
     let fd = socket(
         AddressFamily::Unix,

@@ -500,14 +500,22 @@ render_elements! {
     /// respectively), always the LAST element so every surface
     /// composites over it (epic G1/R3/R6). Exactly one wallpaper
     /// variant is produced per frame — the engine's active backend
-    /// picks which. `CursorMemory` is the named-cursor pixmap from
-    /// the loaded xcursor theme (R8b-render); always prepended at
-    /// INDEX 0 (topmost) above every client surface.
+    /// picks which. `Memory` is a memory-buffer-backed element — used
+    /// for BOTH the named-cursor pixmap from the loaded xcursor theme
+    /// (R8b-render; prepended at INDEX 0, topmost) AND the Epic #71
+    /// diagnostic overlay (R3.2/R-honest.6): a full-output buffer with
+    /// a semitransparent dark backdrop + the diagnostic text (phase,
+    /// broker, window list, journal tail) rasterized via the
+    /// console-font blitter, composited above every surface but BELOW
+    /// the cursor. The two share one variant because they're the same
+    /// inner type (the `render_elements!` macro requires distinct
+    /// per-variant types); z-order is set by position in the element
+    /// list, not the variant.
     pub SceneElement<=GlesRenderer>;
     Surface         = WaylandSurfaceRenderElement<GlesRenderer>,
     Wallpaper       = TextureRenderElement<GlesTexture>,
     WallpaperShader = smithay::backend::renderer::gles::element::PixelShaderElement,
-    CursorMemory    = smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement<GlesRenderer>,
+    Memory          = MemoryRenderBufferRenderElement<GlesRenderer>,
 }
 
 /// R8b-render cursor state. Lives on `DrmBackend` (next to the
@@ -583,7 +591,32 @@ pub struct DrmBackend {
     /// actually advancing the counter post-pivot (not just dispatching
     /// the calloop liveness timer). `halmasuit-debug` also surfaces it
     /// as `Event::FrameRendered.frame_id` for the `frame_audit` stream.
-    frame_counter: u64,
+    ///
+    /// Epic #71 R-honest.1: this is an `Arc<AtomicU64>` — the SAME
+    /// counter the Compositor1 DBus surface (`GetFrameCounter`) and
+    /// the diagnostic overlay read. `main` swaps in the shared
+    /// `CompositorObservability::frame_counter` clone via
+    /// `set_frame_counter` before the render loop starts, so there is
+    /// exactly ONE counter (epic anti-pattern: no second copy).
+    frame_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Epic #71 R3.2: whether to composite the diagnostic overlay
+    /// element this frame. Toggled by `set_overlay_visible` from
+    /// `HalmasuitState::handle_chord_action` in response to
+    /// `Ctrl+Alt+Shift+Esc` / `Esc`-when-open.
+    overlay_visible: bool,
+    /// Epic #71 R-honest.6: the diagnostic text the overlay renders
+    /// (phase / broker / windows / journal tail), composed on the
+    /// calloop thread from the shared observability store + the
+    /// off-thread journal fetch. Set via `set_overlay_text`.
+    overlay_text: String,
+    /// Cached rasterized overlay buffer (semitransparent dark backdrop
+    /// plus the text blitted via the console font). A value of `None`
+    /// means the cache is invalid and the next composite rebuilds it;
+    /// `set_overlay_text` resets it to `None` on every content change.
+    /// The rebuild happens only while the overlay is open, so a closed
+    /// overlay costs nothing.
+    overlay_buffer: Option<MemoryRenderBuffer>,
+
     /// Latest composited frame, published every audited frame for the
     /// D-Bus `Snapshot()` method to read. Only exists in
     /// `halmasuit-debug`.
@@ -1082,7 +1115,15 @@ where
                 cached: None,
                 started_at: std::time::Instant::now(),
             },
-            frame_counter: 0,
+            // Own counter until `main` swaps in the shared
+            // CompositorObservability clone via `set_frame_counter`
+            // (before the render loop starts, so this initial Arc is
+            // never incremented).
+            frame_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // Epic #71 R3.2: overlay starts hidden; chord toggles it.
+            overlay_visible: false,
+            overlay_text: String::new(),
+            overlay_buffer: None,
             #[cfg(feature = "frame_audit")]
             snapshot_buf: crate::dbus::new_buffer(),
             #[cfg(feature = "frame_audit")]
@@ -1094,6 +1135,73 @@ where
 }
 
 impl DrmBackend {
+    /// Epic #71 R-honest.7: release DRM master so another VT (text
+    /// console fbcon, or a getty) can take over the display while
+    /// halmasuit is backgrounded. Called from
+    /// `HalmasuitState::handle_vt_relsig` on the kernel's relsig BEFORE
+    /// it `VT_RELDISP`s the switch away.
+    ///
+    /// Idempotent (the underlying DROP_MASTER ioctl is no-op if we
+    /// already don't hold master). Does NOT tear down the
+    /// `DrmCompositor` — its CRTC / framebuffer state is preserved
+    /// in our address space; only the kernel-side master designation
+    /// is released. `resume()` reacquires.
+    ///
+    /// Note: pageflip attempts that race the master drop will EACCES.
+    /// The render loop's existing DRM-error path swallows transient
+    /// EACCES; the wallpaper-tick timer keeps polling so the next
+    /// successful frame after `resume()` re-paints.
+    ///
+    /// # Errors
+    /// Bubbles DROP_MASTER ioctl errno. The caller logs and continues —
+    /// the VT switch proceeds regardless.
+    pub fn pause(&self) -> io::Result<()> {
+        self.compositor
+            .surface()
+            .device_fd()
+            .release_master_lock()
+            .map_err(|e| io::Error::other(format!("DRM DROP_MASTER: {e}")))?;
+        Ok(())
+    }
+
+    /// Epic #71 R-honest.7: re-acquire DRM master after the kernel
+    /// switches back to halmasuit's home VT. Idempotent. Called from
+    /// `HalmasuitState::handle_vt_acqsig` on the kernel's acqsig before
+    /// it `VT_RELDISP(ackacq)`s.
+    ///
+    /// # Errors
+    /// Bubbles SET_MASTER ioctl errno. If this fails the display
+    /// stays blank — the caller (`handle_vt_acqsig`) logs loudly. The
+    /// user can switch away + back to retry.
+    pub fn resume(&self) -> io::Result<()> {
+        self.compositor
+            .surface()
+            .device_fd()
+            .acquire_master_lock()
+            .map_err(|e| io::Error::other(format!("DRM SET_MASTER: {e}")))?;
+        Ok(())
+    }
+
+    /// Epic #71 R3.2: toggle the diagnostic-overlay composition
+    /// element. Called from `HalmasuitState::handle_chord_action`
+    /// on `Ctrl+Alt+Shift+Esc` / `Esc`-when-open. Cheap state-only
+    /// flip; the visible effect lands on the next render tick.
+    pub const fn set_overlay_visible(&mut self, visible: bool) {
+        self.overlay_visible = visible;
+    }
+
+    /// Epic #71 R-honest.6: set the diagnostic text the overlay
+    /// renders and invalidate the cached buffer so the next composite
+    /// rebuilds the panel with the fresh content. Called from the
+    /// calloop thread (chord-open recompose + the off-thread journal
+    /// fetch's calloop-channel handler).
+    pub fn set_overlay_text(&mut self, text: String) {
+        if self.overlay_text != text {
+            self.overlay_text = text;
+            self.overlay_buffer = None; // force rebuild on next composite
+        }
+    }
+
     /// R8b-render: install the latest `CursorImageStatus` from the
     /// focused client (or halmasuit's own default). When the status
     /// transitions to a new Named icon, drop the cached buffer so
@@ -1203,7 +1311,7 @@ impl DrmBackend {
                     None,
                     Kind::Cursor,
                 ) {
-                    Ok(el) => vec![SceneElement::CursorMemory(el)],
+                    Ok(el) => vec![SceneElement::Memory(el)],
                     Err(e) => {
                         tracing::warn!(error = %e, "cursor MemoryRenderBufferRenderElement::from_buffer");
                         Vec::new()
@@ -1331,6 +1439,16 @@ impl DrmBackend {
                 elements.push(element);
             }
         }
+        // Epic #71 R3.2/R-honest.6: diagnostic overlay composites
+        // above every surface (so it covers the focused app cleanly)
+        // but BELOW the cursor (so the user can still see their
+        // pointer). Insert at index 0 of `elements` now — after the
+        // cursor logic below it'll move to index 1 (one below cursor).
+        if self.overlay_visible
+            && let Some(overlay) = self.build_overlay_element(output)
+        {
+            elements.insert(0, SceneElement::Memory(overlay));
+        }
         // R8b-render: prepend cursor elements so they sit at index 0
         // (topmost). Smithay's render is front-to-back; the cursor
         // composites OVER all layers + foreground.
@@ -1340,6 +1458,80 @@ impl DrmBackend {
             return Ok(combined);
         }
         Ok(elements)
+    }
+
+    /// Epic #71 R-honest.6: build the diagnostic-overlay render
+    /// element — a full-output memory buffer holding a semitransparent
+    /// dark backdrop with the diagnostic text (phase / broker /
+    /// windows / journal tail) rasterized on top via the console-font
+    /// blitter. The buffer is cached (`overlay_buffer`) and rebuilt
+    /// only when `set_overlay_text` invalidates it, so a steady
+    /// open overlay costs one upload, not one per frame. Returns
+    /// `None` if the element can't be built (logged; the overlay just
+    /// doesn't show that frame).
+    fn build_overlay_element(
+        &mut self,
+        output: &smithay::output::Output,
+    ) -> Option<MemoryRenderBufferRenderElement<GlesRenderer>> {
+        use smithay::backend::renderer::element::Kind;
+
+        if self.overlay_buffer.is_none() {
+            self.overlay_buffer = Some(self.rasterize_overlay(output));
+        }
+        // Disjoint field borrows: `buffer` borrows `self.overlay_buffer`,
+        // `from_buffer` borrows `self.renderer` — different fields, OK.
+        let buffer = self.overlay_buffer.as_ref()?;
+        match MemoryRenderBufferRenderElement::from_buffer(
+            &mut self.renderer,
+            smithay::utils::Point::from((0.0_f64, 0.0_f64)),
+            buffer,
+            None,
+            None,
+            None,
+            Kind::Unspecified,
+        ) {
+            Ok(el) => Some(el),
+            Err(e) => {
+                tracing::warn!(error = %e, "diagnostic overlay from_buffer failed");
+                None
+            }
+        }
+    }
+
+    /// Rasterize the diagnostic overlay into a full-output RGBA buffer:
+    /// a semitransparent dark backdrop (so the wallpaper/app dims but
+    /// stays faintly visible — the Force-Quit look) with `overlay_text`
+    /// blitted in light console-font glyphs at the top-left. Pure
+    /// CPU work; called only when the cached buffer is invalidated.
+    fn rasterize_overlay(&self, output: &smithay::output::Output) -> MemoryRenderBuffer {
+        /// Backdrop: black at ~60% alpha. Premultiplied-safe (black is
+        /// 0 in every channel regardless of alpha convention).
+        const OVERLAY_BG: [u8; 4] = [0, 0, 0, 153];
+        /// Text: opaque light grey (alpha 255 → premult == straight).
+        const OVERLAY_FG: [u8; 4] = [220, 220, 220, 255];
+
+        let osize = output.current_mode().map(|m| m.size).unwrap_or_default();
+        let w = osize.w.max(1);
+        let h = osize.h.max(1);
+        let wu = usize::try_from(w).expect("w >= 1");
+        let hu = usize::try_from(h).expect("h >= 1");
+
+        let mut px = vec![0_u8; wu * hu * 4];
+        for chunk in px.chunks_exact_mut(4) {
+            chunk.copy_from_slice(&OVERLAY_BG);
+        }
+        crate::console_font::blit_str(&mut px, wu, hu, 8, 8, &self.overlay_text, OVERLAY_FG);
+
+        // Same Fourcc/byte-order convention as the cursor path:
+        // [R,G,B,A] bytes with Fourcc::Argb8888.
+        MemoryRenderBuffer::from_slice(
+            &px,
+            Fourcc::Argb8888,
+            (w, h),
+            1,
+            smithay::utils::Transform::Normal,
+            None,
+        )
     }
 
     /// Render one frame with no foreground toplevel — the frame-0 /
@@ -1410,8 +1602,13 @@ impl DrmBackend {
         // (counter - 1) for `Event::FrameRendered.frame_id` so the
         // first emitted frame is still id=0; production halmasuit
         // exposes the post-increment value via `frame_counter()` for
-        // the shutdown-liveness line's `frames=N` field.
-        self.frame_counter = self.frame_counter.wrapping_add(1);
+        // the shutdown-liveness line's `frames=N` field AND the
+        // Compositor1 DBus `GetFrameCounter` (R-honest.1: same Arc).
+        // `fetch_add` wraps on u64 overflow like the prior
+        // `wrapping_add`. Relaxed: one-way value flow, no
+        // happens-before dependency on other observability fields.
+        self.frame_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // The frame is now queued for scanout. Under `frame_audit`
         // (halmasuit-debug only) re-render the identical element set
@@ -1438,8 +1635,20 @@ impl DrmBackend {
     /// render loop is actually advancing through shutdown — not just
     /// that the calloop event loop is firing the liveness timer.
     #[must_use]
-    pub const fn frame_counter(&self) -> u64 {
+    pub fn frame_counter(&self) -> u64 {
         self.frame_counter
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Epic #71 R-honest.1: replace this backend's frame counter with
+    /// the shared `CompositorObservability` counter so the render
+    /// path, the shutdown-liveness line, `frame_audit`, and the
+    /// Compositor1 DBus `GetFrameCounter` all observe ONE counter.
+    /// Called by `main` after state construction and BEFORE the render
+    /// loop starts, so the backend's initial own-counter is never
+    /// incremented (no frames lost, no second copy).
+    pub fn set_frame_counter(&mut self, shared: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        self.frame_counter = shared;
     }
 
     /// Re-render `elements` (+ the clear color) into an offscreen
@@ -1476,7 +1685,10 @@ impl DrmBackend {
         // frame is still emitted as id=0 (matches every existing
         // visual test's frame-id assumptions).
         halmasuit_introspect::emit(&halmasuit_introspect::Event::FrameRendered {
-            frame_id: self.frame_counter.wrapping_sub(1),
+            frame_id: self
+                .frame_counter
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .wrapping_sub(1),
             pixel_count: stats.pixel_count,
             clear_pixel_count: stats.clear_pixel_count,
             black_pixel_count: stats.black_pixel_count,

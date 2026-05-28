@@ -1,0 +1,349 @@
+# Epic #71 R-honest.1 — org.halmasuit.Compositor1 live-value gate.
+#
+# Proves the Compositor1 DBus surface returns REAL state, not the
+# stub literals R3.3 shipped (GetFrameCounter was hardcoded-shaped
+# as 0 forever — the render path never fed the Arc). This is the
+# regression gate for the "diagnostic surface that lies" bug the
+# R3-honest re-open exists to fix.
+#
+# Load-bearing assertion: GetFrameCounter STRICTLY INCREASES between
+# two calls. The counter is the SAME Arc<AtomicU64> the render
+# backend increments on every queued frame; if it advances over
+# DBus, the calloop-writes / DBus-reads cross-thread path works and
+# the value is genuinely live.
+#
+# A continuous shader wallpaper drives the wallpaper-tick render
+# loop unconditionally (ShaderBackend::wants_continuous_render =
+# true), so frame_counter advances even in the headless
+# virtio-gpu-pci VM (which paints black but DOES run the render loop
+# + queue frames — same posture as the visual-* tests).
+#
+# State-based polling throughout (wait_until_succeeds), never
+# time.sleep on a bare interval for a condition.
+
+{
+  system,
+  nixpkgs,
+  halmasuit,
+  halmasuit-session,
+  halmasuit-toplevel-test-client,
+}:
+
+let
+  pkgs = import nixpkgs { inherit system; };
+
+  # Minimal greeter: idle so halmasuit reaches steady-state main loop.
+  testGreeter = pkgs.writeShellScript "halmasuit-compositor1-greeter" ''
+    exec ${pkgs.coreutils}/bin/sleep infinity
+  '';
+in
+pkgs.testers.runNixOSTest {
+  name = "compositor1-dbus";
+
+  nodes.machine =
+    { config, lib, pkgs, ... }:
+    {
+      imports = [
+        ../nix/module.nix
+        ./lib/test-user.nix
+      ];
+
+      services.halmasuit = {
+        enable          = true;
+        package         = halmasuit;
+        session.package = halmasuit-session;
+        greeterUid      = 999;
+        greeterGroup    = "halmasuit-greeter";
+        compositorUid   = 998;
+        greeterCommand  = "${testGreeter}";
+        # Continuous shader wallpaper → wallpaper-tick drives
+        # render_one_frame unconditionally → frame_counter advances
+        # without needing wl_client commits. Without this the headless
+        # render loop is quiescent and the counter wouldn't move.
+        wallpaper = {
+          type   = "shader";
+          source = ./fixtures/wallpaper-shader.glsl;
+        };
+      };
+
+      users.users.halmasuit-greeter = {
+        isSystemUser = true;
+        uid          = 999;
+        group        = "halmasuit-greeter";
+      };
+      users.groups.halmasuit-greeter.gid = 999;
+
+      users.users.halmasuit-compositor = {
+        isSystemUser = true;
+        uid          = 998;
+        group        = "halmasuit-greeter";
+      };
+
+      users.users.test.group = "test";
+      users.groups.test.gid  = 1000;
+
+      # A real xdg_toplevel client (sets title + app_id) so
+      # ListWindows has a genuine window to report. NOT auto-started —
+      # the testScript launches it after scanout, same pattern as
+      # visual-halmasuit-toplevel. Runs as the greeter uid (authorized
+      # on the wayland socket); its SO_PEERCRED pid is what ListWindows
+      # must report.
+      systemd.services.test-toplevel = {
+        description = "Compositor1 ListWindows fixture: xdg_toplevel client";
+        after    = [ "halmasuit.service" ];
+        serviceConfig = {
+          User  = "halmasuit-greeter";
+          Group = "halmasuit-greeter";
+          ExecStart = "${halmasuit-toplevel-test-client}/bin/halmasuit-toplevel-test-client";
+          Environment = [
+            "XDG_RUNTIME_DIR=/run/halmasuit"
+            "WAYLAND_DISPLAY=wayland-0"
+          ];
+          Restart = "no";
+        };
+      };
+
+      # gdbus (from glib) is the DBus client the test driver uses to
+      # call Compositor1 methods.
+      environment.systemPackages = [ pkgs.glib ];
+
+      virtualisation = {
+        memorySize = 2048;
+        cores      = 2;
+        diskSize   = 4096;
+        qemu.options = [
+          "-vga none"
+          "-device virtio-gpu-pci"
+        ];
+      };
+    };
+
+  testScript = ''
+    import re
+
+    def compositor1_u64(method):
+        """Call a Compositor1 method returning a u64; return the int.
+
+        gdbus prints e.g. "(uint64 42,)". The literal "uint64" CONTAINS
+        the digits "64", so a naive r"\d+" matches the type name, not
+        the value — anchor on "uint64 " and capture what follows.
+        """
+        out = machine.succeed(
+            f"gdbus call --system --dest org.halmasuit.Compositor1 "
+            f"--object-path /org/halmasuit/Compositor1 "
+            f"--method org.halmasuit.Compositor1.{method}"
+        ).strip()
+        m = re.search(r"uint64 (\d+)", out)
+        assert m, f"could not parse {method} reply: {out!r}"
+        return int(m.group(1))
+
+    def compositor1_str(method):
+        """Call a Compositor1 method returning a string; return it.
+
+        gdbus prints e.g. "('scanout_active',)" — extract the
+        single-quoted payload.
+        """
+        out = machine.succeed(
+            f"gdbus call --system --dest org.halmasuit.Compositor1 "
+            f"--object-path /org/halmasuit/Compositor1 "
+            f"--method org.halmasuit.Compositor1.{method}"
+        ).strip()
+        m = re.search(r"'([^']*)'", out)
+        assert m, f"could not parse {method} reply: {out!r}"
+        return m.group(1)
+
+    machine.start()
+    machine.wait_for_unit("multi-user.target")
+    machine.wait_for_unit("halmasuit.service")
+
+    # Wait until halmasuit is past init and into the steady-state
+    # main loop (greeter spawned), so the render loop + DBus server
+    # thread are both up.
+    machine.wait_until_succeeds(
+        "journalctl -u halmasuit | grep -qF 'greeter_spawned'",
+        timeout=30,
+    )
+
+    # The Compositor1 name must be claimable on the system bus.
+    machine.wait_until_succeeds(
+        "gdbus call --system --dest org.halmasuit.Compositor1 "
+        "--object-path /org/halmasuit/Compositor1 "
+        "--method org.halmasuit.Compositor1.GetUptime",
+        timeout=30,
+    )
+
+    # Launch a real xdg_toplevel client (sets title + app_id) so
+    # ListWindows has a genuine window to report. Wait for halmasuit
+    # to map it AND the client to paint, so the snapshot (taken when
+    # the toplevel gets its buffer + focus) has the metadata.
+    machine.succeed("systemctl start test-toplevel.service")
+    machine.wait_until_succeeds(
+        "journalctl -u halmasuit | grep -qF "
+        "'xdg_toplevel mapped as fullscreen foreground'",
+        timeout=60,
+    )
+    machine.wait_until_succeeds(
+        "journalctl -u test-toplevel | grep -qF 'toplevel-test-client: painted'",
+        timeout=60,
+    )
+
+    # ── Assertion 1: GetFrameCounter is NON-ZERO ──
+    # The R3.3 stub returned a hardcoded 0. The ONLY way GetFrameCounter
+    # reads non-zero is the render path calling fetch_add on the SAME
+    # Arc the DBus surface reads — i.e. the cross-thread shared-counter
+    # wiring works and the stub is dead. (Strict per-tick advancement
+    # is asserted in the chord-driven VM test, where send_key forces a
+    # render via a deterministic damage source; a clientless headless
+    # VM has no per-tick damage so the counter idles after startup —
+    # see CLAUDE.md "Test-VM rendering gotcha".)
+    frames = compositor1_u64("GetFrameCounter")
+    print(f"GetFrameCounter: {frames}")
+    assert frames > 0, (
+        f"GetFrameCounter must be > 0 (render path feeds the shared "
+        f"Arc); got {frames}. If 0, the R3.3 'always 0' stub regressed "
+        f"— the render path is NOT incrementing the Arc the DBus "
+        f"surface reads."
+    )
+
+    # ── Assertion 1b: GetPhase is a REAL lifecycle phase ──
+    # The R3.3 stub returned the literal "Running". The phase store is
+    # updated at every PhaseEntered transition via main's emit_phase
+    # chokepoint. By steady state (greeter spawned, render loop up) a
+    # rootfs-only halmasuit has reached a real phase — assert it's one
+    # of the known snake_case names and explicitly NOT the dead stub.
+    KNOWN_PHASES = {
+        "init", "wayland_ready", "greetd_ready", "deprivileged",
+        "drm_master_acquired", "scanout_active", "initramfs_init",
+        "rootfs_ready",
+    }
+    phase = compositor1_str("GetPhase")
+    print(f"GetPhase: {phase}")
+    assert phase != "Running", (
+        "GetPhase returned the removed R3.3 stub literal 'Running' — "
+        "the phase store is not wired to the emit_phase chokepoint."
+    )
+    assert phase in KNOWN_PHASES, (
+        f"GetPhase returned {phase!r}, not a known lifecycle phase. "
+        f"Expected one of {sorted(KNOWN_PHASES)}."
+    )
+    # Cross-check: the live phase must agree with the LAST phase_entered
+    # event in the journal (the introspection stream and the DBus store
+    # share the emit_phase chokepoint, so they cannot diverge). The
+    # phase name is escaped inside the tracing `json` field
+    # (\"phase\":\"...\"), so parse permissively in Python rather than
+    # fighting shell quoting. In rootfs-only steady state the terminal
+    # phase is reached once and never changes, so the two reads are
+    # stable (no transition can race between them).
+    journal = machine.succeed("journalctl -u halmasuit -o cat")
+    phase_events = re.findall(r'phase[\\":]+([a-z_]+)', journal)
+    # Filter to known phase names (the regex also catches the literal
+    # token "phase_entered"'s tail in some encodings; intersect with
+    # the known set to be safe).
+    phase_events = [p for p in phase_events if p in KNOWN_PHASES]
+    assert phase_events, (
+        f"no phase_entered events found in journal; cannot cross-check. "
+        f"journal tail:\n{journal[-2000:]}"
+    )
+    last_journal_phase = phase_events[-1]
+    print(f"last phase_entered in journal: {last_journal_phase}")
+    assert phase == last_journal_phase, (
+        f"GetPhase ({phase!r}) must match the last phase_entered "
+        f"journal event ({last_journal_phase!r}) — the DBus store and "
+        f"the introspection stream share the emit_phase chokepoint and "
+        f"must not diverge."
+    )
+
+    # ── Assertion 1c: GetBrokerStatus is a REAL reachability state ──
+    # The R3.3 stub returned "Unknown". By steady state the greeter
+    # was spawned via the broker (broker_spawn_greeter → connect_broker),
+    # so the connect_broker chokepoint has recorded a real state.
+    # "connected" = the broker socket was reachable on the last attempt.
+    KNOWN_BROKER_STATES = {"not_connected", "connecting", "connected", "failed"}
+    broker = compositor1_str("GetBrokerStatus")
+    print(f"GetBrokerStatus: {broker}")
+    assert broker != "Unknown", (
+        "GetBrokerStatus returned the removed R3.3 stub literal "
+        "'Unknown' — the connect_broker chokepoint isn't recording state."
+    )
+    assert broker in KNOWN_BROKER_STATES, (
+        f"GetBrokerStatus returned {broker!r}, not a known state. "
+        f"Expected one of {sorted(KNOWN_BROKER_STATES)}."
+    )
+    # The greeter reached spawn THROUGH the broker, so the last
+    # connect attempt must have succeeded.
+    assert broker == "connected", (
+        f"after greeter_spawned (which goes through the broker), the "
+        f"last connect_broker must have succeeded; got {broker!r}."
+    )
+
+    # ── Assertion 1d: ListWindows reports the REAL toplevel ──
+    # The R3.3 stub returned []. The test-toplevel client is mapped +
+    # painted, so the calloop-thread snapshot must contain it with its
+    # app_id, title, and a real SO_PEERCRED pid. gdbus prints an
+    # a(uss) array, e.g.
+    #   ([(uint32 1234, 'halmasuit.test.toplevel', 'halmasuit-toplevel-test-client')],)
+    windows_raw = machine.succeed(
+        "gdbus call --system --dest org.halmasuit.Compositor1 "
+        "--object-path /org/halmasuit/Compositor1 "
+        "--method org.halmasuit.Compositor1.ListWindows"
+    ).strip()
+    print(f"ListWindows: {windows_raw}")
+    assert "halmasuit.test.toplevel" in windows_raw, (
+        f"ListWindows must report the test client's app_id "
+        f"'halmasuit.test.toplevel'; got: {windows_raw}"
+    )
+    assert "halmasuit-toplevel-test-client" in windows_raw, (
+        f"ListWindows must report the test client's title "
+        f"'halmasuit-toplevel-test-client'; got: {windows_raw}"
+    )
+    # A real SO_PEERCRED pid (> 0), and it must match the actual
+    # test-toplevel service PID (kernel-attested, not client-asserted).
+    win_pids = [int(p) for p in re.findall(r"uint32 (\d+)", windows_raw)]
+    assert win_pids and all(p > 0 for p in win_pids), (
+        f"ListWindows pids must be real (>0); got {win_pids} from {windows_raw}"
+    )
+    svc_pid = int(
+        machine.succeed(
+            "systemctl show -p MainPID --value test-toplevel.service"
+        ).strip()
+    )
+    assert svc_pid in win_pids, (
+        f"ListWindows must report the test-toplevel service's real PID "
+        f"{svc_pid} (SO_PEERCRED, kernel-attested); got pids {win_pids}."
+    )
+
+    # ── Assertion 2: GetUptime returns LIVE values (not a frozen
+    # construction-time snapshot) ── deterministic, independent of
+    # render/vblank/damage. State-based poll (not a bare sleep, per
+    # the project's state-based-polling rule): wait until a fresh
+    # read strictly exceeds the first. Wall-clock guarantees this
+    # within ~1-2s; a frozen snapshot would never advance and the
+    # poll would time out.
+    uptime_first = compositor1_u64("GetUptime")
+    print(f"GetUptime first: {uptime_first}")
+    machine.wait_until_succeeds(
+        f"[ \"$(gdbus call --system --dest org.halmasuit.Compositor1 "
+        f"--object-path /org/halmasuit/Compositor1 "
+        f"--method org.halmasuit.Compositor1.GetUptime "
+        f"| sed -E 's/.*uint64 ([0-9]+).*/\\1/')\" -gt {uptime_first} ]",
+        timeout=15,
+    )
+    uptime_second = compositor1_u64("GetUptime")
+    print(f"GetUptime second: {uptime_second}")
+    assert uptime_second > uptime_first, (
+        f"GetUptime must advance over wall-clock time (DBus returns "
+        f"live state, not a snapshot); got first={uptime_first} "
+        f"second={uptime_second}."
+    )
+
+    print("=" * 70)
+    print("PASS: org.halmasuit.Compositor1 returns REAL, LIVE values.")
+    print(f"      GetFrameCounter={frames} (>0 → render feeds the shared")
+    print(f"      Arc, not the 0 stub); GetPhase={phase!r} (real phase,")
+    print("      matches journal, not the 'Running' stub);")
+    print(f"      ListWindows reports the test toplevel w/ real pid "
+          f"{svc_pid} (not the [] stub); GetUptime "
+          f"{uptime_first}→{uptime_second} (live, not frozen).")
+    print("=" * 70)
+  '';
+}

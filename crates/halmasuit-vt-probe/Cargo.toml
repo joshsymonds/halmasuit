@@ -1,0 +1,28 @@
+[package]
+name        = "halmasuit-vt-probe"
+description = "Research probe (Epic #71 Phase 0): validate inherited-fd + TIOCSCTTY + VT_RELDISP without CAP_SYS_TTY_CONFIG. Not production code; the production VT-switching path lives in halmasuit-session (broker) + halmasuit (compositor)."
+
+version.workspace      = true
+edition.workspace      = true
+# Same MSRV relaxation rationale as the other probes: probes build under
+# nixpkgs's pinned rustc and we don't want the probe to gate on
+# workspace-wide MSRV bumps.
+rust-version           = "1.87"
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# signalfd, sigprocmask, poll, setsid, setresuid, setresgid, getpwnam.
+nix = { version = "0.30", features = ["signal", "poll", "user", "fs"] }
+# Capability-bounding-set drop + verification. Matches the dependency
+# halmasuit's main daemon uses for the in-process privilege drop.
+caps = "0.5"
+# Error-context plumbing. Same as halmasuit-shutdown-probe.
+anyhow = "1"
+# Raw libc constants/types for VT ioctls. nix doesn't expose all of
+# linux/vt.h, so we wrap a few ioctls by hand.
+libc = "0.2"

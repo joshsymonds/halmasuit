@@ -11,6 +11,10 @@
 //! Same clean-room posture as `halmasuit-greetd`: the shapes are owned
 //! here and pinned by the `wire_format_*` drift tests, so an accidental
 //! change to the contract fails CI.
+//!
+//! VT switching is NOT on this wire: halmasuit owns its home VT directly
+//! (opened in its root startup window, the home-VT model in
+//! `halmasuit/src/vt_switch.rs`), so the broker has no VT role.
 
 #![forbid(unsafe_code)]
 
