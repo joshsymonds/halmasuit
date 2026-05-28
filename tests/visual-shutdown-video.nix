@@ -141,6 +141,11 @@ pkgs.testers.runNixOSTest {
         # shape (low distinct count, high pairwise Hamming).
         phash_min_distinct=3,
         phash_min_hamming_max=20,
+        # The decoder relay produces frames asynchronously; gate
+        # shutdown on observing at least one non-zero phash so the
+        # phash-progression assertion isn't racing the cold-start
+        # window of all-black placeholder frames.
+        wait_for_nonzero_phash=True,
     )
   '';
 }

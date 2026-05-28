@@ -33,6 +33,16 @@
 #     Shader cell uses (3, 8); video uses (3, 20) — testsrc's 8x8
 #     phash quantizes to ~5-6 buckets but with large Hamming spread.
 #     Image cell passes None for both (no animation).
+#   - `wait_for_nonzero_phash` (bool): before machine.shutdown(),
+#     poll the journal for a `frame_rendered` event whose `phash`
+#     field is non-zero. Defeats a startup race observed in the
+#     video cell: if the decoder relay hasn't produced its first
+#     non-black frame before shutdown begins, the captured event
+#     window can contain only all-zero phashes and the
+#     phash-progression assertion sees < min_distinct buckets.
+#     Video cell enables; shader cell doesn't need it (the shader
+#     renders synchronously and the first frame already varies);
+#     image cell doesn't need it (no animation).
 #
 # The session_cmd path is interpolated at Nix evaluation time and
 # passed in by each cell; this module never imports Nix paths.
@@ -54,6 +64,7 @@ def run(
     assert_frame_advancement: bool = False,
     phash_min_distinct: int | None = None,
     phash_min_hamming_max: int | None = None,
+    wait_for_nonzero_phash: bool = False,
 ) -> None:
     """Drive the boot → auth → niri → shutdown sequence and assert
     the matrix-shared survival invariants. See module docstring.
@@ -92,6 +103,33 @@ def run(
         "systemctl show -p MainPID --value halmasuit.service"
     ).strip()
     print(f"PASS: halmasuit pid {halmasuit_pid} with niri session up")
+
+    # ── Optional: wait for first non-zero phash before shutdown ───
+    # Video cell's decoder relay produces its first decoded frame
+    # asynchronously after halmasuit comes up; if shutdown is
+    # triggered before that, the captured event window may contain
+    # only all-zero phashes (frame_rendered for the placeholder
+    # black framebuffer) and the phash-progression assertion sees
+    # < min_distinct buckets. Polling the journal for at least one
+    # `frame_rendered ... phash=<non-zero>` line converts this race
+    # into a deterministic gate.
+    if wait_for_nonzero_phash:
+        # halmasuit's tracing output wraps the event JSON inside an
+        # outer envelope: `"json":"{\"event\":\"frame_rendered\",
+        # ...,\"phash\":<int>}"`. The inner `phash` field is
+        # escaped-JSON-in-JSON, so the literal text in journalctl
+        # output is `\"phash\":<digits>`. Match any non-zero phash:
+        # exclude `\"phash\":0\b` and require a digit follows.
+        machine.wait_until_succeeds(
+            "journalctl -u halmasuit -o cat "
+            "| grep -E 'frame_rendered.*\\\\\"phash\\\\\":[1-9]' "
+            "| head -n 1 | grep -q .",
+            timeout=30,
+        )
+        print(
+            f"PASS: at least one frame_rendered event with non-zero phash "
+            f"observed before shutdown ({cell_name})"
+        )
 
     # ── Optional pre-shutdown assertion (e.g. SSIMULACRA2 golden) ──
     if pre_shutdown_hook is not None:
