@@ -151,6 +151,60 @@ pkgs.testers.runNixOSTest {
         "__GLX_VENDOR_LIBRARY_NAME=nvidia missing from initramfs unit"
     )
 
+    # ─ Assert the nvidia-devnodes ExecStartPre is wired ─────────────
+    # The nvidia branch's mknod helper script runs before halmasuit's
+    # main process to pre-create /dev/nvidiactl + /dev/nvidia* in
+    # initramfs (the gnomon 2026-05-28 gen-382 failure mode: nvidia
+    # kernel modules don't auto-create those nodes, NixOS udev rules
+    # are rootfs-only and PATH-dependent, libEGL_nvidia silently
+    # skips its EGL platform registration without them).
+    import re
+    devnodes_re = re.compile(
+        r'ExecStartPre=(\S*halmasuit-nvidia-devnodes\S*)'
+    )
+    m = devnodes_re.search(initrd_unit)
+    assert m, (
+        "initramfs halmasuit.service is missing the nvidia-devnodes "
+        f"ExecStartPre line. Unit text:\n{initrd_unit}"
+    )
+    devnodes_script = m.group(1)
+
+    # ─ Assert the devnodes script is actually IN the initramfs ─────
+    # This is the gen-383 regression gate. systemd died there with
+    # status=203/EXEC because the unit referenced a /nix/store path
+    # that wasn't baked into the initramfs closure (NixOS's
+    # initrd-builder follows storePaths' transitive closure, NOT
+    # arbitrary references discovered by scanning unit text). The
+    # check: extract the initramfs cpio, list its contents, verify
+    # the script's store path appears.
+    initrd_file = machine.succeed(
+        "readlink -f /run/booted-system/initrd"
+    ).strip()
+
+    # NixOS systemd initramfs is two concatenated cpios: a tiny
+    # microcode cpio (~300 KB) followed by a zstd-compressed cpio
+    # carrying the actual rootfs. The zstd magic `28 b5 2f fd`
+    # marks the second segment. Find it by scanning, then list.
+    listing_cmd = (
+        f"python3 -c \"import sys\n"
+        f"with open('{initrd_file}', 'rb') as f: data = f.read()\n"
+        f"i = data.find(b'\\x28\\xb5\\x2f\\xfd')\n"
+        f"sys.stdout.buffer.write(data[i:])\" | "
+        f"zstd -dc | cpio -t 2>/dev/null"
+    )
+    initrd_contents = machine.succeed(listing_cmd)
+
+    # The ExecStartPre value is an absolute /nix/store path; the
+    # cpio listing has paths relative to /. Strip the leading slash
+    # for the membership check.
+    script_in_cpio = devnodes_script.lstrip("/")
+    assert script_in_cpio in initrd_contents, (
+        f"nvidia-devnodes script {devnodes_script!r} is referenced by "
+        f"ExecStartPre but NOT present in the initramfs cpio. This is "
+        f"the gen-383 regression: storePaths missing the script.\n"
+        f"Initramfs file count: {len(initrd_contents.splitlines())}"
+    )
+
     print("halmasuit-nvidia-egl-env: PASS")
   '';
 }
