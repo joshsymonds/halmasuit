@@ -773,6 +773,7 @@
           inherit nixpkgs;
           halmasuit            = self.packages.x86_64-linux.halmasuit;
           halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-luks       = self.packages.x86_64-linux.halmasuit-luks;
         };
         # Epic #1 R12: first real-PAM gate. run_pam_auth against the
         # real libpam stack with the real test user — NO mock.

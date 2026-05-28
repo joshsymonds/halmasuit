@@ -8,7 +8,16 @@ default:
 # ── Top-level gates ─────────────────────────────────────────────────────────
 
 # Full local CI gate. Run before every push.
-check: lint r14-gate vis-selftest test
+check: lint r14-gate vis-selftest nvidia-egl-env-gate test
+
+# Pure Nix-eval structural gate: asserts the halmasuit module's
+# nvidia branch produces the expected unit shape — env vars, the
+# nvidia-devnodes ExecStartPre, AND that the devnodes script is in
+# `boot.initrd.systemd.storePaths` (gen-383 regression class). Fast
+# (~3s eval, no VM); see tests/halmasuit-nvidia-egl-env.nix for the
+# full list of structural invariants under check.
+nvidia-egl-env-gate:
+    nix build .#checks.x86_64-linux.halmasuit-nvidia-egl-env -L --print-build-logs --no-link
 
 # R14 epic close-gate (Amendment A9 fold-in, review G3/F3): the
 # unprivileged compositor must never transitively link libpam. Exactly
@@ -73,9 +82,6 @@ test-vm:
     echo
     echo "── halmasuit-multi-drm-auto ──"
     nix build .#checks.x86_64-linux.halmasuit-multi-drm-auto -L --print-build-logs --no-link
-    echo
-    echo "── halmasuit-nvidia-egl-env ──"
-    nix build .#checks.x86_64-linux.halmasuit-nvidia-egl-env -L --print-build-logs --no-link
     echo
     echo "── initrd-survival ──"
     nix build .#checks.x86_64-linux.initrd-survival -L --print-build-logs --no-link
