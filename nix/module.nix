@@ -421,6 +421,73 @@ in
       };
     };
 
+    rendering = {
+      backend = lib.mkOption {
+        type        = lib.types.enum [ "software" "mesa" "nvidia" ];
+        default     = "software";
+        description = ''
+          Which rendering backend halmasuit's smithay GLES +
+          DrmCompositor runs against.
+
+          `software` (default) — forces Mesa llvmpipe via
+          `LIBGL_ALWAYS_SOFTWARE=1`; Mesa + libglvnd baked into
+          initramfs storePaths. Used by halmasuit's headless VM
+          test matrix; safe on any host but rendering is CPU-only.
+
+          `mesa` — drops `LIBGL_ALWAYS_SOFTWARE`; keeps Mesa +
+          libglvnd in initramfs. Right for real-hardware AMD /
+          Intel deployments where Mesa is the GPU driver.
+
+          `nvidia` — drops `LIBGL_ALWAYS_SOFTWARE`; swaps initramfs
+          storePaths from `${pkgs.mesa}` to
+          `${cfg.rendering.nvidiaPackage}`; sets
+          `__GLX_VENDOR_LIBRARY_NAME=nvidia` and
+          `__EGL_VENDOR_LIBRARY_FILENAMES` so libglvnd dispatches
+          through the NVIDIA proprietary ICD. Consumers needing
+          additional NVIDIA closures (egl-wayland, egl-gbm) add
+          them via `rendering.extraInitrdStorePaths` — the module
+          stays generic to the choice of platform plugin set. The
+          `nvidia-drm` runtime path is NOT exercised by any
+          halmasuit VM test (research established no single-GPU
+          passthrough route on consumer Blackwell); validation
+          happens at deploy-time on the consumer's actual
+          hardware, gated by bootloader rollback.
+        '';
+      };
+
+      nvidiaPackage = lib.mkOption {
+        type        = lib.types.nullOr lib.types.package;
+        default     = config.hardware.nvidia.package or null;
+        defaultText = lib.literalExpression "config.hardware.nvidia.package";
+        description = ''
+          The NVIDIA proprietary driver package
+          (`pkgs.linuxPackages.nvidiaPackages.*` or equivalent)
+          baked into the initramfs storePaths when
+          `rendering.backend = "nvidia"`. Defaults to
+          `config.hardware.nvidia.package` so most consumers do
+          not need to set this. `null` is rejected by an
+          assertion when the nvidia backend is selected.
+        '';
+      };
+
+      extraInitrdStorePaths = lib.mkOption {
+        type        = lib.types.listOf lib.types.path;
+        default     = [];
+        example     = lib.literalExpression ''
+          [
+            "''${pkgs.egl-wayland}"
+            "''${pkgs.egl-gbm}"
+          ]
+        '';
+        description = ''
+          Additional store paths to bake into halmasuit's
+          initramfs closure. Escape hatch for vendor ICDs,
+          egl-platform plugins, glvnd manifests, or other
+          runtime deps not covered by the chosen `backend`.
+        '';
+      };
+    };
+
     luks = {
       package = lib.mkOption {
         type        = lib.types.package;
@@ -711,17 +778,14 @@ in
         # broker socket defaults to /run/halmasuit-session.sock — the
         # ListenSequentialPacket the broker unit binds below — so no
         # HALMASUIT_BROKER_SOCKET override is needed here.
-        # Force Mesa to use llvmpipe (software rasterizer) until the
-        # epic's real-hardware shakedown subtask validates virgl /
-        # native GPU paths on gnomon. Deterministic, doesn't need
-        # virtio-gpu-gl or host EGL backend, and produces stable
-        # goldens.
-        LIBGL_ALWAYS_SOFTWARE = "1";
         # NixOS routes runtime OpenGL through /run/opengl-driver/lib.
         # halmasuit's binary has libglvnd's lib dir in RPATH (via the
         # halmasuit derivation's postFixup) but Mesa's DRI driver
         # (dri_gbm.so) still loads from the dlopen search path. The
         # libglvnd dispatch also looks here for vendor JSON.
+        # /run/opengl-driver is vendor-aware on rootfs (NixOS's
+        # hardware.graphics machinery wires the correct driver in),
+        # so the same path works for software / mesa / nvidia.
         LD_LIBRARY_PATH = "/run/opengl-driver/lib";
         # R8b-render — xcursor theme + size for halmasuit's visible
         # cursor render path. Propagated through the broker
@@ -729,6 +793,21 @@ in
         # renders the same theme. See `services.halmasuit.cursor`.
         XCURSOR_THEME = cfg.cursor.theme;
         XCURSOR_SIZE  = toString cfg.cursor.size;
+      } // lib.optionalAttrs (cfg.rendering.backend == "software") {
+        # Software backend: force Mesa llvmpipe. Deterministic;
+        # doesn't need virtio-gpu-gl or a host EGL backend;
+        # produces stable goldens. Default for the headless VM
+        # test matrix.
+        LIBGL_ALWAYS_SOFTWARE = "1";
+      } // lib.optionalAttrs (cfg.rendering.backend == "nvidia") {
+        # libglvnd dispatch: route GLX/EGL via the NVIDIA ICD
+        # rather than Mesa. The manifest path is inside the nvidia
+        # driver closure; the storePaths block below bakes the
+        # closure into initramfs so this env path resolves
+        # cross-pivot.
+        __GLX_VENDOR_LIBRARY_NAME = "nvidia";
+        __EGL_VENDOR_LIBRARY_FILENAMES =
+          "${cfg.rendering.nvidiaPackage}/share/glvnd/egl_vendor.d/10_nvidia.json";
       } // lib.optionalAttrs (cfg.greeterCommand != null) {
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.
@@ -811,6 +890,26 @@ in
        description  = lib.mkDefault "halmasuit greeter peer (SO_PEERCRED-authorized greetd client)";
      };
      users.groups.${cfg.greeterGroup}.gid = lib.mkDefault cfg.greeterUid;
+   })
+
+   # Rendering-backend assertion: the nvidia variant requires a
+   # resolved nvidiaPackage. The option defaults to
+   # `config.hardware.nvidia.package or null`, so this catches the
+   # "enabled nvidia rendering on a host without hardware.nvidia.*"
+   # misconfiguration before runtime.
+   (lib.mkIf ((cfg.enable || cfg.fromInitrd.enable) && cfg.rendering.backend == "nvidia") {
+     assertions = [
+       {
+         assertion = cfg.rendering.nvidiaPackage != null;
+         message   = ''
+           services.halmasuit.rendering.backend = "nvidia" requires
+           services.halmasuit.rendering.nvidiaPackage to resolve to
+           a package. Defaults to config.hardware.nvidia.package;
+           either enable hardware.nvidia.* on this host (which sets
+           that default) or pass an explicit nvidiaPackage.
+         '';
+       }
+     ];
    })
 
    # Epic #1 R6 / Amendment A2: the socket-activated privileged broker.
@@ -1080,10 +1179,13 @@ in
      boot.initrd.systemd.storePaths = [
        "${cfg.package}/bin/halmasuit"
        "${cfg.luks.package}/bin/halmasuit-luks"
-       "${pkgs.mesa}"
        "${pkgs.libglvnd}"
        "${pkgs.xkeyboard-config}"
-     ] ++ lib.optionals (cfg.wallpaper != null) [
+     ] ++ (if cfg.rendering.backend == "nvidia"
+           then [ "${cfg.rendering.nvidiaPackage}" ]
+           else [ "${pkgs.mesa}" ])
+       ++ cfg.rendering.extraInitrdStorePaths
+       ++ lib.optionals (cfg.wallpaper != null) [
        # Wallpaper assets must be in the initramfs closure so the
        # wallpaper plane can composite from frame 0 (G1/R3 — no
        # pre-client solid phase). `cfg.wallpaper.source` is the
@@ -1144,9 +1246,10 @@ in
          #    that ignores `LIBGL_DRIVERS_PATH`. The rootfs systemd
          #    activation script (hardware.graphics.enable) builds the
          #    symlink farm at rootfs boot; in initramfs that activation
-         #    never runs. Pointing at `${pkgs.mesa}` satisfies the loader
-         #    because its `lib/gbm/dri_gbm.so` is in the initramfs
-         #    storePaths closure.
+         #    never runs. The symlink target tracks the rendering
+         #    backend: Mesa for software/mesa, the NVIDIA proprietary
+         #    closure for nvidia (which provides its own GBM backend
+         #    under `lib/gbm/`).
          # 2. `/run/halmasuit/`. The Wayland socket lives here per
          #    XDG_RUNTIME_DIR. Created by mkdir rather than
          #    `RuntimeDirectory=` — `RuntimeDirectory=` makes systemd
@@ -1155,8 +1258,13 @@ in
          #    post-pivot and breaks halmasuit's survival (the probe in
          #    drm-master-probe-phase2 doesn't use `RuntimeDirectory=`
          #    and survives cleanly).
-         ExecStartPre = [
-           "${pkgs.coreutils}/bin/ln -sfn ${pkgs.mesa} /run/opengl-driver"
+         ExecStartPre = let
+           glDriverTarget =
+             if cfg.rendering.backend == "nvidia"
+             then "${cfg.rendering.nvidiaPackage}"
+             else "${pkgs.mesa}";
+         in [
+           "${pkgs.coreutils}/bin/ln -sfn ${glDriverTarget} /run/opengl-driver"
            "${pkgs.coreutils}/bin/mkdir -p /run/halmasuit"
          ];
          ExecStart      = lib.getExe cfg.package;
@@ -1269,13 +1377,29 @@ in
          HALMASUIT_COMPOSITOR_GID = toString config.users.groups.${cfg.greeterGroup}.gid;
          HALMASUIT_PAM_SERVICE    = cfg.pamService;
 
-         # Mesa runtime. /run/opengl-driver symlink is created by the
-         # ExecStartPre above; LD_LIBRARY_PATH carries libglvnd's
-         # libEGL/libGL dispatch and Mesa's libgallium.
-         # llvmpipe is forced for the VM-test virtio-gpu-pci substrate
-         # (matches the rootfs unit's LIBGL_ALWAYS_SOFTWARE=1).
+         # GL runtime. /run/opengl-driver symlink is created by the
+         # ExecStartPre above (points at pkgs.mesa); LD_LIBRARY_PATH
+         # carries libglvnd's libEGL/libGL dispatch and the chosen
+         # backend's vendor library directory. The initramfs has no
+         # NixOS hardware.graphics machinery, so the vendor library
+         # path is selected here based on rendering.backend.
+         LD_LIBRARY_PATH =
+           if cfg.rendering.backend == "nvidia"
+           then "${pkgs.libglvnd}/lib:${cfg.rendering.nvidiaPackage}/lib"
+           else "${pkgs.libglvnd}/lib:${pkgs.mesa}/lib";
+       } // lib.optionalAttrs (cfg.rendering.backend == "software") {
+         # Software backend: force Mesa llvmpipe. Matches the
+         # rootfs unit's same conditional; mandatory for the
+         # VM-test virtio-gpu-pci substrate.
          LIBGL_ALWAYS_SOFTWARE = "1";
-         LD_LIBRARY_PATH       = "${pkgs.libglvnd}/lib:${pkgs.mesa}/lib";
+       } // lib.optionalAttrs (cfg.rendering.backend == "nvidia") {
+         # libglvnd dispatch through the NVIDIA proprietary ICD.
+         # The manifest paths resolve to the
+         # `cfg.rendering.nvidiaPackage` closure baked into the
+         # initramfs storePaths block below.
+         __GLX_VENDOR_LIBRARY_NAME = "nvidia";
+         __EGL_VENDOR_LIBRARY_FILENAMES =
+           "${cfg.rendering.nvidiaPackage}/share/glvnd/egl_vendor.d/10_nvidia.json";
        } // lib.optionalAttrs (cfg.greeterCommand != null) {
          # Greeter binary halmasuit fork+execs post-pivot.
          HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
