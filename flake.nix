@@ -761,6 +761,18 @@
           expectedPath = "/dev/dri/card0";
           testName     = "auto";
         };
+        # Multi-output kernel-clone gate (Epic #15 subtask #19/#20). One
+        # virtio-gpu device with max_outputs=2 → two connectors on one
+        # DRM card. Asserts halmasuit's enumeration + cloned_connectors=2
+        # log line. Cannot validate the NVIDIA kernel-clone end-to-end
+        # in CI (no passthrough), but pins the halmasuit-side logic.
+        halmasuit-multi-output = import ./tests/halmasuit-multi-output.nix {
+          system    = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit            = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client  = self.packages.x86_64-linux.halmasuit-vm-client;
+        };
         # NVIDIA-EGL env shape regression gate. Cannot replicate the
         # actual NVIDIA failure in CI (no single-GPU passthrough on
         # consumer Blackwell); asserts the UNIT shape — that

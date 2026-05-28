@@ -661,6 +661,62 @@ impl WallpaperTickAction {
     }
 }
 
+/// Map a drm-rs `Interface` enum variant to the canonical Wayland
+/// short-name prefix that compositors surface to users ("DP" for
+/// DisplayPort, "HDMI-A" for HDMI Type-A, "eDP" for embedded
+/// DisplayPort, etc.). Lives in a pure helper so unit tests can pin
+/// the mapping without needing a real `connector::Info` (which is
+/// opaque / kernel-supplied).
+///
+/// Follows libdrm's `drmModeGetConnectorName` convention — matches
+/// `wlr-randr`, `niri msg outputs`, and the major compositors.
+const fn interface_prefix(
+    iface: smithay::reexports::drm::control::connector::Interface,
+) -> &'static str {
+    use smithay::reexports::drm::control::connector::Interface;
+    match iface {
+        Interface::DisplayPort => "DP",
+        Interface::HDMIA => "HDMI-A",
+        Interface::HDMIB => "HDMI-B",
+        Interface::DVII => "DVI-I",
+        Interface::DVID => "DVI-D",
+        Interface::DVIA => "DVI-A",
+        Interface::VGA => "VGA",
+        Interface::EmbeddedDisplayPort => "eDP",
+        Interface::Composite => "Composite",
+        Interface::SVideo => "SVIDEO",
+        Interface::LVDS => "LVDS",
+        Interface::Component => "Component",
+        Interface::NinePinDIN => "DIN",
+        Interface::DSI => "DSI",
+        Interface::DPI => "DPI",
+        Interface::Writeback => "Writeback",
+        Interface::SPI => "SPI",
+        Interface::USB => "USB",
+        Interface::TV => "TV",
+        Interface::Virtual => "Virtual",
+        // `Interface::Unknown` AND any future `#[non_exhaustive]`
+        // additions (DisplayPort-MST, VirtIO, etc.) collapse to
+        // "Unknown" — a new drm-rs variant won't break the build,
+        // and users see the actual name via the journal's
+        // `available` list when matching fails.
+        _ => "Unknown",
+    }
+}
+
+/// Render a DRM connector's `(interface, interface_id)` as the
+/// canonical Wayland short-name ("DP-3", "HDMI-A-1", "eDP-1", etc.).
+/// Used to match against `services.halmasuit.rendering.primaryOutput`
+/// (env `HALMASUIT_PRIMARY_OUTPUT`) when selecting which connector
+/// should lead the multi-connector clone.
+fn connector_short_name(info: &connector::Info) -> String {
+    format!(
+        "{}-{}",
+        interface_prefix(info.interface()),
+        info.interface_id()
+    )
+}
+
 /// Set up the full DRM/GBM/EGL/GLES/DrmCompositor stack by opening the
 /// DRM device at `path` directly and issuing `DRM_IOCTL_SET_MASTER`
 /// ourselves. halmasuit is a system compositor: it owns master for its
@@ -778,12 +834,44 @@ where
         .resource_handles()
         .map_err(|e| io::Error::other(format!("resource_handles: {e}")))?;
 
-    let connected: Vec<_> = res
+    let mut connected: Vec<_> = res
         .connectors()
         .iter()
         .filter_map(|&h| drm.get_connector(h, true).ok())
         .filter(|info| info.state() == connector::State::Connected)
         .collect();
+
+    // Honor `services.halmasuit.rendering.primaryOutput` (env
+    // HALMASUIT_PRIMARY_OUTPUT). When set to a connector short-name
+    // like "DP-3", reorder `connected` so the matching connector is
+    // first. The rest of the pipeline takes its first element as the
+    // canonical mode source AND the lead handle in the clone list, so
+    // a swap-to-front is sufficient. When the env is unset or doesn't
+    // match any connected connector, fall back to enumeration order
+    // (the same single-monitor behavior we always had).
+    if let Ok(want) = std::env::var("HALMASUIT_PRIMARY_OUTPUT") {
+        if let Some(idx) = connected
+            .iter()
+            .position(|info| connector_short_name(info) == want)
+        {
+            if idx != 0 {
+                connected.swap(0, idx);
+            }
+            tracing::info!(
+                target: "halmasuit",
+                primary = %want,
+                "primary output pinned"
+            );
+        } else {
+            let available: Vec<_> = connected.iter().map(connector_short_name).collect();
+            tracing::warn!(
+                target: "halmasuit",
+                requested = %want,
+                ?available,
+                "HALMASUIT_PRIMARY_OUTPUT not found among connected connectors; using enumeration order"
+            );
+        }
+    }
 
     let connector_info = connected
         .first()
@@ -1532,6 +1620,27 @@ mod tests {
         assert!(color.g().abs() < eps);
         assert!((color.b() - f32::from(0x14_u8) / 255.0).abs() < eps);
         assert!((color.a() - 1.0).abs() < eps);
+    }
+
+    /// Pin the connector Interface → short-name prefix table used by
+    /// `services.halmasuit.rendering.primaryOutput` matching. The
+    /// exact spellings come from libdrm's drmModeGetConnectorName +
+    /// what wlr-randr / niri surface; users will type these in their
+    /// config so they must not drift.
+    #[test]
+    fn interface_prefix_pins_canonical_wayland_short_names() {
+        use smithay::reexports::drm::control::connector::Interface;
+        assert_eq!(interface_prefix(Interface::DisplayPort), "DP");
+        assert_eq!(interface_prefix(Interface::HDMIA), "HDMI-A");
+        assert_eq!(interface_prefix(Interface::HDMIB), "HDMI-B");
+        assert_eq!(interface_prefix(Interface::EmbeddedDisplayPort), "eDP");
+        assert_eq!(interface_prefix(Interface::DVII), "DVI-I");
+        assert_eq!(interface_prefix(Interface::DVID), "DVI-D");
+        assert_eq!(interface_prefix(Interface::VGA), "VGA");
+        assert_eq!(interface_prefix(Interface::Virtual), "Virtual");
+        // Unknown is the explicit fallback both for the named variant
+        // and for any future #[non_exhaustive] additions.
+        assert_eq!(interface_prefix(Interface::Unknown), "Unknown");
     }
 
     // The wallpaper z-order contract is unit-tested by

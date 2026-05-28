@@ -668,6 +668,35 @@ in
           healthy halmasuit.
         '';
       };
+
+      primaryOutput = lib.mkOption {
+        type    = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "DP-3";
+        description = ''
+          Canonical Wayland short-name of the connector that should
+          be treated as the primary in halmasuit's multi-connector
+          kernel-clone scanout. Its mode becomes the cloned mode;
+          its handle leads the clone list. Other connected
+          connectors with compatible modes are cloned alongside,
+          showing the same scanout — `mirror` semantics at the
+          kernel level.
+
+          Naming uses the canonical Wayland short forms: `DP-N` for
+          DisplayPort, `HDMI-A-N` for HDMI Type-A, `eDP-N` for
+          embedded DisplayPort (laptop panels), etc. Match the
+          connector_id from `niri msg outputs` or `wlr-randr`.
+
+          When null, enumeration order wins: whichever connected
+          connector enumerates first becomes the primary. Useful for
+          single-monitor hosts and VM test substrates where the
+          choice is unambiguous.
+
+          When set but no connected connector matches, halmasuit
+          logs a warning and falls back to enumeration order — the
+          option is advisory, not load-bearing.
+        '';
+      };
     };
 
     drmDevice = lib.mkOption {
@@ -1052,6 +1081,14 @@ in
         # Greeter binary halmasuit fork+execs at startup as the
         # greeter user. See `services.halmasuit.greeterCommand`.
         HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
+      } // lib.optionalAttrs (cfg.rendering.primaryOutput != null) {
+        # Pin a specific connector as the primary in the
+        # multi-connector clone enumeration. The Rust resolver in
+        # drm.rs matches this against the connector short-name
+        # ("DP-3", "HDMI-A-1", etc.) and puts the matching one first
+        # — its mode becomes the canonical cloned mode. See
+        # `services.halmasuit.rendering.primaryOutput`.
+        HALMASUIT_PRIMARY_OUTPUT = cfg.rendering.primaryOutput;
       } // wallpaperEnv // drmDeviceEnv;
     };
    })
@@ -1745,6 +1782,10 @@ in
        } // lib.optionalAttrs (cfg.greeterCommand != null) {
          # Greeter binary halmasuit fork+execs post-pivot.
          HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
+       } // lib.optionalAttrs (cfg.rendering.primaryOutput != null) {
+         # Mirrors the rootfs unit (see comment there). The Rust
+         # resolver runs in initramfs too, so the env must travel.
+         HALMASUIT_PRIMARY_OUTPUT = cfg.rendering.primaryOutput;
        } // wallpaperEnv // drmDeviceEnv;
      };
 
