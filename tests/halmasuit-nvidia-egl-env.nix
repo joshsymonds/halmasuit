@@ -171,5 +171,65 @@ EOF
   grep -qE 'halmasuit-nvidia-devnodes' $out/initrd-store-paths.txt \
     || fail "halmasuit-nvidia-devnodes not in boot.initrd.systemd.storePaths"
 
+  # ── (6) Every text-format storePaths entry's /nix/store refs are
+  #       ALSO in storePaths ────────────────────────────────────────
+  # THE gen-384 regression gate. make-initrd-ng walks runtime deps
+  # via ELF RUNPATH/NEEDED only — for text files (shell scripts,
+  # config files, etc.), /nix/store references inside the body are
+  # NOT followed. So every binary a script INVOKES via absolute path
+  # must be listed as its OWN storePaths entry. The gen-384 failure
+  # mode: the devnodes script was in storePaths, but its bare
+  # gnugrep ref was not, and systemd's ExecStartPre crashed with
+  # "/nix/store/.../gnugrep-3.12/bin/grep: No such file or directory".
+  #
+  # The check: extract every /nix/store/HASH-NAME prefix referenced
+  # by any text-format storePaths entry, then for each one verify
+  # SOME storePaths entry has that prefix (the binary must be
+  # reachable as a storePaths entry; make-initrd-ng will resolve
+  # the rest via the directory walk).
+  #
+  # Tools: file(1) to classify (skip ELF — those follow runpath),
+  # grep -oP to extract refs.
+  echo "── closure check: text-format storePaths entries ─────────"
+  any_failed=0
+  while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    if [ ! -e "$entry" ]; then continue; fi
+    # ELF: make-initrd-ng follows RUNPATH, skip the text-scan check.
+    if ${pkgs.file}/bin/file -bL "$entry" 2>/dev/null | grep -q ELF; then
+      continue
+    fi
+    # Some "entries" are directories (e.g. a package root). For
+    # those, make-initrd-ng walks the contents — each file gets
+    # its own pass through copy_file, ELF deps are followed. We
+    # only need to scan PLAIN-TEXT files at storePaths leaves.
+    if [ -d "$entry" ]; then continue; fi
+    if ! ${pkgs.file}/bin/file -bL "$entry" 2>/dev/null | grep -qiE 'text|script'; then
+      continue
+    fi
+    refs=$(${pkgs.gnugrep}/bin/grep -oP '/nix/store/[a-z0-9]{32}-[^/[:space:]"'"'"']+' "$entry" 2>/dev/null | sort -u || true)
+    [ -z "$refs" ] && continue
+    while IFS= read -r ref; do
+      [ -z "$ref" ] && continue
+      # Extract the store-prefix (everything up to the second `/`
+      # under /nix/store/). A ref like
+      # `/nix/store/HASH-coreutils-9.10/bin/cut` reduces to
+      # `/nix/store/HASH-coreutils-9.10`.
+      prefix=$(echo "$ref" | ${pkgs.gnugrep}/bin/grep -oP '^/nix/store/[a-z0-9]{32}-[^/]+')
+      # Does ANY storePaths entry have this prefix?
+      if ! ${pkgs.gnugrep}/bin/grep -qxF "$prefix" $out/initrd-store-paths.txt \
+        && ! ${pkgs.gnugrep}/bin/grep -q "^$prefix/" $out/initrd-store-paths.txt; then
+        echo "  MISS: $entry refs $ref"
+        echo "        but $prefix not in storePaths"
+        any_failed=1
+      fi
+    done <<EOF
+$refs
+EOF
+  done < $out/initrd-store-paths.txt
+  if [ "$any_failed" -ne 0 ]; then
+    fail "text-format storePaths entries reference paths not in storePaths"
+  fi
+
   echo "halmasuit-nvidia-egl-env-gate: PASS"
 ''

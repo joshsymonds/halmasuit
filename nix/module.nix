@@ -1375,16 +1375,22 @@ in
      ] ++ (if cfg.rendering.backend == "nvidia"
            then [
              "${cfg.rendering.nvidiaPackage}"
-             # The Phase B nvidia-devnode ExecStartPre script itself.
-             # Listing the script's store path here makes NixOS's
-             # initrd-builder follow ITS transitive closure (which
-             # pulls in the coreutils + gnugrep binaries that the
-             # script references by absolute path). Without this entry,
-             # the unit file carries the script's /nix/store path
-             # but the script binary doesn't land in initramfs — gen
-             # 383 failed exactly here with `Failed at step EXEC …
-             # No such file or directory`.
+             # The Phase B nvidia-devnode ExecStartPre script. Listing
+             # it lands the script file in the initramfs — necessary
+             # but NOT sufficient. The big trap: NixOS's make-initrd-ng
+             # walks runtime dependencies via ELF RUNPATH only. For
+             # a text-format shell script, /nix/store references in
+             # the script body are NOT followed. So every binary the
+             # script invokes must ALSO be listed below as its own
+             # storePaths entry. Gnomon 2026-05-28 gen-384 failed
+             # exactly here: the script landed, but its grep
+             # invocation pointed at a gnugrep path that wasn't in
+             # the cpio. The halmasuit-nvidia-egl-env-gate VM check
+             # asserts each script-referenced binary is reachable.
              "${nvidiaDevnodesScript}"
+             "${pkgs.coreutils}"
+             "${pkgs.gnugrep}"
+             "${pkgs.bash}"
            ]
            else [ "${pkgs.mesa}" ])
        ++ cfg.rendering.extraInitrdStorePaths
