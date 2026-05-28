@@ -150,6 +150,22 @@ pkgs.testers.runNixOSTest {
     )
     print("acqsig handled: DRM resumed + VT_RELDISP(ackacq) → back on tty8")
 
+    # ── 3. Second chord switch (multi-switch: both take effect) ──
+    # halmasuit is foreground on tty8 again; a SECOND chord to a
+    # different VT must also work. The home-VT model has no per-switch
+    # TIOCSCTTY (it owns tty8 for its whole life), so the old R2.2
+    # "second switch EPERMs on TIOCSCTTY" failure mode is gone by
+    # construction — this pins that.
+    machine.send_key("ctrl-alt-f3")
+    machine.wait_until_succeeds(
+        '[ "$(cat /sys/class/tty/tty0/active)" = tty3 ]', timeout=30
+    )
+    machine.succeed("timeout 15 chvt 8 || true")
+    machine.wait_until_succeeds(
+        '[ "$(cat /sys/class/tty/tty0/active)" = tty8 ]', timeout=30
+    )
+    print("second chord switch (tty8→tty3→tty8) also took effect")
+
     print("=" * 70)
     print("PASS: home-VT cooperative loop — halmasuit owns tty8, a chord")
     print("      VT_ACTIVATE(2) drove relsig→release→tty2, and chvt 8 drove")
