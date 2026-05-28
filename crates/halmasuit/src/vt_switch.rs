@@ -155,6 +155,34 @@ impl VtFdSetup for RealVtFdSetup {
     }
 }
 
+/// Map a keysym to a VT switch target VT number, if the keysym is one
+/// of the `XF86Switch_VT_N` cooperative-switching keysyms xkb
+/// generates for Ctrl+Alt+F<N>. Returns `None` for any other keysym.
+///
+/// xkb resolves Ctrl+Alt+F<N> to keysym `XF86Switch_VT_<N>` in the
+/// standard layouts (per `/usr/share/X11/xkb/symbols/srvr_ctrl`); a
+/// bare F<N> press without the modifiers resolves to plain `F<N>` and
+/// must NOT trigger a VT switch. This means the chord-modifier check
+/// is structurally embedded in the keysym — we don't need to inspect
+/// `ModifiersState` separately. (smithay's anvil example uses the
+/// same pattern.)
+///
+/// System chords are hardcoded per Epic #71's anti-patterns — NOT
+/// user-configurable. F-keys 1..=12 only; F13+ pass through.
+#[must_use]
+pub fn detect_vt_chord(keysym_raw: u32) -> Option<u8> {
+    // KEY_XF86Switch_VT_1 = 0x1008FE01, ..._12 = 0x1008FE0C — a
+    // contiguous range. The constants come from xkbcommon's
+    // `keysymdef.h` (re-exported from smithay).
+    const XF86_SWITCH_VT_1: u32 = 0x1008_FE01;
+    const XF86_SWITCH_VT_12: u32 = 0x1008_FE0C;
+    if (XF86_SWITCH_VT_1..=XF86_SWITCH_VT_12).contains(&keysym_raw) {
+        u8::try_from(keysym_raw - XF86_SWITCH_VT_1 + 1).ok()
+    } else {
+        None
+    }
+}
+
 /// No-op fd-setup used by unit tests. The IPC dance is driven against
 /// a non-TTY fd (a pipe end, typically), so the real ioctls would
 /// fail; this skips them.
@@ -726,5 +754,48 @@ mod tests {
             switcher.broker_socket,
             std::path::Path::new("/run/halmasuit/broker.sock")
         );
+    }
+
+    /// R2.1 chord detection: `XF86Switch_VT_1..=12` map to target VT
+    /// 1..=12. The keysym range is contiguous + load-bearing — if
+    /// xkbcommon ever renumbers them, the mapping breaks silently.
+    #[test]
+    fn detect_vt_chord_maps_xf86_switch_vt_to_target() {
+        // XF86Switch_VT_1 = 0x1008FE01 per xkbcommon's keysymdef.h.
+        for vt in 1_u8..=12 {
+            let keysym = 0x1008_FE00 + u32::from(vt);
+            assert_eq!(
+                detect_vt_chord(keysym),
+                Some(vt),
+                "expected VT{vt} for keysym 0x{keysym:08x}",
+            );
+        }
+    }
+
+    /// Bare F-keys (no Ctrl+Alt) MUST NOT trigger a VT switch — xkb
+    /// resolves them to keysyms outside the XF86Switch_VT_* range.
+    #[test]
+    fn detect_vt_chord_ignores_bare_function_keys() {
+        // F1 = 0xFFBE, F12 = 0xFFC9 — outside the XF86Switch_VT range.
+        for keysym in 0xFFBE_u32..=0xFFC9 {
+            assert_eq!(
+                detect_vt_chord(keysym),
+                None,
+                "bare F-key keysym 0x{keysym:08x} must NOT trigger VT switch",
+            );
+        }
+        // Plain ASCII keys MUST NOT match either.
+        for keysym in [0x0061_u32, 0x0041, 0xFF0D /* Return */] {
+            assert!(detect_vt_chord(keysym).is_none());
+        }
+    }
+
+    /// XF86Switch_VT_13+ doesn't exist in xkbcommon, but defensively:
+    /// keysyms one past the end of the recognized range MUST NOT
+    /// resolve. Guards against off-by-one in the range bound.
+    #[test]
+    fn detect_vt_chord_rejects_above_vt12() {
+        assert_eq!(detect_vt_chord(0x1008_FE0D), None);
+        assert_eq!(detect_vt_chord(0x1008_FE00), None); // one BEFORE start
     }
 }

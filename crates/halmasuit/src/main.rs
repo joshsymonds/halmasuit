@@ -481,9 +481,24 @@ impl HalmasuitState {
                 let time = event.time_msec();
                 let code = event.key_code();
                 let key_state = event.state();
-                keyboard.input::<(), _>(self, code, key_state, serial, time, |_, _, _| {
-                    FilterResult::Forward
-                });
+                // Epic #71 R2.1: intercept Ctrl+Alt+F1..F12 BEFORE
+                // forwarding to the focused client. xkb resolves the
+                // chord to keysym XF86Switch_VT_<N>; bare F<N> without
+                // the modifiers stays plain F<N> and falls through.
+                // System chord — NOT user-configurable per the epic's
+                // anti-patterns.
+                let chord_press = matches!(key_state, smithay::backend::input::KeyState::Pressed);
+                let target_vt: Option<u8> =
+                    keyboard.input::<u8, _>(self, code, key_state, serial, time, |_, _, handle| {
+                        if !chord_press {
+                            return FilterResult::Forward;
+                        }
+                        vt_switch::detect_vt_chord(handle.modified_sym().raw())
+                            .map_or(FilterResult::Forward, FilterResult::Intercept)
+                    });
+                if let Some(vt) = target_vt {
+                    self.trigger_vt_switch(vt);
+                }
             }
             InputEvent::PointerMotion { event } => self.on_pointer_relative_motion(&event),
             InputEvent::PointerMotionAbsolute { event } => {
@@ -498,6 +513,71 @@ impl HalmasuitState {
             InputEvent::TouchCancel { event: _ } => self.on_touch_cancel(),
             _ => {
                 // Tablet, switch — not in v1 scope. Future epics.
+            }
+        }
+    }
+
+    /// Epic #71 R2.1: drive the broker-mediated VT-switching IPC
+    /// dance for `target_vt`. Called from `dispatch_libinput`'s
+    /// keyboard filter when `Ctrl+Alt+F<target_vt>` is pressed.
+    ///
+    /// Runs synchronously on the calloop thread. The transient-
+    /// one-shot pattern is the same as `broker_spawn_greeter` and
+    /// the cross-pivot `RequestRootFd` retry path; the
+    /// "compositor never blocks the calloop thread on broker IPC"
+    /// rule applies to the long-lived relay, NOT to discrete
+    /// user-triggered transient requests. Documented in
+    /// `vt_switch.rs`'s module doc.
+    ///
+    /// R2.1 uses NO-OP hooks for `before_drop_master` /
+    /// `after_drop_master` / `on_activated`. R2.2 plugs in real
+    /// DRM pause/resume through the same `VtSwitchHooks` seam
+    /// without reshaping this method.
+    ///
+    /// On any failure (broker rejected, IPC error), the chord is
+    /// effectively a no-op from the user's perspective and the
+    /// reason is logged. We do NOT panic the compositor over a
+    /// failed switch — the user can press the chord again.
+    #[allow(
+        clippy::needless_pass_by_ref_mut,
+        reason = "R2.x will mutate self (retain vt_fd for the per-VT signalfd loop, update DRM master state); &mut now keeps the signature stable across the next R2 sub-task"
+    )]
+    fn trigger_vt_switch(&mut self, target_vt: u8) {
+        let no_op_drop = || Ok(());
+        let no_op_activated = |_fd: std::os::fd::BorrowedFd<'_>| Ok(());
+        let hooks = vt_switch::VtSwitchHooks {
+            before_drop_master: &no_op_drop,
+            after_drop_master: &no_op_drop,
+            on_activated: &no_op_activated,
+        };
+
+        let switcher = vt_switch::VtSwitcher::new(self.broker_socket.clone());
+        match switcher.request_switch(target_vt, &hooks, &vt_switch::RealVtFdSetup) {
+            Ok(vt_switch::VtSwitchOutcome::Activated { vt_fd }) => {
+                tracing::info!(
+                    target_vt = target_vt,
+                    "VT switch activated; kernel switched to tty{target_vt}",
+                );
+                // R2.x will retain this fd to drive the per-VT
+                // signalfd loop. For R2.1 we drop it — the kernel
+                // switch already happened; subsequent signals are
+                // sigprocmask-blocked at startup so the compositor
+                // stays alive without VT_RELDISP acks.
+                drop(vt_fd);
+            }
+            Ok(vt_switch::VtSwitchOutcome::Rejected { reason }) => {
+                tracing::warn!(
+                    target_vt = target_vt,
+                    reason = ?reason,
+                    "VT switch rejected by broker",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target_vt = target_vt,
+                    error = %e,
+                    "VT switch IPC failed",
+                );
             }
         }
     }
@@ -4093,12 +4173,48 @@ fn main() -> io::Result<()> {
     // true thereafter. In rootfs-only (`services.halmasuit.enable=
     // true`) mode the flag starts true at construction — no boot
     // pivot to survive.
-    let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT, Signal::SIGCHLD])?;
+    // Epic #71 R2.1: SIGUSR1/SIGUSR2 are the kernel's cooperative VT-
+    // switching signals (relsig/acqsig). Once the compositor has done
+    // VT_SETMODE PROCESS on a VT fd (in `trigger_vt_switch`), the
+    // kernel can deliver these signals at any moment when a VT switch
+    // happens. Without them being signalfd-routed here, the default
+    // disposition is termination — Phase 0's probe + R1.4's VM test
+    // both document this. Adding them to the calloop `Signals` source
+    // sigprocmask-blocks them AND routes them to this handler. R2.1's
+    // handler is a no-op (just logs); the kernel-level switch
+    // completes anyway (kernel doesn't wait on VT_RELDISP-ACKACQ for
+    // the acquired side). R2.x will plug in real VT_RELDISP handling
+    // here for the cooperative drop-master/reacquire dance.
+    let signals = Signals::new(&[
+        Signal::SIGTERM,
+        Signal::SIGINT,
+        Signal::SIGCHLD,
+        Signal::SIGUSR1,
+        Signal::SIGUSR2,
+    ])?;
     loop_handle
         .insert_source(
             signals,
             move |event, (), state: &mut HalmasuitState| match event.signal() {
                 Signal::SIGCHLD => reap_zombie_children(state),
+                Signal::SIGUSR1 => {
+                    // VT relsig: kernel asks us to release our VT
+                    // (we're switching away). R2.x will drop DRM
+                    // master + VT_RELDISP(1) here. For R2.1 we log
+                    // and let the kernel continue — without
+                    // VT_RELDISP the kernel may stall the switch
+                    // until something resolves it, but for the
+                    // current R2.1 protocol (compositor TIOCSCTTYs
+                    // into the NEW vt, not its old one) we never
+                    // hit this path in practice.
+                    tracing::info!("received SIGUSR1 (VT relsig); R2.x will handle");
+                }
+                Signal::SIGUSR2 => {
+                    // VT acqsig: kernel notifying us that we've
+                    // become the active VT. R2.x will reacquire
+                    // DRM master here. For R2.1 we log.
+                    tracing::info!("received SIGUSR2 (VT acqsig); R2.x will handle");
+                }
                 Signal::SIGTERM if !state.shutdown_armed => {
                     tracing::info!("SIGTERM ignored (shutdown_armed=false, boot pivot in flight)");
                 }
