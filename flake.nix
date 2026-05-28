@@ -655,6 +655,18 @@
               mainProgram = "ssimulacra2_rs";
             };
           };
+
+          # NixOS toplevels for the nspawn test tier (H4). The
+          # toplevels are built normally via `nix build`; running the
+          # actual test requires sudo + systemd-nspawn (the rig is
+          # invoked from `just check-nspawn-*` recipes). nspawn tests
+          # are a developer-loop substrate, not a CI gate — see
+          # tests/lib/nspawn-rig.sh for the operational notes.
+          run-pam-auth-nspawn-toplevel = import ./tests/run-pam-auth-nspawn.nix {
+            inherit system nixpkgs;
+            halmasuit-session-pam-testdriver =
+              self.packages.${system}.halmasuit-session-pam-testdriver;
+          };
         });
 
       # NixOS modules halmasuit exports. Consumers (a user's nix-config, the

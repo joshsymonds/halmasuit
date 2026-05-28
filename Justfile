@@ -316,6 +316,21 @@ test-vm-initrd-survival:
 check-initrd-size:
     nix build .#checks.x86_64-linux.initrd-size-gate -L --print-build-logs --no-link
 
+# nspawn test tier (H4): drive a NixOS toplevel through
+# systemd-nspawn for fast iteration on non-pivot-coupled tests.
+# Requires sudo (systemd-nspawn needs CAP_SYS_ADMIN+CAP_NET_ADMIN).
+# Not a CI gate — the corresponding VM test (run-pam-auth) remains
+# the CI gate; nspawn is the dev-loop substrate.
+check-nspawn-pam-auth:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "── building run-pam-auth-nspawn toplevel ──"
+    toplevel=$(nix build --no-link --print-out-paths \
+        .#packages.x86_64-linux.run-pam-auth-nspawn-toplevel)
+    echo "── booting nspawn (requires sudo) ──"
+    sudo ./tests/lib/nspawn-rig.sh run-pam-auth "$toplevel" \
+        "$toplevel/etc/run-pam-auth-test.sh"
+
 # Phase B hard gate: full LUKS-backed boot + survival + chroot +
 # greeter spawn + PAM auth → SessionOpened end-to-end.
 test-vm-full-boot-flash:
