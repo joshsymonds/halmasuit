@@ -15,6 +15,12 @@ Inh = "Inh"
 CapInh = "CapInh"
 # Plural of PNG. typos rewrites "PNGs" → "PONs".
 PNGs = "PNGs"
+# "Level of Detail" — graphics-rendering abbreviation used in kushuh's
+# star-map design doc. typos rewrites "LOD" → "LOAD".
+LOD = "LOD"
+# Simon Ser — maintainer of wlroots, freedesktop projects. typos
+# rewrites "Ser" → "Set". Cited by surname in design docs.
+Ser = "Ser"
 
 [files]
 extend-exclude = [
