@@ -216,6 +216,29 @@ pkgs.testers.runNixOSTest {
         f"must not diverge."
     )
 
+    # ── Assertion 1c: GetBrokerStatus is a REAL reachability state ──
+    # The R3.3 stub returned "Unknown". By steady state the greeter
+    # was spawned via the broker (broker_spawn_greeter → connect_broker),
+    # so the connect_broker chokepoint has recorded a real state.
+    # "connected" = the broker socket was reachable on the last attempt.
+    KNOWN_BROKER_STATES = {"not_connected", "connecting", "connected", "failed"}
+    broker = compositor1_str("GetBrokerStatus")
+    print(f"GetBrokerStatus: {broker}")
+    assert broker != "Unknown", (
+        "GetBrokerStatus returned the removed R3.3 stub literal "
+        "'Unknown' — the connect_broker chokepoint isn't recording state."
+    )
+    assert broker in KNOWN_BROKER_STATES, (
+        f"GetBrokerStatus returned {broker!r}, not a known state. "
+        f"Expected one of {sorted(KNOWN_BROKER_STATES)}."
+    )
+    # The greeter reached spawn THROUGH the broker, so the last
+    # connect attempt must have succeeded.
+    assert broker == "connected", (
+        f"after greeter_spawned (which goes through the broker), the "
+        f"last connect_broker must have succeeded; got {broker!r}."
+    )
+
     # ── Assertion 2: GetUptime returns LIVE values (not a frozen
     # construction-time snapshot) ── deterministic, independent of
     # render/vblank/damage. State-based poll (not a bare sleep, per

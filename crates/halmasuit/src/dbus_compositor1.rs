@@ -31,10 +31,86 @@
 //! names from the same process).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use halmasuit_introspect::Phase;
+
+/// Epic #71 R-honest.3: the compositor's most-recent broker
+/// reachability state.
+///
+/// The compositor talks to the privileged `halmasuit-session` broker
+/// over TRANSIENT connections (one per greeter episode, plus one-shot
+/// RequestRootFd / SpawnGreeter / RequestVtSwitch). There is no
+/// persistent held connection, so "state" means: did the most recent
+/// `connect_broker` attempt succeed or fail? `Connected` therefore
+/// reads as "the broker socket was reachable on the last attempt"
+/// (the socket-activated unit responded), NOT "a connection is held
+/// open right now". The CLI/overlay text reflects this wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerConnectionState {
+    /// No broker connection has been attempted yet this process.
+    NotConnected,
+    /// A `connect_broker` attempt is in flight.
+    Connecting,
+    /// The most recent `connect_broker` succeeded (socket reachable /
+    /// socket-activated unit responded).
+    Connected,
+    /// The most recent `connect_broker` failed (socket missing,
+    /// permission denied, activation failed).
+    Failed,
+}
+
+impl BrokerConnectionState {
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::NotConnected => 0,
+            Self::Connecting => 1,
+            Self::Connected => 2,
+            Self::Failed => 3,
+        }
+    }
+
+    const fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => Self::NotConnected,
+            1 => Self::Connecting,
+            2 => Self::Connected,
+            3 => Self::Failed,
+            _ => return None,
+        })
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::NotConnected => "not_connected",
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Global broker-reachability store (R-honest.3). Single source of
+/// truth, written by [`record_broker_state`] from the `connect_broker`
+/// chokepoint, read by `GetBrokerStatus` + (R3.x) the overlay.
+/// Initialized to `NotConnected` (0).
+static BROKER_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// Record the compositor's broker-reachability state. Called from
+/// `broker_session::connect_broker` (the single chokepoint every
+/// broker connection flows through). Relaxed: one-way value flow.
+pub fn record_broker_state(state: BrokerConnectionState) {
+    BROKER_STATE.store(state.as_u8(), Ordering::Relaxed);
+}
+
+/// Current broker state as a stable snake_case name, or `"unknown"`
+/// for an unmappable discriminant (never, on a matched binary).
+#[must_use]
+pub fn broker_state_name() -> &'static str {
+    BrokerConnectionState::from_u8(BROKER_STATE.load(Ordering::Relaxed))
+        .map_or("unknown", BrokerConnectionState::name)
+}
 
 /// Epic #71 R-honest.2: the single global current-phase store.
 ///
@@ -166,17 +242,18 @@ impl Compositor1 {
         Vec::new()
     }
 
-    /// Broker connection state: one of `"NotConnected"`,
-    /// `"Connecting"`, `"Connected"`, `"Failed"`.
-    ///
-    /// R3.3 stub returns `"Unknown"`. R3.x will track this via the
-    /// existing `broker_session` lifecycle events.
+    /// Broker reachability state as a stable snake_case name: one of
+    /// `"not_connected"`, `"connecting"`, `"connected"`, `"failed"`
+    /// (R-honest.3). Live value from the global store, updated at the
+    /// `connect_broker` chokepoint. `"connected"` = the broker socket
+    /// was reachable on the last attempt (see
+    /// [`BrokerConnectionState`]).
     #[allow(
         clippy::unused_self,
-        reason = "trivial stub; R3.x will read broker state"
+        reason = "reads the global BROKER_STATE store; &self for the zbus interface signature"
     )]
     fn get_broker_status(&self) -> String {
-        "Unknown".to_owned()
+        broker_state_name().to_owned()
     }
 }
 
@@ -265,13 +342,33 @@ mod tests {
         let comp = Compositor1::new(state);
 
         // Stage 2: methods exist and return the right shapes. GetPhase
-        // reads the global phase store; the remaining stubs
-        // (broker/windows) get wired in later R-honest sub-tasks.
+        // + GetBrokerStatus read their global stores; ListWindows gets
+        // wired in a later R-honest sub-task.
         let _ = comp.get_phase(); // a real phase name (see record_phase test)
         let _ = comp.get_uptime(); // any u64 is fine
         assert_eq!(comp.get_frame_counter(), 0);
         assert!(comp.list_windows().is_empty());
-        assert_eq!(comp.get_broker_status(), "Unknown");
+        let _ = comp.get_broker_status(); // a real state (see record_broker_state test)
+    }
+
+    /// R-honest.3: `record_broker_state` updates the global store and
+    /// `get_broker_status` reads it back as the matching snake_case
+    /// name — proving the DBus surface reports the LIVE broker state,
+    /// not the removed `"Unknown"` stub. (nextest process-isolates the
+    /// global per test.)
+    #[test]
+    fn get_broker_status_reflects_recorded_state() {
+        let comp = Compositor1::new(CompositorObservability::new());
+        // Default before any connect attempt.
+        assert_eq!(comp.get_broker_status(), "not_connected");
+        record_broker_state(BrokerConnectionState::Connecting);
+        assert_eq!(comp.get_broker_status(), "connecting");
+        record_broker_state(BrokerConnectionState::Connected);
+        assert_eq!(comp.get_broker_status(), "connected");
+        record_broker_state(BrokerConnectionState::Failed);
+        assert_eq!(comp.get_broker_status(), "failed");
+        // Never the removed stub.
+        assert_ne!(comp.get_broker_status(), "Unknown");
     }
 
     /// R-honest.2: `record_phase` updates the global store and
