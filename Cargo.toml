@@ -61,6 +61,11 @@ members = [
     # user via a fullscreen xdg_toplevel, writes the response to the
     # agent socket. Spawned by halmasuit when started from initramfs.
     "crates/halmasuit-luks",
+    # Role/perspective-based nested Wayland compositor (see
+    # crates/kushuh/ARCHITECTURE.md). Currently lib-only: the config
+    # domain model (Phase 1). The smithay compositor binary lands in
+    # Phase 2.
+    "crates/kushuh",
     "xtask",
 ]
 
