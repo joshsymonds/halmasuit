@@ -1440,6 +1440,15 @@ in
              "${pkgs.coreutils}"
              "${pkgs.gnugrep}"
              "${pkgs.bash}"
+             # Full glibc. make-initrd-ng copies individual glibc libs
+             # only as it resolves them via RUNPATH; NVIDIA's libs have
+             # no glibc in RUNPATH, so `librt.so.1` (needed by
+             # libEGL_nvidia + libnvidia-glsi, but NOT by halmasuit's
+             # own closure) never gets copied. Listing glibc as a root
+             # forces the whole lib dir in, so librt.so.1 — and any
+             # other glibc sibling a future driver dlopens — is present
+             # and resolves via the LD_LIBRARY_PATH entry above.
+             "${pkgs.glibc}"
            ]
            else [ "${pkgs.mesa}" ])
        ++ lib.optionals cfg.rendering.debugStrace [
@@ -1678,9 +1687,26 @@ in
          # backend's vendor library directory. The initramfs has no
          # NixOS hardware.graphics machinery, so the vendor library
          # path is selected here based on rendering.backend.
+         #
+         # `${pkgs.glibc}/lib` is appended for the nvidia backend
+         # because NVIDIA's libs (libEGL_nvidia, libnvidia-glsi) carry
+         # NO glibc dir in their RUNPATH — they rely on the system
+         # ld.so.cache / default /lib to resolve glibc, neither of
+         # which exists in an initramfs. libglvnd dlopens
+         # libEGL_nvidia, which DT_NEEDEDs `librt.so.1`; halmasuit's
+         # OWN closure doesn't need librt, so it's the one glibc lib
+         # neither copied into the initramfs NOR findable at runtime,
+         # and the vendor dlopen fails SILENTLY — libglvnd falls back
+         # to no vendor, EGL_KHR_platform_gbm never registers, and
+         # smithay dies with "Unable to find suitable EGL platform".
+         # (Diagnosed 2026-05-28 via an initramfs strace: the loader
+         # searched every RUNPATH dir for librt.so.1 and found none,
+         # immediately before the DRM teardown + exit.) Appending
+         # glibc makes the full glibc set findable; the matching
+         # storePaths entry below makes librt.so.1 physically present.
          LD_LIBRARY_PATH =
            if cfg.rendering.backend == "nvidia"
-           then "${pkgs.libglvnd}/lib:${cfg.rendering.nvidiaPackage}/lib"
+           then "${pkgs.libglvnd}/lib:${cfg.rendering.nvidiaPackage}/lib:${pkgs.glibc}/lib"
            else "${pkgs.libglvnd}/lib:${pkgs.mesa}/lib";
        } // lib.optionalAttrs (cfg.rendering.backend == "software") {
          # Software backend: force Mesa llvmpipe. Matches the
