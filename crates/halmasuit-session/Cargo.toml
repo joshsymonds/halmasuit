@@ -28,7 +28,10 @@ halmasuit-session-ipc = { path = "../halmasuit-session-ipc", version = "0.1" }
 # ephemeral auth worker (Epic R4). signal: child signal-mask reset
 # (memory project-pre-exec-signal-mask) + SIGKILL-no-grace test.
 # resource: setrlimit bound on the disposable auth child (R4).
-nix                  = { workspace = true, features = ["socket", "uio", "user", "process", "signal", "resource", "fs"] }
+# poll: Epic #71 R1 master-drop watchdog (timeout the wait on
+# VtSwitchMasterDropped — systemd #21388 lesson, NEVER fire VT_ACTIVATE
+# on timeout).
+nix                  = { workspace = true, features = ["socket", "uio", "user", "process", "signal", "resource", "fs", "poll"] }
 # The Epic-R6 / Amendment-A2 broker event loop: ONE loop multiplexing
 # the systemd listener fd + the in-flight worker + the greeter + an
 # idle-exit timer (so evict-old is reachable and "no standing root when

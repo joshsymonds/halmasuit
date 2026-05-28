@@ -925,6 +925,16 @@ in
          # /etc/shadow in-process rather than forking the setuid
          # unix_chkpwd helper — the fork path is fragile under any
          # sandboxed parent (memory project-pam-unix-shadow-group).
+         #
+         # Capabilities the broker uses (all implicit via root —
+         # there is NO `CapabilityBoundingSet=` / `AmbientCapabilities=`
+         # restriction, this is documentation of the surface):
+         #   CAP_SYS_ADMIN     pam_namespace, pam_loginuid, fork+exec
+         #   CAP_DAC_READ_SEARCH  /etc/shadow read via shadow group
+         #   CAP_SYS_PTRACE    pam_keyinit edge cases
+         #   CAP_SYS_TTY_CONFIG  Epic #71 R1 VT_ACTIVATE ioctl
+         #                       (compositor never holds this; broker
+         #                       fires the ioctl on its behalf)
          SupplementaryGroups = [ "shadow" ];
          # Generous backstop ONLY (a wedged module is bounded by the
          # broker's per-worker RLIMIT_CPU + SIGKILL-anytime + idle
