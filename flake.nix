@@ -681,6 +681,14 @@
       overlays.default = final: _prev: {
         halmasuit         = self.packages.${final.stdenv.hostPlatform.system}.halmasuit;
         halmasuit-session = self.packages.${final.stdenv.hostPlatform.system}.halmasuit-session;
+        # Phase B / video-wallpaper deployments default these
+        # packages in the module options (luks.package,
+        # decoder.package); without them in the overlay, any
+        # consumer enabling `fromInitrd` or `wallpaper.type =
+        # "video"` fails eval with `attribute missing` on the
+        # module-side default.
+        halmasuit-luks    = self.packages.${final.stdenv.hostPlatform.system}.halmasuit-luks;
+        halmasuit-decoder = self.packages.${final.stdenv.hostPlatform.system}.halmasuit-decoder;
       };
 
       # NixOS VM tests run on Linux only. Limited to x86_64-linux because
