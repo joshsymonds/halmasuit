@@ -764,6 +764,15 @@
           system = "x86_64-linux";
           inherit nixpkgs;
         };
+        # Epic #71 Phase 0 probe: validate that an unprivileged process
+        # can call TIOCSCTTY + VT_RELDISP on an inherited VT fd without
+        # holding CAP_SYS_TTY_CONFIG. The production broker-passes-fd
+        # design assumes this works; the probe answers the question
+        # empirically before production commits.
+        vt-probe-phase0 = import ./tests/vt-probe-phase0.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+        };
         # Phase B (initramfs survival): real halmasuit binary in
         # boot.initrd.systemd.services with SurviveFinalKillSignal=yes,
         # asserts PID + DRM-master + Wayland-socket continuity across

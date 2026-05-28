@@ -30,6 +30,14 @@ members = [
     # Phase 0 validates SurviveFinalKillSignal=yes survives the
     # rootfs kill spree; Phase 1 + Phase 2 land in follow-up tasks.
     "crates/halmasuit-shutdown-probe",
+    # Research probe — Epic #71 Phase 0 (VT switching). Empirically
+    # validates that the compositor can satisfy the kernel's `perm`
+    # check for `VT_RELDISP` on an inherited VT fd by calling
+    # `TIOCSCTTY` — without holding `CAP_SYS_TTY_CONFIG`. The
+    # production broker-mediated VT-switching design assumes this
+    # works; this probe answers the question before production
+    # commits to it.
+    "crates/halmasuit-vt-probe",
     # Layer-shell test client — throwaway, used by
     # tests/visual-halmasuit-layer.nix to verify halmasuit composites
     # wl_clients via wlr-layer-shell.
