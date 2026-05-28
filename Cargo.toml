@@ -38,6 +38,14 @@ members = [
     # works; this probe answers the question before production
     # commits to it.
     "crates/halmasuit-vt-probe",
+    # Test-only: VM-test client driving Epic #71 R1 broker↔compositor
+    # VT-switching IPC end-to-end. Connects to the real
+    # halmasuit-session broker, drives RequestVtSwitch through to
+    # VtSwitchActivated (happy mode) or VtSwitchRejected{MasterDropTimeout}
+    # (timeout mode), logs a VERDICT line. Independent consumer of
+    # halmasuit-session-ipc — same wire-test pattern as
+    # halmasuit-vm-client (greetd protocol) vs halmasuit's own driver.
+    "crates/halmasuit-vt-test-client",
     # Layer-shell test client — throwaway, used by
     # tests/visual-halmasuit-layer.nix to verify halmasuit composites
     # wl_clients via wlr-layer-shell.

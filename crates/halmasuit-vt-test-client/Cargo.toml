@@ -1,0 +1,36 @@
+[package]
+name        = "halmasuit-vt-test-client"
+description = "VM-test client driving Epic #71 R1 broker↔compositor VT-switching IPC end-to-end. Connects to the real halmasuit-session broker, drives RequestVtSwitch through to VtSwitchActivated (happy mode) or VtSwitchRejected{MasterDropTimeout} (timeout mode), logs a VERDICT line. Test-only; not in production."
+
+version.workspace      = true
+edition.workspace      = true
+# Same MSRV relaxation as the Phase 0 probe: this binary builds under
+# nixpkgs's pinned rustc; we don't want a test-only binary to gate on
+# workspace-wide MSRV bumps.
+rust-version           = "1.87"
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Frozen wire contract — encode/decode VT-switching frames against the
+# same crate the broker and compositor use. Independent consumer (this
+# binary doesn't import `crate::halmasuit::vt_switch`), which is the
+# point of this test: prove the wire works end-to-end with two
+# independent implementations.
+halmasuit-session-ipc = { path = "../halmasuit-session-ipc", version = "0.1" }
+# Socket primitives (socketpair-free here — production broker socket),
+# poll, recvmsg-with-cmsg-space, setsid.
+nix = { version = "0.30", features = ["socket", "poll", "user", "fs", "process", "uio", "signal"] }
+# Raw libc constants/types for VT ioctls. nix doesn't expose
+# linux/vt.h.
+libc = "0.2"
+# Error-context plumbing. Same as halmasuit-vt-probe.
+anyhow = "1"
+
+[[bin]]
+name = "halmasuit-vt-test-client"
+path = "src/main.rs"
