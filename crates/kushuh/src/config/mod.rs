@@ -19,5 +19,7 @@
 //! 6. The semantic validator.
 
 mod region;
+mod role;
 
 pub use region::{Region, RegionError};
+pub use role::{AppRef, Binding, BindingError, Role, RoleError};

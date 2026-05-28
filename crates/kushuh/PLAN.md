@@ -41,8 +41,10 @@ design pass.
 1. **`Region`** ✅ — the atomic geometry leaf: a validated rectangle in
    monitor-percentage space (`x`/`y`/`width`/`height` as `0..=100`,
    non-zero area, fits the monitor).
-2. **`Role`** — a named position (monitor + `Region`) with a binding.
-   Binding is a sum type; see the binding fork below.
+2. **`Role`** ✅ — a named position (monitor + `Region`) with a `Binding`.
+   `Binding` is a four-kind sum type; see the resolved binding fork below.
+   App references carry an optional `profile` for separate-state instances
+   (a `code` Firefox vs a `personal` Firefox).
 3. **`Perspective`** — a named set of roles. The ambient role is
    implicit/structural, not a member of the roles list.
 4. **`Config` / `Layout`** — the top-level model. Separates role
@@ -65,22 +67,35 @@ it states a "probable default, to be confirmed" or shows two forms.
 Each is a 1–2 sentence decision made at the relevant type's checkpoint,
 not a re-derivation of the model.
 
-- **Binding has four forms, not three** (decided at `Role`): `bind-app`
-  (sticky), `bind-app-candidates [...]` (cycle), no binding (flex), and
-  `bind-app-pattern "App" title="<regex>"` (pattern — e.g. the doc's
-  Zoom `title="^Meeting$"`). The `Binding` enum needs a `Pattern`
-  variant carrying an app id and an optional title regex.
+- **Binding has four kinds, not three** — RESOLVED at `Role`.
+  `Binding` is `Sticky(AppRef)` (launch & own one instance),
+  `Cycle(Vec<AppRef>)` (swap between ≥2 candidates), `Pattern { app_id,
+  title_regex }` (catch a window the app spawns itself — the Zoom meeting
+  window, a reading-titled Firefox — `kushuh` does not launch it), and
+  `Flex` (free/scratch, no rule). `Pattern` is distinct from `Sticky`
+  because it *catches* rather than *launches*. This extends the doc's
+  schema, which listed only three forms.
+- **App instances carry a `profile`** — RESOLVED at `Role`. An `AppRef`
+  is `app_id` + optional `profile`. A `code` Firefox and a `personal`
+  Firefox are one `app_id`, two profiles, launched as separate processes
+  with **separate state** (independent history/logins). The model stores
+  the label; the profile→launch mapping (`firefox -P code`) is a Phase 3
+  runtime concern. This extends the doc's KDL schema with a `profile=`
+  property (finalized at the KDL-parser task).
+- **Per-perspective vs global roles** — semantics RESOLVED, structure
+  pending at `Config`. Roles are **isolated per perspective**: each
+  perspective gets its *own* instance (Code's Firefox ≠ Personal's
+  Firefox), not a shared one. The structural representation (how
+  definitions and bindings are laid out in `Config`) is still decided at
+  the `Config` task.
 - **Two perspective syntaxes** (decided at `Perspective`): roles *by
   reference* (`perspective "code" { roles "editor" "browser" }`) vs
   roles *defined inline* (`perspective "meeting" { role "x" { … } }`).
   The model must support both, or we pick one.
-- **Per-perspective vs global roles** (decided at `Config`): the doc's
-  probable default is "shared apps, per-perspective role bindings." The
-  definition/binding split keeps both that and per-perspective isolation
-  expressible without hard-committing the policy.
 - **Cycle vs tabbed** — *deferred to the Phase 3 engine.* The model only
-  stores the candidate list; how a role presents multiple candidates is
-  an engine decision, not a config-model one.
+  stores the candidate list; how a role presents multiple windows (one
+  slot holds *its* instance, not all windows of an app) is an engine
+  decision, not a config-model one.
 
 ---
 
