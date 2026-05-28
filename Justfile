@@ -62,9 +62,6 @@ test:
 test-vm:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "── smoke-boot ──"
-    nix build .#checks.x86_64-linux.smoke-boot -L --print-build-logs --no-link
-    echo
     echo "── halmasuit-vm ──"
     nix build .#checks.x86_64-linux.halmasuit-vm -L --print-build-logs --no-link
     echo
@@ -376,7 +373,7 @@ test-vm-visual-phase-b-enc-video:
 # Useful for `machine.screenshot("name")`, `machine.send_chars(...)`, and
 # poking at the VM state by hand.
 #
-# Usage: just test-vm-interactive smoke-boot
+# Usage: just test-vm-interactive halmasuit-vm
 test-vm-interactive name:
     nix run .#checks.x86_64-linux.{{name}}.driverInteractive
 
@@ -393,7 +390,7 @@ test-vm-interactive name:
 # Watch output:   tail -f /tmp/halmasuit-drive.log
 # Stop:           just test-vm-drive-stop
 #
-# Usage: just test-vm-drive smoke-boot
+# Usage: just test-vm-drive halmasuit-vm
 test-vm-drive name:
     #!/usr/bin/env bash
     set -euo pipefail

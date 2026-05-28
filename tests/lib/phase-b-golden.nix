@@ -9,7 +9,7 @@
 #         wallpaper = ...;
 #         lukshape  = "side-volume";  # or "encrypted-root" (follow-up)
 #         inherit halmasuit-debug halmasuit-luks halmasuit-session
-#                 halmasuit-vm-client nix-config;
+#                 halmasuit-vm-client niri-flake dms;
 #         wallpaperStorePaths = [];
 #       })
 #     ];
@@ -44,7 +44,8 @@
   # image/shader cells aren't forced to build a decoder closure they
   # never exercise.
   halmasuit-decoder ? null,
-  nix-config,
+  niri-flake,
+  dms,
   wallpaperStorePaths ? [ ],
 }:
 
@@ -53,9 +54,9 @@
 let
   inherit (pkgs) system;
 
-  niri = nix-config.inputs.niri-flake.packages.${system}.niri-unstable;
-  dmsShell = nix-config.inputs.dms.packages.${system}.dms-shell;
-  dmsQuickshell = nix-config.inputs.dms.packages.${system}.quickshell;
+  niri = niri-flake.packages.${system}.niri-unstable;
+  dmsShell = dms.packages.${system}.dms-shell;
+  dmsQuickshell = dms.packages.${system}.quickshell;
 
   # Minimal niri config — empty workspace, no animations, no
   # autostart. Two settings are load-bearing for the matrix goldens:
@@ -215,8 +216,8 @@ let
 in
 {
   imports = [
-    nix-config.inputs.niri-flake.nixosModules.niri
-    nix-config.inputs.dms.nixosModules.greeter
+    niri-flake.nixosModules.niri
+    dms.nixosModules.greeter
   ];
 
   # Niri is the session command (wrapped above). Module-managed so

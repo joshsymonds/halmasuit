@@ -26,7 +26,7 @@
 {
   system,
   nixpkgs,
-  nix-config,
+  niri-flake,
   halmasuit,
   halmasuit-decoder,
   halmasuit-session,
@@ -39,7 +39,7 @@ let
     inherit system;
     config.allowUnfree = true;
   };
-  niri = nix-config.inputs.niri-flake.packages.${system}.niri-unstable;
+  niri = niri-flake.packages.${system}.niri-unstable;
 
   # 2s, 320x240, 30fps, baseline-profile h264 in mp4 — same shape
   # as visual-phase-b-side-video.nix's videoFixture. testsrc has

@@ -33,7 +33,8 @@
 {
   system,
   nixpkgs,
-  nix-config,
+  niri-flake,
+  dms,
   halmasuit,
   halmasuit-session,
   ssimulacra2-cli,
@@ -44,10 +45,10 @@ let
     inherit system;
     config.allowUnfree = true;
   };
-  niri = nix-config.inputs.niri-flake.packages.${system}.niri-unstable;
-  dmsShell = nix-config.inputs.dms.packages.${system}.dms-shell;
-  dmsQuickshell = nix-config.inputs.dms.packages.${system}.quickshell;
-  testInputs = nix-config.inputs // { inherit nix-config; };
+  niri = niri-flake.packages.${system}.niri-unstable;
+  dmsShell = dms.packages.${system}.dms-shell;
+  dmsQuickshell = dms.packages.${system}.quickshell;
+  testInputs = { inherit niri-flake dms; };
 
   # Run DMS Quickshell directly as halmasuit's greeter — no nested
   # compositor in the chain.
@@ -96,8 +97,8 @@ pkgs.testers.runNixOSTest {
       imports = [
         ../nix/module.nix
         ./lib/test-user.nix
-        nix-config.inputs.niri-flake.nixosModules.niri
-        nix-config.inputs.dms.nixosModules.greeter
+        niri-flake.nixosModules.niri
+        dms.nixosModules.greeter
       ];
 
       programs.niri.enable = true;

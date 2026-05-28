@@ -8,7 +8,8 @@
 {
   system,
   nixpkgs,
-  nix-config,
+  niri-flake,
+  dms,
   halmasuit-debug,
   halmasuit-luks,
   halmasuit-session,
@@ -44,7 +45,7 @@ pkgs.testers.runNixOSTest {
         };
         lukshape = "side-volume";
         inherit halmasuit-debug halmasuit-luks halmasuit-session
-                halmasuit-vm-client nix-config;
+                halmasuit-vm-client niri-flake dms;
         wallpaperStorePaths = [ ./fixtures/wallpaper-shader.glsl ];
       })
     ];

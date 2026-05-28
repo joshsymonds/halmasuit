@@ -1128,7 +1128,7 @@ Justfile targets (mirroring savecraft's organization):
 just check           # lint + test (the fast local gate; <30s)
 just lint            # clippy + cargo-deny + typos + cargo-machete + rustfmt --check
 just test            # cargo nextest + llvm-cov ≥ 80% on critical crates
-just test-vm         # NixOS VM tests (smoke-boot must pass; login-flash expected RED in v1)
+just test-vm         # NixOS VM tests (login-flash is the canonical GREEN gate)
 just test-vm-drive name  # agent-drivable interactive VM (QEMU window + FIFO cmd file)
 just test-vm-interactive name   # interactive driver for a specific test
 just fmt             # rustfmt --edition 2024

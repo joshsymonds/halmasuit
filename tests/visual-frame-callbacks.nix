@@ -26,7 +26,7 @@
 {
   system,
   nixpkgs,
-  nix-config,
+  niri-flake,
   halmasuit,
   halmasuit-session,
   ssimulacra2-cli,
@@ -40,7 +40,7 @@ let
 
   # Unmodified upstream niri — the same software-render setup as
   # visual-niri-session (llvmpipe forced; no DRI3).
-  niri = nix-config.inputs.niri-flake.packages.${system}.niri-unstable;
+  niri = niri-flake.packages.${system}.niri-unstable;
 
   niriConfig = pkgs.writeText "niri-config.kdl" ''
     input { keyboard { xkb {} } }

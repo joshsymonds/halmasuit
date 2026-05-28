@@ -18,7 +18,7 @@
 {
   system,
   nixpkgs,
-  nix-config,
+  niri-flake,
   halmasuit,
   halmasuit-session,
   halmasuit-vm-client,
@@ -31,7 +31,7 @@ let
     inherit system;
     config.allowUnfree = true;
   };
-  niri = nix-config.inputs.niri-flake.packages.${system}.niri-unstable;
+  niri = niri-flake.packages.${system}.niri-unstable;
 
   # Same minimal niri config visual-niri-session uses — empty workspace,
   # no autostart, no keybinds. The gate proves the broker→niri handover,

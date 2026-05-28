@@ -2,8 +2,8 @@
 # the REAL DankGreeter as halmasuit's greeter, over the wallpaper
 # plane.
 #
-# The real greeter stack (gnomon's, unmodified, pinned via nix-config's
-# dms flake): the `dms` greeter NixOS module builds the `dms-greeter`
+# The real greeter stack (gnomon's, unmodified, pinned via halmasuit's
+# dms input): the `dms` greeter NixOS module builds the `dms-greeter`
 # greetd-client wrapper → a nested niri (greeter-mode compositor) →
 # Quickshell/Qt running the DMS Material-You login UI. greetd is
 # force-disabled — halmasuit is the display manager; it forks the
@@ -24,7 +24,8 @@
 {
   system,
   nixpkgs,
-  nix-config,
+  niri-flake,
+  dms,
   halmasuit,
   halmasuit-session,
   ssimulacra2-cli,
@@ -35,10 +36,12 @@ let
     inherit system;
     config.allowUnfree = true;
   };
-  niri = nix-config.inputs.niri-flake.packages.${system}.niri-unstable;
-  # The dms greeter NixOS module expects `inputs` (and the dms flake
-  # injects `dmsPkgs`). Same pattern as smoke-boot.nix.
-  testInputs = nix-config.inputs // { inherit nix-config; };
+  niri = niri-flake.packages.${system}.niri-unstable;
+  # niri-flake's NixOS module destructures `inputs` from module args.
+  # We thread niri-flake + dms through specialArgs; DMS's greeter
+  # module receives `dmsPkgs` at module-build time and doesn't read
+  # `inputs` itself.
+  testInputs = { inherit niri-flake dms; };
 in
 pkgs.testers.runNixOSTest {
   name = "visual-dankgreeter";
@@ -61,8 +64,8 @@ pkgs.testers.runNixOSTest {
         ../nix/module.nix
         ./lib/test-user.nix
         # The real, unmodified greeter stack (exactly what gnomon runs).
-        nix-config.inputs.niri-flake.nixosModules.niri
-        nix-config.inputs.dms.nixosModules.greeter
+        niri-flake.nixosModules.niri
+        dms.nixosModules.greeter
       ];
 
       # niri-flake provides programs.niri.{enable,package}; the dms

@@ -128,7 +128,7 @@ Requires Nix with flakes enabled.
 nix develop          # rust + cargo tooling + qemu + lints
 just check           # rustfmt + clippy -D warnings + cargo-deny +
                      # cargo-machete + typos + nextest (377)
-just test-vm         # NixOS VM gates (49): smoke-boot, halmasuit-vm,
+just test-vm         # NixOS VM gates (48): halmasuit-vm,
                      # initrd-survival, full-boot-flash, luks-unlock,
                      # visual-initrd-pixmap, visual-phase-b-* (6-cell
                      # matrix), run-pam-auth, session-r5r6,

@@ -2,8 +2,8 @@
 # as the broker-launched session, over the wallpaper.
 #
 # Forks visual-foreground.nix, swapping the xdg_toplevel STAND-IN
-# session for unmodified upstream niri (pinned via nix-config's
-# niri-flake — the same revision gnomon runs). The arc:
+# session for unmodified upstream niri (pinned via halmasuit's
+# niri-flake input — the same revision gnomon runs). The arc:
 #
 #   halmasuit (wallpaper from frame 0) + a layer-shell greeter stand-in
 #   → halmasuit-vm-client drives a REAL greetd full-auth → compositor
@@ -27,7 +27,7 @@
 {
   system,
   nixpkgs,
-  nix-config,
+  niri-flake,
   halmasuit,
   halmasuit-session,
   halmasuit-layer-shell-test-client,
@@ -39,13 +39,13 @@ let
   pkgs = import nixpkgs {
     inherit system;
     # niri-flake's pinned niri-unstable may pull unfree deps
-    # transitively (same rationale as smoke-boot.nix).
+    # transitively.
     config.allowUnfree = true;
   };
 
   # Unmodified upstream niri, the exact revision gnomon runs (via
-  # nix-config's own niri-flake input — never vendored or patched).
-  niri = nix-config.inputs.niri-flake.packages.${system}.niri-unstable;
+  # halmasuit's niri-flake input — never vendored or patched).
+  niri = niri-flake.packages.${system}.niri-unstable;
 
   # Minimal valid niri config: empty workspace, no autostart, no
   # keybinds needed — the gate only needs niri to come up as

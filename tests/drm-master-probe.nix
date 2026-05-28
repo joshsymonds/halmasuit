@@ -2,9 +2,8 @@
 # master from boot through multi-user.target on a stock NixOS system,
 # without logind brokerage or contention.
 #
-# Sibling to tests/smoke-boot.nix. Does not require the dms-niri desktop
-# stack — substrate is intentionally minimal so the only thing exercising
-# DRM is our probe.
+# Substrate is intentionally minimal — no desktop stack — so the only
+# thing exercising DRM is our probe.
 
 {
   system,
