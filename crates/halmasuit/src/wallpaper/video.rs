@@ -181,6 +181,19 @@ impl VideoBackend {
 }
 
 impl WallpaperBackend for VideoBackend {
+    /// Video wallpapers need the wallpaper-engine tick to drive
+    /// renders unconditionally: the decoder relay produces frames
+    /// asynchronously, and `render_element` is what consumes them
+    /// (via the `poll_frames()` call at the top + the GPU upload of
+    /// the latest decoded frame). Without continuous renders, queued
+    /// decoder frames pile up unused and the on-screen video freezes
+    /// the moment the render path goes idle — most visibly during
+    /// the post-PrepareForShutdown window when no Wayland client
+    /// commits drive `frame_pending`.
+    fn wants_continuous_render(&self) -> bool {
+        true
+    }
+
     fn requested_fallback(&self) -> Option<FallbackKind> {
         // Only request a fallback when (a) the relay has been spawned
         // (otherwise there's nothing to fail), (b) the relay is dead

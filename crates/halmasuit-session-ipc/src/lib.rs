@@ -137,6 +137,23 @@ pub enum CompositorToBroker {
     /// with the root fd then closes the connection — this connection
     /// is dedicated to the root-fd transfer.
     RequestRootFd,
+    /// Epic #47 R1: request the broker to spawn the greeter. The
+    /// broker reads its OWN `HALMASUIT_GREETER_UID` and
+    /// `HALMASUIT_GREETER_COMMAND` env vars (the compositor is
+    /// unprivileged and MUST NOT assert spawn policy) and
+    /// fork-then-drops a child to that uid, then `execve`s the
+    /// configured command. The broker responds with
+    /// [`BrokerToCompositor::GreeterSpawned`] carrying the spawned
+    /// pid plus an SCM_RIGHTS pidfd for the compositor to signal at
+    /// session-start swap time (the same shape Amendment A5.6 uses
+    /// for the session leader pidfd).
+    ///
+    /// Sent on a TRANSIENT broker connection dedicated to the
+    /// greeter spawn — analogous to `RequestRootFd`, NOT the
+    /// per-greeter-episode relay connection that carries the
+    /// auth/session-lifecycle frames (CLAUDE.md hard rule: one
+    /// OwnedFd per episode, no sharing).
+    SpawnGreeter,
 }
 
 /// How a launched user session ended (Amendment A5.2).
@@ -202,6 +219,18 @@ pub enum BrokerToCompositor {
     /// ancillary data on the same frame; the compositor extracts it
     /// via `recvmsg` with a cmsg buffer.
     RootFd,
+    /// Epic #47 R1: response to [`CompositorToBroker::SpawnGreeter`].
+    /// `pid` names the greeter the broker forked + dropped + exec'd
+    /// (so the compositor's introspection / logs can refer to it);
+    /// the actual signaling capability — a pidfd to send `SIGKILL`
+    /// at swap time — travels as SCM_RIGHTS ancillary data on the
+    /// same frame. The compositor consumes the pidfd via `recvmsg`
+    /// with a cmsg buffer, identical to how it consumes the leader
+    /// pidfd in [`Self::SessionOpened`]'s post-Amendment-A5.6 path.
+    /// Carrying a bare `pid` (no fd) is forbidden by the same
+    /// "no raw leader pid" rule (CLAUDE.md hard rule); the pid is
+    /// informational, the pidfd is authority.
+    GreeterSpawned { pid: i32 },
 }
 
 /// Hard ceiling on a single framed message. Mirrors `halmasuit-greetd`'s
@@ -451,6 +480,7 @@ mod tests {
             "session_opened",
             "session_ended",
             "root_fd",
+            "greeter_spawned",
             "worker_success",
             "worker_failure",
         ] {
@@ -465,15 +495,21 @@ mod tests {
             );
         }
 
-        // Conversely: `request_root_fd` (the new C→B tag) must NOT
-        // decode as any BrokerToCompositor variant. The broker is
-        // the recipient of root-fd requests, not the emitter.
-        let req = encode(&CompositorToBroker::RequestRootFd).unwrap();
-        let as_b2c: Result<Option<(BrokerToCompositor, usize)>, _> = try_decode(&req);
-        assert!(
-            matches!(as_b2c, Err(CodecError::Json(_))),
-            "request_root_fd must not decode as BrokerToCompositor, got {as_b2c:?}"
-        );
+        // Conversely: `request_root_fd` and `spawn_greeter` (C→B
+        // tags) must NOT decode as any BrokerToCompositor variant.
+        // The broker is the recipient of these requests, not the
+        // emitter.
+        for c2b in [
+            CompositorToBroker::RequestRootFd,
+            CompositorToBroker::SpawnGreeter,
+        ] {
+            let bytes = encode(&c2b).unwrap();
+            let as_b2c: Result<Option<(BrokerToCompositor, usize)>, _> = try_decode(&bytes);
+            assert!(
+                matches!(as_b2c, Err(CodecError::Json(_))),
+                "{c2b:?} must not decode as BrokerToCompositor, got {as_b2c:?}"
+            );
+        }
     }
 
     // ── Amendment A5: broker→compositor session-lifecycle frames ─────
@@ -544,6 +580,29 @@ mod tests {
     }
 
     #[test]
+    fn wire_format_spawn_greeter() {
+        // Epic #47 R1: C→B request for the broker to fork-then-drop
+        // the greeter. Empty body: the compositor MUST NOT assert
+        // spawn policy (greeter_uid + command are read from broker's
+        // own env). The tag is the entire payload.
+        let json = r#"{"type":"spawn_greeter"}"#;
+        let parsed: CompositorToBroker = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, CompositorToBroker::SpawnGreeter);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn wire_format_greeter_spawned() {
+        // Epic #47 R1: B→C reply naming the spawned greeter pid. The
+        // signaling capability (pidfd) travels as SCM_RIGHTS auxdata
+        // on the same frame, identical to SessionOpened's A5.6 path.
+        let json = r#"{"type":"greeter_spawned","pid":1234}"#;
+        let parsed: BrokerToCompositor = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, BrokerToCompositor::GreeterSpawned { pid: 1234 });
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+
+    #[test]
     fn broker_to_compositor_only_frames_do_not_cross_decode_as_compositor_to_broker() {
         // Structural anti-forge guarantee: frames the unprivileged
         // compositor must NEVER be able to forge MUST NOT decode as
@@ -574,6 +633,7 @@ mod tests {
                 outcome: SessionOutcome::Signaled { signal: 15 },
             },
             BrokerToCompositor::RootFd,
+            BrokerToCompositor::GreeterSpawned { pid: 4242 },
         ] {
             let bytes = encode(&frame).unwrap();
             let as_c2b: Result<Option<(CompositorToBroker, usize)>, _> = try_decode(&bytes);
@@ -603,6 +663,7 @@ mod tests {
             },
             CompositorToBroker::Cancel,
             CompositorToBroker::RequestRootFd,
+            CompositorToBroker::SpawnGreeter,
         ] {
             let bytes = encode(&msg).unwrap();
             let (decoded, consumed): (CompositorToBroker, usize) =
@@ -635,6 +696,7 @@ mod tests {
                 outcome: SessionOutcome::Signaled { signal: 9 },
             },
             BrokerToCompositor::RootFd,
+            BrokerToCompositor::GreeterSpawned { pid: 9876 },
         ] {
             let bytes = encode(&msg).unwrap();
             let (decoded, consumed): (BrokerToCompositor, usize) =

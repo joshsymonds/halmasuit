@@ -43,13 +43,10 @@ use smithay::backend::renderer::element::render_elements;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
-use smithay::backend::session::Session;
-use smithay::backend::session::libseat::LibSeatSession;
 use smithay::output::{Mode as OutputMode, Output, OutputModeSource, PhysicalProperties, Subpixel};
 use smithay::reexports::drm::Device as BaseDrmDevice;
 use smithay::reexports::drm::control::Device as ControlDevice;
 use smithay::reexports::drm::control::connector;
-use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::DeviceFd;
 
 use crate::wallpaper::{
@@ -197,9 +194,14 @@ pub struct DrmBackend {
     /// `started_at` anchors animation timing — `Instant`-based
     /// elapsed time chooses the active animation frame.
     cursor: CursorRenderState,
-    /// Monotonic frame counter for the `frame_audit` `FrameRendered`
-    /// stream. Only exists in `halmasuit-debug`.
-    #[cfg(feature = "frame_audit")]
+    /// Monotonic frame counter, incremented on every successful render
+    /// path through `render_one_frame` / `render_layer_elements` /
+    /// the wallpaper-engine tick. Always present (not feature-gated):
+    /// production halmasuit exposes it via the shutdown-liveness line
+    /// so the pivot-survival test can assert the render loop is
+    /// actually advancing the counter post-pivot (not just dispatching
+    /// the calloop liveness timer). `halmasuit-debug` also surfaces it
+    /// as `Event::FrameRendered.frame_id` for the `frame_audit` stream.
     frame_counter: u64,
     /// Latest composited frame, published every audited frame for the
     /// D-Bus `Snapshot()` method to read. Only exists in
@@ -235,80 +237,75 @@ impl DrmBackend {
     /// [`setup_drm_backend`] for `WallpaperConfig::Video`
     /// configurations. For non-video backends this is a no-op.
     ///
-    /// Returns `true` iff a fallback swap fired this tick — the
-    /// timer callback in `main.rs` uses this to queue an explicit
-    /// render so the newly-installed fallback reaches the screen
-    /// (idle render loop after relay-death produces no vblank to
-    /// pick up the swap otherwise).
-    pub fn tick_wallpaper(&mut self) -> bool {
-        self.wallpaper.tick(&mut self.renderer)
+    /// Returns the wallpaper-tick decision: drives the per-tick render
+    /// AND the fallback-swap state machine in a single call. The
+    /// `main.rs` wallpaper-tick callback consumes this and renders if
+    /// the action is non-`Idle`.
+    pub fn tick_wallpaper(&mut self) -> WallpaperTickAction {
+        let fallback_swapped = self.wallpaper.tick(&mut self.renderer);
+        let wants_continuous = self.wallpaper.wants_continuous_render();
+        match (fallback_swapped, wants_continuous) {
+            (true, _) => WallpaperTickAction::RenderAndSwapped,
+            (false, true) => WallpaperTickAction::RenderContinuous,
+            (false, false) => WallpaperTickAction::Idle,
+        }
     }
 }
 
-/// Set up the full DRM/GBM/EGL/GLES/DrmCompositor stack on the device
-/// at `path`. The DRM fd is opened through the libseat `session`
-/// (seatd brokers it and owns DRM master — halmasuit never issues
-/// `SET_MASTER`; the improved privilege posture validated by
-/// drm-master-probe Phase 4). Picks the first connected connector +
-/// its preferred mode + first CRTC, builds a GBM allocator + EGL
-/// display + GLES renderer + DrmCompositor wrapping that surface,
-/// registers the DRM event source with calloop for vblank
-/// notifications, and returns the retained backend plus a smithay
-/// `Output` for the caller to register as a global.
-///
-/// The caller is responsible for calling `output.create_global::<S>(&display_handle)`
-/// after this returns — we don't do it here because that call requires
-/// `S: GlobalDispatch<WlOutput, …>` which is implemented at the
-/// caller's site, not in this module.
-///
-/// `drm_event_handler` is invoked from inside the calloop callback
-/// when `DrmEvent::VBlank` fires.
-///
-/// # Errors
-///
-/// Bubbles any DRM ioctl, GBM allocation, EGL initialization, or
-/// calloop registration failure with context.
-pub fn setup_drm_backend<S, F>(
-    session: &mut LibSeatSession,
-    path: &Path,
-    loop_handle: &smithay::reexports::calloop::LoopHandle<'static, S>,
-    drm_event_handler: F,
-    wallpaper_config: Option<WallpaperConfig>,
-) -> io::Result<(
-    DrmBackend,
-    smithay::reexports::calloop::RegistrationToken,
-    Output,
-)>
-where
-    S: 'static,
-    F: FnMut(DrmEvent, &mut Option<smithay::backend::drm::DrmEventMetadata>, &mut S) + 'static,
-{
-    // seatd brokers the DRM fd (it holds master; we never SET_MASTER).
-    // O_CLOEXEC|O_NONBLOCK|O_RDWR matches the anvil udev pattern.
-    let owned_fd = session
-        .open(path, OFlags::RDWR | OFlags::CLOEXEC | OFlags::NONBLOCK)
-        .map_err(|e| io::Error::other(format!("libseat session.open({}): {e}", path.display())))?;
-    let device_fd = DrmDeviceFd::new(DeviceFd::from(owned_fd));
-    build_drm_pipeline(
-        device_fd,
-        MasterAcquisition::FromSeatd,
-        loop_handle,
-        drm_event_handler,
-        wallpaper_config,
-    )
+/// Outcome of `DrmBackend::tick_wallpaper` — encodes both the
+/// fallback-swap state-machine step AND whether the active backend
+/// needs a per-tick render. `main.rs`'s wallpaper-tick callback
+/// matches on this to decide whether to call `render_one_frame`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WallpaperTickAction {
+    /// No render needed this tick. Static-wallpaper config (image)
+    /// with no fallback swap pending — the kernel keeps scanning out
+    /// the last-flipped framebuffer.
+    Idle,
+    /// Render this tick because the active backend wants continuous
+    /// renders (shader, video — `wants_continuous_render() == true`),
+    /// not because a swap fired.
+    RenderContinuous,
+    /// A fallback swap fired this tick (e.g. video relay died); the
+    /// freshly-installed fallback must reach the screen, so the
+    /// caller queues a render.
+    RenderAndSwapped,
+}
+
+impl WallpaperTickAction {
+    /// `true` iff this action wants the caller to invoke `render_one_frame`.
+    #[must_use]
+    pub const fn wants_render(self) -> bool {
+        !matches!(self, Self::Idle)
+    }
 }
 
 /// Set up the full DRM/GBM/EGL/GLES/DrmCompositor stack by opening the
-/// DRM device at `path` **directly** (no libseat brokerage) and
-/// issuing `DRM_IOCTL_SET_MASTER` ourselves. The Phase B boot-from-
-/// initrd deployment path: in initramfs there is no seatd to broker
-/// the fd and no other DRM consumer to contend with, so halmasuit
-/// owns master direct for its process lifetime. drm-master-probe
-/// Phase 1+2 validated that the master designation survives both
-/// `setresuid` and `switch_root` via `SurviveFinalKillSignal=yes`.
+/// DRM device at `path` directly and issuing `DRM_IOCTL_SET_MASTER`
+/// ourselves. halmasuit is a system compositor: it owns master for its
+/// entire process lifetime, in both the rootfs and the initramfs
+/// deployment paths. No libseat / no seatd anywhere in the runtime
+/// closure (R2.3) — the kernel's "first opener wins" rule grants us
+/// master implicitly on open, and the subsequent `acquire_master_lock`
+/// is idempotent. Probes drm-master-probe-phase{1,2} validated that
+/// the master designation survives both `setresuid` (privilege drop)
+/// and `switch_root` (initramfs→rootfs pivot) when paired with
+/// `SurviveFinalKillSignal=yes`.
 ///
-/// Same returned shape as [`setup_drm_backend`]; the caller registers
-/// the smithay `Output` global from its concrete-state context.
+/// Picks the first connected connector + its preferred mode + first
+/// CRTC, builds a GBM allocator + EGL display + GLES renderer +
+/// DrmCompositor wrapping that surface, registers the DRM event source
+/// with calloop for vblank notifications, and returns the retained
+/// backend plus a smithay `Output` for the caller to register as a
+/// global.
+///
+/// The caller is responsible for calling
+/// `output.create_global::<S>(&display_handle)` after this returns —
+/// that call requires `S: GlobalDispatch<WlOutput, …>` which is
+/// implemented at the caller's site, not in this module.
+///
+/// `drm_event_handler` is invoked from inside the calloop callback
+/// when `DrmEvent::VBlank` fires.
 ///
 /// # Errors
 ///
@@ -331,55 +328,29 @@ where
     use std::os::fd::OwnedFd;
     use std::os::unix::fs::OpenOptionsExt;
     // O_RDWR | O_NONBLOCK. O_CLOEXEC is set by std's OpenOptions by
-    // default since Rust 1.20; explicit O_NONBLOCK matches the libseat
-    // path's flags.
+    // default since Rust 1.20.
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
-        .map_err(|e| {
-            io::Error::other(format!("open {} (direct, no libseat): {e}", path.display()))
-        })?;
+        .map_err(|e| io::Error::other(format!("open {}: {e}", path.display())))?;
     let owned_fd: OwnedFd = file.into();
     let device_fd = DrmDeviceFd::new(DeviceFd::from(owned_fd));
-    build_drm_pipeline(
-        device_fd,
-        MasterAcquisition::Direct,
-        loop_handle,
-        drm_event_handler,
-        wallpaper_config,
-    )
-}
-
-/// Whether the DRM fd was opened with master already held by another
-/// process (libseat / seatd brokered case) or whether we must issue
-/// `DRM_IOCTL_SET_MASTER` ourselves (the direct-open Phase B case).
-#[derive(Clone, Copy)]
-enum MasterAcquisition {
-    /// libseat/seatd is the master; halmasuit holds a brokered fd
-    /// without master designation. NEVER call `acquire_master_lock`
-    /// in this mode — it would race seatd.
-    FromSeatd,
-    /// halmasuit opened `/dev/dri/card0` directly and must issue
-    /// `SET_MASTER` to become master. Used in the Phase B
-    /// boot-from-initrd deployment, where no seatd exists.
-    Direct,
+    build_drm_pipeline(device_fd, loop_handle, drm_event_handler, wallpaper_config)
 }
 
 // reason: a single linear DRM→GBM→EGL→GLES→DrmCompositor→calloop
-// init sequence shared by `setup_drm_backend` and `setup_drm_direct`.
-// The ordering is load-bearing (master before GBM, EGL before GLES,
-// surface before compositor); splitting it into more helpers scatters
-// that ordering across the module for no readability or testability
-// gain.
+// init sequence used by `setup_drm_direct`. The ordering is
+// load-bearing (master before GBM, EGL before GLES, surface before
+// compositor); splitting it into more helpers scatters that ordering
+// across the module for no readability or testability gain.
 #[allow(
     clippy::too_many_lines,
     reason = "linear hardware-init sequence; ordering is load-bearing"
 )]
 fn build_drm_pipeline<S, F>(
     device_fd: DrmDeviceFd,
-    master: MasterAcquisition,
     loop_handle: &smithay::reexports::calloop::LoopHandle<'static, S>,
     drm_event_handler: F,
     wallpaper_config: Option<WallpaperConfig>,
@@ -397,15 +368,13 @@ where
     let (mut drm, notifier) = DrmDevice::new(device_fd.clone(), true)
         .map_err(|e| io::Error::other(format!("DrmDevice::new: {e}")))?;
 
-    // SET_MASTER for the direct-open path. drm-rs's
-    // `ControlDevice::acquire_master_lock` issues `DRM_IOCTL_SET_MASTER`;
-    // idempotent on an fd that already has master (the libseat path
-    // skips it on principle to avoid racing seatd, not because it
-    // would fail).
-    if matches!(master, MasterAcquisition::Direct) {
-        drm.acquire_master_lock()
-            .map_err(|e| io::Error::other(format!("DRM SET_MASTER (direct): {e}")))?;
-    }
+    // SET_MASTER. drm-rs's `ControlDevice::acquire_master_lock` issues
+    // `DRM_IOCTL_SET_MASTER`; idempotent on an fd that already has
+    // master (which it should, courtesy of the kernel's "first opener
+    // wins" rule — but call this explicitly so the master designation
+    // is recorded against this fd before we touch CRTCs).
+    drm.acquire_master_lock()
+        .map_err(|e| io::Error::other(format!("DRM SET_MASTER: {e}")))?;
 
     // Pick connector + mode + CRTC. Same shape as the B.1 slice; the
     // resource-handle enumeration goes through drm-rs (re-exposed via
@@ -587,7 +556,6 @@ where
                 cached: None,
                 started_at: std::time::Instant::now(),
             },
-            #[cfg(feature = "frame_audit")]
             frame_counter: 0,
             #[cfg(feature = "frame_audit")]
             snapshot_buf: crate::dbus::new_buffer(),
@@ -912,6 +880,13 @@ impl DrmBackend {
             .queue_frame(())
             .map_err(|e| io::Error::other(format!("queue_frame: {e}")))?;
 
+        // Advance the always-on render counter. `audit_frame` reads
+        // (counter - 1) for `Event::FrameRendered.frame_id` so the
+        // first emitted frame is still id=0; production halmasuit
+        // exposes the post-increment value via `frame_counter()` for
+        // the shutdown-liveness line's `frames=N` field.
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+
         // The frame is now queued for scanout. Under `frame_audit`
         // (halmasuit-debug only) re-render the identical element set
         // into an offscreen texture, read it back, analyze it, and
@@ -929,6 +904,16 @@ impl DrmBackend {
         let _ = output;
 
         Ok(true)
+    }
+
+    /// Total frames the render path has queued for scanout. Monotonic,
+    /// wraps on u64 overflow. Read by the shutdown-liveness timer to
+    /// prove (via the `frames=N` field of the liveness line) that the
+    /// render loop is actually advancing through shutdown — not just
+    /// that the calloop event loop is firing the liveness timer.
+    #[must_use]
+    pub const fn frame_counter(&self) -> u64 {
+        self.frame_counter
     }
 
     /// Re-render `elements` (+ the clear color) into an offscreen
@@ -960,15 +945,18 @@ impl DrmBackend {
                 height: hu,
             });
         }
+        // The caller (`render_one_frame`) bumped `frame_counter`
+        // after `queue_frame` succeeded; subtract one so the first
+        // frame is still emitted as id=0 (matches every existing
+        // visual test's frame-id assumptions).
         halmasuit_introspect::emit(&halmasuit_introspect::Event::FrameRendered {
-            frame_id: self.frame_counter,
+            frame_id: self.frame_counter.wrapping_sub(1),
             pixel_count: stats.pixel_count,
             clear_pixel_count: stats.clear_pixel_count,
             black_pixel_count: stats.black_pixel_count,
             degenerate: stats.degenerate,
             phash: stats.phash,
         });
-        self.frame_counter += 1;
         // Wallpaper-plane-only auxiliary capture (closes C-G1: the
         // session-scene golden has niri's opaque fullscreen toplevel
         // covering the wallpaper plane, so all six matrix cells'

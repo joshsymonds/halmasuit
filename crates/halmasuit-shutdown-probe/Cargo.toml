@@ -1,0 +1,32 @@
+[package]
+name        = "halmasuit-shutdown-probe"
+description = "Research probe: validate same-PID survival through systemd shutdown for halmasuit Epic #47 R2 (wallpaper continuity to kernel halt). Not production code; halmasuit is the production home for the surviving compositor."
+
+version.workspace      = true
+edition.workspace      = true
+# Same MSRV relaxation rationale as drm-master-probe: probes build under
+# nixpkgs's pinned rustc (currently 1.94.x on unstable) and we don't want
+# the probe to gate on workspace-wide MSRV bumps. Highest feature actually
+# used is std::os::unix::ffi (stable since 1.0).
+rust-version           = "1.87"
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# signalfd, sigprocmask, poll. `libc` would be needed for direct
+# syscall wrappers; we use nix's safe layer instead, so libc itself
+# isn't a direct dep.
+nix = { version = "0.30", features = ["signal", "poll"] }
+# Phase 2: DRM ioctls. Same crate + version as drm-master-probe.
+# Phase 0/1 don't link this; cargo's resolver only pulls it in
+# because Phase 2 is in the same binary, but the lean phase0/phase1
+# builds don't pay any runtime cost for it.
+drm = "0.15"
+# Error-context plumbing for the Phase 2 DRM setup chain (mirror of
+# drm-master-probe's pattern; the setup chain has eleven steps,
+# every one of which can fail in informative ways).
+anyhow = "1"

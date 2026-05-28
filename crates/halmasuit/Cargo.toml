@@ -28,7 +28,7 @@ workspace = true
 # (epic G1/R3/R6) — that is production behavior, not frame_audit.
 # The exact-image audit math (`frame_audit`) is arithmetic over the
 # readback bytes; no `img_hash`.
-frame_audit = ["dep:zbus", "dep:png"]
+frame_audit = ["dep:png"]
 
 [dependencies]
 halmasuit-introspect = { path = "../halmasuit-introspect", version = "0.1" }
@@ -68,14 +68,14 @@ smithay = { workspace = true, features = [
     # committed wl_clients into a frame. Required by B.3's wlr-layer-shell
     # path; depended on transitively by B.5+ when we layer toplevels.
     "desktop",
-    # Epic layer E (input): seatd brokers the DRM fd (replacing
-    # self-SET_MASTER — validated by drm-master-probe Phase 4) and the
-    # libinput device fds. `backend_udev` is what enables `input/udev`
-    # (`Libinput::new_with_udev` / `udev_assign_seat`) — `backend_libinput`
-    # alone does not. Input/seat is CORE, not frame_audit-gated.
-    "backend_session_libseat",
+    # Input subsystem. halmasuit opens `/dev/dri/card0` and
+    # `/dev/input/event*` directly while still root (no libseat / no
+    # seatd anywhere in the runtime closure — R2.3). `backend_libinput`
+    # gives us smithay's `LibinputInputBackend` calloop adapter; we
+    # construct the `Libinput` context via `Libinput::new_from_path`
+    # with halmasuit's own `DirectInputInterface`, so neither
+    # `backend_session_libseat` nor `backend_udev` is needed.
     "backend_libinput",
-    "backend_udev",
 ] }
 # calloop comes in two ways: (1) via smithay's reexport for general
 # event-loop use, (2) directly here for the `signals` feature smithay
@@ -92,7 +92,7 @@ calloop.workspace            = true
 # broker (the BrokerSession PamSession — Epic R3 / Amendment A4/A5).
 # `uio`: recvmsg/SCM_RIGHTS to receive the poll-only leader pidfd
 # backstop the broker passes on `SessionOpened` (Amendment A5.6).
-nix = { workspace = true, features = ["user", "signal", "process", "socket", "uio", "fs"] }
+nix = { workspace = true, features = ["user", "signal", "process", "socket", "uio", "fs", "poll"] }
 # drm-rs types reach halmasuit via `smithay::reexports::drm` — same
 # version smithay itself uses (0.14 at the pinned rev), avoiding the
 # multi-version-of-drm problem (smithay's DrmDevice impls drm 0.14's
@@ -122,7 +122,13 @@ serde = { workspace = true }
 serde_json.workspace = true
 # frame_audit-only. `optional = true` keeps them out of the default
 # (production) dependency graph entirely; `frame_audit` turns them on.
-zbus = { workspace = true, optional = true }
+# zbus is a production dep (no longer feature-gated): halmasuit
+# subscribes to org.freedesktop.login1.PrepareForShutdown to learn
+# "shutdown is imminent" under `SurviveFinalKillSignal=yes` (where
+# the SIGTERM kill spree never reaches us). The `frame_audit`
+# feature also uses zbus to serve the diagnostic `Snapshot()`
+# method; that path is still gated, but zbus itself is unconditional.
+zbus = { workspace = true }
 png  = { workspace = true, optional = true }
 caps.workspace = true
 # libc for raw syscall wrappers: pidfd_open / pidfd_send_signal

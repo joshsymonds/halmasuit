@@ -75,6 +75,32 @@ pub enum WallpaperConfig {
     },
 }
 
+impl WallpaperConfig {
+    /// `true` for backends whose runtime
+    /// [`WallpaperBackend::wants_continuous_render`](crate::wallpaper::WallpaperBackend::wants_continuous_render)
+    /// returns `true`. Read at config-time by `main.rs` to decide
+    /// whether to register the wallpaper-engine 100 ms tick at all —
+    /// static backends (image) skip the timer registration entirely
+    /// so the compositor can stay deep-idle on battery-backed
+    /// hardware. Animated backends (shader, video) need the tick to
+    /// drive their per-frame state forward (iTime advance, decoder
+    /// frame consumption) and so DO register the timer.
+    ///
+    /// The agreement test in `tests` below pins this to stay in
+    /// sync with the trait's runtime decision: if a future
+    /// `WallpaperConfig::Foo` variant lands without a matching
+    /// `wants_continuous_render` override (or vice versa), the
+    /// exhaustive `match` on this enum fails to compile / the test
+    /// fires.
+    #[must_use]
+    pub const fn needs_tick(&self) -> bool {
+        match self {
+            Self::Image { .. } => false,
+            Self::Shader { .. } | Self::Video { .. } => true,
+        }
+    }
+}
+
 /// Default `loop_playback` for video wallpapers — `true`, matching
 /// the simple env-var path's inference.
 const fn default_loop() -> bool {
@@ -250,6 +276,45 @@ pub fn default_shadertoy_bindings() -> &'static HashMap<String, UniformBinding> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins `WallpaperConfig::needs_tick` to stay in sync with each
+    /// backend's runtime `WallpaperBackend::wants_continuous_render`
+    /// decision. The `match` on every variant means a future
+    /// `WallpaperConfig::Foo` addition fails to compile here AND
+    /// forces a deliberate choice about whether Foo needs the tick
+    /// (and a matching trait-method override on the corresponding
+    /// backend impl). Defense against silent drift between the
+    /// config-time and runtime views of "animated vs static."
+    #[test]
+    fn needs_tick_agrees_with_backend_runtime() {
+        // Synthetic instances — only the variant shape matters for
+        // `needs_tick`, the actual filesystem paths are not opened.
+        let image = WallpaperConfig::Image {
+            source: PathBuf::from("/dev/null"),
+        };
+        let shader = WallpaperConfig::Shader {
+            source: PathBuf::from("/dev/null"),
+            uniforms: HashMap::new(),
+        };
+        let video = WallpaperConfig::Video {
+            source: PathBuf::from("/dev/null"),
+            loop_playback: true,
+            fallback: None,
+        };
+        // Image: static frame, no per-tick work — tick MUST NOT
+        // register (deep-idle preservation on battery-backed boxes).
+        assert!(!image.needs_tick());
+        // Shader/Video: iTime / decoder frame consumption — tick
+        // MUST register.
+        assert!(shader.needs_tick());
+        assert!(video.needs_tick());
+
+        // Future-variant fail-closed: `WallpaperConfig::needs_tick`'s
+        // exhaustive match (above in this file) fails to compile when
+        // a new variant lands without a tick-policy decision, forcing
+        // the author through the choice deliberately rather than
+        // inheriting a silent default.
+    }
 
     #[test]
     fn extension_inference_picks_image_for_png() {

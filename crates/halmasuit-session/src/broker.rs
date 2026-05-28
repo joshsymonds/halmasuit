@@ -514,6 +514,168 @@ fn serve_root_fd_request(
     }
 }
 
+/// Outcome of the first-frame dispatch inside [`admit_one`].
+enum FirstFrame {
+    /// The frame is `BeginAuth` — the caller proceeds to slot creation.
+    BeginAuth { service: String, username: String },
+    /// The frame was a transient request (`RequestRootFd` /
+    /// `SpawnGreeter`), fully served by its handler, OR the frame was
+    /// unexpected / unreadable. Either way, the connection has been
+    /// handled and the caller should just return `Ok(true)`.
+    Handled,
+}
+
+/// Read and dispatch the first frame on a newly-admitted connection.
+///
+/// Splits the per-frame routing out of [`admit_one`] so the latter
+/// fits the workspace clippy `too_many_lines` cap (additive R1
+/// dispatch arms pushed it over). All transient-connection handlers
+/// (`RequestRootFd`, `SpawnGreeter`) run inline; the `BeginAuth` path
+/// returns up so the caller can proceed to slot creation.
+fn dispatch_first_frame(greeter: &SeqpacketChannel, puid: u32, bl: &mut BrokerLoop) -> FirstFrame {
+    match greeter.recv::<CompositorToBroker>() {
+        Ok(CompositorToBroker::BeginAuth { service, username }) => {
+            FirstFrame::BeginAuth { service, username }
+        }
+        Ok(CompositorToBroker::RequestRootFd) => {
+            serve_root_fd_request(greeter, puid, bl.slot.relay_peer_uid(), &mut bl.refusal_log);
+            FirstFrame::Handled
+        }
+        Ok(CompositorToBroker::SpawnGreeter) => {
+            serve_spawn_greeter_request(
+                greeter,
+                puid,
+                bl.slot.relay_peer_uid(),
+                &mut bl.refusal_log,
+            );
+            FirstFrame::Handled
+        }
+        Ok(_) => {
+            tracing_log("first frame was not BeginAuth; dropping connection");
+            FirstFrame::Handled
+        }
+        Err(e) => {
+            tracing_log(&format!("reading BeginAuth failed: {e}"));
+            FirstFrame::Handled
+        }
+    }
+}
+
+/// Serve a `CompositorToBroker::SpawnGreeter` frame (Epic #47 R1):
+/// SO_PEERCRED-gate the relay peer (same shape as
+/// [`serve_root_fd_request`]), resolve greeter identity from the
+/// broker's OWN env (NEVER from the frame — compositor is the
+/// unprivileged peer and asserts no policy), fork-then-drop a child
+/// to the greeter uid, return a `BrokerToCompositor::GreeterSpawned`
+/// reply with the spawned pid AND its pidfd attached via SCM_RIGHTS.
+///
+/// Errors are logged + the connection is closed (compositor's spawn
+/// request just doesn't get fulfilled). No further frames are
+/// expected on this channel; it's a dedicated transient connection.
+///
+/// The fork-then-drop machinery lives in [`crate::worker::spawn_greeter`]
+/// next to [`crate::worker::spawn_session_leader`] (same safety
+/// posture: pre-fork gate, no-alloc privileged window, child never
+/// returns into Rust). Env lookup keys mirror the existing pre-drop
+/// `spawn_greeter` in `halmasuit/src/main.rs` so the same NixOS
+/// module sets both unit's `Environment=`.
+fn serve_spawn_greeter_request(
+    greeter: &SeqpacketChannel,
+    puid: u32,
+    relay_peer_uid: u32,
+    refusal_log: &mut RefusalLog,
+) {
+    use std::os::fd::AsFd;
+
+    use crate::worker::spawn_greeter;
+
+    if puid != 0 && puid != relay_peer_uid {
+        refusal_log.record_refusal(puid, relay_peer_uid);
+        return;
+    }
+
+    let spec = match greeter_spec_from_env() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing_log(&format!(
+                "greeter spec from env failed: {e}; refusing SpawnGreeter"
+            ));
+            return;
+        }
+    };
+
+    match spawn_greeter(&spec) {
+        Ok(handle) => {
+            // pid is informational; pidfd is authority (CLAUDE.md hard
+            // rule: no raw leader pid in frame, signal capability via
+            // SCM_RIGHTS pidfd). i32 narrowing: pids are positive
+            // 31-bit values on linux; the wire type is i32.
+            let pid = i32::try_from(handle.pid).unwrap_or(-1);
+            if let Err(e) = send_frame_with_fd(
+                greeter,
+                &BrokerToCompositor::GreeterSpawned { pid },
+                Some(handle.pidfd().as_fd()),
+            ) {
+                tracing_log(&format!("send GreeterSpawned failed: {e:?}"));
+            }
+            // Broker's local pidfd copy: the SCM_RIGHTS send dup'd the
+            // fd into the compositor's table; ours is no longer needed.
+            // WorkerHandle drops normally here, closing the pidfd.
+            drop(handle);
+        }
+        Err(e) => {
+            tracing_log(&format!("spawn_greeter failed: {e}"));
+        }
+    }
+}
+
+/// Resolve the greeter spec from the broker's own env.
+///
+/// The compositor never asserts spawn policy; the broker reads
+/// `HALMASUIT_GREETER_UID`, `HALMASUIT_GREETER_COMMAND`,
+/// `HALMASUIT_GREETER_GID`, `HALMASUIT_GREETER_NAME`,
+/// `HALMASUIT_GREETER_HOME`, `HALMASUIT_GREETD_SOCKET` from its own
+/// process env (set by the NixOS module's `Environment=` directive
+/// on the broker unit).
+fn greeter_spec_from_env() -> Result<crate::worker::GreeterSpec, String> {
+    use std::path::PathBuf;
+
+    let uid = std::env::var("HALMASUIT_GREETER_UID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or("HALMASUIT_GREETER_UID missing or unparsable")?;
+    let command_str = std::env::var("HALMASUIT_GREETER_COMMAND").unwrap_or_default();
+    if command_str.is_empty() {
+        return Err("HALMASUIT_GREETER_COMMAND empty".to_owned());
+    }
+    // gid defaults to uid (matches existing pre-drop spawn_greeter
+    // fallback when getpwuid fails and HALMASUIT_GREETER_GID is unset).
+    let gid = std::env::var("HALMASUIT_GREETER_GID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(uid);
+    let name = std::env::var("HALMASUIT_GREETER_NAME")
+        .unwrap_or_else(|_| format!("halmasuit-greeter-{uid}"));
+    let home = PathBuf::from(
+        std::env::var("HALMASUIT_GREETER_HOME").unwrap_or_else(|_| "/var/empty".to_owned()),
+    );
+    // GREETD_SOCK must match what halmasuit's setup_greetd_listener
+    // bound to. The NixOS module sets HALMASUIT_GREETD_SOCKET to the
+    // same value on BOTH the broker unit AND the compositor unit's
+    // Environment= directive, so reading it from broker env is
+    // equivalent to reading it from compositor env.
+    let greetd_sock = std::env::var("HALMASUIT_GREETD_SOCKET")
+        .unwrap_or_else(|_| "/run/halmasuit/greetd.sock".to_owned());
+    Ok(crate::worker::GreeterSpec {
+        uid,
+        gid,
+        name,
+        home,
+        command: PathBuf::from(command_str),
+        greetd_sock,
+    })
+}
+
 /// Accept and admit ONE pending connection on `listener_fd`.
 ///
 /// `listener_fd` is already O_NONBLOCK. `Ok(true)` = a connection was
@@ -586,25 +748,9 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
         bl.refusal_log.record_refusal(puid, relay_uid);
         return Ok(true);
     }
-    let begin = match greeter.recv::<CompositorToBroker>() {
-        Ok(CompositorToBroker::BeginAuth { service, username }) => (service, username),
-        Ok(CompositorToBroker::RequestRootFd) => {
-            serve_root_fd_request(
-                &greeter,
-                puid,
-                bl.slot.relay_peer_uid(),
-                &mut bl.refusal_log,
-            );
-            return Ok(true);
-        }
-        Ok(_) => {
-            tracing_log("first frame was not BeginAuth; dropping connection");
-            return Ok(true);
-        }
-        Err(e) => {
-            tracing_log(&format!("reading BeginAuth failed: {e}"));
-            return Ok(true);
-        }
+    let begin = match dispatch_first_frame(&greeter, puid, bl) {
+        FirstFrame::BeginAuth { service, username } => (service, username),
+        FirstFrame::Handled => return Ok(true),
     };
     // A new connection supersedes any in-flight one. Drop the old
     // loop sources BEFORE create() so a stale readiness can't fire

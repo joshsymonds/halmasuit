@@ -442,6 +442,27 @@
             };
           };
 
+          # halmasuit-shutdown-probe — research probe for Epic #47 R2
+          # (wallpaper continuity to kernel halt). Three-phase probe;
+          # Phase 0 only landed today. Lean closure (signalfd + libc),
+          # no smithay / no DRM. Phase 2 (when it lands) will need a
+          # DRM-aware build variant analogous to drm-master-probe-phase4.
+          halmasuit-shutdown-probe = rustPlatform.buildRustPackage {
+            pname   = "halmasuit-shutdown-probe";
+            version = "0.1.0";
+            src     = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            cargoBuildFlags = [ "-p" "halmasuit-shutdown-probe" ];
+            doCheck = false; # NixOS VM test is the actual test
+            meta = {
+              description = "Phase 0 research probe — SurviveFinalKillSignal=yes on rootfs shutdown kill spree (Epic #47 R2)";
+              license     = pkgs.lib.licenses.asl20;
+            };
+          };
+
           # drm-master-probe-phase4 — the SAME probe built with the
           # `phase4` cargo feature (libseat/seatd survival across
           # setresuid). Separate package so the phase-0–3 tests keep
@@ -719,6 +740,30 @@
           system = "x86_64-linux";
           inherit nixpkgs;
         };
+        # Epic #47 R2 Phase 0 probe: SurviveFinalKillSignal=yes on the
+        # rootfs side. drm-master-probe-phase2 already proved this for
+        # the boot pivot; this proves it for the shutdown pivot.
+        halmasuit-shutdown-probe-phase0 = import ./tests/halmasuit-shutdown-probe-phase0.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+        };
+        # Epic #47 R2 Phase 1 probe: same-PID survival across
+        # systemd-shutdown's pivot to /run/initramfs. Adds
+        # boot.initrd.systemd.shutdownRamfs.storePaths so the probe
+        # binary lives in the post-pivot tmpfs view.
+        halmasuit-shutdown-probe-phase1 = import ./tests/halmasuit-shutdown-probe-phase1.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+        };
+        # Epic #47 R2 Phase 2 probe (THE risky one): DRM master fd
+        # survival across the shutdownRamfs pivot. No documented
+        # prior art for a graphics process doing this. If this
+        # passes, production wiring is unblocked. If it fails, fall
+        # back to the partial-scope alternative.
+        halmasuit-shutdown-probe-phase2 = import ./tests/halmasuit-shutdown-probe-phase2.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+        };
         # Phase B (initramfs survival): real halmasuit binary in
         # boot.initrd.systemd.services with SurviveFinalKillSignal=yes,
         # asserts PID + DRM-master + Wayland-socket continuity across
@@ -909,6 +954,81 @@
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
           halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Epic #47 R1 hard gate: login → SIGKILL niri → broker-respawn
+        # greeter (NEW pid) → second login. Uses the same direct-niri
+        # session command pattern as visual-niri-session (bypassing
+        # niri-session's dbus dep) so the two-key swap_gate actually
+        # reaches Swapped under headless rendering.
+        visual-logout-respawn = import ./tests/visual-logout-respawn.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Epic #47 R2.1 hard gate: SIGTERM-arming + graceful tear-down.
+        # halmasuit ignores SIGTERM during the boot pivot (shutdown_armed
+        # = false in fromInitrd mode until Phase::RootfsReady), then
+        # honors it as the real shutdown signal post-arming. This test
+        # exercises the rootfs-only path (shutdown_armed=true at start)
+        # and asserts wallpaper-only recomposite + clean exit + no
+        # flash across the tear-down.
+        visual-shutdown-tear-down = import ./tests/visual-shutdown-tear-down.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Epic #47 R2.2 hard gate: production halmasuit survives the
+        # rootfs→shutdownRamfs pivot under an actual `systemctl
+        # poweroff`. Pivot survival was probe-validated in
+        # halmasuit-shutdown-probe-phase{1,2}; this test exercises
+        # the production binary (with the broker-launched greeter,
+        # the real DRM backend, the SurviveFinalKillSignal unit
+        # directive, and the systemd.shutdownRamfs.storePaths
+        # wiring) and asserts the same PID emits liveness lines
+        # AFTER the post-pivot `shutdown[1]:` marker.
+        visual-shutdown-pivot-survival = import ./tests/visual-shutdown-pivot-survival.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+        };
+        # Epic #61 R3.4: image cell of the wallpaper-shutdown-survival
+        # matrix. Pairs with pivot-survival (shader cell, has phash-
+        # progression + frame-counter advancing assertions). Image is
+        # static, so this cell asserts only the survival invariants
+        # (PID continuity, no coredump, liveness past pivot marker).
+        visual-shutdown-image = import ./tests/visual-shutdown-image.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+          ssimulacra2-cli                   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Epic #61 R3.5: video cell of the wallpaper-shutdown-survival
+        # matrix. Asserts the full animation invariants (frame counter
+        # advances + phash progression) plus the shared survival
+        # invariants. Drives the halmasuit-decoder relay path end-to-
+        # end through the shutdown sequence.
+        visual-shutdown-video = import ./tests/visual-shutdown-video.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs nix-config;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-decoder                 = self.packages.x86_64-linux.halmasuit-decoder;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
         };
         # R13 forcing function (the reason this epic exists): the
         # real DMS DankGreeter (Quickshell/Qt6 + greeter-niri) as

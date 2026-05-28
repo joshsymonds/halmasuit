@@ -739,6 +739,245 @@ pub fn spawn_session_leader(
     }
 }
 
+/// Minimum acceptable greeter uid.
+///
+/// Below 100 is either root (0), `bin`/`daemon`-class system uids
+/// that have legacy privileges (typically 1-99 across distros), or
+/// the `(uid_t)-1` sentinel. The halmasuit-greeter system user
+/// NixOS auto-creates lands at 999, well above this floor. The
+/// session-leader's [`crate::session_leader::UID_MIN`] (1000) is
+/// the SEPARATE floor for AUTHENTICATED users — the greeter is
+/// structurally lower because it's the unauthenticated entry
+/// point, but still must not be root and must not be system
+/// reserved.
+pub const UID_FLOOR_GREETER: u32 = 100;
+
+/// Concrete identity + paths the broker needs to spawn the greeter.
+///
+/// Broker reads these from its own env (`HALMASUIT_GREETER_*`).
+/// The compositor never asserts any of them (Epic #47 R1
+/// anti-pattern: the compositor is the unprivileged peer, broker
+/// is policy authority).
+#[derive(Debug, Clone)]
+pub struct GreeterSpec {
+    /// Target uid for the greeter process. Must be ≥ [`UID_FLOOR_GREETER`].
+    pub uid: u32,
+    /// Target primary gid. Must be ≥ [`UID_FLOOR_GREETER`].
+    pub gid: u32,
+    /// `USER` / `LOGNAME` env value.
+    pub name: String,
+    /// `HOME` env value (typically `/var/empty` for the system greeter).
+    pub home: std::path::PathBuf,
+    /// Absolute path to the greeter binary (e.g. the DankGreeter
+    /// quickshell launcher wrapper).
+    pub command: std::path::PathBuf,
+    /// `GREETD_SOCK` env value — the path/abstract-name halmasuit's
+    /// greetd listener bound to. Must match
+    /// `greetd_socket_path_from_env()` in the compositor.
+    pub greetd_sock: String,
+}
+
+/// Spawn the greeter from the already-root broker via fork-then-drop.
+///
+/// The already-root broker forks; the child drops to the greeter uid +
+/// `execve`s the configured command; the parent returns a
+/// [`WorkerHandle`] holding the spawned pid plus a pidfd. The pidfd
+/// is what the broker hands back to the compositor (via SCM_RIGHTS)
+/// for race-free `pidfd_send_signal(SIGKILL)` at the session-start
+/// swap (CLAUDE.md `project-pidfd-over-raw-kill`).
+///
+/// Same fork-then-drop discipline as [`spawn_session_leader`] but for
+/// the unauthenticated greeter — different UID floor (system users
+/// land below 1000), no PAM-derived supplementary groups (greeter is
+/// not a PAM principal), and a fixed env shape (broker is policy
+/// authority; the env it sends is non-negotiable: USER, LOGNAME, HOME,
+/// XDG_RUNTIME_DIR=/run/halmasuit, WAYLAND_DISPLAY=wayland-0,
+/// GREETD_SOCK=<configured>, PATH=<systemd default>).
+///
+/// # Errors
+///
+/// [`io::ErrorKind::PermissionDenied`] if EUID != 0 OR the spec's
+/// uid/gid is below [`UID_FLOOR_GREETER`] or the `(uid_t)-1`/`u32::MAX`
+/// sentinel (no fork performed). [`io::ErrorKind::InvalidInput`] on an
+/// interior NUL in an arg or env entry; any errno from `fork` /
+/// `pidfd_open`. The CHILD never returns through this `Result` — on
+/// ANY drop/exec failure it `libc::_exit`s.
+pub fn spawn_greeter(spec: &GreeterSpec) -> io::Result<WorkerHandle> {
+    use nix::unistd::{Gid, Uid};
+
+    greeter_prefork_gates(spec)?;
+    let (path, argv, envv) = build_greeter_cstrings(spec)?;
+    let uid = Uid::from_raw(spec.uid);
+    let gid = Gid::from_raw(spec.gid);
+
+    // SAFETY: fork(2). Child path is straight-line, ends in libc::_exit
+    // on ANY failure — NEVER returns into Rust. Same discipline as
+    // spawn_session_leader; same `?`/return prohibition (Epic R7).
+    #[expect(
+        unsafe_code,
+        reason = "fork(2) for the broker-side greeter spawn (Epic #47 R1)"
+    )]
+    let fork = unsafe { nix::unistd::fork() }.map_err(io::Error::from)?;
+
+    match fork {
+        nix::unistd::ForkResult::Child => greeter_child_exec(uid, gid, &path, &argv, &envv),
+        nix::unistd::ForkResult::Parent { child } => {
+            let pid = u32::try_from(child.as_raw())
+                .map_err(|_| io::Error::other("child pid out of range"))?;
+            let pidfd = pidfd_open_for(pid)?;
+            Ok(WorkerHandle { pid, pidfd })
+        }
+    }
+}
+
+/// Pre-fork fail-closed gates for [`spawn_greeter`]. EUID must be 0
+/// (broker invariant); spec uid/gid must be at or above
+/// [`UID_FLOOR_GREETER`] and not the `(uid_t)-1`/`u32::MAX` sentinel.
+/// Defence-in-depth re-check — matches `spawn_session_leader`'s
+/// posture even if a future caller bypasses validation upstream.
+fn greeter_prefork_gates(spec: &GreeterSpec) -> io::Result<()> {
+    if nix::unistd::geteuid().as_raw() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "spawn_greeter requires EUID=0",
+        ));
+    }
+    if spec.uid == u32::MAX || spec.uid < UID_FLOOR_GREETER {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "uid {} below UID_FLOOR_GREETER ({}) or is sentinel",
+                spec.uid, UID_FLOOR_GREETER
+            ),
+        ));
+    }
+    if spec.gid == u32::MAX || spec.gid < UID_FLOOR_GREETER {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "gid {} below UID_FLOOR_GREETER ({}) or is sentinel",
+                spec.gid, UID_FLOOR_GREETER
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Build CString argv + envv before the fork.
+///
+/// All allocations happen here so the privileged window between
+/// the first `setres*` and `execve` has ZERO allocations (Epic
+/// R7/R11). Same discipline as `spawn_session_leader`.
+fn greeter_child_env_pairs(spec: &GreeterSpec, home_str: &str) -> [(&'static str, String); 7] {
+    [
+        ("USER", spec.name.clone()),
+        ("LOGNAME", spec.name.clone()),
+        ("HOME", home_str.to_owned()),
+        ("XDG_RUNTIME_DIR", "/run/halmasuit".to_owned()),
+        ("WAYLAND_DISPLAY", "wayland-0".to_owned()),
+        ("GREETD_SOCK", spec.greetd_sock.clone()),
+        (
+            "PATH",
+            "/run/wrappers/bin:/run/current-system/sw/bin:/usr/bin:/bin".to_owned(),
+        ),
+    ]
+}
+
+fn build_greeter_cstrings(
+    spec: &GreeterSpec,
+) -> io::Result<(
+    std::ffi::CString,
+    Vec<std::ffi::CString>,
+    Vec<std::ffi::CString>,
+)> {
+    use std::ffi::CString;
+    let to_c = |s: &str| -> io::Result<CString> {
+        CString::new(s).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "interior NUL in greeter arg/env",
+            )
+        })
+    };
+    let path = to_c(spec.command.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "greeter command path is non-UTF8",
+        )
+    })?)?;
+    // argv = [command]. Greeters take no positional args; the
+    // launcher reads its config from env.
+    let argv: Vec<CString> = vec![path.clone()];
+    let home_str = spec.home.to_str().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "greeter HOME path is non-UTF8")
+    })?;
+    let envv: Vec<CString> = greeter_child_env_pairs(spec, home_str)
+        .iter()
+        .map(|(k, v)| to_c(&format!("{k}={v}")))
+        .collect::<io::Result<_>>()?;
+    Ok((path, argv, envv))
+}
+
+/// Child-side privilege drop + execve. NEVER returns into Rust —
+/// on ANY failure, `libc::_exit`s with a distinct code. Same exit
+/// code band (81-87, 127) as `spawn_session_leader::run_child` for
+/// post-mortem consistency. NO `?`/return in the child path
+/// (Epic R7 — re-entering the root parent with duplicated state).
+fn greeter_child_exec(
+    uid: nix::unistd::Uid,
+    gid: nix::unistd::Gid,
+    path: &std::ffi::CString,
+    argv: &[std::ffi::CString],
+    envv: &[std::ffi::CString],
+) -> ! {
+    let die = |code: i32| -> ! {
+        #[expect(unsafe_code, reason = "child _exit on drop/exec failure (Epic #47 R1)")]
+        unsafe {
+            libc::_exit(code)
+        }
+    };
+    if nix::unistd::setsid().is_err() {
+        die(81);
+    }
+    if nix::unistd::setresgid(gid, gid, gid).is_err() {
+        die(82);
+    }
+    // Greeter has NO supplementary groups (system user, not a PAM
+    // principal). Only the primary gid — matches the existing
+    // pre-drop spawn_greeter in main.rs. Crucially NOT
+    // getgrouplist(name) and NOT getgroups()/handle-owner's groups
+    // (latter leaks `shadow` per CVE-2021-41617).
+    if nix::unistd::setgroups(&[gid]).is_err() {
+        die(83);
+    }
+    if nix::unistd::setresuid(uid, uid, uid).is_err() {
+        die(84);
+    }
+    // Re-verify the drop actually happened (Epic R7).
+    match nix::unistd::getresuid() {
+        Ok(r) if r.real == uid && r.effective == uid && r.saved == uid => {}
+        _ => die(85),
+    }
+    match nix::unistd::getresgid() {
+        Ok(r) if r.real == gid && r.effective == gid && r.saved == gid => {}
+        _ => die(86),
+    }
+    if nix::sys::prctl::set_no_new_privs().is_err() {
+        die(87);
+    }
+    // memory project-pre-exec-signal-mask: empty the inherited block
+    // mask so the greeter is signal-deliverable.
+    let _ = nix::sys::signal::sigprocmask(
+        nix::sys::signal::SigmaskHow::SIG_SETMASK,
+        Some(&nix::sys::signal::SigSet::empty()),
+        None,
+    );
+    match nix::unistd::execve(path.as_c_str(), argv, envv) {
+        Ok(_) => unreachable!("execve returns Infallible on success"),
+        Err(_) => die(127),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

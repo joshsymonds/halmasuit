@@ -25,6 +25,11 @@ members = [
     "crates/halmasuit-vm-client",
     # Research probe — not v2 production. See RESEARCH.md.
     "crates/drm-master-probe",
+    # Research probe — Epic #47 R2 (wallpaper continuity to kernel
+    # halt). Three-sub-phase probe analogous to drm-master-probe:
+    # Phase 0 validates SurviveFinalKillSignal=yes survives the
+    # rootfs kill spree; Phase 1 + Phase 2 land in follow-up tasks.
+    "crates/halmasuit-shutdown-probe",
     # Layer-shell test client — throwaway, used by
     # tests/visual-halmasuit-layer.nix to verify halmasuit composites
     # wl_clients via wlr-layer-shell.

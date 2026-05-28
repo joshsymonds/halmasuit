@@ -29,6 +29,8 @@ The body assumes `import os`, `import sys`, `import time`, `import re`
 already happened in the cell shim.
 """
 
+import phash_progression
+
 
 def fg_events(machine, visual):
     return [
@@ -234,13 +236,28 @@ def run(machine, visual, *, cell_name, lukshape, no_flash_mode):
     #   no-flash anchor is — decoder startup may have produced an
     #   empty fbo at the read moment.
     time.sleep(2)
-    visual.assert_matches_golden(machine, f"{cell_name}-session")
-    print("PASS: session-scene golden")
-    if no_flash_mode == "strict":
-        visual.assert_matches_golden(
-            machine, f"{cell_name}-wallpaper", scene="wallpaper-only"
+    # SSIMULACRA2 goldens only fit STATIC content. Animated cells
+    # (shader, video) have R3.1's wallpaper-tick driving continuous
+    # animation post-boot, so the captured frame's iTime varies
+    # boot-to-boot and a fixed golden can't match. The
+    # phash_progression assertion further down replaces this for
+    # animated cells — it proves the wallpaper IS animating (frames
+    # are distinct) without depending on a fixed-iTime golden.
+    is_animated = "shader" in cell_name or "video" in cell_name
+    if not is_animated:
+        visual.assert_matches_golden(machine, f"{cell_name}-session")
+        print("PASS: session-scene golden")
+        if no_flash_mode == "strict":
+            visual.assert_matches_golden(
+                machine, f"{cell_name}-wallpaper", scene="wallpaper-only"
+            )
+            print("PASS: wallpaper-only golden (variant-distinct)")
+    else:
+        print(
+            f"SKIP: SSIMULACRA2 golden for animated cell {cell_name!r} — "
+            f"phash_progression assertion below covers the animating-"
+            f"content invariant without iTime-stability requirement."
         )
-        print("PASS: wallpaper-only golden (variant-distinct)")
 
     # ── No-flash invariant over the full timeline ───────────────────
     if no_flash_mode == "strict":
@@ -287,5 +304,45 @@ def run(machine, visual, *, cell_name, lukshape, no_flash_mode):
             "frames after first non-degenerate; pre-decode startup window "
             "excluded)"
         )
+
+    # ── Phash-progression for animated cells (R3.6) ─────────────────
+    # Catches the "frozen frame would pass today" gap: the no-flash
+    # stream check above asserts every frame_rendered is non-degenerate
+    # with stable pixel_count and zero sentinel pixels, but it does
+    # NOT compare consecutive phashes — a pathological "render the
+    # same frame N times" bug satisfies all those checks. Asserting
+    # the phash stream actually varies catches it.
+    #
+    # Image cells skip this (image is static — frames ARE supposed to
+    # be identical). Shader and video cells assert it with thresholds
+    # matched to their fixtures' boot-time animation characteristic.
+    if "image" not in cell_name:
+        # Cache: video cells already captured `events` via the no-flash
+        # suffix path above (line 277). Reuse it instead of re-shelling
+        # to `journalctl -b -u halmasuit -o cat --no-pager` and reparsing
+        # the entire boot journal a second time.
+        if no_flash_mode != "strict" and "events" in locals():
+            pass  # `events` from the suffix branch is fresh enough
+        else:
+            events = visual.introspect_events(machine)
+        if "shader" in cell_name:
+            # The 60s-period sine shader has subtle frame-to-frame
+            # change in the boot window; loose thresholds prove
+            # animation without false positives.
+            phash_progression.assert_animating(
+                events,
+                min_distinct_phashes=3,
+                min_hamming_max=8,
+            )
+        elif "video" in cell_name:
+            # testsrc + 8x8 phash quantization → low distinct count,
+            # high pairwise Hamming spread. Matches the shutdown-video
+            # cell's tuning.
+            phash_progression.assert_animating(
+                events,
+                min_distinct_phashes=3,
+                min_hamming_max=20,
+            )
+        print(f"PASS: phash progression for {cell_name} (frames are distinct, not frozen)")
 
     print(f"visual-{cell_name}: ALL ASSERTIONS PASSED")

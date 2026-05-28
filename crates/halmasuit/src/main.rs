@@ -47,7 +47,6 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -70,9 +69,7 @@ use smithay::backend::input::{
     Event as InputEventTrait, InputEvent, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
     PointerMotionEvent,
 };
-use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::session::Session;
-use smithay::backend::session::libseat::LibSeatSession;
+use smithay::backend::libinput::LibinputInputBackend;
 use smithay::desktop::layer_map_for_output;
 use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::keyboard::FilterResult;
@@ -106,8 +103,16 @@ const MAX_GREETD_CONNECTIONS: usize = 4;
 /// Compositor state passed to calloop callbacks. Holds the smithay
 /// per-protocol state structs and the greetd-connection map; each new
 /// protocol adds its `*State` here as it lands.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "frame_pending / shutdown_armed / shutting_down / \
+              session_first_frame_emitted are semantically distinct \
+              lifecycle bits (per-tick render coalesce / shutdown-signal \
+              arming / post-shutdown render gating / swap-gate key \
+              signaling). Folding them into a bitflag enum would obscure \
+              call-site intent without removing the per-flag cost."
+)]
 struct HalmasuitState {
-    running: bool,
     display_handle: DisplayHandle,
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -303,13 +308,16 @@ struct HalmasuitState {
     /// `Session`. Gates keyboard focus (greeter layer vs session
     /// toplevel) so focus follows the lifecycle, not connection order.
     foreground: halmasuit_introspect::Foreground,
-    /// The libseat session brokering halmasuit's DRM (and, in E2, the
-    /// libinput) device fds. Retained for the process lifetime: if it
-    /// drops, seatd tears the session down and the brokered fds are
-    /// revoked. `None` only on the SKIP (no-DRM/dev) path. Epic
-    /// layer E; survival across the privilege drop validated by
-    /// drm-master-probe Phase 4.
-    libseat_session: Option<LibSeatSession>,
+    /// Registration token for the libinput calloop source. halmasuit
+    /// opens `/dev/input/event*` directly (no libseat brokerage; R2.3)
+    /// while still root via `setup_libinput_direct`; libinput holds
+    /// the OwnedFds across the subsequent privilege drop. `None` on
+    /// the SKIP (no-DRM/dev) path and on the initramfs-pre-pivot path
+    /// (the post-pivot `setup_post_pivot_input` populates it once
+    /// `/dev/input/event*` is available on the rootfs). The token is
+    /// removed by `graceful_shutdown` so the calloop loop stops
+    /// dispatching against the input subsystem during shutdown.
+    libinput_token: Option<RegistrationToken>,
 
     // ── greetd I/O ──────────────────────────────────────────────────────
     /// LoopHandle for inserting per-connection sources from inside
@@ -331,12 +339,41 @@ struct HalmasuitState {
     /// Authorised greeter UID; connections from any other uid are
     /// dropped by `handle_listener_ready`.
     greeter_uid: u32,
+    /// Epic #47 R2.1: gates the SIGTERM handler's response.
+    ///
+    /// In the fromInitrd deployment, SIGTERM is sent twice in a
+    /// single boot: once during the boot pivot's
+    /// `systemd-shutdown --switch-root` kill spree (which we ignore
+    /// — survival is the whole point of the fromInitrd shape), and
+    /// again during the rootfs→shutdownRamfs pivot at actual system
+    /// shutdown (which SHOULD drive graceful tear-down).
+    /// Distinguishing them needs state: this flag flips true when
+    /// `Phase::RootfsReady` is emitted, which only happens AFTER the
+    /// boot pivot is complete.
+    /// A SIGTERM with this flag false in fromInitrd mode is the boot
+    /// pivot's kill spree (ignored, deferred to the
+    /// SurviveFinalKillSignal directive and the broker root-fd
+    /// handoff); with this flag true, it is the real shutdown signal.
+    ///
+    /// In rootfs-only mode (`services.halmasuit.enable=true` with no
+    /// fromInitrd), the flag flips true at startup completion — there's
+    /// no boot pivot to ignore.
+    shutdown_armed: bool,
+    /// Epic #47 R2.2: set by `graceful_shutdown` after the wallpaper-
+    /// only recomposite. The render path observes this to keep the
+    /// wallpaper plane composited (no greeter, no session toplevel)
+    /// from now until the kernel halts the process. halmasuit's main
+    /// loop has no clean-exit termination — it keeps painting through
+    /// the rootfs→shutdownRamfs pivot via SurviveFinalKillSignal +
+    /// the shutdownRamfs storePaths wiring (probe-validated by
+    /// halmasuit-shutdown-probe-phase{0,1,2}).
+    shutting_down: bool,
     /// Held so the registered listener token survives for the lifetime
     /// of the compositor; calloop drops the source on shutdown.
     greetd_listener_token: Option<RegistrationToken>,
 
     /// The GLES + GBM + DrmCompositor stack. Constructed in `main()`
-    /// while still root via [`drm::setup_drm_backend`]; the underlying
+    /// while still root via [`drm::setup_drm_direct`]; the underlying
     /// DRM fd's master designation survives the subsequent `setresuid`
     /// to the compositor user (drm-master-probe Phase 1).
     ///
@@ -752,6 +789,36 @@ impl HalmasuitState {
                     to: halmasuit_introspect::Foreground::Greeter,
                 });
                 self.set_keyboard_focus(None);
+                // Epic #47 R1: the previous session's uid lingered in
+                // `session_uid` and the swap_gate had transitioned to a
+                // terminal Reverted state — both blocked the next login
+                // from succeeding. Clear and re-arm.
+                self.session_uid = None;
+                self.swap = swap_gate::SwapGate::new();
+                // Respawn the greeter so the user can log back in. The
+                // SIGKILL at swap time left `state.greeter = None`;
+                // ask the broker (uid 998 compositor cannot setuid
+                // to greeter uid; broker is the policy authority).
+                // Degraded state on failure: log + continue, wallpaper
+                // stays visible, no greeter — operator can systemctl
+                // restart halmasuit to recover.
+                match broker_spawn_greeter() {
+                    Ok(handle) => {
+                        tracing::info!(
+                            greeter_pid = handle.pid,
+                            "greeter respawned via broker after session end"
+                        );
+                        emit(&Event::GreeterSpawned { pid: handle.pid });
+                        self.greeter = Some(handle);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "post-logout broker_spawn_greeter failed; halmasuit running \
+                             without a greeter until operator intervenes"
+                        );
+                    }
+                }
             }
         }
         // Re-composite now so the swap/revert is visible this frame and
@@ -1022,11 +1089,20 @@ impl HalmasuitState {
     /// one-frame-per-commit; fine for these low-frequency scenes).
     /// The foreground toplevel is composited above the layer
     /// background by `render_layer_elements`.
+    ///
+    /// Keeps rendering when `shutting_down` is true so video and
+    /// shader wallpapers continue animating through shutdown. After
+    /// graceful_shutdown clears `foreground_toplevel`, the composite
+    /// is wallpaper-only — exactly the frame stream the user sees
+    /// from PrepareForShutdown to kernel halt.
     fn repaint(&mut self) {
-        let fg_surface = self
-            .foreground_toplevel
-            .as_ref()
-            .map(|t| t.wl_surface().clone());
+        let fg_surface = if self.shutting_down {
+            None
+        } else {
+            self.foreground_toplevel
+                .as_ref()
+                .map(|t| t.wl_surface().clone())
+        };
         if let Some(backend) = self.drm_backend.as_mut()
             && let Err(e) = backend.render_layer_elements(
                 &self.output,
@@ -2207,51 +2283,46 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
         }
     }
 
-    // (2) Spawn greeter while still root (child setresuids in pre_exec).
-    if let Some(cmd) = greeter_command_from_env() {
-        match spawn_greeter(state.greeter_uid, &cmd) {
-            Ok(handle) => {
-                tracing::info!(
-                    greeter_pid = handle.pid,
-                    greeter_cmd = %cmd.display(),
-                    "post-pivot greeter spawned"
-                );
-                emit(&Event::GreeterSpawned { pid: handle.pid });
-                emit(&Event::ForegroundChanged {
-                    to: halmasuit_introspect::Foreground::Greeter,
-                });
-                state.greeter = Some(handle);
-            }
-            Err(e) => {
-                tracing::error!(error = %e, greeter_cmd = %cmd.display(), "post-pivot greeter spawn failed");
-                step_errors.push(format!("spawn_greeter: {e}"));
-            }
+    // (2) Spawn greeter via broker. The broker reads
+    // HALMASUIT_GREETER_COMMAND/UID/etc. from its own env and forks-
+    // then-drops to the greeter uid; the compositor is already
+    // uid 998 here (Phase B fromInitrd dropped before this runs in
+    // some configurations) so a setuid-from-compositor would EPERM
+    // anyway. Broker is the policy authority (Epic #47 R1).
+    match broker_spawn_greeter() {
+        Ok(handle) => {
+            tracing::info!(
+                greeter_pid = handle.pid,
+                "post-pivot greeter spawned via broker"
+            );
+            emit(&Event::GreeterSpawned { pid: handle.pid });
+            emit(&Event::ForegroundChanged {
+                to: halmasuit_introspect::Foreground::Greeter,
+            });
+            state.greeter = Some(handle);
         }
-    } else {
-        tracing::warn!("HALMASUIT_GREETER_COMMAND unset post-pivot; running without a greeter");
+        Err(e) => {
+            tracing::error!(error = %e, "post-pivot broker_spawn_greeter failed");
+            step_errors.push(format!("broker_spawn_greeter: {e}"));
+        }
     }
 
-    // libinput / libseat — post-pivot wiring for input device fds.
-    // The Phase B initramfs phase deliberately skips libseat (no seatd
-    // pre-pivot — see the `in_initramfs` branch in `main`); DRM is
-    // direct-opened with SET_MASTER instead. seatd comes up post-pivot
-    // as a rootfs unit, and from this point libinput can broker the
-    // keyboard / pointer / touch fds through it. Without this branch
-    // the wl_seat capabilities advertise but never carry events —
-    // halmasuit ignores host keystrokes / pointer motion entirely and
-    // any Wayland greeter ends up unfocusable.
-    //
-    // The DRM side stays direct-opened from initramfs; libseat brokers
-    // ONLY the input subsystem here. drm-master-probe Phase 4
-    // validated that a libseat session survives the subsequent
-    // setresuid in `drop_privileges` below.
+    // libinput — post-pivot input wiring. The Phase B initramfs phase
+    // deliberately starts with no libinput (no `/dev/input/event*` on
+    // devtmpfs is interesting pre-pivot — only halmasuit-luks needs
+    // input, and it handles its own raw VT). Post-pivot, the rootfs
+    // is mounted and `/dev/input/event*` is populated; we enumerate
+    // them directly via `setup_libinput_direct` (R2.3: no libseat / no
+    // seatd anywhere in the runtime closure). halmasuit is still root
+    // at this point — `drop_privileges` runs further down — so the
+    // direct opens succeed.
     //
     // Errors are degraded-state recoverable (same posture as
-    // setup_greetd_listener / spawn_greeter above): if seatd is
-    // unreachable or udev_assign_seat fails, log + continue without
+    // setup_greetd_listener / spawn_greeter above): if /dev/input is
+    // missing or libinput rejects every device, log + continue without
     // input. The visible surface still composites; only interactive
     // greeters lose input.
-    if state.libseat_session.is_none() {
+    if state.libinput_token.is_none() {
         step_errors.extend(setup_post_pivot_input(state));
     }
 
@@ -2392,91 +2463,141 @@ fn apply_chroot_to_root_fd(root_fd: &std::os::fd::OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Post-pivot libseat + libinput attach (Phase B fromInitrd path only).
+/// Post-pivot libinput attach (Phase B fromInitrd path only).
 ///
-/// The Phase B initramfs phase deliberately skips libseat — no seatd
-/// pre-pivot, DRM is direct-opened with SET_MASTER. seatd comes up
-/// post-pivot as a rootfs unit, after which libinput can broker the
-/// keyboard / pointer / touch fds through it. Without this branch the
-/// `wl_seat` capabilities advertise but never carry events; halmasuit
-/// ignores host keystrokes and any Wayland greeter is unfocusable.
-///
-/// DRM stays direct-opened from initramfs; libseat brokers ONLY the
-/// input subsystem here. drm-master-probe Phase 4 validated that the
-/// libseat session survives the subsequent `setresuid` in
-/// `drop_privileges`.
+/// The Phase B initramfs phase deliberately starts with no libinput
+/// — there's no input subsystem available until the rootfs is up
+/// (`/dev/input/event*` lives on devtmpfs, which the kernel mounts
+/// before the rootfs is selected, but no input is needed pre-pivot
+/// because halmasuit-luks is the only thing reading password input
+/// and it handles its own raw VT). Post-pivot, we enumerate input
+/// devices via the same direct-open path the rootfs deployment uses
+/// — see `setup_libinput_direct`. No libseat, no seatd, no brokerage:
+/// the running compositor is still root at this point (privilege drop
+/// happens later in `run_post_pivot_setup`'s sequence).
 ///
 /// Each step is degraded-state recoverable (same posture as
-/// setup_greetd_listener / spawn_greeter in `run_post_pivot_setup`):
+/// `setup_greetd_listener` / `spawn_greeter` in `run_post_pivot_setup`):
 /// errors are returned as strings for the caller's `step_errors`
 /// aggregate; the function never panics or returns Err.
 fn setup_post_pivot_input(state: &mut HalmasuitState) -> Vec<String> {
     let mut errs: Vec<String> = Vec::new();
-    // "Fail loud" marker: LibSeatSession::new ultimately calls
-    // libseat_open_seat → poll(-1) (unbounded; no upstream timeout),
-    // and the smithay types LibSeatSession + LibSeatSessionNotifier
-    // are !Send (hold an Rc), so we can't wrap the call on a watchdog
-    // thread without invasive smithay changes. The practical failure
-    // mode is "seatd not running" → connect EAGAIN → fast Err; the
-    // pathological "seatd accepted but never replies" hang shows up
-    // as halmasuit silently stuck inside this function. Emit a
-    // before/after pair so a missing "post-pivot: LibSeatSession::new
-    // returned" line in the journal pinpoints the hang to seatd
-    // rather than to compositor logic.
-    tracing::info!("post-pivot: calling LibSeatSession::new (blocks until seatd responds)");
-    let (session, libseat_notifier) = match LibSeatSession::new() {
-        Ok(pair) => pair,
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "post-pivot: LibSeatSession::new failed (is seatd reachable?)"
-            );
-            errs.push(format!("post-pivot LibSeatSession::new: {e}"));
-            return errs;
+    match setup_libinput_direct(&state.loop_handle) {
+        Ok(token) => {
+            state.libinput_token = Some(token);
+            tracing::info!("post-pivot: libinput backend attached (direct, no libseat)");
         }
-    };
-    tracing::info!(seat = %session.seat(), "post-pivot: LibSeatSession::new returned");
-    if let Err(e) = state.loop_handle.insert_source(
-        libseat_notifier,
-        |event, (), _state: &mut HalmasuitState| {
-            tracing::info!(?event, "libseat session event (post-pivot)");
-        },
-    ) {
-        tracing::error!(error = %e, "post-pivot: insert libseat notifier failed");
-        errs.push(format!("insert libseat notifier: {e}"));
+        Err(e) => {
+            tracing::error!(error = %e, "post-pivot: setup_libinput_direct failed");
+            errs.push(format!("post-pivot setup_libinput_direct: {e}"));
+        }
     }
-    if let Err(e) = attach_libinput(&state.loop_handle, &session) {
-        tracing::error!(error = %e, "post-pivot: attach_libinput failed");
-        errs.push(format!("post-pivot attach_libinput: {e}"));
-    } else {
-        tracing::info!(seat = %session.seat(), "post-pivot: libinput backend attached");
-    }
-    state.libseat_session = Some(session);
     errs
 }
 
-/// Build a libinput backend brokered through `session`, attach it to
-/// the calloop, and dispatch events to `HalmasuitState::dispatch_libinput`.
-/// Used by both the rootfs deployment (in `main`) and the Phase B
-/// post-pivot path (in `setup_post_pivot_input`); both walk the same
-/// four-stage sequence (Libinput::new_with_udev → udev_assign_seat →
-/// LibinputInputBackend::new → loop_handle.insert_source).
-fn attach_libinput(
+/// Direct-open `LibinputInterface` impl: no libseat / seatd brokerage.
+///
+/// `setup_libinput_direct` calls into this while halmasuit is still
+/// root, so the O_RDWR opens against `/dev/input/event*` succeed against
+/// the kernel's uaccess-tagged ACL the same way they would for any other
+/// root opener. libinput stashes the resulting OwnedFds; after
+/// `drop_privileges` the compositor runs as the compositor user, but the
+/// fds remain valid — Linux checks file permissions at `open(2)`, not
+/// at subsequent `read(2)` / `write(2)`.
+struct DirectInputInterface;
+impl smithay::reexports::input::LibinputInterface for DirectInputInterface {
+    fn open_restricted(
+        &mut self,
+        path: &std::path::Path,
+        flags: i32,
+    ) -> Result<std::os::fd::OwnedFd, i32> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let accmode = flags & libc::O_ACCMODE;
+        std::fs::OpenOptions::new()
+            .custom_flags(flags)
+            .read(accmode == libc::O_RDONLY || accmode == libc::O_RDWR)
+            .write(accmode == libc::O_WRONLY || accmode == libc::O_RDWR)
+            .open(path)
+            .map(std::os::fd::OwnedFd::from)
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
+    }
+    fn close_restricted(&mut self, fd: std::os::fd::OwnedFd) {
+        drop(fd);
+    }
+}
+
+/// Build a libinput backend that opens `/dev/input/event*` devices
+/// directly (no libseat / seatd brokerage), attach it to the calloop,
+/// and dispatch events to `HalmasuitState::dispatch_libinput`.
+///
+/// halmasuit is a system compositor and enumerates input devices once
+/// at startup — no udev-monitor-driven hotplug. Newly-plugged USB
+/// devices won't be picked up without a compositor restart (intentional;
+/// matches the "system compositor enumerated at boot" framing). The
+/// trade for that loss is removing seatd from the runtime closure
+/// entirely, which collapses the rootfs→shutdownRamfs pivot survival
+/// surface (R2.3): no standing root daemon to keep alive across the
+/// pivot, no smithay `LibSeatSessionNotifier` panic vector when seatd
+/// dies mid-shutdown.
+///
+/// Each `/dev/input/eventN` open happens via `DirectInputInterface`
+/// while halmasuit is still root. libinput retains the OwnedFds;
+/// subsequent reads work after `drop_privileges` because the kernel
+/// checks file permissions at `open()`, not on later I/O.
+fn setup_libinput_direct(
     loop_handle: &LoopHandle<'static, HalmasuitState>,
-    session: &LibSeatSession,
-) -> io::Result<()> {
-    let mut libinput = smithay::reexports::input::Libinput::new_with_udev(
-        LibinputSessionInterface::from(session.clone()),
+) -> io::Result<RegistrationToken> {
+    let mut libinput = smithay::reexports::input::Libinput::new_from_path(DirectInputInterface);
+    let entries = match std::fs::read_dir("/dev/input") {
+        Ok(it) => it,
+        Err(e) => {
+            // Test / SKIP-DRM environments may have no /dev/input. Log
+            // and proceed with a libinput context that has no devices;
+            // the calloop source still drives correctly (it just never
+            // produces events).
+            tracing::warn!(
+                error = %e,
+                "/dev/input: read_dir failed; no input devices will be enumerated"
+            );
+            return loop_handle
+                .insert_source(
+                    LibinputInputBackend::new(libinput),
+                    |event, (), state: &mut HalmasuitState| state.dispatch_libinput(event),
+                )
+                .map_err(|e| io::Error::other(format!("insert libinput backend: {e}")));
+        }
+    };
+    let mut device_count = 0u32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("event") {
+            continue;
+        }
+        let Some(path_str) = path.to_str() else {
+            continue;
+        };
+        // `path_add_device` calls back into `DirectInputInterface::
+        // open_restricted`. `None` means libinput rejected the device
+        // (e.g., kernel reported no input-class capability). Log +
+        // skip; not fatal.
+        if libinput.path_add_device(path_str).is_none() {
+            tracing::debug!(path = %path.display(), "libinput.path_add_device refused");
+            continue;
+        }
+        device_count += 1;
+    }
+    tracing::info!(
+        device_count,
+        "libinput direct: enumerated /dev/input/event* devices"
     );
-    libinput
-        .udev_assign_seat(&session.seat())
-        .map_err(|()| io::Error::other(format!("libinput udev_assign_seat({})", session.seat())))?;
     loop_handle
         .insert_source(
             LibinputInputBackend::new(libinput),
             |event, (), state: &mut HalmasuitState| state.dispatch_libinput(event),
         )
-        .map(|_token| ())
         .map_err(|e| io::Error::other(format!("insert libinput backend: {e}")))
 }
 
@@ -2650,14 +2771,6 @@ fn compositor_uid_from_env() -> io::Result<Option<u32>> {
     })
 }
 
-/// Path of the greeter binary to exec at startup. Returns `None` when
-/// `HALMASUIT_GREETER_COMMAND` is unset (dev mode — halmasuit runs
-/// without a greeter). Production deployments always set it via
-/// `services.halmasuit.greeterCommand`.
-fn greeter_command_from_env() -> Option<PathBuf> {
-    std::env::var_os("HALMASUIT_GREETER_COMMAND").map(PathBuf::from)
-}
-
 /// Resolve the wallpaper config from environment. Returns `None`
 /// when neither `HALMASUIT_WALLPAPER_CONFIG` nor `HALMASUIT_WALLPAPER_PATH`
 /// is set — non-visual integration tests run without a wallpaper
@@ -2688,176 +2801,76 @@ fn wallpaper_config_from_env() -> io::Result<Option<wallpaper::WallpaperConfig>>
 /// variable greeters look up for the auth socket.
 ///
 /// # Errors
-/// Bubbles passwd-lookup failure, fork failure, or exec failure
-/// with context.
-fn spawn_greeter(greeter_uid: u32, command: &Path) -> io::Result<GreeterHandle> {
-    use nix::unistd::{Gid, Uid, User};
-    use std::os::unix::process::CommandExt;
-
-    // Phase B v2: in the fromInitrd deployment, halmasuit's retained
-    // initramfs root has no /etc/passwd visible to its process root
-    // (cross-pivot per-process root divergence — see nix/module.nix's
-    // "Phase B v1 → v2" docstring). `User::from_uid` would fail with
-    // ENOENT in that case. Fall back to env-provided identity fields
-    // (HALMASUIT_GREETER_GID/NAME/HOME) when the passwd lookup fails.
-    // The rootfs `enable` deployment hits the Ok branch as before.
-    let (gid_raw, greeter_name, greeter_home) =
-        if let Ok(Some(u)) = User::from_uid(Uid::from_raw(greeter_uid)) {
-            (u.gid.as_raw(), u.name.clone(), u.dir)
-        } else {
-            // If HALMASUIT_GREETER_GID is unset (or unparsable) we fall
-            // back to using `greeter_uid` as the gid. That's the right
-            // default when greeter uid == gid (the auto-created system
-            // user shape the module ships out of the box), but breaks
-            // silently if an operator overrides ONE of greeterUid /
-            // greeterGroup without the other. Surface that case so
-            // misconfiguration is greppable rather than mysterious
-            // permission errors later.
-            let env_gid_raw = std::env::var("HALMASUIT_GREETER_GID")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok());
-            let env_gid: u32 = env_gid_raw.unwrap_or(greeter_uid);
-            if env_gid_raw.is_none() {
-                tracing::warn!(
-                    uid = greeter_uid,
-                    fallback_gid = env_gid,
-                    "HALMASUIT_GREETER_GID unset/unparsable on env-fallback path; \
-                     defaulting gid to greeter uid (correct only when uid == gid)"
-                );
-            }
-            let env_name = std::env::var("HALMASUIT_GREETER_NAME")
-                .unwrap_or_else(|_| format!("halmasuit-greeter-{greeter_uid}"));
-            let env_home = PathBuf::from(
-                std::env::var("HALMASUIT_GREETER_HOME").unwrap_or_else(|_| "/var/empty".to_owned()),
-            );
-            tracing::warn!(
-                uid = greeter_uid,
-                gid = env_gid,
-                name = %env_name,
-                home = ?env_home,
-                "getpwuid failed; using env-provided greeter identity fallback"
-            );
-            (env_gid, env_name, env_home)
-        };
-
-    let mut cmd = Command::new(command);
-    cmd.env_clear()
-        .env("USER", &greeter_name)
-        .env("LOGNAME", &greeter_name)
-        .env("HOME", greeter_home.as_os_str())
-        .env("XDG_RUNTIME_DIR", "/run/halmasuit")
-        .env("WAYLAND_DISPLAY", "wayland-0")
-        // GREETD_SOCK MUST match the path/abstract-name halmasuit's
-        // own greetd listener bound to. The fromInitrd deployment
-        // uses an abstract socket (`@halmasuit-greetd`) to bridge
-        // the cross-pivot mount-namespace boundary; the rootfs
-        // deployment uses `/run/halmasuit/greetd.sock`. Reading
-        // through the same helper as `setup_greetd_listener` keeps
-        // the two ends in lockstep — hardcoding the filesystem path
-        // here would break the greeter's BeginAuth in the fromInitrd
-        // shape because the abstract socket is unreachable via
-        // `connect("/run/halmasuit/greetd.sock")`.
-        .env("GREETD_SOCK", greetd_socket_path_from_env())
-        // PATH so the greeter can exec children (session command,
-        // PAM helpers). Match systemd's default unit PATH.
-        .env(
-            "PATH",
-            "/run/wrappers/bin:/run/current-system/sw/bin:/usr/bin:/bin",
-        );
-
-    // SAFETY: `pre_exec` runs in the forked child between `fork(2)`
-    // and `execve(2)`. The closure must only call async-signal-safe
-    // syscalls (man signal-safety(7)). `setgroups`, `setresgid`,
-    // and `setresuid` are all on the AS-safe list. We do NOT
-    // allocate, log, or take any Rust mutex here.
-    let target_gid = Gid::from_raw(gid_raw);
-    let target_uid = Uid::from_raw(greeter_uid);
-    #[expect(
-        unsafe_code,
-        reason = "pre_exec runs between fork and exec; closure body is async-signal-safe"
-    )]
-    unsafe {
-        cmd.pre_exec(move || {
-            // Restore the default signal mask. The parent (halmasuit)
-            // blocks SIGTERM/SIGINT to drive them via calloop's
-            // signalfd source; that mask propagates through fork+
-            // execve and would leave the greeter unable to receive
-            // either signal — systemd's SIGTERM on unit stop is
-            // ignored, the cgroup never empties, and the unit ends
-            // up in 'failed' state after the final-sigterm timeout.
-            let empty = nix::sys::signal::SigSet::empty();
-            nix::sys::signal::sigprocmask(
-                nix::sys::signal::SigmaskHow::SIG_SETMASK,
-                Some(&empty),
-                None,
-            )?;
-
-            nix::unistd::setgroups(&[target_gid])?;
-            nix::unistd::setresgid(target_gid, target_gid, target_gid)?;
-            nix::unistd::setresuid(target_uid, target_uid, target_uid)?;
-            Ok(())
-        });
-    }
-
-    let child = cmd
-        .spawn()
-        .map_err(|e| io::Error::other(format!("spawn greeter {}: {e}", command.display())))?;
-    let pid = child.id();
-    // Acquire a pidfd for the freshly-spawned child. The pidfd is the
-    // race-free signal target — `kill(pid, …)` after SIGCHLD reaps
-    // the entry can hit a recycled pid (and with our retained
-    // `CAP_KILL`, would signal whichever unrelated process now holds
-    // it). pidfd_send_signal targets the original task by fd and
-    // returns `ESRCH` once that task has terminated, regardless of
-    // pid reuse. There is a tiny window between Command::spawn
-    // returning and our pidfd_open here in which the greeter could
-    // exit and a new process inherit the pid — for which we
-    // tolerate the same risk one round (the next kill returns
-    // ESRCH if reused, plus the freshly-opened pidfd is still
-    // bound to whatever was at the pid at fd-open time).
-    let pidfd =
-        pidfd_open_for(pid).map_err(|e| io::Error::other(format!("pidfd_open({pid}): {e}")))?;
-    // Child handle is dropped here. On Unix, Child::drop is a no-op
-    // (doesn't kill, doesn't reap); we no longer need the type-level
-    // identity once the pidfd is in hand. SIGCHLD reaper handles
-    // termination accounting via waitpid.
-    drop(child);
-    Ok(GreeterHandle { pid, pidfd })
-}
-
-/// Open a pidfd for an existing pid.
+/// Ask the broker to spawn the greeter (Epic #47 R1).
 ///
-/// Wraps `pidfd_open(2)` (Linux ≥ 5.3). Returns an `OwnedFd` that
-/// can be passed to `pidfd_send_signal_owned` for race-free signal
-/// delivery, then closed on drop.
+/// Replaces the prior in-compositor `spawn_greeter`: the compositor
+/// no longer holds CAP_SETUID (it has empty bounding set), so it
+/// cannot setresuid to the greeter uid itself. The broker (already
+/// root, holds the privileges) does the fork-then-drop; the
+/// compositor sends `CompositorToBroker::SpawnGreeter` on a TRANSIENT
+/// broker connection and consumes the `BrokerToCompositor::
+/// GreeterSpawned { pid }` reply + the pidfd-via-SCM_RIGHTS.
+///
+/// Sync recv is correct here for the same reason `RequestRootFd`'s
+/// initial connect is sync: this only fires at startup + on Revert,
+/// not from the live render path; no calloop frame is racing. The
+/// broker side also doesn't block — it spawns + replies + closes.
 ///
 /// # Errors
-/// Any errno from `pidfd_open` (notably `ESRCH` if the pid has
-/// already exited between fork and this call).
-fn pidfd_open_for(pid: u32) -> io::Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd;
+/// Any error from `connect_broker`, `send`, `recv_with_fd`, or a
+/// broker reply that doesn't carry the SCM_RIGHTS pidfd attachment.
+fn broker_spawn_greeter() -> io::Result<GreeterHandle> {
+    use std::os::fd::AsFd;
 
-    let pid_signed = i32::try_from(pid)
-        .map_err(|_| io::Error::other(format!("pid {pid} does not fit in i32")))?;
-    // SAFETY: `pidfd_open(2)` is a numeric syscall with no pointer
-    // arguments. Returns a non-negative fd on success or -1 with
-    // errno set on failure. We construct the OwnedFd only on success.
-    #[expect(unsafe_code, reason = "raw pidfd_open syscall via libc")]
-    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::pid_t::from(pid_signed), 0_u32) };
-    if raw < 0 {
-        return Err(io::Error::last_os_error());
+    use halmasuit_session_ipc::{BrokerToCompositor, CompositorToBroker};
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+    let broker_path = broker_socket_path_from_env();
+    let chan = connect_broker(&broker_path)
+        .map_err(|e| io::Error::other(format!("connect_broker for SpawnGreeter: {e:?}")))?;
+    chan.send(&CompositorToBroker::SpawnGreeter)
+        .map_err(|e| io::Error::other(format!("send SpawnGreeter: {e:?}")))?;
+    // `recv_with_fd` is MSG_DONTWAIT, so a fresh response isn't ready
+    // until the broker has forked + sent. Poll with a generous
+    // timeout — broker-side spawn is bounded by `fork() + exec()`
+    // plus a few syscalls, well under 5s in practice. Failure to
+    // get a reply within this window means the broker died or
+    // refused the request (SO_PEERCRED gate, env not configured).
+    let mut pollfds = [PollFd::new(chan.as_fd(), PollFlags::POLLIN)];
+    let n = poll(
+        &mut pollfds,
+        PollTimeout::try_from(5_000_i32).unwrap_or(PollTimeout::MAX),
+    )
+    .map_err(|e| io::Error::other(format!("poll broker reply: {e}")))?;
+    if n == 0 {
+        return Err(io::Error::other(
+            "broker did not reply to SpawnGreeter within 5s",
+        ));
     }
-    // syscall returns `c_long` (i64 on x86_64); a valid fd from
-    // `pidfd_open(2)` fits in i32 by construction (kernel-side
-    // fd allocator caps well below INT_MAX). Use try_from for the
-    // narrowing to surface any future drift.
-    let raw_fd: i32 = i32::try_from(raw)
-        .map_err(|_| io::Error::other(format!("pidfd_open returned out-of-range fd {raw}")))?;
-    // SAFETY: `raw_fd` is a fresh kernel fd from the successful
-    // syscall above; nothing else holds it.
-    #[expect(unsafe_code, reason = "wrap fresh fd into OwnedFd")]
-    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
-    Ok(fd)
+    let (frame, pidfd) = chan
+        .recv_with_fd()
+        .map_err(|e| io::Error::other(format!("recv GreeterSpawned: {e:?}")))?
+        .ok_or_else(|| io::Error::other("broker closed without sending GreeterSpawned"))?;
+    let pid = match frame {
+        BrokerToCompositor::GreeterSpawned { pid } => pid,
+        other => {
+            return Err(io::Error::other(format!(
+                "broker reply was not GreeterSpawned: {other:?}"
+            )));
+        }
+    };
+    let pidfd = pidfd
+        .ok_or_else(|| io::Error::other("broker GreeterSpawned reply missing SCM_RIGHTS pidfd"))?;
+    // i32 → u32: pid is unsigned in this crate's GreeterHandle to
+    // match Command::id()'s legacy shape. A negative wire value
+    // indicates broker-side narrowing failure (it sends -1 if it
+    // couldn't fit the pid in i32). Treat -1 as "broker spawned but
+    // could not report pid"; the pidfd is still the authority.
+    let pid_u32 = u32::try_from(pid).unwrap_or(0);
+    Ok(GreeterHandle {
+        pid: pid_u32,
+        pidfd,
+    })
 }
 
 /// Send a signal to a pidfd. Race-free wrt pid reuse — if the
@@ -2931,6 +2944,306 @@ fn classify_reaped_child(
     } else {
         ReapOutcome::GreeterDiedExpected
     }
+}
+
+/// Epic #47 R2 graceful shutdown.
+///
+/// SIGKILL the greeter (if alive), composite wallpaper-only (no
+/// greeter, no session toplevel), emit `Event::Shutdown`. The main
+/// loop KEEPS RUNNING — halmasuit stays alive painting the wallpaper
+/// through systemd-shutdown's kill spree and through the rootfs→
+/// shutdownRamfs pivot, until the kernel halts the process. This is
+/// the production form of what halmasuit-shutdown-probe-phase{0,1,2}
+/// empirically validated; the `SurviveFinalKillSignal=yes` unit
+/// directive + the binary's presence in `systemd.shutdownRamfs.
+/// storePaths` are what let the same PID + same DRM master survive
+/// the pivot.
+///
+/// The render path observes `state.shutting_down` to suppress any
+/// greeter/session input (R2.2); the wallpaper plane is composited
+/// from frame 0 by the existing `render_layer_elements` path; setting
+/// `state.greeter = None` and `state.foreground_toplevel = None`
+/// means the next render has no non-wallpaper elements, so the
+/// screen is wallpaper-only from this point until kernel halt.
+fn graceful_shutdown(state: &mut HalmasuitState, reason: ShutdownReason) {
+    // Idempotent on re-entry. PrepareForShutdown triggers graceful_shutdown
+    // first (~0-1 s before the kill spree); the broadcast SIGTERM that
+    // follows triggers a second invocation through the signal handler.
+    // (`SurviveFinalKillSignal=yes` only exempts the final SIGKILL — the
+    // SIGTERM that precedes it is always delivered.) The second call has
+    // no work to do: the greeter is already gone, the wallpaper-only
+    // recomposite already landed, libinput is already unsubscribed.
+    // Bail early.
+    if state.shutting_down {
+        tracing::info!(
+            ?reason,
+            "graceful_shutdown re-entry while already shutting down; ignored"
+        );
+        return;
+    }
+
+    if let Some(g) = state.greeter.take() {
+        let pid = g.pid;
+        match pidfd_send_signal(&g.pidfd, libc::SIGKILL) {
+            Ok(()) => emit(&Event::GreeterTerminated { pid }),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    greeter_pid = pid,
+                    "graceful_shutdown: pidfd_send_signal greeter SIGKILL failed"
+                );
+            }
+        }
+    }
+    // Drop the foreground toplevel reference so the wallpaper plane
+    // composites alone. The session leader's lifecycle is the broker's
+    // problem (it's the sole reaper); we just stop showing the
+    // surface.
+    state.foreground_toplevel = None;
+    state.foreground = halmasuit_introspect::Foreground::Greeter;
+
+    // Recomposite immediately so the wallpaper-only state is visible
+    // this frame, not via a stale intermediate. From this point on the
+    // device is NOT paused — the existing per-VBlank render loop keeps
+    // driving new frames into the wallpaper plane through the entire
+    // shutdown sequence. That's load-bearing for video and shader
+    // wallpapers: they need continuous CPU/GPU work to animate, and
+    // pausing the DrmDevice (the previous R2.4 behavior) froze them on
+    // the last-flipped framebuffer. With the device left active, image
+    // wallpapers look identical (the same composited frame), shaders
+    // keep animating, and videos keep decoding all the way until the
+    // kernel halts the process.
+    //
+    // The trade-off: smithay's render path may surface transient
+    // errors during the shutdown handoff (broker dbus disconnect,
+    // page-flip ioctls colliding with the systemd-shutdown takeover).
+    // Those are logged at WARN and ignored — render_one_frame's
+    // existing error path drops the failing frame and continues.
+    if let Some(backend) = state.drm_backend.as_mut()
+        && let Err(e) = backend.render_layer_elements(&state.output, None, HALMASUIT_BRAND_CLEAR)
+    {
+        tracing::warn!(error = %e, "graceful_shutdown: render_layer_elements failed");
+    }
+
+    // R2.2 / R2.3: remove the libinput source from the calloop loop.
+    // halmasuit doesn't need libinput post-shutdown (no input routing
+    // to a dying session). With R2.3's direct-open libinput
+    // (`setup_libinput_direct`), the device fds are owned by the
+    // libinput context — removing the calloop source stops dispatch;
+    // dropping the source's owner drops the libinput context, which
+    // closes the fds.
+    if let Some(tok) = state.libinput_token.take() {
+        state.loop_handle.remove(tok);
+    }
+
+    emit(&Event::Shutdown { reason });
+    state.shutting_down = true;
+
+    // R2.2 liveness signal: write one kmsg line on entry so that
+    // tests which deliver SIGTERM directly (visual-shutdown-tear-down
+    // sends `kill -TERM`, not the SurviveFinalKillSignal-blocked
+    // shutdown spree) can observe the transition immediately. The
+    // periodic liveness cadence is driven by the always-on
+    // `HALMASUIT_LIVENESS_INTERVAL_MS` timer registered at startup —
+    // that one fires regardless of whether the SIGTERM signal handler
+    // ran, which is what's needed under SurviveFinalKillSignal=yes
+    // where SIGTERM is never delivered.
+    let pid = std::process::id();
+    let frames = state
+        .drm_backend
+        .as_ref()
+        .map_or(0, drm::DrmBackend::frame_counter);
+    write_kmsg(&format!(
+        "halmasuit-shutdown-liveness pid={pid} frames={frames} init"
+    ));
+}
+
+/// Best-effort write of a liveness line. The shutdown-liveness timer
+/// hits this every 250ms while halmasuit is in the post-SIGTERM
+/// wallpaper-only mode. The NixOS module pins halmasuit's stdout to
+/// `StandardOutput=journal+kmsg`, so systemd opens fd 1 against
+/// /dev/kmsg pre-exec (bypassing the compositor's `ProtectKernelLogs`
+/// seccomp filter, which only blocks the compositor from opening it
+/// itself). The inherited fd is a character-device handle owned by
+/// the kernel, so writes survive the rootfs→shutdownRamfs pivot —
+/// post-pivot lines still land on the kernel ring buffer + serial
+/// console, where the pivot-survival VM test reads them back.
+/// A stderr wrapper that silently swallows write errors. tracing_subscriber's
+/// fmt layer ultimately routes through `_eprint`, which **panics** when its
+/// write returns `Err` ("failed printing to stderr"). During shutdown,
+/// systemd-journald is killed mid-spree and halmasuit's `StandardOutput=kmsg`
+/// pipe breaks; the next `tracing::info!`/`warn!` panics, the default panic
+/// handler ALSO writes to stderr, that ALSO panics, and Rust's runtime
+/// resolves "panic while panicking" by calling `std::process::abort()` —
+/// which is exactly the SIGABRT this whole investigation was chasing. The
+/// fix is to never let a write error propagate out of the tracing writer.
+///
+/// `make_shutdown_safe_stderr` is the MakeWriter the fmt layer calls per
+/// event; `ShutdownSafeStderr` is the actual `io::Write` it returns. We
+/// take a fresh lock per event (cheap, matches what `io::stderr` does).
+struct ShutdownSafeStderr(std::io::StderrLock<'static>);
+
+impl io::Write for ShutdownSafeStderr {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let _ = self.0.write(buf);
+        // Always claim full success so tracing's `_eprint` path never
+        // sees an `Err` and never panics. Bytes that don't reach the
+        // kernel ring buffer during shutdown are by definition not
+        // recoverable anyway.
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        let _ = self.0.flush();
+        Ok(())
+    }
+}
+
+fn make_shutdown_safe_stderr() -> ShutdownSafeStderr {
+    ShutdownSafeStderr(io::stderr().lock())
+}
+
+/// Write a single line to the kernel ring buffer via halmasuit's
+/// stdout. The unit's `StandardOutput=file:/dev/kmsg` arranges for
+/// systemd (as PID 1, with the necessary privileges) to open
+/// `/dev/kmsg` directly and pass that fd as stdout — bypassing
+/// journald entirely. The fd survives `systemd-journald` being
+/// killed mid-shutdown, so liveness lines keep landing in dmesg
+/// through the rootfs→shutdownRamfs pivot until kernel halt.
+///
+/// Deliberately ignores write/flush errors. The same double-panic
+/// hazard documented on `ShutdownSafeStderr` would fire if these
+/// were routed through `tracing::warn!` during shutdown — stderr is
+/// the same potentially-broken pipe as stdout in dev environments
+/// without `file:/dev/kmsg`, and `_eprint`'s `failed printing to
+/// stderr` panic would abort the process. Silently dropping bytes
+/// is fine: by the time write_kmsg would fail, there's no surviving
+/// log sink to report the failure to anyway.
+fn write_kmsg(line: &str) {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
+
+/// Spawn a background thread that subscribes to
+/// `org.freedesktop.login1.Manager.PrepareForShutdown` and posts each
+/// `(true,)` signal into a calloop channel back to the main loop, where
+/// the receiving callback triggers `graceful_shutdown`.
+///
+/// Why a thread + channel and not async-zbus inline: halmasuit's
+/// calloop is sync, smithay's reexports of calloop don't enable the
+/// `executor` feature, and zbus's `blocking::Connection` is a clean
+/// fit. The thread owns a Connection + signal-stream iterator; calloop
+/// receives only `bool` payloads. The thread exits naturally when the
+/// channel's receiver drops (which happens on compositor shutdown — at
+/// which point the system bus is also tearing down, so the iterator's
+/// next read would error anyway).
+///
+/// Failure to connect to the system bus or to subscribe is non-fatal:
+/// log + continue. halmasuit still works without PrepareForShutdown
+/// — it just doesn't get the graceful shutdown cue under
+/// `SurviveFinalKillSignal=yes`, and the wallpaper-only mode never
+/// engages. SIGTERM-driven paths (visual-shutdown-tear-down's `kill
+/// -TERM` test posture, and any operator-issued `systemctl stop`) are
+/// unaffected.
+fn spawn_prepare_for_shutdown_watcher(loop_handle: &LoopHandle<'static, HalmasuitState>) {
+    let (tx, channel) = calloop::channel::channel::<bool>();
+    if let Err(e) = loop_handle.insert_source(channel, |event, (), state: &mut HalmasuitState| {
+        let calloop::channel::Event::Msg(arming) = event else {
+            return;
+        };
+        if !arming {
+            // `PrepareForShutdown(false)` means a previously-scheduled
+            // shutdown was cancelled. halmasuit doesn't currently
+            // support resuming from the wallpaper-only state (the
+            // DRM device is paused; smithay doesn't have a clean
+            // "reverse the tear-down" path here). Cancelling
+            // shutdown post-tear-down is a vanishingly rare operator
+            // pattern; log it and rely on the operator to restart
+            // halmasuit if they really meant to keep the session
+            // alive.
+            tracing::info!("PrepareForShutdown(false): not unwinding wallpaper-only state");
+            return;
+        }
+        if state.shutting_down {
+            // Idempotent: a repeated PrepareForShutdown(true) after we
+            // already tore down. systemd-logind broadcasts the signal
+            // to all subscribers and can theoretically emit it more
+            // than once if a `Reboot()` follows a `PowerOff()`.
+            return;
+        }
+        tracing::info!("PrepareForShutdown(true) received; entering graceful_shutdown");
+        graceful_shutdown(state, ShutdownReason::PrepareForShutdown);
+    }) {
+        tracing::error!(error = %e, "insert PrepareForShutdown calloop channel failed");
+        return;
+    }
+
+    if let Err(e) = std::thread::Builder::new()
+        .name("login1-watcher".to_owned())
+        .spawn(move || run_prepare_for_shutdown_loop(&tx))
+    {
+        tracing::error!(error = %e, "spawn login1-watcher thread failed");
+    }
+}
+
+/// Blocking inner loop for the login1 watcher thread. Connects to the
+/// system bus, builds a signal stream on
+/// `org.freedesktop.login1.Manager.PrepareForShutdown`, and forwards
+/// each `(arming: bool,)` payload through `tx`. Exits if the connection
+/// dies, the bus name vanishes, or `tx` is dropped — all of which are
+/// terminal for the watcher's purpose.
+fn run_prepare_for_shutdown_loop(tx: &calloop::channel::Sender<bool>) {
+    let conn = match zbus::blocking::Connection::system() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "login1-watcher: zbus system() failed; no shutdown cue");
+            return;
+        }
+    };
+
+    // Subscribe to Manager.PrepareForShutdown.  zbus's blocking
+    // MatchRule/signal-iterator path is the canonical "watch for a
+    // specific signal forever" shape.  See zbus 5.x docs.
+    let proxy = match zbus::blocking::Proxy::new(
+        &conn,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "login1-watcher: Proxy::new failed");
+            return;
+        }
+    };
+
+    let iter = match proxy.receive_signal("PrepareForShutdown") {
+        Ok(it) => it,
+        Err(e) => {
+            tracing::warn!(error = %e, "login1-watcher: receive_signal failed");
+            return;
+        }
+    };
+
+    tracing::info!("login1-watcher: subscribed to PrepareForShutdown");
+
+    for msg in iter {
+        let arming: bool = match msg.body().deserialize() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "login1-watcher: PrepareForShutdown body decode failed");
+                continue;
+            }
+        };
+        if tx.send(arming).is_err() {
+            // Receiver gone → compositor is shutting down on its own
+            // (or never made it past startup). Nothing left to do.
+            tracing::info!("login1-watcher: channel closed; exiting");
+            return;
+        }
+    }
+    tracing::info!("login1-watcher: signal stream ended");
 }
 
 /// Reap zombie children (coalesced SIGCHLD: one signal may cover
@@ -3278,6 +3591,19 @@ fn handle_drm_event(
     _meta: &mut Option<smithay::backend::drm::DrmEventMetadata>,
     state: &mut HalmasuitState,
 ) {
+    // Epic #47 R2.2: once `graceful_shutdown` has run, halmasuit is in
+    // the wallpaper-only paint-until-halt state. The last frame is
+    // already scanned out and the kernel keeps refreshing it from the
+    // bound framebuffer (probe phase 2 validated this). Skipping all
+    // per-VBlank ioctls + per-surface presentation-feedback + layer-
+    // map walks avoids interacting with any of the subsystems
+    // systemd-shutdown is concurrently dismantling (libseat, dbus,
+    // greeter/session client trees), which is where the post-SIGTERM
+    // unwrap panics that broke an earlier iteration of the
+    // pivot-survival test originated.
+    if state.shutting_down {
+        return;
+    }
     match event {
         smithay::backend::drm::DrmEvent::VBlank(_crtc) => {
             // R5 (convergence epic): release dead popups before any
@@ -3384,7 +3710,7 @@ fn main() -> io::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .json()
-        .with_writer(io::stderr)
+        .with_writer(make_shutdown_safe_stderr)
         .with_env_filter(env_filter)
         .init();
 
@@ -3434,10 +3760,17 @@ fn main() -> io::Result<()> {
     // wallpaper anchor emitted below.
     let wallpaper_config = wallpaper_config_from_env()?;
     let wallpaper_configured = wallpaper_config.is_some();
-    let wallpaper_is_video = matches!(
-        wallpaper_config,
-        Some(crate::wallpaper::WallpaperConfig::Video { .. })
-    );
+    // Whether the configured wallpaper needs the periodic wallpaper-engine
+    // tick — true for any animated backend (shader, video). Image is
+    // static so the tick would be pure waste. This mirrors the runtime
+    // `WallpaperBackend::wants_continuous_render` decision, but at the
+    // config layer because the timer is registered BEFORE the backend
+    // is instantiated. The agreement test in
+    // `wallpaper::config::tests::needs_tick_agrees_with_backend_runtime`
+    // pins these two views to stay in sync across future variant adds.
+    let wallpaper_needs_tick = wallpaper_config
+        .as_ref()
+        .is_some_and(crate::wallpaper::WallpaperConfig::needs_tick);
 
     // Initialize the Wayland display + protocol state.
     let display: Display<HalmasuitState> = Display::new().map_err(io::Error::other)?;
@@ -3474,70 +3807,38 @@ fn main() -> io::Result<()> {
         EventLoop::try_new().map_err(io::Error::other)?;
     let loop_handle = event_loop.handle();
 
-    // Build the DRM backend if a device path was resolved. Three paths:
+    // Build the DRM backend if a device path was resolved. Two paths
+    // (R2.3 collapsed the prior three into two by removing the libseat-
+    // brokered branch):
     //
-    // 1. `Some(path)` + `in_initramfs`: open `/dev/dri/card0` directly
-    //    and issue SET_MASTER ourselves (no libseat, no libinput).
-    //    drm-master-probe Phases 1+2 validated the survival semantics.
-    // 2. `Some(path)` + !`in_initramfs`: production rootfs deployment —
-    //    libseat brokers the DRM fd, seatd holds master, libinput
-    //    routes input through the same session.
-    // 3. `None`: the dev/test SKIP path — synthesized 1920x1080
+    // 1. `Some(path)`: open `/dev/dri/card0` directly and issue
+    //    `SET_MASTER` ourselves (no libseat, no seatd). Same for both
+    //    rootfs and initramfs deployments — halmasuit is a system
+    //    compositor and holds master for its entire lifetime. Probes
+    //    drm-master-probe-phase{1,2,4} validated that the master
+    //    designation survives both `setresuid` and `switch_root`. In
+    //    rootfs mode, libinput is enumerated here too via the direct-
+    //    open path; in initramfs mode, libinput attaches post-pivot
+    //    once `/dev/input/event*` is available on the rootfs.
+    // 2. `None`: the dev/test SKIP path — synthesized 1920x1080
     //    placeholder so wl_clients can still discover an output global.
-    let (drm_backend, drm_token, output, libseat_session) = if let Some(path) = &drm_device_path {
-        if in_initramfs {
-            // Direct-DRM path (Phase B). No libseat (no seatd in the
-            // initramfs); no libinput (no input is needed before
-            // halmasuit-luks lands in a follow-up task).
-            let (backend, token, real_output) =
-                drm::setup_drm_direct(path, &loop_handle, handle_drm_event, wallpaper_config)?;
-            real_output.create_global::<HalmasuitState>(&display_handle);
-            emit(&Event::PhaseEntered {
-                phase: Phase::DrmMasterAcquired,
-            });
-            (Some(backend), Some(token), real_output, None)
+    let (drm_backend, drm_token, output, libinput_token) = if let Some(path) = &drm_device_path {
+        let (backend, token, real_output) =
+            drm::setup_drm_direct(path, &loop_handle, handle_drm_event, wallpaper_config)?;
+        real_output.create_global::<HalmasuitState>(&display_handle);
+        emit(&Event::PhaseEntered {
+            phase: Phase::DrmMasterAcquired,
+        });
+        // Rootfs deployment: enumerate input here. Initramfs deployment:
+        // `setup_post_pivot_input` runs the same `setup_libinput_direct`
+        // call post-pivot. Either way, no libseat: each `/dev/input/
+        // event*` is opened directly while halmasuit is still root.
+        let libinput_tok = if in_initramfs {
+            None
         } else {
-            // Open the libseat session (seatd backend) while still
-            // root, BEFORE the privilege drop below. seatd brokers
-            // the DRM + input fds and owns DRM master; halmasuit
-            // never SET_MASTERs. drm-master-probe Phase 4 validated
-            // this session survives the subsequent setresuid.
-            let (mut session, libseat_notifier) = LibSeatSession::new().map_err(|e| {
-                io::Error::other(format!("LibSeatSession::new (is seatd reachable?): {e}"))
-            })?;
-            // Service libseat session (activate/pause) events. v1
-            // in-VM: no VT switching (epic out-of-scope) — log only,
-            // but the source MUST be registered so libseat's event
-            // fd is drained.
-            loop_handle
-                .insert_source(
-                    libseat_notifier,
-                    |event, (), _state: &mut HalmasuitState| {
-                        tracing::info!(?event, "libseat session event");
-                    },
-                )
-                .map_err(|e| io::Error::other(format!("insert libseat notifier: {e}")))?;
-            let (backend, token, real_output) = drm::setup_drm_backend(
-                &mut session,
-                path,
-                &loop_handle,
-                handle_drm_event,
-                wallpaper_config,
-            )?;
-
-            // libinput, fed device fds through the SAME seatd session
-            // (validated surviving setresuid by drm-master-probe
-            // Phase 4). Events are routed to the keyboard-focused
-            // client. Same four-stage sequence as the Phase B post-pivot
-            // path; extracted to `attach_libinput`.
-            attach_libinput(&loop_handle, &session)?;
-
-            real_output.create_global::<HalmasuitState>(&display_handle);
-            emit(&Event::PhaseEntered {
-                phase: Phase::DrmMasterAcquired,
-            });
-            (Some(backend), Some(token), real_output, Some(session))
-        }
+            Some(setup_libinput_direct(&loop_handle)?)
+        };
+        (Some(backend), Some(token), real_output, libinput_tok)
     } else {
         // SKIP path: synthesized placeholder. Geometry is invented;
         // the advertisement exists so clients can discover an output
@@ -3773,28 +4074,32 @@ fn main() -> io::Result<()> {
     // Signal source. Register BEFORE the first dispatch so a SIGTERM
     // racing startup is still caught.
     //
-    // Initramfs gating (Phase B): when halmasuit was started from the
-    // initramfs (`in_initramfs == true`), `initrd-cleanup.service`
-    // sends SIGTERM to every initramfs unit during the pivot to rootfs
-    // (`IgnoreOnIsolate=yes` doesn't prevent this — systemd 256+
-    // explicitly stops the unit, not just removes its watch). The
-    // boot-from-initrd deployment needs halmasuit to outlast that
-    // signal, mirroring drm-master-probe-phase2's
-    // `diagnostic_signal_handler` which logs SIGTERM and continues.
-    // The post-pivot graceful-shutdown path lands alongside the
-    // post-pivot privilege drop in a follow-up task.
+    // SIGTERM has two distinct meanings in the fromInitrd deployment:
+    //   1. During the boot pivot, `initrd-cleanup.service` sends
+    //      SIGTERM to every initramfs unit as systemd-shutdown tears
+    //      down the initramfs and switches root. halmasuit MUST
+    //      survive this (the whole point of the fromInitrd shape) —
+    //      its `SurviveFinalKillSignal=yes` directive prevents the
+    //      kill spree's SIGKILL from landing, and we ignore the
+    //      preceding SIGTERM here.
+    //   2. At actual system shutdown, systemd-shutdown sends SIGTERM
+    //      to halmasuit again BEFORE pivoting to /run/initramfs/
+    //      shutdown. This one drives graceful tear-down: SIGKILL the
+    //      greeter (if alive), composite wallpaper-only, exit cleanly.
+    //
+    // `state.shutdown_armed` distinguishes them: false during the
+    // boot pivot window (until `Phase::RootfsReady` fires the flip),
+    // true thereafter. In rootfs-only (`services.halmasuit.enable=
+    // true`) mode the flag starts true at construction — no boot
+    // pivot to survive.
     let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT, Signal::SIGCHLD])?;
-    let started_from_initramfs = in_initramfs;
     loop_handle
         .insert_source(
             signals,
             move |event, (), state: &mut HalmasuitState| match event.signal() {
                 Signal::SIGCHLD => reap_zombie_children(state),
-                Signal::SIGTERM if started_from_initramfs => {
-                    tracing::info!(
-                        "SIGTERM ignored (started_from_initramfs=true). \
-                         Post-pivot graceful shutdown lands in a follow-up Phase B task."
-                    );
+                Signal::SIGTERM if !state.shutdown_armed => {
+                    tracing::info!("SIGTERM ignored (shutdown_armed=false, boot pivot in flight)");
                 }
                 sig => {
                     let reason = match sig {
@@ -3802,8 +4107,7 @@ fn main() -> io::Result<()> {
                         Signal::SIGINT => ShutdownReason::SignalInt,
                         _ => ShutdownReason::Internal,
                     };
-                    emit(&Event::Shutdown { reason });
-                    state.running = false;
+                    graceful_shutdown(state, reason);
                 }
             },
         )
@@ -3845,6 +4149,70 @@ fn main() -> io::Result<()> {
         )
         .map_err(|e| io::Error::other(format!("insert popup-cleanup timer: {e}")))?;
 
+    // Epic #47 R2.2 liveness timer.
+    //
+    // systemd-shutdown's `SurviveFinalKillSignal=yes` semantics
+    // SUPPRESS the SIGTERM that would otherwise trigger
+    // `graceful_shutdown` — protected units never see it. Without
+    // that signal halmasuit can't infer "shutdown is happening" and
+    // can't switch into a faster liveness cadence, so we keep one
+    // always-running calloop timer that writes
+    // `halmasuit-shutdown-liveness pid=N` to stdout (routed to
+    // /dev/kmsg by `StandardOutput=kmsg`). The kmsg writes survive
+    // the rootfs→shutdownRamfs pivot because /dev/kmsg is a kernel-
+    // owned character device that doesn't go away with the rootfs
+    // unmount.
+    //
+    // The cadence is gated on the `HALMASUIT_LIVENESS_INTERVAL_MS`
+    // environment variable: unset (the production default), the
+    // timer is not registered at all and there is no kmsg noise.
+    // The VM pivot-survival test sets it to a small value (25 ms,
+    // well below the ~50 ms window between post-pivot pivot-marker
+    // and kernel power-off) so it can reliably observe at least one
+    // liveness line post-pivot.
+    if let Ok(interval_ms_str) = std::env::var("HALMASUIT_LIVENESS_INTERVAL_MS")
+        && let Ok(interval_ms) = interval_ms_str.parse::<u64>()
+        && interval_ms > 0
+    {
+        let interval = Duration::from_millis(interval_ms);
+        let pid = std::process::id();
+        loop_handle
+            .insert_source(
+                Timer::from_duration(interval),
+                move |_deadline, (), state: &mut HalmasuitState| {
+                    // `frames=N` is the always-on render counter from
+                    // DrmBackend. Asserting this is INCREASING across
+                    // post-pivot liveness lines proves the render loop
+                    // is actually advancing — not just that the calloop
+                    // liveness timer is firing. (See visual-shutdown-
+                    // pivot-survival.nix's frame-progression assertion.)
+                    let frames = state
+                        .drm_backend
+                        .as_ref()
+                        .map_or(0, drm::DrmBackend::frame_counter);
+                    write_kmsg(&format!(
+                        "halmasuit-shutdown-liveness pid={pid} frames={frames}"
+                    ));
+                    TimeoutAction::ToDuration(interval)
+                },
+            )
+            .map_err(|e| io::Error::other(format!("insert liveness timer: {e}")))?;
+    }
+
+    // Epic #47 R2.4: org.freedesktop.login1.PrepareForShutdown(true)
+    // subscription. systemd-logind broadcasts this signal at the
+    // very start of every shutdown sequence (poweroff, reboot,
+    // suspend, hibernate, kexec) — BEFORE the unit-stop kill spree,
+    // before `SurviveFinalKillSignal=yes` could possibly become
+    // relevant. It's the canonical "shutdown is imminent" cue for
+    // long-lived system processes that need to clean up gracefully.
+    // halmasuit subscribes to it (via a dedicated zbus-blocking
+    // thread that posts into a calloop channel back to the main
+    // loop) and treats it as the trigger for `graceful_shutdown` —
+    // greeter killed, wallpaper-only recomposite, `DrmDevice::pause`,
+    // and the rest of the wallpaper-only paint-until-halt path.
+    spawn_prepare_for_shutdown_watcher(&loop_handle);
+
     // greetd socket setup. Production: NixOS module sets
     // HALMASUIT_GREETD_SOCKET to `/run/halmasuit/greetd.sock` and
     // HALMASUIT_GREETER_UID to the greeter system user's uid.
@@ -3865,22 +4233,23 @@ fn main() -> io::Result<()> {
         (Some(token), uid, svc)
     };
 
-    // Spawn the configured greeter while halmasuit is still root.
-    // The child uses `pre_exec` to setresuid into the greeter user
-    // before execve, so the greeter never sees root. After the fork,
-    // the parent (halmasuit) proceeds into its own privilege drop
-    // below. Greeter failure logs but doesn't abort halmasuit:
+    // Ask the broker to spawn the configured greeter (Epic #47 R1).
+    // The broker is the policy authority — it reads
+    // HALMASUIT_GREETER_COMMAND/UID/etc. from its own env, forks-
+    // then-drops a child to the greeter uid, returns the pidfd via
+    // SCM_RIGHTS. Greeter failure logs but doesn't abort halmasuit:
     // operators may run halmasuit without a greeter during dev.
     //
     // Skipped in the initramfs path: the greeter is the rootfs
     // login UI; an analogous "halmasuit-luks" prompt for the
-    // initramfs path lands as its own task.
+    // initramfs path lands as its own task. (The post-pivot
+    // `run_post_pivot_setup` does the broker-spawn for fromInitrd.)
     let greeter = if in_initramfs {
         None
-    } else if let Some(cmd) = greeter_command_from_env() {
-        match spawn_greeter(greeter_uid, &cmd) {
+    } else {
+        match broker_spawn_greeter() {
             Ok(handle) => {
-                tracing::info!(greeter_pid = handle.pid, greeter_cmd = %cmd.display(), "greeter spawned");
+                tracing::info!(greeter_pid = handle.pid, "greeter spawned via broker");
                 emit(&Event::GreeterSpawned { pid: handle.pid });
                 emit(&Event::ForegroundChanged {
                     to: halmasuit_introspect::Foreground::Greeter,
@@ -3888,16 +4257,10 @@ fn main() -> io::Result<()> {
                 Some(handle)
             }
             Err(e) => {
-                tracing::error!(error = %e, greeter_cmd = %cmd.display(), "greeter spawn failed");
+                tracing::error!(error = %e, "broker_spawn_greeter failed");
                 None
             }
         }
-    } else {
-        tracing::warn!(
-            "HALMASUIT_GREETER_COMMAND unset; halmasuit running without a greeter. \
-             Production deployments set this via services.halmasuit.greeterCommand."
-        );
-        None
     };
 
     // Cache output-mode-derived constants once; the mode is stable
@@ -3914,7 +4277,6 @@ fn main() -> io::Result<()> {
     );
 
     let mut state = HalmasuitState {
-        running: true,
         display_handle,
         compositor_state,
         xdg_shell_state,
@@ -3952,13 +4314,20 @@ fn main() -> io::Result<()> {
         foreground_toplevel: None,
         popups: PopupManager::default(),
         foreground: halmasuit_introspect::Foreground::Greeter,
-        libseat_session,
+        libinput_token,
         loop_handle: loop_handle.clone(),
         connections: HashMap::new(),
         next_conn_id: 0,
         pam_service,
         broker_socket: broker_socket_path_from_env(),
         greeter_uid,
+        // Epic #47 R2.1: in rootfs-only mode no boot-pivot kill spree
+        // exists, so SIGTERM should drive graceful shutdown from the
+        // start. In fromInitrd mode the pivot-poll calloop source flips
+        // this true on `Phase::RootfsReady` — before that, SIGTERM is
+        // the boot kill spree and stays ignored.
+        shutdown_armed: !in_initramfs,
+        shutting_down: false,
         greetd_listener_token,
         drm_backend,
         _drm_token: drm_token,
@@ -4025,54 +4394,73 @@ fn main() -> io::Result<()> {
     }
 
     // Wallpaper-engine background tick: a calloop timer at 100 ms
-    // drives [`DrmBackend::tick_wallpaper`], which delegates to
-    // [`WallpaperEngine::tick`]. Tick has two responsibilities:
+    // drives [`DrmBackend::tick_wallpaper`] AND
+    // [`DrmBackend::wallpaper_wants_continuous`]-gated renders for
+    // animated wallpaper backends (shader, video). Three
+    // responsibilities:
     // (1) call the active backend's
-    //     [`WallpaperBackend::poll_pending`] — only `VideoBackend`
-    //     does useful work, draining the decoder's IPC socket
-    //     independently of the render path; and
+    //     [`WallpaperBackend::poll_pending`] — `VideoBackend` drains
+    //     the decoder's IPC socket independently of the render path;
+    //     other backends no-op.
     // (2) check whether the active backend has requested a
     //     fallback swap (e.g. relay-dead after the restart budget
     //     exhausted) and execute it — load-bearing for VM-test
     //     Gate 6 / Epic #12 Req 10's "fallback after N forced
     //     crashes" criterion.
+    // (3) for `wants_continuous_render` backends, drive
+    //     `render_one_frame` every tick so animation advances even
+    //     when no Wayland client commits are firing repaints. THIS
+    //     IS LOAD-BEARING through shutdown — once niri exits during
+    //     `graceful_shutdown`, there are no client commits, and the
+    //     tick is the only path that keeps shader/video frames
+    //     advancing all the way to kernel halt (Epic #61 R3.1).
     //
-    // For image/shader/no-wallpaper configurations, registering
-    // the timer would wake the compositor 10× per second forever
-    // for a no-op — preventing deep-idle CPU states on battery-
-    // backed hardware. Gate the registration on the wallpaper
-    // type.
+    // For image/no-wallpaper configurations, registering the timer
+    // would wake the compositor 10× per second forever for a no-op
+    // — preventing deep-idle CPU states on battery-backed hardware.
+    // Gate the registration on `wallpaper_needs_tick`, which mirrors
+    // `WallpaperBackend::wants_continuous_render` at config-time.
     //
     // 100 ms is a deliberate compromise: low enough to bound
-    // crash-recovery latency below human-perceptible levels, high
-    // enough that an idle compositor stays mostly asleep. Frame-
-    // delivery latency for active playback is unaffected because
-    // render_element ALSO polls when the render path fires; the
-    // timer is the keepalive for periods when the render loop has
-    // stopped (wallpaper content stabilized → no new vblanks).
-    //
-    // When tick reports a fallback swap fired, the callback
-    // queues an explicit `render_one_frame` — otherwise the
-    // newly-installed fallback would sit in the engine without
-    // reaching the screen, because a dead relay produces no
-    // content → no vblank → no render path activation.
+    // crash-recovery latency below human-perceptible levels and to
+    // animate a shader at 10 fps (visible motion), high enough that
+    // an idle compositor stays mostly asleep when the wallpaper is
+    // static. Frame-delivery latency for active playback is
+    // unaffected because `render_element` ALSO polls when the render
+    // path fires; the timer is the keepalive for periods when the
+    // render loop has stopped (wallpaper content stabilized → no new
+    // vblanks).
     //
     // Wraps around forever via `TimeoutAction::ToDuration(period)`.
-    if wallpaper_is_video {
+    if wallpaper_needs_tick {
         let wallpaper_tick = calloop::timer::Timer::immediate();
         loop_handle
             .insert_source(
                 wallpaper_tick,
                 |_deadline, &mut (), state: &mut HalmasuitState| {
-                    if let Some(backend) = state.drm_backend.as_mut()
-                        && backend.tick_wallpaper()
-                        && let Err(e) =
-                            backend.render_one_frame(&state.output, HALMASUIT_BRAND_CLEAR)
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            "wallpaper-tick: render after fallback swap failed",
-                        );
+                    // `DrmBackend::tick_wallpaper` returns a
+                    // [`WallpaperTickAction`] encoding both the fallback-
+                    // swap state-machine step AND whether the backend
+                    // wants a per-tick render. Match on it and render if
+                    // the action is non-Idle (Render{Continuous,AndSwapped}).
+                    // Static backends (image) return `Idle` — the kernel
+                    // keeps scanning out the last-flipped framebuffer
+                    // and we don't waste GLES draw calls. Animated
+                    // backends (shader, video) return `RenderContinuous`
+                    // every tick — shader's `iTime` advances + video's
+                    // decoder frames reach the screen until kernel halt.
+                    if let Some(backend) = state.drm_backend.as_mut() {
+                        let action = backend.tick_wallpaper();
+                        if action.wants_render()
+                            && let Err(e) =
+                                backend.render_one_frame(&state.output, HALMASUIT_BRAND_CLEAR)
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                ?action,
+                                "wallpaper-tick: render failed",
+                            );
+                        }
                     }
                     calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(100))
                 },
@@ -4195,6 +4583,10 @@ fn main() -> io::Result<()> {
                             emit(&Event::PhaseEntered {
                                 phase: Phase::RootfsReady,
                             });
+                            // Epic #47 R2.1: the boot pivot is complete.
+                            // A SIGTERM from this point is the real
+                            // shutdown signal, not the boot kill spree.
+                            state.shutdown_armed = true;
                             phase = PivotPhase::Connecting {
                                 deadline: Instant::now() + Duration::from_secs(10),
                                 next_delay: Duration::from_millis(20),
@@ -4303,8 +4695,16 @@ fn main() -> io::Result<()> {
     // by the calloop source above.
     // Consecutive failed-iteration counter for the R5 degrade-in-place
     // log rate-limiter; reset on the first clean iteration.
+    //
+    // Epic #47 R2.2: there is no clean-exit termination. halmasuit
+    // paints from initramfs handoff through kernel halt; the SIGTERM/
+    // SIGINT path runs `graceful_shutdown` (greeter killed, wallpaper-
+    // only recomposite, Event::Shutdown emitted) but the loop keeps
+    // dispatching so the wallpaper plane survives systemd-shutdown's
+    // rootfs→shutdownRamfs pivot. External SIGKILL or kernel halt is
+    // what stops the process.
     let mut consecutive_errors = 0u32;
-    while state.running {
+    loop {
         run_loop_iteration(&mut consecutive_errors, || {
             event_loop
                 .dispatch(Some(Duration::from_millis(16)), &mut state)
@@ -4323,11 +4723,6 @@ fn main() -> io::Result<()> {
             Ok(())
         });
     }
-
-    // Reached only via the deliberate Shutdown path (`state.running`
-    // cleared in the SIGTERM/SIGINT closure): a clean exit 0, which
-    // systemd's `Restart=on-failure` correctly does NOT restart.
-    Ok(())
 }
 
 #[cfg(test)]

@@ -514,13 +514,15 @@ in
     # requests the name; shipping it unconditionally keeps the module
     # single-codepath. `services.dbus.enable` is required because the
     # minimal VM-test images don't bring the system bus up otherwise.
-    # seatd: the root device broker libseat connects to. halmasuit
-    # acquires its DRM (and, layer E2, libinput) fds through a
-    # LibSeatSession instead of self-issuing SET_MASTER — the
-    # privilege posture validated by drm-master-probe Phase 4 (seatd
-    # owns master; halmasuit never does). Required for ALL halmasuit
-    # deployments now, not just a test.
-    services.seatd.enable = true;
+    # Epic #47 R2.3: seatd is NOT enabled. halmasuit is a system
+    # compositor that owns DRM master + input device fds for its
+    # entire process lifetime; it opens /dev/dri/card0 and
+    # /dev/input/event* directly via setup_drm_direct +
+    # setup_libinput_direct while still root, then privilege-drops.
+    # No libseat / no seatd anywhere in the runtime closure —
+    # collapsing the standing-root-daemon survival surface that
+    # would otherwise have to be carried across the rootfs→
+    # shutdownRamfs pivot.
 
     services.dbus.enable = true;
     services.dbus.packages = [
@@ -548,18 +550,63 @@ in
     systemd.services.halmasuit = {
       description = "halmasuit — Linux system compositor";
       wantedBy    = [ "multi-user.target" ];
-      # seatd must be up before halmasuit so `LibSeatSession::new()`
-      # can reach the seatd socket while halmasuit is still root
-      # (pre-privilege-drop). `requires` so a seatd failure fails
-      # halmasuit loudly rather than silently losing the GPU.
-      #
       # `halmasuit-session.socket` ordered before us so the broker's
       # SOCK_SEQPACKET listening socket is bound (PID 1 owns it) by the
       # time the compositor relays its first greeter auth to it (Epic
       # #1 R3). NOT `requires`: the broker is socket-activated and
       # idle-exits — only the socket need exist, not a running service.
-      after       = [ "local-fs.target" "seatd.service" "halmasuit-session.socket" ];
-      requires    = [ "seatd.service" ];
+      #
+      # `DefaultDependencies = false` (in unitConfig below) suppresses
+      # the implicit `Conflicts=shutdown.target` + `Before=shutdown.target`
+      # + `After=sysinit.target` + `After=basic.target` injection — we
+      # WANT halmasuit to survive the shutdown sequence, but we still
+      # need the sysinit / basic ordering, so they're re-added here
+      # explicitly. `Before=shutdown.target` ordering is also explicit
+      # so that systemd-shutdown runs AFTER halmasuit has been started.
+      after       = [
+        "sysinit.target"
+        "basic.target"
+        "local-fs.target"
+        "halmasuit-session.socket"
+      ];
+      # `Wants` rather than `Requires`: required at boot for halmasuit
+      # to function (some sysinit paths are mandatory), but `Requires`
+      # causes systemd to cascade-stop halmasuit when sysinit.target
+      # stops during shutdown, defeating the survive-the-pivot
+      # architecture. Boot ordering is enforced by `After=` (above);
+      # if sysinit fails, halmasuit's own initialization fails for
+      # cause, not via a propagation cascade. `Before=shutdown.target`
+      # is explicit so the start ordering is preserved (we still want
+      # halmasuit started before shutdown.target is considered
+      # reachable), but with `DefaultDependencies=false` there is no
+      # implicit `Conflicts=shutdown.target` so reaching shutdown.target
+      # doesn't trigger halmasuit's stop.
+      wants       = [ "sysinit.target" ];
+      before      = [ "shutdown.target" ];
+
+      unitConfig = {
+        # Epic #47 R2.2: halmasuit MUST survive systemd-shutdown's
+        # final kill spree so it can keep painting the wallpaper
+        # plane through the rootfs→shutdownRamfs pivot until the
+        # kernel halts.
+        #
+        # `DefaultDependencies=false` suppresses the implicit
+        # `Conflicts=shutdown.target` + `Before=shutdown.target`
+        # pair systemd would otherwise inject; without it systemd
+        # stops halmasuit during the normal shutdown unit-stop
+        # sequence, the unit enters 'failed' state, and when
+        # systemd-shutdown's broad kill spree fires the
+        # `SurviveFinalKillSignal=yes` exemption no longer applies
+        # to the unit's PID (it's no longer "active"). With
+        # DefaultDependencies=false halmasuit stays active through
+        # the entire shutdown sequence; the only kill attempt is
+        # systemd-shutdown's final SIGTERM/SIGKILL, which
+        # SurviveFinalKillSignal=yes blocks. Same pattern the
+        # halmasuit-shutdown-probe-phase{0,1,2} units use; same
+        # pattern is load-bearing for the production binary.
+        DefaultDependencies   = false;
+        SurviveFinalKillSignal = "yes";
+      };
 
       serviceConfig = {
         Type           = "simple";
@@ -569,9 +616,38 @@ in
         # to recover from.
         Restart        = "on-failure";
         RestartSec     = "1s";
-        # Capture stderr only; halmasuit emits its NDJSON event stream
-        # there. stdout stays silent for now.
-        StandardOutput = "null";
+        # Epic #47 R2.2: `KillMode=process` confines `systemctl stop
+        # halmasuit.service` (dev workflow) to signaling halmasuit's
+        # main PID only, leaving any child trees alone. Paired with
+        # `DefaultDependencies=false` in unitConfig (which removes the
+        # implicit shutdown.target conflict), this unit no longer
+        # participates in systemd's unit-stop phase during system
+        # shutdown — the only kill attempt halmasuit sees during
+        # shutdown is systemd-shutdown's broad SIGTERM/SIGKILL kill
+        # spree, which `SurviveFinalKillSignal=yes` blocks. The
+        # SIGTERM IS forwarded to halmasuit at that point (the kill
+        # spree sends SIGTERM first, then SIGKILL; SurviveFinalKillSignal
+        # only suppresses the SIGKILL), triggering
+        # `graceful_shutdown` and the wallpaper-only post-shutdown
+        # paint loop right before the rootfs→shutdownRamfs pivot.
+        KillMode       = "process";
+        # halmasuit emits its NDJSON event stream on stderr via
+        # tracing-subscriber; stdout is reserved for the R2.2 shutdown-
+        # liveness writes (one line per HALMASUIT_LIVENESS_INTERVAL_MS
+        # while the always-on liveness timer is running). Routing
+        # stdout to `file:/dev/kmsg` is what makes those lines survive
+        # the entire shutdown sequence end-to-end: systemd opens fd 1
+        # against /dev/kmsg directly (NOT through the journal socket,
+        # which `StandardOutput=kmsg` does), so the fd remains valid
+        # after systemd-journald is killed by the shutdown kill spree
+        # and across the rootfs→shutdownRamfs pivot. The compositor
+        # has `ProtectKernelLogs=true` and can't open /dev/kmsg
+        # itself, but the pre-opened fd inherited from systemd works
+        # regardless. The /dev/kmsg character device is kernel-owned
+        # and survives every userspace teardown, so writes land in
+        # the kernel ring buffer (visible via dmesg and on the serial
+        # console) all the way until the kernel halts.
+        StandardOutput = "file:/dev/kmsg";
         StandardError  = "journal";
         # RuntimeDirectory creates /run/halmasuit/ with the unit's UID.
         # Unit starts as root, so /run/halmasuit is owned root:<Group=>;
@@ -647,10 +723,6 @@ in
         # (dri_gbm.so) still loads from the dlopen search path. The
         # libglvnd dispatch also looks here for vendor JSON.
         LD_LIBRARY_PATH = "/run/opengl-driver/lib";
-        # Force libseat's seatd backend. halmasuit runs as a system
-        # service with no logind session, so libseat's autodetect
-        # (logind → seatd → builtin) is ambiguous; pin it.
-        LIBSEAT_BACKEND = "seatd";
         # R8b-render — xcursor theme + size for halmasuit's visible
         # cursor render path. Propagated through the broker
         # session-leader env allowlist so the child compositor
@@ -761,6 +833,21 @@ in
        ${cfg.pamService} = {};
      };
 
+     # Epic #47 R2.2: ship halmasuit (+ its transitive closure: Mesa,
+     # libgbm, libglvnd, libdrm, glibc, ld-linux, …) into the shutdown
+     # initramfs. systemd-shutdown pivots into /run/initramfs at the
+     # tail of the shutdown sequence; processes that survive via
+     # `SurviveFinalKillSignal=yes` continue running with the same
+     # PID + fds, but their mmap'd executable + libraries must be
+     # backed by the shutdownRamfs tmpfs — otherwise the rootfs
+     # unmount that follows pulls them out from under the running
+     # process. halmasuit-shutdown-probe-phase{1,2} validated this
+     # is sufficient (with `SurviveFinalKillSignal=yes`) for the
+     # process + its DRM master to survive the pivot. nix-store
+     # closure resolution via storePaths picks up the transitive
+     # deps automatically.
+     systemd.shutdownRamfs.storePaths = [ "${cfg.package}/bin/halmasuit" ];
+
      systemd.sockets."halmasuit-session" = {
        description = "halmasuit-session privileged PAM-lifecycle broker socket";
        wantedBy    = [ "sockets.target" ];
@@ -868,6 +955,21 @@ in
          HALMASUIT_BROKER_PEER_UID = toString brokerPeerUid;
          # PAM service file lookup key — /etc/pam.d/<value>.
          HALMASUIT_PAM_SERVICE = cfg.pamService;
+         # Epic #47 R1: broker is the policy authority for greeter
+         # spawn. The compositor is unprivileged + can't setuid
+         # itself; it sends `SpawnGreeter` and the broker reads
+         # these env vars to fork-then-drop the greeter child. Same
+         # values the compositor unit's env has (so the in-compositor
+         # and broker-side resolution match exactly — drift here would
+         # mean the greeter runs as a different uid depending on which
+         # path spawned it, which is unsafe).
+         HALMASUIT_GREETER_UID  = toString cfg.greeterUid;
+         HALMASUIT_GREETER_GID  = toString config.users.groups.${cfg.greeterGroup}.gid;
+         HALMASUIT_GREETER_NAME = cfg.greeterUser;
+         HALMASUIT_GREETER_HOME = "/var/empty";
+         HALMASUIT_GREETD_SOCKET = "/run/halmasuit/greetd.sock";
+       } // lib.optionalAttrs (cfg.greeterCommand != null) {
+         HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
        };
      };
 
@@ -894,8 +996,10 @@ in
            services.halmasuit.fromInitrd.enable and
            services.halmasuit.enable cannot both be true. They are
            mutually exclusive deployment shapes:
-             - enable = true       → rootfs-only, libseat-brokered DRM
+             - enable = true       → rootfs-only, direct DRM
              - fromInitrd.enable   → boot-from-initrd, direct DRM
+           (R2.3: both shapes are direct-DRM / direct-input — no
+            libseat / no seatd anywhere in the runtime closure.)
          '';
        }
        {
@@ -921,10 +1025,10 @@ in
      # indirection in initramfs).
      hardware.graphics.enable = true;
 
-     # halmasuit needs seatd in rootfs too (post-pivot, when the broker
-     # session-leader child connects to negotiate device acquisition).
-     # Same shape as the rootfs `enable` deployment.
-     services.seatd.enable = true;
+     # Epic #47 R2.3: seatd is NOT enabled — halmasuit opens DRM +
+     # input devices directly via setup_drm_direct +
+     # setup_libinput_direct, no libseat brokerage anywhere in the
+     # runtime closure.
 
      # System bus + halmasuit ownership policy for the post-pivot
      # rootfs dbus-broker. halmasuit-debug's `Snapshot()` D-Bus thread
@@ -1057,7 +1161,12 @@ in
          ];
          ExecStart      = lib.getExe cfg.package;
          Restart        = "no";
-         StandardOutput = "journal";
+         # `file:/dev/kmsg` for the same shutdown-liveness reason as
+         # the rootfs unit (see the long comment in the `enable`
+         # branch above): halmasuit writes liveness lines on stdout;
+         # `file:/dev/kmsg` has systemd open the device directly so
+         # the fd survives journald death and the rootfs pivot.
+         StandardOutput = "file:/dev/kmsg";
          StandardError  = "journal";
          # Cross-pivot per-process-root divergence: at switch_root
          # halmasuit's process-root diverges from rootfs systemd's

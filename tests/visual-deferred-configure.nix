@@ -118,7 +118,6 @@ pkgs.testers.runNixOSTest {
 
     machine.start()
     machine.wait_for_unit("multi-user.target")
-    machine.wait_for_unit("seatd.service")
     machine.wait_for_unit("halmasuit.service")
 
     # halmasuit is up and has spawned the test client as its greeter.
