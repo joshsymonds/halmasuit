@@ -1317,7 +1317,17 @@ in
        "${pkgs.libglvnd}"
        "${pkgs.xkeyboard-config}"
      ] ++ (if cfg.rendering.backend == "nvidia"
-           then [ "${cfg.rendering.nvidiaPackage}" ]
+           then [
+             "${cfg.rendering.nvidiaPackage}"
+             # The Phase B nvidia-devnode ExecStartPre script (defined
+             # below) calls into coreutils + gnugrep by absolute path.
+             # The unit file's reference would pull these transitively,
+             # but enumerate them here so the dependency is visible at
+             # the storePaths boundary and a future refactor can't
+             # accidentally drop them.
+             "${pkgs.coreutils}"
+             "${pkgs.gnugrep}"
+           ]
            else [ "${pkgs.mesa}" ])
        ++ cfg.rendering.extraInitrdStorePaths
        ++ lib.optionals (cfg.wallpaper != null) [
@@ -1409,9 +1419,66 @@ in
              if cfg.rendering.backend == "nvidia"
              then "${cfg.rendering.nvidiaPackage}"
              else "${pkgs.mesa}";
+
+           # NVIDIA Phase B device-node creation. The NVIDIA proprietary
+           # kernel modules expose char devices at major 195 (control +
+           # per-GPU + modeset) and a dynamic major for UVM, but they do
+           # NOT auto-create the /dev nodes via devtmpfs (unlike DRM,
+           # which the kernel's drm core registers as a class so udev
+           # auto-mknods). On rootfs, NixOS ships `/etc/udev/rules.d`
+           # entries that mknod these nodes when the matching kernel
+           # uevent fires; in initramfs we have neither those rules nor
+           # the rootfs PATH that the bare `mknod` in those rules
+           # depends on (the rules invoke `bash -c 'mknod …'` with no
+           # absolute path, so PATH lookup fails initramfs-side even
+           # when the rules are present). libEGL_nvidia silently fails
+           # to register its EGL platform plugins when
+           # `/dev/nvidiactl` is missing — observed on gnomon 2026-05-28
+           # as "Skipping EGL platform … Missing extensions:
+           # \[\"EGL_KHR_platform_gbm\"\]" right after halmasuit's
+           # already-successful DRM master acquisition.
+           #
+           # Idempotent: every mknod is guarded by `[ -e … ]`, so reruns
+           # (e.g. systemd's restart loop) and post-pivot re-execs are
+           # no-ops. All paths are absolute /nix/store entries so the
+           # script's behavior is independent of $PATH.
+           nvidiaDevnodes = pkgs.writeShellScript "halmasuit-nvidia-devnodes" ''
+             set -e
+             # /dev/nvidiactl — driver-wide control device. Fixed major
+             # 195, minor 255.
+             [ -e /dev/nvidiactl ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidiactl c 195 255
+
+             # /dev/nvidia0..N — per-GPU compute. Minor numbers come
+             # from /proc/driver/nvidia/gpus/*/information after
+             # nvidia.ko enumeration. Major is 195.
+             for info in /proc/driver/nvidia/gpus/*/information; do
+               minor=$(${pkgs.gnugrep}/bin/grep '^Minor' "$info" \
+                 | ${pkgs.coreutils}/bin/cut -d' ' -f4 \
+                 | ${pkgs.coreutils}/bin/tr -d '[:space:]')
+               if [ -n "$minor" ]; then
+                 [ -e /dev/nvidia$minor ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia$minor c 195 $minor
+               fi
+             done
+
+             # /dev/nvidia-modeset — modeset kernel module. Fixed major
+             # 195, minor 254.
+             [ -e /dev/nvidia-modeset ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia-modeset c 195 254
+
+             # /dev/nvidia-uvm + nvidia-uvm-tools — UVM (CUDA unified
+             # memory). Dynamic major; read from /proc/devices.
+             uvm_major=$(${pkgs.gnugrep}/bin/grep ' nvidia-uvm$' /proc/devices \
+               | ${pkgs.coreutils}/bin/cut -d' ' -f1 \
+               | ${pkgs.coreutils}/bin/tr -d '[:space:]')
+             if [ -n "$uvm_major" ]; then
+               [ -e /dev/nvidia-uvm ]       || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia-uvm       c "$uvm_major" 0
+               [ -e /dev/nvidia-uvm-tools ] || ${pkgs.coreutils}/bin/mknod -m 666 /dev/nvidia-uvm-tools c "$uvm_major" 1
+             fi
+           '';
          in [
            "${pkgs.coreutils}/bin/ln -sfn ${glDriverTarget} /run/opengl-driver"
            "${pkgs.coreutils}/bin/mkdir -p /run/halmasuit"
+         ] ++ lib.optionals (cfg.rendering.backend == "nvidia") [
+           "${nvidiaDevnodes}"
          ];
          ExecStart      = lib.getExe cfg.package;
          Restart        = "no";
