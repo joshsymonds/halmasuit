@@ -308,6 +308,14 @@ test-shutdown-probe-phase2:
 test-vm-initrd-survival:
     nix build .#checks.x86_64-linux.initrd-survival -L --print-build-logs --no-link
 
+# Boot-size regression gate. Builds a Phase B halmasuit initramfs
+# and fails if it exceeds the threshold encoded in
+# tests/initrd-size-gate.nix. Catches closure regressions before
+# they hit deployment-time ESP overflow. Threshold bumps are
+# deliberate — document the reason in the commit message.
+check-initrd-size:
+    nix build .#checks.x86_64-linux.initrd-size-gate -L --print-build-logs --no-link
+
 # Phase B hard gate: full LUKS-backed boot + survival + chroot +
 # greeter spawn + PAM auth → SessionOpened end-to-end.
 test-vm-full-boot-flash:

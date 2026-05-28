@@ -772,6 +772,18 @@
           system = "x86_64-linux";
           inherit nixpkgs;
         };
+        # Boot-size regression gate: builds a Phase B halmasuit
+        # config and fails when the initramfs exceeds threshold.
+        # Catches closure regressions BEFORE deployment-time ESP
+        # overflow on signed UKI partitions. Threshold maintenance
+        # is intentional friction — bump deliberately, document why.
+        initrd-size-gate = import ./tests/initrd-size-gate.nix {
+          system            = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-luks    = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+        };
         # Phase B (initramfs survival): real halmasuit binary in
         # boot.initrd.systemd.services with SurviveFinalKillSignal=yes,
         # asserts PID + DRM-master + Wayland-socket continuity across
