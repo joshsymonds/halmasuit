@@ -35,6 +35,7 @@ mod context;
 mod cursor;
 #[cfg(feature = "frame_audit")]
 mod dbus;
+mod diagnostic;
 mod drm;
 #[cfg(feature = "frame_audit")]
 mod frame_audit;
@@ -360,6 +361,11 @@ struct HalmasuitState {
     /// fromInitrd), the flag flips true at startup completion — there's
     /// no boot pivot to ignore.
     shutdown_armed: bool,
+    /// Epic #71 R3.1: diagnostic overlay open/closed state.
+    /// Toggled by `Ctrl+Alt+Shift+Esc` (the Linux SAK chord). Bare
+    /// `Esc` while open closes it. R3.2 reads this flag in the
+    /// render path to composite the overlay layer.
+    diag_overlay_open: bool,
     /// Epic #47 R2.2: set by `graceful_shutdown` after the wallpaper-
     /// only recomposite. The render path observes this to keep the
     /// wallpaper plane composited (no greeter, no session toplevel)
@@ -481,23 +487,49 @@ impl HalmasuitState {
                 let time = event.time_msec();
                 let code = event.key_code();
                 let key_state = event.state();
-                // Epic #71 R2.1: intercept Ctrl+Alt+F1..F12 BEFORE
-                // forwarding to the focused client. xkb resolves the
-                // chord to keysym XF86Switch_VT_<N>; bare F<N> without
-                // the modifiers stays plain F<N> and falls through.
-                // System chord — NOT user-configurable per the epic's
-                // anti-patterns.
+                // Epic #71 system chords: intercept BEFORE forwarding
+                // to the focused client.
+                //
+                //   R2.1: Ctrl+Alt+F1..F12 → VT switch. xkb resolves
+                //         the modifier+F-key combination to a unique
+                //         XF86Switch_VT_<N> keysym so the modifier
+                //         check is structurally embedded in the keysym.
+                //   R3.1: Ctrl+Alt+Shift+Esc (Linux SAK) → toggle the
+                //         diagnostic overlay. Plain Esc resolves to
+                //         XK_Escape regardless of modifiers; we must
+                //         inspect ModifiersState explicitly.
+                //   R3.1: bare Esc while the overlay is open → close
+                //         the overlay.
+                //
+                // System chords are HARDCODED per Epic #71's anti-
+                // patterns — never user-configurable.
                 let chord_press = matches!(key_state, smithay::backend::input::KeyState::Pressed);
-                let target_vt: Option<u8> =
-                    keyboard.input::<u8, _>(self, code, key_state, serial, time, |_, _, handle| {
+                let action: Option<ChordAction> = keyboard.input::<ChordAction, _>(
+                    self,
+                    code,
+                    key_state,
+                    serial,
+                    time,
+                    |state, mods, handle| {
                         if !chord_press {
                             return FilterResult::Forward;
                         }
-                        vt_switch::detect_vt_chord(handle.modified_sym().raw())
-                            .map_or(FilterResult::Forward, FilterResult::Intercept)
-                    });
-                if let Some(vt) = target_vt {
-                    self.trigger_vt_switch(vt);
+                        let keysym = handle.modified_sym().raw();
+                        if let Some(vt) = vt_switch::detect_vt_chord(keysym) {
+                            return FilterResult::Intercept(ChordAction::VtSwitch(vt));
+                        }
+                        if diagnostic::detect_overlay_chord(keysym, mods.ctrl, mods.alt, mods.shift)
+                        {
+                            return FilterResult::Intercept(ChordAction::OverlayToggle);
+                        }
+                        if state.diag_overlay_open && diagnostic::is_dismiss_key(keysym) {
+                            return FilterResult::Intercept(ChordAction::OverlayDismiss);
+                        }
+                        FilterResult::Forward
+                    },
+                );
+                if let Some(action) = action {
+                    self.handle_chord_action(action);
                 }
             }
             InputEvent::PointerMotion { event } => self.on_pointer_relative_motion(&event),
@@ -513,6 +545,43 @@ impl HalmasuitState {
             InputEvent::TouchCancel { event: _ } => self.on_touch_cancel(),
             _ => {
                 // Tablet, switch — not in v1 scope. Future epics.
+            }
+        }
+    }
+}
+
+/// Epic #71 system-chord action dispatched by `dispatch_libinput`'s
+/// keyboard filter. The filter inspects keysym+modifiers and emits
+/// the matching variant; the caller (`handle_chord_action`) acts on
+/// it with `&mut self` access to the state.
+#[derive(Debug, Clone, Copy)]
+enum ChordAction {
+    /// R2.1 Ctrl+Alt+F<N> → switch to VT N.
+    VtSwitch(u8),
+    /// R3.1 Ctrl+Alt+Shift+Esc → toggle the diagnostic overlay.
+    OverlayToggle,
+    /// R3.1 bare Esc while overlay is open → close the overlay.
+    OverlayDismiss,
+}
+
+impl HalmasuitState {
+    /// Dispatch a system-chord action detected by the keyboard
+    /// filter in `dispatch_libinput`. One method so the filter
+    /// closure stays small + each action's implementation can
+    /// borrow `&mut self` cleanly.
+    fn handle_chord_action(&mut self, action: ChordAction) {
+        match action {
+            ChordAction::VtSwitch(vt) => self.trigger_vt_switch(vt),
+            ChordAction::OverlayToggle => {
+                self.diag_overlay_open = !self.diag_overlay_open;
+                tracing::info!(
+                    open = self.diag_overlay_open,
+                    "diagnostic overlay toggled (R3.1 — rendering lands in R3.2)",
+                );
+            }
+            ChordAction::OverlayDismiss => {
+                self.diag_overlay_open = false;
+                tracing::info!("diagnostic overlay dismissed via Esc");
             }
         }
     }
@@ -4454,6 +4523,8 @@ fn main() -> io::Result<()> {
         // this true on `Phase::RootfsReady` — before that, SIGTERM is
         // the boot kill spree and stays ignored.
         shutdown_armed: !in_initramfs,
+        // Epic #71 R3.1: overlay starts closed. Toggled by chord.
+        diag_overlay_open: false,
         shutting_down: false,
         greetd_listener_token,
         drm_backend,
