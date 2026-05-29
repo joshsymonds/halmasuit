@@ -863,13 +863,63 @@ fn greeter_prefork_gates(spec: &GreeterSpec) -> io::Result<()> {
     Ok(())
 }
 
+/// Env keys harvested from the broker's own environment at greeter
+/// spawn time (Epic #35 R3).
+///
+/// Each is a pure path/identifier value with NO shell-injection or
+/// library-loader-tampering surface (unlike `LD_*`/`MALLOC_*`/`IFS`,
+/// which remain forbidden). The same risk profile as `PATH`/`HOME` —
+/// they tell the loader WHERE to look for already-built artifacts;
+/// they do NOT control HOW those artifacts execute.
+///
+/// gen-400 saw three `libEGL warning: failed to get driver name for
+/// fd -1` lines from DMS Quickshell on NVIDIA hardware because the
+/// greeter's env was the fixed 7-entry shape below — no NVIDIA EGL
+/// vendor descriptors reachable. With this passthrough, the nix
+/// module's `boot.initrd.systemd.services.halmasuit-session.environment`
+/// (which already sets these for the broker on `rendering.backend
+/// == "nvidia"`) cascades into the greeter's env automatically.
+///
+/// Empty / unset broker-side env vars are NOT propagated (preserves
+/// the fixed-env contract on non-NVIDIA backends).
+const GREETER_ENV_PASSTHROUGH: &[&str] = &[
+    // libglvnd EGL vendor descriptor (NVIDIA's
+    // `share/glvnd/egl_vendor.d/10_nvidia.json`).
+    "__EGL_VENDOR_LIBRARY_FILENAMES",
+    // libEGL external-platform plugin discovery
+    // (`share/egl/egl_external_platform.d/*.json`).
+    "__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS",
+    // libglvnd GLX vendor name (e.g. "nvidia").
+    "__GLX_VENDOR_LIBRARY_NAME",
+    // Mesa GBM/EGL driver path. Unused on NVIDIA but harmless to
+    // pass through if the operator sets it.
+    "LIBGL_DRIVERS_PATH",
+];
+
+/// Read [`GREETER_ENV_PASSTHROUGH`] keys from a caller-supplied env
+/// lookup. Used by [`greeter_child_env_pairs`] to bridge NVIDIA EGL
+/// discovery into the spawned greeter. Skips unset keys; the
+/// returned vec is empty on non-NVIDIA deployments.
+///
+/// Generic over the lookup so tests can inject a fixed map without
+/// mutating process-global state.
+fn harvest_passthrough_env<F>(env_lookup: F) -> Vec<(&'static str, String)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    GREETER_ENV_PASSTHROUGH
+        .iter()
+        .filter_map(|k| env_lookup(k).map(|v| (*k, v)))
+        .collect()
+}
+
 /// Build CString argv + envv before the fork.
 ///
 /// All allocations happen here so the privileged window between
 /// the first `setres*` and `execve` has ZERO allocations (Epic
 /// R7/R11). Same discipline as `spawn_session_leader`.
-fn greeter_child_env_pairs(spec: &GreeterSpec, home_str: &str) -> [(&'static str, String); 7] {
-    [
+fn greeter_child_env_pairs(spec: &GreeterSpec, home_str: &str) -> Vec<(&'static str, String)> {
+    let mut env: Vec<(&'static str, String)> = vec![
         ("USER", spec.name.clone()),
         ("LOGNAME", spec.name.clone()),
         ("HOME", home_str.to_owned()),
@@ -880,7 +930,9 @@ fn greeter_child_env_pairs(spec: &GreeterSpec, home_str: &str) -> [(&'static str
             "PATH",
             "/run/wrappers/bin:/run/current-system/sw/bin:/usr/bin:/bin".to_owned(),
         ),
-    ]
+    ];
+    env.extend(harvest_passthrough_env(|k| std::env::var(k).ok()));
+    env
 }
 
 fn build_greeter_cstrings(
@@ -983,6 +1035,81 @@ mod tests {
     use super::*;
     use nix::sys::signal::Signal;
     use nix::sys::wait::WaitStatus;
+
+    // Epic #35 R3: greeter env passthrough for NVIDIA EGL discovery.
+
+    #[test]
+    fn harvest_passthrough_env_empty_when_no_vars_set() {
+        // Non-NVIDIA deployment (or unconfigured): no passthrough
+        // vars in broker env → harvest returns empty, the greeter's
+        // env stays the fixed 7-entry shape.
+        let env = harvest_passthrough_env(|_| None);
+        assert!(env.is_empty(), "expected empty harvest, got {env:?}");
+    }
+
+    #[test]
+    fn harvest_passthrough_env_picks_up_egl_vars() {
+        // NVIDIA deployment: halmasuit's nix module sets these on the
+        // broker's environment. Harvest must propagate them to the
+        // greeter so libEGL discovery can find the NVIDIA platform
+        // plugin (gen-400's `libEGL warning: failed to get driver
+        // name for fd -1` was the absence of this).
+        let stub = |k: &str| -> Option<String> {
+            match k {
+                "__EGL_VENDOR_LIBRARY_FILENAMES" => {
+                    Some("/nix/store/.../share/glvnd/egl_vendor.d/10_nvidia.json".to_owned())
+                }
+                "__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS" => {
+                    Some("/nix/store/.../share/egl/egl_external_platform.d".to_owned())
+                }
+                "__GLX_VENDOR_LIBRARY_NAME" => Some("nvidia".to_owned()),
+                _ => None,
+            }
+        };
+        let env = harvest_passthrough_env(stub);
+        let map: std::collections::HashMap<_, _> =
+            env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(map.len(), 3);
+        assert!(
+            map.get("__EGL_VENDOR_LIBRARY_FILENAMES")
+                .is_some_and(|v| v.contains("10_nvidia.json")),
+            "expected __EGL_VENDOR_LIBRARY_FILENAMES in harvest, got {map:?}"
+        );
+        assert_eq!(map.get("__GLX_VENDOR_LIBRARY_NAME"), Some(&"nvidia"));
+    }
+
+    #[test]
+    fn harvest_passthrough_env_skips_unset_vars() {
+        // Partial NVIDIA env (e.g. operator forgot one var): harvest
+        // propagates what IS set, skips the rest. No empty-string
+        // passthrough (would tell libEGL "look here for nothing" and
+        // break discovery worse than not setting at all).
+        let stub = |k: &str| -> Option<String> {
+            match k {
+                "__GLX_VENDOR_LIBRARY_NAME" => Some("nvidia".to_owned()),
+                _ => None,
+            }
+        };
+        let env = harvest_passthrough_env(stub);
+        assert_eq!(env.len(), 1, "expected only one entry, got {env:?}");
+        assert_eq!(env[0].0, "__GLX_VENDOR_LIBRARY_NAME");
+    }
+
+    #[test]
+    fn passthrough_keys_match_documented_set() {
+        // Surface diff for the privileged-boundary review: any new
+        // entry added to GREETER_ENV_PASSTHROUGH must be discussed.
+        // This test makes the set explicit and fails-fast on drift.
+        assert_eq!(
+            GREETER_ENV_PASSTHROUGH,
+            [
+                "__EGL_VENDOR_LIBRARY_FILENAMES",
+                "__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS",
+                "__GLX_VENDOR_LIBRARY_NAME",
+                "LIBGL_DRIVERS_PATH",
+            ]
+        );
+    }
 
     fn seqpacket_pair() -> (SeqpacketChannel, SeqpacketChannel) {
         use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
