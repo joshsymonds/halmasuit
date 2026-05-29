@@ -318,12 +318,14 @@ struct HalmasuitState {
     /// Registration token for the libinput calloop source. halmasuit
     /// opens `/dev/input/event*` directly (no libseat brokerage; R2.3)
     /// while still root via `setup_libinput_direct`; libinput holds
-    /// the OwnedFds across the subsequent privilege drop. `None` on
-    /// the SKIP (no-DRM/dev) path and on the initramfs-pre-pivot path
-    /// (the post-pivot `setup_post_pivot_input` populates it once
-    /// `/dev/input/event*` is available on the rootfs). The token is
-    /// removed by `graceful_shutdown` so the calloop loop stops
-    /// dispatching against the input subsystem during shutdown.
+    /// the OwnedFds across the subsequent privilege drop. Set in BOTH
+    /// deployments: the rootfs path enumerates at startup, and the
+    /// initramfs path enumerates too (the interactive LUKS prompt is a
+    /// `wl_keyboard` client and needs seat input pre-pivot). `None` only
+    /// on the SKIP (no-DRM/dev) path or if initramfs enumeration found no
+    /// devices. The token is removed by `graceful_shutdown` so the
+    /// calloop loop stops dispatching against the input subsystem during
+    /// shutdown.
     libinput_token: Option<RegistrationToken>,
 
     // ── greetd I/O ──────────────────────────────────────────────────────
@@ -2737,21 +2739,22 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
         }
     }
 
-    // libinput — post-pivot input wiring. The Phase B initramfs phase
-    // deliberately starts with no libinput (no `/dev/input/event*` on
-    // devtmpfs is interesting pre-pivot — only halmasuit-luks needs
-    // input, and it handles its own raw VT). Post-pivot, the rootfs
-    // is mounted and `/dev/input/event*` is populated; we enumerate
-    // them directly via `setup_libinput_direct` (R2.3: no libseat / no
-    // seatd anywhere in the runtime closure). halmasuit is still root
-    // at this point — `drop_privileges` runs further down — so the
-    // direct opens succeed.
+    // libinput — post-pivot input wiring, only if the initramfs phase
+    // didn't already enumerate. halmasuit enumerates `/dev/input/event*`
+    // in BOTH phases (the initramfs interactive LUKS prompt is a
+    // `wl_keyboard` client and needs seat input pre-pivot); this
+    // post-pivot call is the rootfs-only deployment's first enumeration,
+    // and a fromInitrd fallback if no input devices existed pre-pivot.
+    // Direct opens (R2.3: no libseat / no seatd anywhere in the runtime
+    // closure); halmasuit is still root at this point — `drop_privileges`
+    // runs further down — so the opens succeed.
     //
     // Errors are degraded-state recoverable (same posture as
     // setup_greetd_listener / spawn_greeter above): if /dev/input is
     // missing or libinput rejects every device, log + continue without
     // input. The visible surface still composites; only interactive
-    // greeters lose input.
+    // greeters lose input. The `is_none()` guard skips this when the
+    // initramfs phase already registered a token.
     if state.libinput_token.is_none() {
         step_errors.extend(setup_post_pivot_input(state));
     }
@@ -2898,18 +2901,18 @@ fn apply_chroot_to_root_fd(root_fd: &std::os::fd::OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Post-pivot libinput attach (Phase B fromInitrd path only).
+/// Post-pivot libinput attach fallback (Phase B fromInitrd path only).
 ///
-/// The Phase B initramfs phase deliberately starts with no libinput
-/// — there's no input subsystem available until the rootfs is up
-/// (`/dev/input/event*` lives on devtmpfs, which the kernel mounts
-/// before the rootfs is selected, but no input is needed pre-pivot
-/// because halmasuit-luks is the only thing reading password input
-/// and it handles its own raw VT). Post-pivot, we enumerate input
-/// devices via the same direct-open path the rootfs deployment uses
-/// — see `setup_libinput_direct`. No libseat, no seatd, no brokerage:
-/// the running compositor is still root at this point (privilege drop
-/// happens later in `run_post_pivot_setup`'s sequence).
+/// The initramfs phase normally enumerates input itself (the interactive
+/// LUKS prompt — `halmasuit-luks`, a `wl_keyboard` client — needs the
+/// seat to receive keys pre-pivot; `/dev/input/event*` lives on devtmpfs,
+/// which the kernel mounts before the rootfs is selected). This
+/// post-pivot call is the fallback for when no input devices were present
+/// pre-pivot: it re-enumerates via the same direct-open path the rootfs
+/// deployment uses (see `setup_libinput_direct`), guarded by
+/// `libinput_token.is_none()` so it never double-registers. No libseat,
+/// no seatd, no brokerage: the compositor is still root at this point
+/// (privilege drop happens later in `run_post_pivot_setup`'s sequence).
 ///
 /// Each step is degraded-state recoverable (same posture as
 /// `setup_greetd_listener` / `spawn_greeter` in `run_post_pivot_setup`):
@@ -4630,12 +4633,30 @@ fn main() -> io::Result<()> {
             output.create_global::<HalmasuitState>(&display_handle);
         }
         emit_phase(Phase::DrmMasterAcquired);
-        // Rootfs deployment: enumerate input here. Initramfs deployment:
-        // `setup_post_pivot_input` runs the same `setup_libinput_direct`
-        // call post-pivot. Either way, no libseat: each `/dev/input/
-        // event*` is opened directly while halmasuit is still root.
+        // Enumerate input in BOTH deployments. halmasuit is root here in
+        // either case, so each `/dev/input/event*` is opened directly (no
+        // libseat). Initramfs: the interactive LUKS prompt
+        // (`halmasuit-luks`, a `wl_keyboard` client) needs the seat to
+        // receive keys pre-pivot — without this the prompt renders but
+        // cannot be typed into. `setup_post_pivot_input`'s
+        // `libinput_token.is_none()` guard then skips the duplicate
+        // post-pivot call. The enumerated device count is logged by
+        // `setup_libinput_direct`, so a keyboard-less initramfs is visible
+        // in the journal rather than a silent no-op.
         let libinput_tok = if in_initramfs {
-            None
+            // Graceful: a libinput-context failure must not fail the boot
+            // (the non-interactive `--passphrase-from` auto-unlock path
+            // needs no input). Zero devices is already logged + non-fatal.
+            match setup_libinput_direct(&loop_handle) {
+                Ok(token) => Some(token),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "initramfs: setup_libinput_direct failed; the interactive LUKS prompt will not receive keyboard input"
+                    );
+                    None
+                }
+            }
         } else {
             Some(setup_libinput_direct(&loop_handle)?)
         };
