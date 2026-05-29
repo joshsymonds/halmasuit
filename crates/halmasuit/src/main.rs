@@ -5579,6 +5579,15 @@ fn main() -> io::Result<()> {
                             // `Phase::Deprivileged` in
                             // `run_post_pivot_setup`, reached only after
                             // the spree window has closed.
+                            //
+                            // The pivot is done — we're in the rootfs.
+                            // Clear the initramfs flag so the session
+                            // toplevel (niri) is fullscreened, not
+                            // centered like the initramfs LUKS prompt.
+                            state.in_initramfs = false;
+                            if let Some(backend) = state.drm_backend.as_mut() {
+                                backend.set_in_initramfs(false);
+                            }
                             phase = PivotPhase::Connecting {
                                 deadline: Instant::now() + Duration::from_secs(10),
                                 next_delay: Duration::from_millis(20),

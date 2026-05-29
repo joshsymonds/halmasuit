@@ -137,6 +137,9 @@ test-vm:
     echo "── login-flash ──"
     nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link
     echo
+    echo "── visual-wallpaper-event ──"
+    nix build .#checks.x86_64-linux.visual-wallpaper-event -L --print-build-logs --no-link
+    echo
     echo "── halmasuit-input ──"
     nix build .#checks.x86_64-linux.halmasuit-input -L --print-build-logs --no-link
     echo

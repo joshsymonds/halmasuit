@@ -701,6 +701,16 @@
           halmasuit            = self.packages.x86_64-linux.halmasuit;
           halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
         };
+        # Reactive-wallpaper bus gate: a shader wallpaper's event_time
+        # uniform is driven by halmasuit.session.opened across a real
+        # login; asserts the wallpaper_uniform_applied journald marker
+        # (pixels are unobservable headless).
+        visual-wallpaper-event = import ./tests/visual-wallpaper-event.nix {
+          system               = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit            = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
+        };
         # Epic #12 task 10: end-to-end video wallpaper gate. Real
         # h264, real rsmpeg, real sandbox; asserts decoder spawn,
         # crash-recovery respawn within budget, budget-exhaustion
