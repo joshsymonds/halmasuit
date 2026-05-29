@@ -1529,14 +1529,16 @@ in
      # initramfs — REQUIRED for the interactive LUKS prompt
      # (services.halmasuit.luks.passphraseFile = null), which reads
      # keystrokes as a wl_keyboard client of halmasuit's seat. Without
-     # them the prompt renders but cannot be typed into. evdev creates the
-     # event* nodes; i8042 + atkbd are the PS/2 keyboard (the QEMU test
-     # VM, and `send_chars`); usbhid + hid_generic cover USB keyboards.
-     # Real-hardware USB host-controller modules (xhci_hcd, …) are
-     # operator-supplied outside this option.
+     # them the prompt renders but cannot be typed into. evdev creates
+     # the event* nodes; virtio_input is the QEMU `-device
+     # virtio-keyboard` the NixOS test VM uses (and `send_chars` drives);
+     # i8042 + atkbd are real-hardware PS/2; usbhid + hid_generic cover
+     # USB keyboards. Real-hardware USB host-controller modules
+     # (xhci_hcd, …) are operator-supplied outside this option.
      boot.initrd.availableKernelModules = [
        "virtio_gpu"
        "evdev"
+       "virtio_input"
        "i8042"
        "atkbd"
        "usbhid"
@@ -1545,6 +1547,7 @@ in
      boot.initrd.kernelModules = [
        "virtio_gpu"
        "evdev"
+       "virtio_input"
        "i8042"
        "atkbd"
        "usbhid"

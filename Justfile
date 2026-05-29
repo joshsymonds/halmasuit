@@ -110,6 +110,9 @@ test-vm:
     echo "── visual-phase-b-side-image ──"
     nix build .#checks.x86_64-linux.visual-phase-b-side-image -L --print-build-logs --no-link
     echo
+    echo "── visual-phase-b-luks-interactive ──"
+    nix build .#checks.x86_64-linux.visual-phase-b-luks-interactive -L --print-build-logs --no-link
+    echo
     echo "── visual-phase-b-side-shader ──"
     nix build .#checks.x86_64-linux.visual-phase-b-side-shader -L --print-build-logs --no-link
     echo

@@ -988,6 +988,18 @@
           halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Interactive LUKS unlock gate: halmasuit-luks runs interactively
+        # (no --passphrase-from), maps a Wayland prompt, and the volume is
+        # unlocked by a TYPED passphrase — proves initramfs keyboard input
+        # (epic req 11) + the centered/windowed prompt + LuksPromptShown.
+        visual-phase-b-luks-interactive = import ./tests/visual-phase-b-luks-interactive.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs niri-flake dms;
+          halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+        };
         # Epic #35 cell (side, shader): same shape, animated GLSL
         # fragment-shader wallpaper (tests/fixtures/wallpaper-shader.glsl).
         visual-phase-b-side-shader = import ./tests/visual-phase-b-side-shader.nix {
