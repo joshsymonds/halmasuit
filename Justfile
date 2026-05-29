@@ -200,6 +200,9 @@ test-vm:
     echo "── visual-dankgreeter-auth ──"
     nix build .#checks.x86_64-linux.visual-dankgreeter-auth -L --print-build-logs --no-link
     echo
+    echo "── halmasuit-live-signin ──"
+    nix build .#checks.x86_64-linux.halmasuit-live-signin -L --print-build-logs --no-link
+    echo
     # Convergence epic R2: wl_surface.frame callbacks (no Mesa-EGL wedge).
     echo "── visual-frame-callbacks ──"
     nix build .#checks.x86_64-linux.visual-frame-callbacks -L --print-build-logs --no-link

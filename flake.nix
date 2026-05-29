@@ -1254,6 +1254,19 @@
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
           ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Epic #35 R2: real-DMS + real-pam_u2f gen-400 regression gate.
+        # Reproduces the user's gnomon PAM stack (pam_u2f sufficient +
+        # pam_unix try_first_pass), drives the actual UI through DMS
+        # Quickshell, asserts no flash window between wallpaper and
+        # greeter, no libEGL warnings, and end-to-end signin via Q→Q
+        # conv. The test the gen-400 deploy needed.
+        halmasuit-live-signin = import ./tests/halmasuit-live-signin.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs niri-flake dms;
+          halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+          ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         # R12 (GTK4 half): real GTK4 wayland client as halmasuit's
         # greeter. Qt6 is covered by visual-dankgreeter (Quickshell);
         # this proves the parallel GTK4 path through the same
