@@ -64,6 +64,17 @@ impl WallpaperEngine {
         }
     }
 
+    /// Forward a fired system event to the active backend; returns the
+    /// GLSL uniform names the backend updated (empty if no backend, or
+    /// no binding matches `event_name`). See
+    /// [`WallpaperBackend::notify_event`].
+    pub(crate) fn notify_event(&mut self, event_name: &str, value: f32) -> Vec<String> {
+        self.backend
+            .as_mut()
+            .map(|b| b.notify_event(event_name, value))
+            .unwrap_or_default()
+    }
+
     /// `true` iff a backend is configured. Drives the frame-0 anchor
     /// emission in `main.rs` (the `ClientFirstFrame { Wallpaper }`
     /// event is suppressed when no backend is configured).

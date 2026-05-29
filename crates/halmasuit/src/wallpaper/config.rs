@@ -109,11 +109,12 @@ const fn default_loop() -> bool {
 
 /// What feeds a named uniform in a shader wallpaper.
 ///
-/// Phase-A wires only `Auto*` and `Static`; `EventTime` /
-/// `EventValue` parse cleanly and the engine logs a one-time
-/// "wallpaper bus not yet connected" warning. The bus-event epic
-/// connects them without changing this enum (that is the point of
-/// typing all four kinds today).
+/// All four kinds are live: `Auto*` and `Static` are computed each
+/// frame; `EventTime` / `EventValue` are driven by the lifecycle bus —
+/// when an `Event` whose canonical name matches the binding's `event`
+/// fires, the wallpaper records the fire time / value (see
+/// `ShaderBackend::notify_event`) and `current_uniforms` binds it,
+/// reading the `-1.0` / `0.0` "not fired yet" sentinel until then.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UniformBinding {

@@ -701,6 +701,16 @@
           halmasuit            = self.packages.x86_64-linux.halmasuit;
           halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
         };
+        # Reactive-wallpaper bus gate: a shader wallpaper's event_time
+        # uniform is driven by halmasuit.session.opened across a real
+        # login; asserts the wallpaper_uniform_applied journald marker
+        # (pixels are unobservable headless).
+        visual-wallpaper-event = import ./tests/visual-wallpaper-event.nix {
+          system               = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit            = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
+        };
         # Epic #12 task 10: end-to-end video wallpaper gate. Real
         # h264, real rsmpeg, real sandbox; asserts decoder spawn,
         # crash-recovery respawn within budget, budget-exhaustion
@@ -988,6 +998,18 @@
           halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
           ssimulacra2-cli     = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
+        # Interactive LUKS unlock gate: halmasuit-luks runs interactively
+        # (no --passphrase-from), maps a Wayland prompt, and the volume is
+        # unlocked by a TYPED passphrase — proves initramfs keyboard input
+        # (epic req 11) + the centered/windowed prompt + LuksPromptShown.
+        visual-phase-b-luks-interactive = import ./tests/visual-phase-b-luks-interactive.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs niri-flake dms;
+          halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
         };
         # Epic #35 cell (side, shader): same shape, animated GLSL
         # fragment-shader wallpaper (tests/fixtures/wallpaper-shader.glsl).

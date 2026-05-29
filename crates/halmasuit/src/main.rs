@@ -318,12 +318,14 @@ struct HalmasuitState {
     /// Registration token for the libinput calloop source. halmasuit
     /// opens `/dev/input/event*` directly (no libseat brokerage; R2.3)
     /// while still root via `setup_libinput_direct`; libinput holds
-    /// the OwnedFds across the subsequent privilege drop. `None` on
-    /// the SKIP (no-DRM/dev) path and on the initramfs-pre-pivot path
-    /// (the post-pivot `setup_post_pivot_input` populates it once
-    /// `/dev/input/event*` is available on the rootfs). The token is
-    /// removed by `graceful_shutdown` so the calloop loop stops
-    /// dispatching against the input subsystem during shutdown.
+    /// the OwnedFds across the subsequent privilege drop. Set in BOTH
+    /// deployments: the rootfs path enumerates at startup, and the
+    /// initramfs path enumerates too (the interactive LUKS prompt is a
+    /// `wl_keyboard` client and needs seat input pre-pivot). `None` only
+    /// on the SKIP (no-DRM/dev) path or if initramfs enumeration found no
+    /// devices. The token is removed by `graceful_shutdown` so the
+    /// calloop loop stops dispatching against the input subsystem during
+    /// shutdown.
     libinput_token: Option<RegistrationToken>,
 
     // ── greetd I/O ──────────────────────────────────────────────────────
@@ -437,6 +439,13 @@ struct HalmasuitState {
     /// in-practice PrepareForShutdown-before-SIGTERM ordering the
     /// re-entry-bail already depends on.
     shutdown_inhibitor: Option<std::os::fd::OwnedFd>,
+    /// Whether halmasuit is running in the Phase-B initramfs. Drives the
+    /// LUKS-prompt path: `new_toplevel` emits `LuksPromptShown` and
+    /// configures the toplevel as a centered self-sized window (vs the
+    /// rootfs greeter/session, which is fullscreened). Cached from
+    /// `context::is_initramfs()` at construction so the per-map handler
+    /// needn't stat `/etc/initrd-release`.
+    in_initramfs: bool,
     /// Held so the registered listener token survives for the lifetime
     /// of the compositor; calloop drops the source on shutdown.
     greetd_listener_token: Option<RegistrationToken>,
@@ -1601,15 +1610,31 @@ impl XdgShellHandler for HalmasuitState {
         // wl_surface.commit, per xdg-shell spec (smithay smallvil
         // pattern; see commit handler R4 block).
         use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-        let (w, h): (i32, i32) = self
-            .primary_output()
-            .current_mode()
-            .map_or((1280, 800), |m| (m.size.w, m.size.h));
-        surface.with_pending_state(|state| {
-            state.size = Some((w, h).into());
-            state.states.set(xdg_toplevel::State::Activated);
-            state.states.set(xdg_toplevel::State::Fullscreen);
-        });
+        if self.in_initramfs {
+            // The LUKS prompt is a self-sized window the compositor
+            // centers over the wallpaper (see `DrmBackend::scene_elements`)
+            // — NOT fullscreen, so the reactive wallpaper shows and reacts
+            // around it. Leave `size` unset so the agent declares its own
+            // content size; keep Activated for keyboard focus.
+            surface.with_pending_state(|state| {
+                state.states.set(xdg_toplevel::State::Activated);
+            });
+            // In the initramfs, halmasuit-luks is the only client, so a
+            // mapped toplevel here IS the unlock prompt appearing.
+            emit(&Event::LuksPromptShown);
+            tracing::info!("luks prompt toplevel mapped (centered, self-sized)");
+        } else {
+            let (w, h): (i32, i32) = self
+                .primary_output()
+                .current_mode()
+                .map_or((1280, 800), |m| (m.size.w, m.size.h));
+            surface.with_pending_state(|state| {
+                state.size = Some((w, h).into());
+                state.states.set(xdg_toplevel::State::Activated);
+                state.states.set(xdg_toplevel::State::Fullscreen);
+            });
+            tracing::info!(w, h, "xdg_toplevel mapped as fullscreen foreground");
+        }
         // R6 (convergence epic): emit `wl_surface.enter` for the
         // toplevel so the client picks the correct buffer scale,
         // transform, and frame timing. The foreground toplevel is
@@ -1621,7 +1646,6 @@ impl XdgShellHandler for HalmasuitState {
         for output in &self.outputs {
             output.enter(surface.wl_surface());
         }
-        tracing::info!(w, h, "xdg_toplevel mapped as fullscreen foreground");
         self.foreground_toplevel = Some(surface);
         // R-honest.4: a new toplevel exists (title/app_id may still be
         // unset until first commit; the focus path re-snapshots once
@@ -2715,21 +2739,22 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
         }
     }
 
-    // libinput — post-pivot input wiring. The Phase B initramfs phase
-    // deliberately starts with no libinput (no `/dev/input/event*` on
-    // devtmpfs is interesting pre-pivot — only halmasuit-luks needs
-    // input, and it handles its own raw VT). Post-pivot, the rootfs
-    // is mounted and `/dev/input/event*` is populated; we enumerate
-    // them directly via `setup_libinput_direct` (R2.3: no libseat / no
-    // seatd anywhere in the runtime closure). halmasuit is still root
-    // at this point — `drop_privileges` runs further down — so the
-    // direct opens succeed.
+    // libinput — post-pivot input wiring, only if the initramfs phase
+    // didn't already enumerate. halmasuit enumerates `/dev/input/event*`
+    // in BOTH phases (the initramfs interactive LUKS prompt is a
+    // `wl_keyboard` client and needs seat input pre-pivot); this
+    // post-pivot call is the rootfs-only deployment's first enumeration,
+    // and a fromInitrd fallback if no input devices existed pre-pivot.
+    // Direct opens (R2.3: no libseat / no seatd anywhere in the runtime
+    // closure); halmasuit is still root at this point — `drop_privileges`
+    // runs further down — so the opens succeed.
     //
     // Errors are degraded-state recoverable (same posture as
     // setup_greetd_listener / spawn_greeter above): if /dev/input is
     // missing or libinput rejects every device, log + continue without
     // input. The visible surface still composites; only interactive
-    // greeters lose input.
+    // greeters lose input. The `is_none()` guard skips this when the
+    // initramfs phase already registered a token.
     if state.libinput_token.is_none() {
         step_errors.extend(setup_post_pivot_input(state));
     }
@@ -2876,18 +2901,18 @@ fn apply_chroot_to_root_fd(root_fd: &std::os::fd::OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Post-pivot libinput attach (Phase B fromInitrd path only).
+/// Post-pivot libinput attach fallback (Phase B fromInitrd path only).
 ///
-/// The Phase B initramfs phase deliberately starts with no libinput
-/// — there's no input subsystem available until the rootfs is up
-/// (`/dev/input/event*` lives on devtmpfs, which the kernel mounts
-/// before the rootfs is selected, but no input is needed pre-pivot
-/// because halmasuit-luks is the only thing reading password input
-/// and it handles its own raw VT). Post-pivot, we enumerate input
-/// devices via the same direct-open path the rootfs deployment uses
-/// — see `setup_libinput_direct`. No libseat, no seatd, no brokerage:
-/// the running compositor is still root at this point (privilege drop
-/// happens later in `run_post_pivot_setup`'s sequence).
+/// The initramfs phase normally enumerates input itself (the interactive
+/// LUKS prompt — `halmasuit-luks`, a `wl_keyboard` client — needs the
+/// seat to receive keys pre-pivot; `/dev/input/event*` lives on devtmpfs,
+/// which the kernel mounts before the rootfs is selected). This
+/// post-pivot call is the fallback for when no input devices were present
+/// pre-pivot: it re-enumerates via the same direct-open path the rootfs
+/// deployment uses (see `setup_libinput_direct`), guarded by
+/// `libinput_token.is_none()` so it never double-registers. No libseat,
+/// no seatd, no brokerage: the compositor is still root at this point
+/// (privilege drop happens later in `run_post_pivot_setup`'s sequence).
 ///
 /// Each step is degraded-state recoverable (same posture as
 /// `setup_greetd_listener` / `spawn_greeter` in `run_post_pivot_setup`):
@@ -3861,6 +3886,55 @@ fn acquire_shutdown_delay_inhibitor() -> Option<std::os::fd::OwnedFd> {
     Some(std::os::fd::OwnedFd::from(fd))
 }
 
+/// Wire the reactive-wallpaper event consumer: a calloop channel fed by
+/// a single `halmasuit-introspect` listener, drained on the main loop
+/// with `&mut HalmasuitState`.
+///
+/// `emit()` logs first, then hands each `Event` to the registered
+/// listener, which does a non-blocking send onto the channel (the
+/// `&mut state` reentrancy trap is sidestepped: delivery is deferred to
+/// the next loop turn). The handler resolves the event's wallpaper-facing
+/// canonical name; for a bound `EventTime`/`EventValue` uniform it writes
+/// the fire time / value and emits a `WallpaperUniformApplied` marker per
+/// uniform. Events with no canonical name (per-frame churn, diagnostics,
+/// and `WallpaperUniformApplied` itself) are cheap no-ops — the latter is
+/// why the marker cannot re-trigger a write.
+///
+/// Live-only by design: events emitted before this registration are not
+/// replayed (matching the bus's documented semantics).
+fn spawn_wallpaper_event_consumer(loop_handle: &LoopHandle<'static, HalmasuitState>) {
+    let (tx, channel) = calloop::channel::channel::<Event>();
+    if let Err(e) = loop_handle.insert_source(channel, |event, (), state: &mut HalmasuitState| {
+        let calloop::channel::Event::Msg(event) = event else {
+            return;
+        };
+        let Some(event_name) = halmasuit_events::canonical_name(&event) else {
+            return;
+        };
+        let Some(backend) = state.drm_backend.as_mut() else {
+            return;
+        };
+        let value = halmasuit_events::event_value(&event);
+        for uniform in backend.notify_wallpaper_event(event_name, value) {
+            emit(&Event::WallpaperUniformApplied {
+                event_name: event_name.to_owned(),
+                uniform,
+            });
+        }
+    }) {
+        tracing::error!(error = %e, "insert wallpaper-event calloop channel failed");
+        return;
+    }
+
+    // The Sender lives for the process lifetime inside the global
+    // listener registry. Send is non-blocking; a closed channel (only at
+    // teardown, once the loop source is gone) drops the event silently —
+    // the observability path must never block or panic the emitter.
+    halmasuit_introspect::register_listener(move |event| {
+        let _ = tx.send(event.clone());
+    });
+}
+
 /// Blocking inner loop for the login1 watcher thread. Connects to the
 /// system bus, builds a signal stream on
 /// `org.freedesktop.login1.Manager.PrepareForShutdown`, and forwards
@@ -4400,7 +4474,7 @@ fn main() -> io::Result<()> {
 
     emit(&Event::Started {
         pid: std::process::id(),
-        version: env!("CARGO_PKG_VERSION"),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
     });
 
     // Block the calloop-consumed signals process-wide BEFORE anything
@@ -4559,12 +4633,30 @@ fn main() -> io::Result<()> {
             output.create_global::<HalmasuitState>(&display_handle);
         }
         emit_phase(Phase::DrmMasterAcquired);
-        // Rootfs deployment: enumerate input here. Initramfs deployment:
-        // `setup_post_pivot_input` runs the same `setup_libinput_direct`
-        // call post-pivot. Either way, no libseat: each `/dev/input/
-        // event*` is opened directly while halmasuit is still root.
+        // Enumerate input in BOTH deployments. halmasuit is root here in
+        // either case, so each `/dev/input/event*` is opened directly (no
+        // libseat). Initramfs: the interactive LUKS prompt
+        // (`halmasuit-luks`, a `wl_keyboard` client) needs the seat to
+        // receive keys pre-pivot — without this the prompt renders but
+        // cannot be typed into. `setup_post_pivot_input`'s
+        // `libinput_token.is_none()` guard then skips the duplicate
+        // post-pivot call. The enumerated device count is logged by
+        // `setup_libinput_direct`, so a keyboard-less initramfs is visible
+        // in the journal rather than a silent no-op.
         let libinput_tok = if in_initramfs {
-            None
+            // Graceful: a libinput-context failure must not fail the boot
+            // (the non-interactive `--passphrase-from` auto-unlock path
+            // needs no input). Zero devices is already logged + non-fatal.
+            match setup_libinput_direct(&loop_handle) {
+                Ok(token) => Some(token),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "initramfs: setup_libinput_direct failed; the interactive LUKS prompt will not receive keyboard input"
+                    );
+                    None
+                }
+            }
         } else {
             Some(setup_libinput_direct(&loop_handle)?)
         };
@@ -5030,6 +5122,11 @@ fn main() -> io::Result<()> {
     // and the rest of the wallpaper-only paint-until-halt path.
     spawn_prepare_for_shutdown_watcher(&loop_handle);
 
+    // Reactive wallpaper: forward lifecycle events to the wallpaper's
+    // EventTime/EventValue uniforms. Registered here so it is live as
+    // early as possible (earlier lifecycle events are not replayed).
+    spawn_wallpaper_event_consumer(&loop_handle);
+
     // Epic #71 R-honest.6: overlay-journal channel (registered before
     // state construction; the Sender is stashed on HalmasuitState).
     let journal_tx = setup_overlay_journal_channel(&loop_handle);
@@ -5178,6 +5275,8 @@ fn main() -> io::Result<()> {
         // this true on `Phase::RootfsReady` — before that, SIGTERM is
         // the boot kill spree and stays ignored.
         shutdown_armed: !in_initramfs,
+        // Drives the LUKS-prompt windowing/emit path in `new_toplevel`.
+        in_initramfs,
         // Epic #71 R3.1: overlay starts closed. Toggled by chord.
         diag_overlay_open: false,
         // Epic #71 R-honest.6: overlay journal cache + channel sender.
@@ -5214,6 +5313,9 @@ fn main() -> io::Result<()> {
     // never incremented.
     if let Some(backend) = state.drm_backend.as_mut() {
         backend.set_frame_counter(state.dbus_state.frame_counter.clone());
+        // Center the foreground toplevel (LUKS prompt) over the
+        // wallpaper in the initramfs; fullscreen it in the rootfs.
+        backend.set_in_initramfs(state.in_initramfs);
     }
 
     // The wallpaper plane is composited from frame 0 (epic G1/R3/R6):
@@ -5498,6 +5600,15 @@ fn main() -> io::Result<()> {
                             // `Phase::Deprivileged` in
                             // `run_post_pivot_setup`, reached only after
                             // the spree window has closed.
+                            //
+                            // The pivot is done — we're in the rootfs.
+                            // Clear the initramfs flag so the session
+                            // toplevel (niri) is fullscreened, not
+                            // centered like the initramfs LUKS prompt.
+                            state.in_initramfs = false;
+                            if let Some(backend) = state.drm_backend.as_mut() {
+                                backend.set_in_initramfs(false);
+                            }
                             phase = PivotPhase::Connecting {
                                 deadline: Instant::now() + Duration::from_secs(10),
                                 next_delay: Duration::from_millis(20),

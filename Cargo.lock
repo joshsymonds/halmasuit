@@ -832,6 +832,7 @@ dependencies = [
  "calloop",
  "caps",
  "halmasuit-decoder-ipc",
+ "halmasuit-events",
  "halmasuit-greetd",
  "halmasuit-introspect",
  "halmasuit-session-ipc",
@@ -889,6 +890,13 @@ dependencies = [
  "anyhow",
  "wayland-client",
  "wayland-protocols",
+]
+
+[[package]]
+name = "halmasuit-events"
+version = "0.1.0"
+dependencies = [
+ "halmasuit-introspect",
 ]
 
 [[package]]

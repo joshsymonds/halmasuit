@@ -1,0 +1,15 @@
+[package]
+name        = "halmasuit-events"
+description = "Wallpaper-facing projection of halmasuit-introspect events: canonical dotted names + uniform values."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+halmasuit-introspect = { path = "../halmasuit-introspect", version = "0.1" }

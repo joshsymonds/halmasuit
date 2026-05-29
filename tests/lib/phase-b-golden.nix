@@ -35,6 +35,12 @@
 {
   wallpaper,
   lukshape ? "side-volume",
+  # When true, halmasuit-luks runs INTERACTIVELY (no --passphrase-from):
+  # it maps a Wayland prompt and the unlock passphrase must be TYPED.
+  # The test drives the keystrokes (proving initramfs keyboard input,
+  # epic req 11). Default false = the non-interactive responder the
+  # golden matrix cells use.
+  interactive ? false,
   halmasuit-debug,
   halmasuit-luks,
   halmasuit-session,
@@ -282,7 +288,10 @@ in
     fromInitrd.enable = lukshape != "encrypted-root";
     package = halmasuit-debug;
     luks.package = halmasuit-luks;
-    luks.passphraseFile = passphraseFile;
+    # Interactive cells set null → the agent maps a Wayland prompt and
+    # waits for typed input; non-interactive cells pass the file → the
+    # agent auto-answers without a UI.
+    luks.passphraseFile = if interactive then null else passphraseFile;
     session.package = halmasuit-session;
     inherit wallpaper;
     greeterCommand = "${greeterCmd}";
