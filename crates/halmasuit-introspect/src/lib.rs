@@ -24,7 +24,7 @@
 
 #![forbid(unsafe_code)]
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// State-transition events emitted by halmasuit during its lifetime.
 ///
@@ -35,7 +35,7 @@ use serde::Serialize;
 /// Future variants carrying user-controlled text (e.g., a `PamChallenge`
 /// variant) must redact the text at construction time in the consuming crate;
 /// see the crate-level documentation.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     /// Process startup. Emitted once at `main()` line 1.
@@ -44,7 +44,10 @@ pub enum Event {
         /// `u32` is the correct domain type.
         pid: u32,
         /// Compositor crate version, typically `env!("CARGO_PKG_VERSION")`.
-        version: &'static str,
+        /// Owned `String` (not `&'static str`) so the schema is
+        /// `Deserialize`-able for out-of-process consumers — a value
+        /// reconstructed from JSON cannot borrow `'static`.
+        version: String,
     },
     /// Phase transition. Emitted on every state change in the compositor's
     /// phase state machine.
@@ -249,7 +252,7 @@ pub enum Event {
 /// `halmasuit_session_ipc::SessionOutcome`; duplicated here so the
 /// introspect schema crate stays dependency-light, like
 /// [`LayerRole`]/[`Foreground`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionExit {
     /// The leader `_exit`ed with this status code (clean — GDM
@@ -269,7 +272,7 @@ pub enum SessionExit {
 /// Which client halmasuit treats as the foreground (composited above
 /// the splash background, keyboard focus target). Decided by the
 /// greetd lifecycle, never by which client connected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Foreground {
     /// The greeter is foreground (pre-auth).
@@ -292,7 +295,7 @@ pub enum Foreground {
 /// wallpaper plane, below normal windows). Duplicated here so
 /// `halmasuit-introspect` needs no smithay dependency; halmasuit
 /// maps the smithay layer value onto this at the emission site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayerRole {
     /// The wallpaper plane — halmasuit's internal bottom-most
@@ -317,7 +320,7 @@ pub enum LayerRole {
 ///
 /// Further variants (`Greeter`, `Session`, `Locked`, `Shutdown`) land
 /// alongside the code that enters them.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     /// Compositor initialization completed: smithay protocol state
@@ -432,7 +435,7 @@ impl Phase {
 }
 
 /// Reason a clean shutdown was initiated.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShutdownReason {
     /// SIGTERM from systemd or another external signal source.
@@ -481,7 +484,7 @@ pub fn emit(event: &Event) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, Foreground, LayerRole, Phase, ShutdownReason, emit};
+    use super::{Event, Foreground, LayerRole, Phase, SessionExit, ShutdownReason, emit};
     use serde_json::Value;
 
     fn round_trip(event: &Event) -> Value {
@@ -493,7 +496,7 @@ mod tests {
     fn event_started_serializes_with_tag() {
         let v = round_trip(&Event::Started {
             pid: 42,
-            version: "0.1.0",
+            version: "0.1.0".to_owned(),
         });
         assert_eq!(v["event"], "started");
         assert_eq!(v["pid"], 42);
@@ -735,12 +738,73 @@ mod tests {
         }
     }
 
+    /// Every `Event` variant must survive a serialize → deserialize
+    /// round-trip back into a typed `Event` (not just `serde_json::Value`).
+    /// This pins the `Deserialize` half of the schema contract that
+    /// out-of-process consumers (and the bus's owned-event channel) rely
+    /// on, and exercises `PartialEq` for the equality assertion.
+    #[test]
+    fn every_variant_round_trips_through_deserialize() {
+        let samples = [
+            Event::Started {
+                pid: 1,
+                version: "0.1.0".to_owned(),
+            },
+            Event::PhaseEntered {
+                phase: Phase::ScanoutActive,
+            },
+            Event::Shutdown {
+                reason: ShutdownReason::PrepareForShutdown,
+            },
+            Event::Fatal {
+                message: "boom".to_owned(),
+            },
+            Event::SessionRequested {
+                uid: 1000,
+                gid: 1000,
+            },
+            Event::GreeterSpawned { pid: 2 },
+            Event::GreeterTerminated { pid: 2 },
+            Event::GreeterKillFailed {
+                pid: 2,
+                error: "No such process (os error 3)".to_owned(),
+            },
+            Event::GreeterDiedPreAuth { pid: 2 },
+            Event::FrameRendered {
+                frame_id: 1,
+                pixel_count: 4,
+                clear_pixel_count: 0,
+                black_pixel_count: 0,
+                degenerate: false,
+                phash: 7,
+            },
+            Event::ClientFirstFrame {
+                role: LayerRole::Overlay,
+            },
+            Event::ForegroundChanged {
+                to: Foreground::Session,
+            },
+            Event::SessionOpened,
+            Event::SessionClientFirstFrame,
+            Event::SessionEnded {
+                outcome: SessionExit::Signaled { signal: 9 },
+            },
+            Event::SessionLeaderPidfdArmed,
+            Event::SessionLeaderExitedViaPidfd,
+        ];
+        for e in samples {
+            let s = serde_json::to_string(&e).expect("serialize");
+            let back: Event = serde_json::from_str(&s).expect("deserialize back into Event");
+            assert_eq!(e, back, "round-trip mismatch for {e:?}");
+        }
+    }
+
     #[test]
     fn emit_without_subscriber_does_not_panic() {
         // No subscriber installed; tracing events become no-ops by design.
         emit(&Event::Started {
             pid: 1,
-            version: "test",
+            version: "test".to_owned(),
         });
         emit(&Event::PhaseEntered { phase: Phase::Init });
         emit(&Event::Shutdown {
@@ -789,7 +853,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             emit(&Event::Started {
                 pid: 99,
-                version: "0.1.0",
+                version: "0.1.0".to_owned(),
             });
         });
 

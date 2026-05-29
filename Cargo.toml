@@ -4,6 +4,11 @@ members = [
     "crates/halmasuit",
     "crates/halmasuit-protocols",
     "crates/halmasuit-introspect",
+    # Wallpaper-facing projection of halmasuit-introspect events: maps
+    # each Event to a stable dotted canonical name and the f32 value the
+    # wallpaper's EventTime/EventValue uniform bindings write. Pure types
+    # over halmasuit-introspect; no runtime deps.
+    "crates/halmasuit-events",
     "crates/halmasuit-greetd",
     "crates/halmasuit-ipc",
     # Pure wire contract for the compositor↔halmasuit-session PAM relay

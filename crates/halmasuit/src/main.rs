@@ -4400,7 +4400,7 @@ fn main() -> io::Result<()> {
 
     emit(&Event::Started {
         pid: std::process::id(),
-        version: env!("CARGO_PKG_VERSION"),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
     });
 
     // Block the calloop-consumed signals process-wide BEFORE anything

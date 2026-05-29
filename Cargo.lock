@@ -892,6 +892,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "halmasuit-events"
+version = "0.1.0"
+dependencies = [
+ "halmasuit-introspect",
+]
+
+[[package]]
 name = "halmasuit-greetd"
 version = "0.1.0"
 dependencies = [
