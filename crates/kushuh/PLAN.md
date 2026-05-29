@@ -72,17 +72,21 @@ design pass.
 4. **`Config`** ✅ — the top-level model: a non-empty, uniquely-named set
    of systems, with `system(name)` lookup. Schema-agnostic resolved form;
    no default/startup-system concept yet (add when the engine needs it).
-5. **KDL parser** ◐ — hand-written `KdlDocument`→types conversion over
+5. **KDL parser** ✅ — hand-written `KdlDocument`→types conversion over
    the official `kdl` crate (v6, KDL v2), with span-aware `ParseError`s.
-   Schema is **B+** (see resolved fork). Done so far: `region` anchors,
-   `system`/`role` nodes, inline geometry or shared `region="…"`, and the
-   `sticky`/flex bindings. Pending (follow-up tasks): the `cycle` and
-   `pattern` binding kinds, and pinning the doc's three example configs
-   (`code` / `meeting` / `reading`) as acceptance fixtures.
-6. **Semantic validator** — reject incoherent configs (out-of-bounds /
-   zero-area regions caught at `Region` construction; duplicate role
-   names within a system; references to slots/roles that do not exist;
-   bad monitor refs) with clear messages.
+   Schema is **B+** (see resolved fork). Covers `region` anchors,
+   `system`/`role` nodes, inline geometry or shared `region="…"`, and all
+   four binding kinds (`sticky`/`cycle`/`pattern`/flex). The three
+   `ARCHITECTURE.md` example layouts (`code`/`meeting`/`reading`) are
+   pinned as a B+ acceptance fixture.
+6. **Semantic validator** — *mostly satisfied at construction/parse*:
+   out-of-bounds/zero-area regions (`Region::new`), duplicate role names
+   within a system (`System::new`), unknown `region="…"` references and
+   duplicate regions/systems (parser + `Config::new`). The B+ schema has
+   no role-by-reference and no monitor registry, so "undefined role" and
+   "bad monitor ref" do not apply. The one genuinely-uncovered coherence
+   check is **region overlap within a system on the same monitor** — not
+   in the epic's listed checks; in-scope vs deferred is an open question.
 
 ---
 

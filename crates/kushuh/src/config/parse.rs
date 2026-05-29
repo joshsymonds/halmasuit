@@ -11,11 +11,10 @@
 //! malformed or incoherent input is a returned [`ParseError`] carrying a
 //! source [`Span`]; nothing here panics on user input.
 //!
-//! Coverage so far: `region` definitions, `system`/`role` nodes, inline
-//! geometry (`monitor` + `rect`) or a shared `region="…"` reference, and
-//! the `sticky` / flex bindings. The `cycle` and `pattern` binding kinds
-//! are recognised and rejected with a clear "not yet supported" error —
-//! they land in a follow-up task.
+//! Coverage: `region` definitions, `system`/`role` nodes, inline geometry
+//! (`monitor` + `rect`) or a shared `region="…"` reference, and all four
+//! binding kinds — `sticky "app" [profile="…"]`, `cycle { app … }`,
+//! `pattern app="…" [title="…"]`, and flex (no binding node).
 
 use std::collections::HashMap;
 
@@ -319,23 +318,62 @@ fn parse_role(
         .map_err(|e| ParseError::at(e.to_string(), span_of(node)))
 }
 
-/// Parse a role's binding child node. Absence of any binding node is
-/// [`Binding::Flex`].
+/// Parse an `app "id" [profile="…"]` node (the shape of a `sticky` node
+/// and of each `cycle` candidate) into an [`AppRef`].
+fn parse_app(node: &KdlNode) -> Result<AppRef, ParseError> {
+    let app_id = first_string_arg(node, "app id")?;
+    let profile = string_prop(node, "profile");
+    AppRef::new(app_id, profile).map_err(|e| ParseError::at(e.to_string(), span_of(node)))
+}
+
+/// Parse a role's binding child node. A role has at most one binding node;
+/// the absence of one is [`Binding::Flex`].
 fn parse_binding(role: &KdlNode) -> Result<Binding, ParseError> {
-    if let Some(node) = child(role, "sticky") {
-        let app_id = first_string_arg(node, "app id")?;
-        let profile = string_prop(node, "profile");
-        let app = AppRef::new(app_id, profile)
-            .map_err(|e| ParseError::at(e.to_string(), span_of(node)))?;
-        return Ok(Binding::Sticky(app));
+    let present: Vec<&str> = ["sticky", "cycle", "pattern"]
+        .into_iter()
+        .filter(|kind| child(role, kind).is_some())
+        .collect();
+    if present.len() > 1 {
+        return Err(ParseError::at(
+            format!(
+                "role has multiple bindings ({}) — a role has exactly one",
+                present.join(", ")
+            ),
+            span_of(role),
+        ));
     }
-    for unsupported in ["cycle", "pattern"] {
-        if let Some(node) = child(role, unsupported) {
-            return Err(ParseError::at(
-                format!("binding kind `{unsupported}` is not yet supported"),
-                span_of(node),
-            ));
-        }
+
+    if let Some(node) = child(role, "sticky") {
+        return Ok(Binding::Sticky(parse_app(node)?));
+    }
+    if let Some(node) = child(role, "cycle") {
+        let candidates = node
+            .children()
+            .into_iter()
+            .flat_map(KdlDocument::nodes)
+            .map(|app| {
+                if app.name().value() == "app" {
+                    parse_app(app)
+                } else {
+                    Err(ParseError::at(
+                        format!(
+                            "unexpected node `{}` in `cycle` (expected `app`)",
+                            app.name().value()
+                        ),
+                        span_of(app),
+                    ))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Binding::cycle(candidates)
+            .map_err(|e| ParseError::at(e.to_string(), span_of(node)));
+    }
+    if let Some(node) = child(role, "pattern") {
+        let app_id = string_prop(node, "app")
+            .ok_or_else(|| ParseError::at("`pattern` needs an `app=\"…\"`", span_of(node)))?;
+        let title = string_prop(node, "title");
+        return Binding::pattern(app_id, title)
+            .map_err(|e| ParseError::at(e.to_string(), span_of(node)));
     }
     Ok(Binding::Flex)
 }
@@ -487,5 +525,246 @@ mod tests {
         let _ = parse("]]] not kdl \u{0}\u{1} ===");
         let _ = parse("");
         let _ = parse("system");
+    }
+
+    #[test]
+    fn cycle_binding_parses_with_per_candidate_profiles() {
+        let config = parse_ok(
+            r#"
+            system "code" {
+                role "companion" {
+                    monitor "DP-2"
+                    rect 0 0 40 100
+                    cycle {
+                        app "claude-desktop"
+                        app "spotify" profile="muzak"
+                    }
+                }
+            }
+            "#,
+        );
+        let role = &config.system("code").unwrap().roles()[0];
+        match role.binding() {
+            Binding::Cycle(candidates) => {
+                assert_eq!(candidates.len(), 2);
+                assert_eq!(candidates[0].app_id(), "claude-desktop");
+                assert_eq!(candidates[0].profile(), None);
+                assert_eq!(candidates[1].app_id(), "spotify");
+                assert_eq!(candidates[1].profile(), Some("muzak"));
+            }
+            other => panic!("expected cycle binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cycle_with_one_candidate_is_an_error() {
+        let err = parse_err(
+            r#"
+            system "code" {
+                role "x" {
+                    monitor "DP-1"
+                    rect 0 0 100 100
+                    cycle { app "spotify" }
+                }
+            }
+            "#,
+        );
+        assert!(err.message().contains("two"), "got: {}", err.message());
+        assert!(err.span().is_some());
+    }
+
+    #[test]
+    fn cycle_rejects_a_non_app_child() {
+        let err = parse_err(
+            r#"
+            system "code" {
+                role "x" {
+                    monitor "DP-1"
+                    rect 0 0 100 100
+                    cycle { sticky "spotify" }
+                }
+            }
+            "#,
+        );
+        assert!(err.message().contains("app"), "got: {}", err.message());
+        assert!(err.span().is_some());
+    }
+
+    #[test]
+    fn pattern_binding_parses() {
+        let config = parse_ok(
+            r#"
+            system "meeting" {
+                role "video" {
+                    monitor "DP-2"
+                    rect 0 0 100 100
+                    pattern app="Zoom" title="^Meeting$"
+                }
+            }
+            "#,
+        );
+        let role = &config.system("meeting").unwrap().roles()[0];
+        assert_eq!(
+            role.binding(),
+            &Binding::Pattern {
+                app_id: "Zoom".to_owned(),
+                title_regex: Some("^Meeting$".to_owned()),
+            },
+        );
+    }
+
+    #[test]
+    fn pattern_without_title_parses() {
+        let config = parse_ok(
+            r#"
+            system "s" {
+                role "r" {
+                    monitor "DP-1"
+                    rect 0 0 100 100
+                    pattern app="firefox"
+                }
+            }
+            "#,
+        );
+        let role = &config.system("s").unwrap().roles()[0];
+        assert_eq!(
+            role.binding(),
+            &Binding::Pattern {
+                app_id: "firefox".to_owned(),
+                title_regex: None,
+            },
+        );
+    }
+
+    #[test]
+    fn pattern_without_app_is_an_error() {
+        let err = parse_err(
+            r#"
+            system "meeting" {
+                role "video" {
+                    monitor "DP-2"
+                    rect 0 0 100 100
+                    pattern title="^Meeting$"
+                }
+            }
+            "#,
+        );
+        assert!(err.message().contains("app"), "got: {}", err.message());
+        assert!(err.span().is_some());
+    }
+
+    #[test]
+    fn role_with_two_bindings_is_an_error() {
+        let err = parse_err(
+            r#"
+            system "s" {
+                role "r" {
+                    monitor "DP-1"
+                    rect 0 0 100 100
+                    sticky "kitty"
+                    cycle { app "a"; app "b" }
+                }
+            }
+            "#,
+        );
+        assert!(
+            err.message().contains("multiple bindings"),
+            "got: {}",
+            err.message()
+        );
+        assert!(err.span().is_some());
+    }
+
+    /// The three `ARCHITECTURE.md` example layouts (`code` / `meeting` /
+    /// `reading`), encoded in the B+ schema, parse and validate as one
+    /// config — exercising every binding kind, a profile, a shared
+    /// `region` referenced across systems, and flex.
+    #[test]
+    fn example_configs_parse_and_validate() {
+        let config = parse_ok(
+            r#"
+            // shared geometry, named once
+            region "right" { monitor "DP-2"; rect 40 0 60 100 }
+            region "left"  { monitor "DP-2"; rect 0 0 40 100 }
+
+            system "code" {
+                role "editor" {
+                    monitor "DP-1"
+                    rect 0 0 100 100
+                    sticky "kitty"
+                }
+                role "browser" region="right" {
+                    sticky "firefox" profile="code"
+                }
+                role "companion" region="left" {
+                    cycle {
+                        app "claude-desktop"
+                        app "spotify"
+                    }
+                }
+                role "scratch" {
+                    monitor "DP-3"
+                    rect 0 80 100 20
+                }
+            }
+
+            system "meeting" {
+                role "video" {
+                    monitor "DP-2"
+                    rect 0 0 100 100
+                    pattern app="Zoom" title="^Meeting$"
+                }
+                role "chat" {
+                    monitor "DP-3"
+                    rect 0 0 100 50
+                    sticky "slack"
+                }
+                role "notes" {
+                    monitor "DP-3"
+                    rect 0 50 100 50
+                    sticky "obsidian"
+                }
+            }
+
+            system "reading" {
+                role "primary" {
+                    monitor "DP-3"
+                    rect 0 0 100 100
+                    pattern app="firefox" title="(?i)reader"
+                }
+            }
+            "#,
+        );
+
+        assert_eq!(config.systems().len(), 3);
+
+        // code: shared region resolved, profile carried, cycle + flex present.
+        let code = config.system("code").unwrap();
+        assert_eq!(code.roles().len(), 4);
+        let browser = &code.roles()[1];
+        assert_eq!(browser.monitor(), "DP-2");
+        assert_eq!(browser.region(), Region::new(40, 0, 60, 100).unwrap());
+        match browser.binding() {
+            Binding::Sticky(app) => assert_eq!(app.profile(), Some("code")),
+            other => panic!("expected sticky firefox, got {other:?}"),
+        }
+        assert!(matches!(code.roles()[2].binding(), Binding::Cycle(c) if c.len() == 2));
+        assert_eq!(code.roles()[3].binding(), &Binding::Flex);
+
+        // meeting: the Zoom catch.
+        let video = &config.system("meeting").unwrap().roles()[0];
+        assert_eq!(
+            video.binding(),
+            &Binding::Pattern {
+                app_id: "Zoom".to_owned(),
+                title_regex: Some("^Meeting$".to_owned()),
+            },
+        );
+
+        // reading: a title-pattern firefox.
+        let primary = &config.system("reading").unwrap().roles()[0];
+        assert!(
+            matches!(primary.binding(), Binding::Pattern { app_id, .. } if app_id == "firefox")
+        );
     }
 }
