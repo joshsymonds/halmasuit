@@ -208,6 +208,17 @@ pkgs.testers.runNixOSTest {
         "'xdg_toplevel mapped as fullscreen foreground'",
         timeout=60,
     )
+    # The map log fires in `new_toplevel` at role-creation, BEFORE the
+    # session client commits its first buffer. The foreground swap is
+    # gated on that first buffer (`session_first_frame`), so it lands a
+    # beat later. Wait for the foreground_changed→session transition
+    # itself (state-based polling, not a sleep) before asserting
+    # ordering, so the assert never races the buffer commit.
+    machine.wait_until_succeeds(
+        "journalctl -u halmasuit -o cat | "
+        "grep foreground_changed | grep -q session",
+        timeout=60,
+    )
     assert fg_events()[:2] == ["greeter", "session"], (
         f"foreground ordering wrong: {fg_events()}"
     )
