@@ -33,7 +33,7 @@ use crate::pam_sys::{
     pam_get_item, pam_getenvlist, pam_handle_t, pam_message, pam_open_session, pam_putenv,
     pam_response, pam_set_item, pam_setcred, pam_start,
 };
-use halmasuit_session_ipc::{BrokerToCompositor, Secret};
+use halmasuit_session_ipc::{DisplayStyle, PromptStyle, Secret};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -97,17 +97,41 @@ fn split_env_pair(entry: &str) -> Option<(String, String)> {
 #[error("conversation responder failed")]
 pub struct ResponderError;
 
-/// Produces the response for one PAM prompt.
+/// Produces the response (or fire-and-forget for display) for ONE PAM
+/// conversation message.
 ///
-/// Called by [`conv_trampoline`] ONLY for styles where
-/// [`conv::style_expects_response`] is true (prompts) — never for
-/// display-only `Info`/`Error`. The real broker impl relays the prompt
-/// over its SEQPACKET channel; tests use a scripted impl.
+/// libpam's conv contract splits along response policy:
+///
+/// - **Prompt** (`PAM_PROMPT_ECHO_ON`/`PAM_PROMPT_ECHO_OFF`) →
+///   [`Self::respond`]. Blocks until the greeter answers; the returned
+///   [`Secret`] becomes the libpam `pam_response_t.resp` for this
+///   message.
+/// - **Display** (`PAM_TEXT_INFO`/`PAM_ERROR_MSG`) → [`Self::display`].
+///   Fire-and-forget: the message goes to the greeter; the conv MUST
+///   NOT block; libpam's `pam_response_t.resp` stays `NULL` for this
+///   message (the trampoline leaves the slot zeroed).
+///
+/// The real broker impl relays each over its SEQPACKET channel; tests
+/// use a scripted impl. Implementations MUST be sound against the
+/// asymmetric semantics — never block in [`Self::display`], never
+/// proceed without a real response in [`Self::respond`].
 pub trait ConvResponder {
+    /// Send a prompt and block for the greeter's response.
+    ///
     /// # Errors
     ///
     /// [`ResponderError`] aborts the conversation (`PAM_CONV_ERR`).
-    fn respond(&mut self, prompt: &BrokerToCompositor) -> Result<Secret, ResponderError>;
+    fn respond(&mut self, style: PromptStyle, message: &str) -> Result<Secret, ResponderError>;
+
+    /// Send a display-only message. Returns as soon as the frame is on
+    /// the wire — MUST NOT wait for the greeter to reply. (libpam's
+    /// `PAM_TEXT_INFO`/`PAM_ERROR_MSG` carry no response data and the
+    /// PAM worker is not blocked on the application here.)
+    ///
+    /// # Errors
+    ///
+    /// [`ResponderError`] aborts the conversation (`PAM_CONV_ERR`).
+    fn display(&mut self, style: DisplayStyle, message: &str) -> Result<(), ResponderError>;
 }
 
 /// Stable appdata behind `pam_conv::appdata_ptr`.
@@ -217,24 +241,34 @@ unsafe extern "C" fn conv_trampoline(
                 cstr.to_string_lossy().into_owned()
             };
 
-            let Ok(prompt) = conv::prompt_from_pam(m.msg_style, &text) else {
+            let Ok(kind) = conv::message_from_pam(m.msg_style, &text) else {
                 rollback_resp_array(resp_array, i);
                 return PAM_CONV_ERR as c_int;
             };
-            let BrokerToCompositor::ConvPrompt { style, .. } = &prompt else {
-                // conv::prompt_from_pam only ever yields ConvPrompt.
-                rollback_resp_array(resp_array, i);
-                return PAM_CONV_ERR as c_int;
-            };
-            if !conv::style_expects_response(*style) {
-                // Display-only (Info/Error): leave the zeroed slot
-                // (NULL resp). Never ask the responder.
-                continue;
-            }
-
-            let Ok(secret) = ctx.responder.respond(&prompt) else {
-                rollback_resp_array(resp_array, i);
-                return PAM_CONV_ERR as c_int;
+            // Exhaustive over MessageKind: any future variant addition
+            // is a compile error here — never a silent swallow. R1/R2/R4
+            // from Epic #24.
+            let secret = match kind {
+                conv::MessageKind::Prompt { style, message } => {
+                    let Ok(secret) = ctx.responder.respond(style, &message) else {
+                        rollback_resp_array(resp_array, i);
+                        return PAM_CONV_ERR as c_int;
+                    };
+                    secret
+                }
+                conv::MessageKind::Display { style, message } => {
+                    // Display-only (Info/Error): forward to the greeter
+                    // (R1 — MUST NOT swallow) but do NOT block (R2).
+                    // The resp_array slot stays zeroed: libpam's
+                    // contract for PAM_TEXT_INFO/PAM_ERROR_MSG is
+                    // `resp = NULL`, and the conv still returns
+                    // PAM_SUCCESS.
+                    if ctx.responder.display(style, &message).is_err() {
+                        rollback_resp_array(resp_array, i);
+                        return PAM_CONV_ERR as c_int;
+                    }
+                    continue;
+                }
             };
             // Wipe every intermediate copy: a Zeroizing buffer, not
             // CString (whose Drop frees without zeroing).
@@ -631,30 +665,52 @@ impl Drop for Pam<'_> {
 mod tests {
     use super::*;
     use crate::pam_sys;
-    use halmasuit_session_ipc::{BrokerToCompositor, PromptStyle};
+    use halmasuit_session_ipc::{BrokerToCompositor, DisplayStyle, PromptStyle};
     use std::ffi::{CString, c_void};
 
     /// A scripted [`ConvResponder`] for direct trampoline invocation —
     /// NO libpam involved (Epic R12: this mocks nothing; it exercises
     /// our own callback with synthetic inputs).
+    ///
+    /// Records every observed conversation message — prompt or display
+    /// — so tests can assert on the exact dispatch the trampoline did.
+    /// Epic #24 R1: the trampoline MUST forward display messages
+    /// (info/error) to the responder, not silently drop them.
     struct ScriptedResponder {
+        /// Reply texts handed to libpam, one per prompt-class message.
         replies: Vec<&'static str>,
         next: usize,
+        /// Every prompt or display the trampoline asked us to handle,
+        /// in arrival order.
         seen: Vec<BrokerToCompositor>,
         fail: bool,
     }
     impl ConvResponder for ScriptedResponder {
         fn respond(
             &mut self,
-            prompt: &BrokerToCompositor,
+            style: PromptStyle,
+            message: &str,
         ) -> Result<halmasuit_session_ipc::Secret, ResponderError> {
-            self.seen.push(prompt.clone());
+            self.seen.push(BrokerToCompositor::ConvPrompt {
+                style,
+                message: message.to_owned(),
+            });
             if self.fail {
                 return Err(ResponderError);
             }
             let r = self.replies[self.next];
             self.next += 1;
             Ok(halmasuit_session_ipc::Secret::new(r.to_owned()))
+        }
+        fn display(&mut self, style: DisplayStyle, message: &str) -> Result<(), ResponderError> {
+            self.seen.push(BrokerToCompositor::ConvDisplay {
+                style,
+                message: message.to_owned(),
+            });
+            if self.fail {
+                return Err(ResponderError);
+            }
+            Ok(())
         }
     }
 
@@ -732,27 +788,42 @@ mod tests {
 
     #[test]
     fn drift_conv_constants_match_pam_sys() {
-        // Pins task #4's hardcoded libpam codes against pam_sys.
+        // Pins the hardcoded libpam codes in `conv.rs` against the
+        // `pam_sys` FFI declarations. If a future Linux-PAM bump
+        // renumbers a code, this fails before the bug reaches the
+        // privileged path.
+        //
+        // Post Epic #24: PromptStyle has been narrowed to 2 variants
+        // and DisplayStyle was added; both go through `message_from_pam`
+        // (which also fails closed on unknown codes — see
+        // `conv::tests::unknown_pam_code_is_an_error_not_a_panic_or_default`).
         assert_eq!(
-            conv::pam_style_of(PromptStyle::Secret),
+            conv::pam_code_of_prompt(PromptStyle::Secret),
             pam_sys::PAM_PROMPT_ECHO_OFF
         );
         assert_eq!(
-            conv::pam_style_of(PromptStyle::Visible),
+            conv::pam_code_of_prompt(PromptStyle::Visible),
             pam_sys::PAM_PROMPT_ECHO_ON
         );
         assert_eq!(
-            conv::pam_style_of(PromptStyle::Error),
+            conv::pam_code_of_display(DisplayStyle::Error),
             pam_sys::PAM_ERROR_MSG
         );
         assert_eq!(
-            conv::pam_style_of(PromptStyle::Info),
+            conv::pam_code_of_display(DisplayStyle::Info),
             pam_sys::PAM_TEXT_INFO
         );
-        assert_eq!(
-            conv::prompt_style_from_pam(pam_sys::PAM_TEXT_INFO).unwrap(),
-            PromptStyle::Info
-        );
+        // Reverse direction: a PAM_TEXT_INFO classifies into the
+        // Display arm with Info style. Drift-guards the trampoline's
+        // dispatch.
+        let kind = conv::message_from_pam(pam_sys::PAM_TEXT_INFO, "").unwrap();
+        match kind {
+            conv::MessageKind::Display {
+                style: DisplayStyle::Info,
+                ..
+            } => {}
+            other => panic!("expected Display{{Info}}, got {other:?}"),
+        }
     }
 
     #[test]
@@ -787,7 +858,15 @@ mod tests {
     }
 
     #[test]
-    fn no_response_collected_for_info_and_error() {
+    fn info_and_error_are_forwarded_to_display_with_null_resp_slots() {
+        // Epic #24 R1: the trampoline MUST forward PAM_TEXT_INFO and
+        // PAM_ERROR_MSG to the responder (via `display()`), not silently
+        // drop them. Pre-Epic-#24 this test asserted the OPPOSITE
+        // ("responder must not be asked") — that was the gen-399 bug.
+        //
+        // Epic #24 R2: even though display IS called, the conv's
+        // `resp_array[i].resp` slot MUST stay NULL — libpam contract
+        // for `PAM_TEXT_INFO`/`PAM_ERROR_MSG`.
         let mut r = ScriptedResponder {
             replies: vec![],
             next: 0,
@@ -796,8 +875,8 @@ mod tests {
         };
         let (rc, resp) = run(
             &[
-                (pam_sys::PAM_TEXT_INFO, "one moment"),
-                (pam_sys::PAM_ERROR_MSG, "bad thing"),
+                (pam_sys::PAM_TEXT_INFO, "Please touch the device"),
+                (pam_sys::PAM_ERROR_MSG, "Authentication failure"),
             ],
             &mut r,
         );
@@ -805,16 +884,100 @@ mod tests {
         assert!(!resp.is_null());
         #[expect(
             unsafe_code,
-            reason = "asserting NULL resp slots for display-only messages."
+            reason = "asserting NULL resp slots for display-only messages \
+                      (libpam contract)."
         )]
         unsafe {
             assert!((*resp.add(0)).resp.is_null());
             assert!((*resp.add(1)).resp.is_null());
         }
         free_like_pam(resp, 2);
-        assert!(
-            r.seen.is_empty(),
-            "responder must not be asked for Info/Error"
+        assert_eq!(
+            r.seen,
+            vec![
+                BrokerToCompositor::ConvDisplay {
+                    style: DisplayStyle::Info,
+                    message: "Please touch the device".into(),
+                },
+                BrokerToCompositor::ConvDisplay {
+                    style: DisplayStyle::Error,
+                    message: "Authentication failure".into(),
+                },
+            ],
+            "trampoline MUST forward display-only messages to the \
+             responder via display() so the greeter can show cues like \
+             `pam_u2f cue`'s 'touch the device'"
+        );
+    }
+
+    #[test]
+    fn display_responder_error_is_conv_err() {
+        // If display() fails (e.g. broker channel closed mid-conv) the
+        // trampoline MUST surface PAM_CONV_ERR with no resp array
+        // published, exactly like the prompt-side error path.
+        let mut r = ScriptedResponder {
+            replies: vec![],
+            next: 0,
+            seen: vec![],
+            fail: true,
+        };
+        let (rc, resp) = run(&[(pam_sys::PAM_TEXT_INFO, "Please touch")], &mut r);
+        assert_eq!(rc, pam_sys::PAM_CONV_ERR);
+        assert!(resp.is_null(), "no array published on the error path");
+    }
+
+    #[test]
+    fn batched_info_then_prompt_dispatches_correctly() {
+        // libpam permits num_msg > 1 with mixed styles in one conv
+        // call. The trampoline iterates per-message; an Info followed
+        // by a Secret prompt in the SAME call must produce: one
+        // display() with the info text + one respond() with the
+        // password. The resp_array slot for the info stays NULL; the
+        // slot for the prompt holds the strdup'd response.
+        //
+        // This shape mirrors the production gen-399 conv shape
+        // (`pam_u2f cue + pam_unix try_first_pass` can deliver both
+        // messages in one conv call when batched).
+        let mut r = ScriptedResponder {
+            replies: vec!["sekrit"],
+            next: 0,
+            seen: vec![],
+            fail: false,
+        };
+        let (rc, resp) = run(
+            &[
+                (pam_sys::PAM_TEXT_INFO, "Please touch the device"),
+                (pam_sys::PAM_PROMPT_ECHO_OFF, "Password: "),
+            ],
+            &mut r,
+        );
+        assert_eq!(rc, pam_sys::PAM_SUCCESS);
+        assert!(!resp.is_null());
+        #[expect(
+            unsafe_code,
+            reason = "reading back trampoline's response array in-test."
+        )]
+        unsafe {
+            assert!(
+                (*resp.add(0)).resp.is_null(),
+                "info slot must be NULL (display-only)"
+            );
+            let pw = std::ffi::CStr::from_ptr((*resp.add(1)).resp);
+            assert_eq!(pw.to_str().unwrap(), "sekrit");
+        }
+        free_like_pam(resp, 2);
+        assert_eq!(
+            r.seen,
+            vec![
+                BrokerToCompositor::ConvDisplay {
+                    style: DisplayStyle::Info,
+                    message: "Please touch the device".into(),
+                },
+                BrokerToCompositor::ConvPrompt {
+                    style: PromptStyle::Secret,
+                    message: "Password: ".into(),
+                },
+            ],
         );
     }
 

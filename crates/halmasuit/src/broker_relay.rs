@@ -26,7 +26,7 @@ use std::fmt;
 
 use halmasuit_greetd::{AuthMessageType, PamStep};
 use halmasuit_session_ipc::{
-    BrokerToCompositor, CompositorToBroker, PromptStyle, Secret, SessionOutcome,
+    BrokerToCompositor, CompositorToBroker, DisplayStyle, PromptStyle, Secret, SessionOutcome,
 };
 
 /// Where the compositor↔broker relay is in the Amendment-A1 sequence.
@@ -159,9 +159,24 @@ impl BrokerRelay {
     pub fn on_broker_frame(&mut self, frame: BrokerToCompositor) -> Result<RelayEvent, RelayError> {
         match (self.phase, frame) {
             // Auth conversation: a prompt keeps us in Authing.
+            // Greeter MUST answer (greetd post_auth_message_response).
             (Phase::Authing, BrokerToCompositor::ConvPrompt { style, message }) => {
                 Ok(RelayEvent::Pam(PamStep::Challenge {
-                    kind: style_to_kind(style),
+                    kind: prompt_to_kind(style),
+                    prompt: message,
+                }))
+            }
+            // Auth conversation: a display-only message keeps us in
+            // Authing too. The greetd wire protocol still mandates a
+            // post_auth_message_response from the greeter (DMS sends
+            // `respond("")`); Epic #24 R5 makes the compositor swallow
+            // that response so it never crosses the broker wire — that
+            // swallow lives in broker_session.rs (frame I/O), not here
+            // (state-machine logic). The PamStep is the same shape: a
+            // greetd AuthMessage with the display kind.
+            (Phase::Authing, BrokerToCompositor::ConvDisplay { style, message }) => {
+                Ok(RelayEvent::Pam(PamStep::Challenge {
+                    kind: display_to_kind(style),
                     prompt: message,
                 }))
             }
@@ -226,15 +241,28 @@ impl BrokerRelay {
     }
 }
 
-/// Map a libpam conversation style to the greetd auth-message type the
-/// state machine hands the greeter. The two enums are deliberately
-/// 1:1 (both mirror libpam's four `pam_message` styles).
-const fn style_to_kind(style: PromptStyle) -> AuthMessageType {
+/// Map a libpam **prompt-class** conv style to the greetd
+/// auth-message type the state machine hands the greeter.
+///
+/// Exhaustive over [`PromptStyle`] — no `_ =>` default. Epic #24 R4
+/// invariant: a future variant addition fails compile here, never
+/// silently absorbs.
+const fn prompt_to_kind(style: PromptStyle) -> AuthMessageType {
     match style {
         PromptStyle::Visible => AuthMessageType::Visible,
         PromptStyle::Secret => AuthMessageType::Secret,
-        PromptStyle::Info => AuthMessageType::Info,
-        PromptStyle::Error => AuthMessageType::Error,
+    }
+}
+
+/// Map a libpam **display-class** conv style to the greetd
+/// auth-message type the state machine hands the greeter.
+///
+/// Exhaustive over [`DisplayStyle`] — no `_ =>` default. Same Epic #24
+/// R4 rationale as [`prompt_to_kind`].
+const fn display_to_kind(style: DisplayStyle) -> AuthMessageType {
+    match style {
+        DisplayStyle::Info => AuthMessageType::Info,
+        DisplayStyle::Error => AuthMessageType::Error,
     }
 }
 
@@ -471,15 +499,15 @@ mod tests {
         );
     }
 
-    // ── style mapping (1:1 across the four libpam styles) ────────────
+    // ── style mapping (Epic #24: split prompt + display, exhaustive) ─
 
     #[test]
-    fn prompt_style_maps_all_four_kinds() {
+    fn prompt_style_maps_both_kinds() {
+        // Post-Epic-#24: PromptStyle is narrowed to {Visible, Secret}.
+        // Each must land on the matching greetd AuthMessageType.
         for (style, kind) in [
             (PromptStyle::Visible, AuthMessageType::Visible),
             (PromptStyle::Secret, AuthMessageType::Secret),
-            (PromptStyle::Info, AuthMessageType::Info),
-            (PromptStyle::Error, AuthMessageType::Error),
         ] {
             let mut r = begun();
             assert_eq!(
@@ -494,6 +522,61 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn display_style_maps_both_kinds() {
+        // DisplayStyle::Info / Error each route through ConvDisplay and
+        // land on the matching greetd AuthMessageType. The state phase
+        // STAYS in Authing for display messages (R4 invariant) — they
+        // do not move the relay toward Authed or Done.
+        for (style, kind) in [
+            (DisplayStyle::Info, AuthMessageType::Info),
+            (DisplayStyle::Error, AuthMessageType::Error),
+        ] {
+            let mut r = begun();
+            assert_eq!(
+                r.on_broker_frame(BrokerToCompositor::ConvDisplay {
+                    style,
+                    message: "m".into(),
+                })
+                .unwrap(),
+                RelayEvent::Pam(PamStep::Challenge {
+                    kind,
+                    prompt: "m".into(),
+                })
+            );
+            // Phase invariant: a display frame doesn't advance us out
+            // of Authing — a subsequent ConvPrompt or Success must
+            // still be accepted.
+            assert_eq!(
+                r.on_broker_frame(BrokerToCompositor::Success {
+                    username: "alice".into(),
+                    uid: 1001,
+                    gid: 1001,
+                })
+                .unwrap(),
+                RelayEvent::Pam(PamStep::Success {
+                    username: "alice".into(),
+                    uid: 1001,
+                    gid: 1001,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn conv_display_after_success_is_out_of_phase() {
+        // Mirror of conv_prompt_after_success_is_out_of_phase: a
+        // display frame outside Authing is fail-closed.
+        let mut r = authed();
+        assert_eq!(
+            r.on_broker_frame(BrokerToCompositor::ConvDisplay {
+                style: DisplayStyle::Info,
+                message: "stale info".into(),
+            }),
+            Err(RelayError::OutOfPhase)
+        );
     }
 
     // ── fail-closed: every out-of-phase frame is rejected ────────────

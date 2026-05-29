@@ -3,8 +3,9 @@
 
 [default]
 # typos parses "PNGs" as the identifier "PN" + "Gs", so the `PN → ON`
-# rule mis-fires. Match the full token.
-extend-ignore-identifiers-re = ["^PNGs$"]
+# rule mis-fires. Same story for "OTPs" (split into "OT" + "Ps"). Match
+# the full token.
+extend-ignore-identifiers-re = ["^PNGs$", "^OTPs$"]
 
 [default.extend-words]
 # Project-specific allow list grows here when typos misfires.
@@ -15,6 +16,9 @@ Inh = "Inh"
 CapInh = "CapInh"
 # Plural of PNG. typos rewrites "PNGs" → "PONs".
 PNGs = "PNGs"
+# Plural of OTP (One-Time Password). typos parses "OTPs" as "OT" + "Ps"
+# and suggests "TOPs/OFPs/...". Same shape as the PNGs case above.
+OTPs = "OTPs"
 # Level Of Detail — standard graphics term used in
 # crates/kushuh/ARCHITECTURE.md's distant-star LOD discussion.
 # typos suggests "LOAD".
