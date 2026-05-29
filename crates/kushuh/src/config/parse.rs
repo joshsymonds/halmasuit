@@ -593,6 +593,173 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_region_name_is_an_error() {
+        let err = parse_err(
+            r#"
+            region "r" { monitor "DP-1"; rect 0 0 50 100 }
+            region "r" { monitor "DP-2"; rect 0 0 60 100 }
+            system "s" { role "x" region="r" { sticky "kitty" } }
+            "#,
+        );
+        assert!(
+            err.message().contains("duplicate region"),
+            "got: {}",
+            err.message()
+        );
+        assert!(err.span().is_some());
+    }
+
+    #[test]
+    fn unexpected_top_level_node_is_an_error() {
+        let err = parse_err(r#"widget "x" { }"#);
+        assert!(
+            err.message().contains("unexpected top-level node"),
+            "got: {}",
+            err.message()
+        );
+        assert!(err.span().is_some());
+    }
+
+    #[test]
+    fn unexpected_node_inside_system_is_an_error() {
+        let err = parse_err(
+            r#"
+            system "s" {
+                widget "x" { }
+            }
+            "#,
+        );
+        assert!(
+            err.message().contains("expected `role`"),
+            "got: {}",
+            err.message()
+        );
+        assert!(err.span().is_some());
+    }
+
+    #[test]
+    fn role_missing_monitor_is_an_error() {
+        let err = parse_err(
+            r#"
+            system "s" {
+                role "x" { rect 0 0 100 100; sticky "kitty" }
+            }
+            "#,
+        );
+        assert!(err.message().contains("monitor"), "got: {}", err.message());
+        assert!(err.span().is_some());
+    }
+
+    #[test]
+    fn role_missing_rect_is_an_error() {
+        let err = parse_err(
+            r#"
+            system "s" {
+                role "x" { monitor "DP-1"; sticky "kitty" }
+            }
+            "#,
+        );
+        assert!(err.message().contains("rect"), "got: {}", err.message());
+        assert!(err.span().is_some());
+    }
+
+    #[test]
+    fn rect_with_wrong_arg_count_is_an_error() {
+        let err = parse_err(
+            r#"
+            system "s" {
+                role "x" { monitor "DP-1"; rect 0 0 100; sticky "kitty" }
+            }
+            "#,
+        );
+        assert!(
+            err.message().contains("4 numbers"),
+            "got: {}",
+            err.message()
+        );
+        assert!(err.span().is_some());
+    }
+
+    #[test]
+    fn rect_with_non_integer_coordinate_is_an_error() {
+        let err = parse_err(
+            r#"
+            system "s" {
+                role "x" { monitor "DP-1"; rect 0 0 50.5 100; sticky "kitty" }
+            }
+            "#,
+        );
+        assert!(err.message().contains("integers"), "got: {}", err.message());
+        assert!(err.span().is_some());
+    }
+
+    #[test]
+    fn rect_coordinate_over_100_is_an_error() {
+        // A valid integer that is out of the 0..=100 percentage range —
+        // distinct from a valid-int-but-bad-region (e.g. zero width).
+        let err = parse_err(
+            r#"
+            system "s" {
+                role "x" { monitor "DP-1"; rect 0 0 200 100; sticky "kitty" }
+            }
+            "#,
+        );
+        assert!(err.message().contains("0..=100"), "got: {}", err.message());
+        assert!(err.span().is_some());
+    }
+
+    #[test]
+    fn role_without_a_name_is_an_error() {
+        let err = parse_err(
+            r#"
+            system "s" {
+                role { monitor "DP-1"; rect 0 0 100 100 }
+            }
+            "#,
+        );
+        assert!(err.message().contains("name"), "got: {}", err.message());
+        assert!(err.span().is_some());
+    }
+
+    #[test]
+    fn duplicate_role_name_surfaces_through_parser_with_span() {
+        let err = parse_err(
+            r#"
+            system "s" {
+                role "dup" { monitor "DP-1"; rect 0 0 100 100 }
+                role "dup" { monitor "DP-2"; rect 0 0 100 100 }
+            }
+            "#,
+        );
+        assert!(
+            err.message().contains("duplicate role"),
+            "got: {}",
+            err.message()
+        );
+        assert!(
+            err.span().is_some(),
+            "parser must attach a span to the wrapped System error"
+        );
+    }
+
+    #[test]
+    fn error_span_locates_the_offending_node() {
+        // Span correctness, not mere presence: the out-of-range rect's span
+        // must cover the `rect …` text in the source, not byte 0.
+        let src = r#"
+            system "s" {
+                role "x" { monitor "DP-1"; rect 0 0 200 100; sticky "kitty" }
+            }
+            "#;
+        let err = parse_err(src);
+        let span = err.span().expect("schema error carries a span");
+        assert!(!span.is_empty(), "span should cover the rect node");
+        let end = span.offset() + span.len();
+        assert!(end <= src.len(), "span must lie within the source");
+        assert_eq!(&src[span.offset()..end], "rect 0 0 200 100");
+    }
+
+    #[test]
     fn garbage_does_not_panic() {
         // The point is that this returns Err rather than panicking.
         let _ = parse("]]] not kdl \u{0}\u{1} ===");
