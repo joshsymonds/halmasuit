@@ -821,6 +821,19 @@
           inherit nixpkgs;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
         };
+        # Epic #28 Pass B B-I1: end-to-end gate on the compositor's
+        # broker_relay::awaiting_display_ack swallow flag. session-conv-
+        # shapes hits the broker wire directly; this drives a real greetd
+        # protocol exchange THROUGH halmasuit's broker_relay against a
+        # real broker emitting PAM_TEXT_INFO (pam_echo + pam_unix
+        # try_first_pass). Catches a swallow-flag regression that would
+        # pass session-conv-shapes.
+        halmasuit-conv-e2e = import ./tests/halmasuit-conv-e2e.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+        };
         drm-master-probe = import ./tests/drm-master-probe.nix {
           system = "x86_64-linux";
           inherit nixpkgs;

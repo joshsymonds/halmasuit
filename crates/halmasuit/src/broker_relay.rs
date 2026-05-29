@@ -22,6 +22,8 @@
 //! explicit phase machine that fails closed on anything out of
 //! sequence.
 
+#![forbid(unsafe_code)]
+
 use std::fmt;
 
 use halmasuit_greetd::{AuthMessageType, PamStep};

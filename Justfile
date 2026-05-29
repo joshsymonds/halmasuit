@@ -137,6 +137,9 @@ test-vm:
     echo "── session-conv-shapes ──"
     nix build .#checks.x86_64-linux.session-conv-shapes -L --print-build-logs --no-link
     echo
+    echo "── halmasuit-conv-e2e ──"
+    nix build .#checks.x86_64-linux.halmasuit-conv-e2e -L --print-build-logs --no-link
+    echo
     echo "── login-flash ──"
     nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link
     echo

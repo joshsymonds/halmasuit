@@ -262,12 +262,15 @@ let
     import json, socket, struct, sys, time
     PATH = "/run/halmasuit-session.sock"
 
-    # The broker's AuthSlot enforces a churn throttle (Epic R5):
-    # DEFAULT_MAX_PER_WINDOW=5 connections per DEFAULT_WINDOW=10s per
-    # uid. Sequential corpus runs WILL trip it unless we spread out.
-    # 2.5s between connections caps us at 4 per 10s sliding window —
-    # comfortably under the bound while keeping total test time
-    # under ~30s.
+    # The broker's AuthSlot enforces a GLOBAL churn throttle (Epic R5):
+    # DEFAULT_MAX_PER_WINDOW=5 connections per DEFAULT_WINDOW=10s,
+    # tracked in a single VecDeque<Instant> on AuthSlot (not keyed by
+    # uid — see crates/halmasuit-session/src/slot.rs). Sequential
+    # corpus runs WILL trip it unless we spread out. 2.5s between
+    # connections caps us at 4 per 10s sliding window — comfortably
+    # under the bound while keeping total test time under ~30s. The
+    # window-prune check uses `>=` (slot.rs:170) so exact-boundary
+    # moments do NOT collide.
     THROTTLE_GAP_SECS = 2.5
 
     with open("${corpusJson}") as f:
@@ -278,10 +281,21 @@ let
         return struct.pack("=I", len(b)) + b
 
     def recv_frame(s):
-        data = s.recv(65536)
+        # SOCK_SEQPACKET: one recv = one datagram. Use MSG_TRUNC to
+        # detect oversize frames that would otherwise silently truncate
+        # at the 65536 buffer (the broker's MAX_MESSAGE_SIZE is 1 MiB;
+        # a >65536 frame is either a regression or a contract change
+        # and must red the test, not silently parse a JSON prefix).
+        data = s.recv(65536, socket.MSG_TRUNC)
         if not data:
             return None
+        if len(data) > 65536:
+            print(f"  FAIL: frame oversized — broker emitted {len(data)} bytes, buffer is 65536", flush=True)
+            return None
         ln = struct.unpack("=I", data[:4])[0]
+        if 4 + ln != len(data):
+            print(f"  FAIL: length-prefix mismatch — prefix says {ln}, datagram is {len(data) - 4} bytes", flush=True)
+            return None
         return json.loads(data[4:4 + ln])
 
     overall_ok = True
@@ -424,8 +438,12 @@ pkgs.testers.runNixOSTest {
     assert "OVERALL_PASS:" in out, (
         "session-conv-shapes corpus FAILED. The broker did not "
         "satisfy the libpam conv contract for one or more of the 10 "
-        "regression-gated sequences (info-then-prompt, info-only-"
-        "success, prompt-then-info, etc.). The per-sequence FAIL "
+        "regression-gated sequences: prompt-only-success, "
+        "info-then-prompt-success, info-info-then-prompt-success, "
+        "info-info-info-then-prompt-success, deny-only-failure, "
+        "info-then-deny-failure, info-info-then-deny-failure, "
+        "info-info-info-then-deny-failure, info-then-prompt-wrong-pw-"
+        "failure, info-prompt-info-success. The per-sequence FAIL "
         "line above names the exact frame that broke; common modes "
         "are: broker emitted UnexpectedFrame for a ConvDisplay; "
         "broker advanced phase on a display; compositor failed to "
@@ -436,9 +454,11 @@ pkgs.testers.runNixOSTest {
 
     print(
         "session-conv-shapes: 10/10 conv sequences satisfied the "
-        "libpam contract across the broker wire — prompt-only, "
-        "info-then-prompt, info-info-then-prompt (×3), display-then-"
-        "failure (×3), prompt-wrong-pw, info-prompt-info."
+        "libpam contract across the broker wire — prompt-only-success, "
+        "info-then-prompt-success, info-info(-info)-then-prompt-success "
+        "(×2), deny-only-failure, info(-info-info)-then-deny-failure "
+        "(×3), info-then-prompt-wrong-pw-failure, info-prompt-info-"
+        "success."
     )
   '';
 }
