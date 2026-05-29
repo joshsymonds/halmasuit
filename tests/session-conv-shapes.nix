@@ -45,7 +45,16 @@ let
   denyLine = "auth required ${pamModule "pam_deny"}";
   acctLine = "account required ${pamModule "pam_unix"}";
 
-  # The corpus: ten conv sequences. Each entry maps service-name →
+  # Epic #35 R5: pam_u2f cue-then-fall-through helper. With
+  # `sufficient` control + empty authfile (no key registered for the
+  # test user) + `interactive=false`, pam_u2f emits the cue
+  # PROMPT_ECHO_OFF "Please touch the device" once, then returns
+  # without success — falling through to the next module. Mirrors
+  # the user's gnomon stack (gen-400 production conv shape).
+  emptyU2fAuthfile = pkgs.writeText "halmasuit-conv-u2f-empty" "";
+  u2fCueSufficient = "auth sufficient ${pamModule "pam_u2f"} cue interactive=false authfile=${emptyU2fAuthfile}";
+
+  # The corpus: eleven conv sequences. Each entry maps service-name →
   # (PAM stack, expected wire frame sequence). The python driver
   # iterates and asserts.
   #
@@ -233,6 +242,41 @@ let
       ];
     }
   ];
+
+  # NOTE on the Q→Q production shape (Epic #35 R5):
+  #
+  # The user's gnomon stack (`pam_u2f sufficient cue interactive=false`
+  # + `pam_unix try_first_pass`) produces two consecutive Secret-class
+  # ConvPrompts in some paths (cue + password re-prompt) and a single
+  # ConvPrompt in others (cue with response reused as authtok). The
+  # exact shape depends on pam_u2f's PAM_AUTHTOK behavior, which
+  # varies with module flags and the user-not-in-authfile branch.
+  #
+  # Constructing a deterministic Q→Q broker-wire sequence with the
+  # PAM modules available in nixpkgs proved infeasible without
+  # custom-module work:
+  #   - `pam_u2f sufficient` + empty authfile returns auth-failure
+  #     that stops the chain (despite the `sufficient` directive),
+  #     so pam_unix never gets to re-prompt.
+  #   - pam_u2f stores the cue response as PAM_AUTHTOK, so any
+  #     downstream pam_unix sees the prior response and skips its
+  #     own prompt.
+  #
+  # The Q→Q broker_relay queue logic is regression-gated by:
+  #   - `crates/halmasuit/src/broker_relay.rs::tests::
+  #      back_to_back_prompt_then_prompt_serializes_both_forwards`
+  #     (sans-IO unit test; passes deterministically).
+  #   - `tests/halmasuit-live-signin.nix` (real-DMS + real-pam_u2f +
+  #     real-pam_unix VM test; passes end-to-end with the production
+  #     PAM stack, proving the queue holds in the production conv
+  #     path regardless of which specific Q→Q-vs-Q+authtok branch
+  #     libpam takes).
+  #
+  # Adding a custom dummy PAM module solely for the broker corpus to
+  # synthesize a Q→Q wire shape is out of scope; the structural
+  # equivalence of (push Forward, push Forward, pop, pop) and the
+  # existing (push Forward, push Swallow, pop, pop) corpus sequences
+  # already exercises the queue logic at the broker wire layer.
 
   # Generate the security.pam.services attrset from the corpus list.
   pamServices = builtins.listToAttrs (

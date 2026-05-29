@@ -517,6 +517,63 @@ mod tests {
     }
 
     #[test]
+    fn back_to_back_prompt_then_prompt_serializes_both_forwards() {
+        // Epic #35 R5 / gen-400 production conv shape: the broker
+        // emits ConvPrompt(Secret) (pam_u2f cue, "Please touch the
+        // device") and ConvPrompt(Secret) (pam_unix's password
+        // fallback, "Password: ") BACK-TO-BACK. Both expect a
+        // ConvResponse — neither is Display-class. The queue must
+        // record two Forward entries; both greeter responses MUST
+        // forward to the broker in arrival order.
+        //
+        // The Pass A/B halmasuit-conv-e2e covered the D→P shape
+        // (`pam_echo + pam_unix`). The user's gnomon stack is Q→Q
+        // (`pam_u2f + pam_unix try_first_pass`) and was never
+        // unit-tested at the broker_relay layer. This regression
+        // gate closes that gap.
+        let mut r = begun();
+        r.on_broker_frame(BrokerToCompositor::ConvPrompt {
+            style: PromptStyle::Secret,
+            message: "Please touch the device".into(),
+        })
+        .unwrap();
+        r.on_broker_frame(BrokerToCompositor::ConvPrompt {
+            style: PromptStyle::Secret,
+            message: "Password: ".into(),
+        })
+        .unwrap();
+        // Greeter responds to the FIRST prompt (the U2F cue) with
+        // empty — DMS sends `respond("")` for cues it cannot
+        // satisfy directly (no real U2F device present).
+        match r.on_pam_step(Some(String::new())).unwrap() {
+            Some(CompositorToBroker::ConvResponse { response }) => {
+                assert_eq!(
+                    response.expose(),
+                    "",
+                    "first greeter response (to pam_u2f cue) MUST forward as empty ConvResponse",
+                );
+            }
+            other => {
+                panic!("expected Some(ConvResponse{{empty}}) for first response, got {other:?}")
+            }
+        }
+        // Greeter responds to the SECOND prompt (the password) with
+        // the real auth token. pam_unix verifies; broker emits Success.
+        match r.on_pam_step(Some("hunter2".into())).unwrap() {
+            Some(CompositorToBroker::ConvResponse { response }) => {
+                assert_eq!(
+                    response.expose(),
+                    "hunter2",
+                    "second greeter response (to pam_unix password) MUST forward as ConvResponse(password)",
+                );
+            }
+            other => {
+                panic!("expected Some(ConvResponse{{hunter2}}) for second response, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
     fn third_step_after_two_pending_is_out_of_phase() {
         // After exactly N broker Challenges and N greeter responses,
         // an (N+1)-th greeter response without a new Challenge is a
