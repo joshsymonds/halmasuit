@@ -1,6 +1,47 @@
 //! The per-connection broker handler (Epic R6 core; Amendment A1
 //! frame routing).
 //!
+//! ## PAM conversation contract (Epic #24)
+//!
+//! The broker's wire protocol with the compositor encodes libpam's
+//! asymmetric conv contract directly: prompts (`PAM_PROMPT_ECHO_ON`/
+//! `PAM_PROMPT_ECHO_OFF`) are two-way (greeter MUST respond), while
+//! display-only messages (`PAM_TEXT_INFO`/`PAM_ERROR_MSG`) are one-way
+//! (`pam_response_t.resp = NULL`, conv returns `PAM_SUCCESS`). On the
+//! broker wire this materializes as two distinct frame types —
+//! [`BrokerToCompositor::ConvPrompt`] and
+//! [`BrokerToCompositor::ConvDisplay`] — with narrowed
+//! [`halmasuit_session_ipc::PromptStyle`] and
+//! [`halmasuit_session_ipc::DisplayStyle`]; constructing a response for
+//! a display is type-impossible.
+//!
+//! [`Relay::on_worker_readable`] gates its phase transition on which
+//! frame the worker emitted: `ConvPrompt → AwaitGreeterConvResponse`
+//! (worker blocks waiting for the response), `ConvDisplay → unchanged
+//! AwaitWorker` (worker did NOT block; it may emit another frame
+//! immediately). Match arms over `BrokerToCompositor` are exhaustive
+//! with nested or-patterns — NO `_ =>` default and NO `Conv(_)`
+//! absorber that would silently route a future variant to
+//! `UnexpectedFrame`. This is what prevents the gen-399 production
+//! failure class from recurring silently when libpam adds a new
+//! `msg_style`.
+//!
+//! Authoritative references for the contract:
+//!
+//! - `pam_conv(3)` — the manpage; the `pam_message`/`pam_response_t`
+//!   asymmetry comes straight from here.
+//! - Linux-PAM Application Developers' Guide §6.2 — conv function
+//!   semantics across all four `msg_style` codes.
+//! - OpenSSH `auth-pam.c` + `monitor_wrap_do_pam_account` — the
+//!   architectural ancestor of this privileged-broker conv proxy
+//!   (forked PAM child, conv relayed over a socket; the most
+//!   security-audited implementation of this exact shape).
+//! - greetd `protocol.md`
+//!   (<https://man.sr.ht/~kennylevinsen/greetd/protocol.md>) — the
+//!   compositor↔greeter wire contract (a `post_auth_message_response`
+//!   for every `auth_message`, which the compositor swallows for
+//!   display-class messages so the asymmetry survives end-to-end).
+//!
 //! Composes the already-built pieces — `AuthSlot` (R5 global single
 //! slot, evict-old, SO_PEERCRED relay-peer gate, churn throttle),
 //! `spawn_session_worker` (the Amendment-A1 one-handle `run_session`

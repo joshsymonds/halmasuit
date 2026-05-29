@@ -134,6 +134,9 @@ test-vm:
     echo "── session-onehandle ──"
     nix build .#checks.x86_64-linux.session-onehandle -L --print-build-logs --no-link
     echo
+    echo "── session-conv-shapes ──"
+    nix build .#checks.x86_64-linux.session-conv-shapes -L --print-build-logs --no-link
+    echo
     echo "── login-flash ──"
     nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link
     echo

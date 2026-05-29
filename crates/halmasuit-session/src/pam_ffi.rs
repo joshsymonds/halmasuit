@@ -1,5 +1,41 @@
 //! The libpam FFI shim — the crate's ONLY `unsafe` surface.
 //!
+//! ## PAM conversation contract (Epic #24)
+//!
+//! [`conv_trampoline`] translates libpam's four `pam_message::msg_style`
+//! codes into a [`crate::conv::MessageKind`] (a closed two-case sum:
+//! `Prompt(PromptStyle, message)` vs. `Display(DisplayStyle, message)`)
+//! and dispatches to the matching [`ConvResponder`] method:
+//!
+//! - **Prompts** (`PAM_PROMPT_ECHO_ON`/`PAM_PROMPT_ECHO_OFF`) → [`ConvResponder::respond`]
+//!   blocks for the greeter's response, fills `resp_array[i].resp`.
+//! - **Display-only** (`PAM_TEXT_INFO`/`PAM_ERROR_MSG`) → [`ConvResponder::display`]
+//!   fires the frame and returns immediately; the `resp_array[i].resp`
+//!   slot stays `NULL` (libpam's documented contract for these styles).
+//!
+//! Before Epic #24 the trampoline silently swallowed display messages
+//! (`continue` past them without forwarding). That left the greeter
+//! blind to PAM cues — `pam_u2f cue`'s "Please touch the device" never
+//! reached DMS — and the greeter's resulting proactive `ConvResponse`
+//! against an `AwaitWorker` broker phase caused the gen-399 production
+//! failure (`unexpected frame for the current phase`).
+//!
+//! The asymmetric forward IS the bug fix; the rest of the FFI safety
+//! construction (`catch_unwind` across `extern "C"`, null-guarded
+//! pointer walks, `libc::calloc`/`strdup` paired with libpam's `free`,
+//! `Zeroizing` of credential buffers, interior-NUL rejection,
+//! partial-failure rollback) is preserved unchanged from
+//! `halmasuit-pam`'s `bridge_conv` (Epic R14).
+//!
+//! Authoritative references for the contract: `pam_conv(3)`; Linux-PAM
+//! Application Developers' Guide §6.2; OpenSSH `auth-pam.c` (the
+//! architectural ancestor — the privileged-broker conv proxy was
+//! modelled on its monitor); greetd `protocol.md` (the
+//! compositor↔greeter wire that lives on the other side of the broker
+//! boundary, which mandates `post_auth_message_response` for every
+//! `auth_message` — the compositor swallows it for display-class
+//! messages so the asymmetry survives end-to-end).
+//!
 //! Successor to `halmasuit-pam`'s FFI (Epic #1 R2/R14): the audited
 //! unsafe marshalling techniques (`catch_unwind` across the C boundary,
 //! null-guarded pointer walks, `libc::calloc`/`strdup` paired with

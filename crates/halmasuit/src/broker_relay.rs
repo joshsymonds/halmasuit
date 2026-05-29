@@ -98,11 +98,25 @@ impl std::error::Error for RelayError {}
 /// (`service` + the client-supplied `username`). The authoritative
 /// identity is NEVER this `username`: it is the broker's PAM-resolved
 /// `Success{username,uid,gid}`, passed through verbatim (Epic R8).
+///
+/// Epic #24 invariant: `awaiting_display_ack` names whether the last
+/// frame we forwarded to the greeter was a [`BrokerToCompositor::ConvDisplay`]
+/// (display-class, one-way on the broker wire). When set, the next
+/// `on_pam_step` MUST return `None` — DMS sends a greetd
+/// `PostAuthMessageResponse` for every `auth_message` regardless of
+/// type, and the compositor's job is to swallow that response for
+/// display-class messages so it never crosses the broker boundary
+/// (the broker stays in `AwaitWorker`; see `crates/halmasuit-session/
+/// src/broker.rs` `on_worker_readable`'s `ConvDisplay` arm).
 #[derive(Debug)]
 pub struct BrokerRelay {
     service: String,
     username: String,
     phase: Phase,
+    /// Set on `ConvDisplay` forward, cleared on `ConvPrompt` forward.
+    /// Read by `on_pam_step` to decide swallow-vs-forward; cleared
+    /// after a swallow so the next conv turn is unambiguous.
+    awaiting_display_ack: bool,
 }
 
 impl BrokerRelay {
@@ -115,35 +129,54 @@ impl BrokerRelay {
             service,
             username,
             phase: Phase::PreAuth,
+            awaiting_display_ack: false,
         }
     }
 
     /// Translate a `halmasuit-greetd` `PamSession::step(response)` call
-    /// into the outbound broker frame.
+    /// into the outbound broker frame, OR `None` if the response is
+    /// for a display-class message and must be swallowed.
     ///
-    /// - `PreAuth`: emits `BeginAuth` (the greetd state machine's
-    ///   initial `step(None)`); `response` is unused here.
-    /// - `Authing`: emits `ConvResponse`. `None` (Info/Error prompts
-    ///   that collect nothing) maps to an empty `Secret` so the
-    ///   conversation turn still advances.
+    /// - `PreAuth`: emits `Some(BeginAuth)` (the greetd state
+    ///   machine's initial `step(None)`); `response` is unused here.
+    /// - `Authing`:
+    ///   - If `awaiting_display_ack` is set (the last frame the
+    ///     compositor forwarded to the greeter was a `ConvDisplay`),
+    ///     returns `None` — Epic #24 R5: the broker stays in
+    ///     `AwaitWorker`, and DMS's `respond("")` MUST NOT be
+    ///     forwarded as a `ConvResponse`. The flag is cleared.
+    ///   - Otherwise emits `Some(ConvResponse{...})`. `None` content
+    ///     (a greeter that sends a no-payload response for an
+    ///     unrecognized prompt) maps to an empty `Secret`.
     ///
     /// # Errors
     /// [`RelayError::OutOfPhase`] if called after auth completed.
     pub fn on_pam_step(
         &mut self,
         response: Option<String>,
-    ) -> Result<CompositorToBroker, RelayError> {
+    ) -> Result<Option<CompositorToBroker>, RelayError> {
         match self.phase {
             Phase::PreAuth => {
                 self.phase = Phase::Authing;
-                Ok(CompositorToBroker::BeginAuth {
+                Ok(Some(CompositorToBroker::BeginAuth {
                     service: self.service.clone(),
                     username: self.username.clone(),
-                })
+                }))
             }
-            Phase::Authing => Ok(CompositorToBroker::ConvResponse {
-                response: Secret::new(response.unwrap_or_default()),
-            }),
+            Phase::Authing => {
+                if self.awaiting_display_ack {
+                    // Epic #24 R5: swallow the greetd-side response to
+                    // a display-class auth_message. The broker stays
+                    // in AwaitWorker; the worker (which is NOT blocked
+                    // — `display()` returned immediately) drives the
+                    // next conv message or PAM step.
+                    self.awaiting_display_ack = false;
+                    return Ok(None);
+                }
+                Ok(Some(CompositorToBroker::ConvResponse {
+                    response: Secret::new(response.unwrap_or_default()),
+                }))
+            }
             Phase::Authed | Phase::Starting | Phase::Running | Phase::Done => {
                 Err(RelayError::OutOfPhase)
             }
@@ -160,7 +193,10 @@ impl BrokerRelay {
         match (self.phase, frame) {
             // Auth conversation: a prompt keeps us in Authing.
             // Greeter MUST answer (greetd post_auth_message_response).
+            // Epic #24 R5: clear the display-ack flag — the next
+            // greeter response is a real ConvResponse to be forwarded.
             (Phase::Authing, BrokerToCompositor::ConvPrompt { style, message }) => {
+                self.awaiting_display_ack = false;
                 Ok(RelayEvent::Pam(PamStep::Challenge {
                     kind: prompt_to_kind(style),
                     prompt: message,
@@ -169,12 +205,12 @@ impl BrokerRelay {
             // Auth conversation: a display-only message keeps us in
             // Authing too. The greetd wire protocol still mandates a
             // post_auth_message_response from the greeter (DMS sends
-            // `respond("")`); Epic #24 R5 makes the compositor swallow
-            // that response so it never crosses the broker wire — that
-            // swallow lives in broker_session.rs (frame I/O), not here
-            // (state-machine logic). The PamStep is the same shape: a
-            // greetd AuthMessage with the display kind.
+            // `respond("")`); Epic #24 R5: arm the display-ack swallow
+            // so the next `on_pam_step` returns None instead of
+            // forwarding a stale ConvResponse to the broker (which is
+            // in AwaitWorker — see broker.rs's ConvDisplay arm).
             (Phase::Authing, BrokerToCompositor::ConvDisplay { style, message }) => {
+                self.awaiting_display_ack = true;
                 Ok(RelayEvent::Pam(PamStep::Challenge {
                     kind: display_to_kind(style),
                     prompt: message,
@@ -309,36 +345,87 @@ mod tests {
         let mut r = relay();
         assert_eq!(
             r.on_pam_step(None).unwrap(),
-            CompositorToBroker::BeginAuth {
+            Some(CompositorToBroker::BeginAuth {
                 service: "halmasuit".into(),
                 username: "alice".into(),
-            }
+            })
         );
     }
 
     #[test]
     fn step_with_response_emits_conv_response() {
+        // Plain prompt path: no display has been forwarded, so the
+        // greeter's response IS a real ConvResponse to be forwarded.
         let mut r = begun();
+        // Drive a prompt through `on_broker_frame` first so the
+        // awaiting_display_ack flag is in its post-prompt state
+        // (false). This models the real flow: broker → ConvPrompt →
+        // greeter → response → on_pam_step.
+        r.on_broker_frame(BrokerToCompositor::ConvPrompt {
+            style: PromptStyle::Secret,
+            message: "pw".into(),
+        })
+        .unwrap();
         let frame = r.on_pam_step(Some("hunter2".into())).unwrap();
         match frame {
-            CompositorToBroker::ConvResponse { response } => {
+            Some(CompositorToBroker::ConvResponse { response }) => {
                 assert_eq!(response.expose(), "hunter2");
             }
-            other => panic!("expected ConvResponse, got {other:?}"),
+            other => panic!("expected Some(ConvResponse), got {other:?}"),
         }
     }
 
     #[test]
-    fn info_prompt_response_none_maps_to_empty_secret() {
-        // PAM_TEXT_INFO/PAM_ERROR_MSG collect nothing; greetd passes
-        // response:None. The turn must still advance — empty Secret.
+    fn display_response_is_swallowed_not_forwarded_to_broker() {
+        // Epic #24 R5: after the broker has forwarded a ConvDisplay
+        // to the greeter, the greeter's mandated greetd-side response
+        // MUST NOT cross the broker boundary. `on_pam_step` returns
+        // `Ok(None)` (swallow); the broker is in `AwaitWorker` and
+        // sending a ConvResponse would trigger UnexpectedFrame.
+        //
+        // This test pins the EXACT behaviour the gen-399 production
+        // bug was caused by drifting from.
         let mut r = begun();
-        match r.on_pam_step(None).unwrap() {
-            CompositorToBroker::ConvResponse { response } => {
-                assert_eq!(response.expose(), "");
-            }
-            other => panic!("expected ConvResponse, got {other:?}"),
-        }
+        r.on_broker_frame(BrokerToCompositor::ConvDisplay {
+            style: DisplayStyle::Info,
+            message: "Please touch the device".into(),
+        })
+        .unwrap();
+        // DMS sends `Greetd.respond("")` for every greetd auth_message
+        // regardless of type. The compositor lifts that as
+        // `Action::Pam { response: Some("") }` (or None depending on
+        // the greeter), and `on_pam_step` MUST swallow it.
+        assert_eq!(
+            r.on_pam_step(Some(String::new())).unwrap(),
+            None,
+            "ConvDisplay response MUST be swallowed (R5)"
+        );
+        // After the swallow, the flag is cleared: the next conv
+        // (e.g. a real prompt) is forwarded normally.
+        r.on_broker_frame(BrokerToCompositor::ConvPrompt {
+            style: PromptStyle::Secret,
+            message: "Password: ".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            r.on_pam_step(Some("hunter2".into())).unwrap(),
+            Some(CompositorToBroker::ConvResponse { .. })
+        ));
+    }
+
+    #[test]
+    fn display_response_swallowed_even_if_greeter_sends_response_none() {
+        // Defensive: some greeters could send a None-content response
+        // for a display message rather than an empty string. The
+        // swallow MUST trigger on the awaiting_display_ack flag, not
+        // on the content of the response.
+        let mut r = begun();
+        r.on_broker_frame(BrokerToCompositor::ConvDisplay {
+            style: DisplayStyle::Error,
+            message: "Authentication failure".into(),
+        })
+        .unwrap();
+        assert_eq!(r.on_pam_step(None).unwrap(), None);
     }
 
     // ── inbound: BrokerToCompositor → RelayEvent ─────────────────────
@@ -413,7 +500,7 @@ mod tests {
         })
         .unwrap();
         let cr = r.on_pam_step(Some("pw".into())).unwrap();
-        assert!(matches!(cr, CompositorToBroker::ConvResponse { .. }));
+        assert!(matches!(cr, Some(CompositorToBroker::ConvResponse { .. })));
         r.on_broker_frame(BrokerToCompositor::Success {
             username: "alice.canonical".into(),
             uid: 1001,

@@ -810,6 +810,17 @@
           inherit nixpkgs;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
         };
+        # PAM conversation-contract corpus (regression gate for the
+        # gen-399 production failure on gnomon: `pam_u2f cue + pam_unix`
+        # → broker "unexpected frame for the current phase"). Uses
+        # pam_echo + pam_unix `try_first_pass` to deterministically
+        # emit `PAM_TEXT_INFO → PAM_PROMPT_ECHO_OFF`, mirroring the
+        # production U2F conv shape without needing a real device.
+        session-conv-shapes = import ./tests/session-conv-shapes.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+        };
         drm-master-probe = import ./tests/drm-master-probe.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
