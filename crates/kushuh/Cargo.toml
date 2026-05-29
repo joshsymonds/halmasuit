@@ -13,6 +13,10 @@ workspace = true
 
 [dependencies]
 # Error enums for config-model validation (Region bounds, and the
-# Role/Perspective/Config validation that follows). KDL / smithay /
-# wayland deps arrive in later tasks; the domain model is pure data.
+# Role/System/Config validation). smithay / wayland deps arrive in
+# Phase 2; the domain model is pure data.
 thiserror.workspace = true
+# KDL v2 config parser. Hand-written KdlDocument→types conversion lives in
+# `src/config/parse.rs`; the `span` feature (kept on by default) carries
+# source spans into our `ParseError` for actionable diagnostics.
+kdl.workspace = true

@@ -72,10 +72,13 @@ design pass.
 4. **`Config`** ✅ — the top-level model: a non-empty, uniquely-named set
    of systems, with `system(name)` lookup. Schema-agnostic resolved form;
    no default/startup-system concept yet (add when the engine needs it).
-5. **KDL parser** — add the official `kdl` crate (KDL v2 spec) and
-   hand-write the `KdlDocument`→types conversion with span-aware,
-   actionable errors. The three `ARCHITECTURE.md` example configs
-   (`code` / `meeting` / `reading`) become acceptance fixtures.
+5. **KDL parser** ◐ — hand-written `KdlDocument`→types conversion over
+   the official `kdl` crate (v6, KDL v2), with span-aware `ParseError`s.
+   Schema is **B+** (see resolved fork). Done so far: `region` anchors,
+   `system`/`role` nodes, inline geometry or shared `region="…"`, and the
+   `sticky`/flex bindings. Pending (follow-up tasks): the `cycle` and
+   `pattern` binding kinds, and pinning the doc's three example configs
+   (`code` / `meeting` / `reading`) as acceptance fixtures.
 6. **Semantic validator** — reject incoherent configs (out-of-bounds /
    zero-area regions caught at `Region` construction; duplicate role
    names within a system; references to slots/roles that do not exist;
@@ -112,12 +115,18 @@ not a re-derivation of the model.
   *schema* (how that is written — shared slots + per-system bindings, vs
   fully-inline, vs a role pool by reference) is a parser concern, decided
   at the `Config`/parser task.
-- **Config schema / two write-forms** — pending at `Config`. The doc
-  shows roles both by reference (`roles "editor" "browser"`) and inline
-  (`role "x" { … }`); separately, the same slot shape may hold a
-  different app/profile per system. Whatever the source syntax, a
-  resolved `System` is `name + Vec<Role>`, so this is a parser/`Config`
-  decision, not a `System`-type one.
+- **Config schema / write-form** — RESOLVED as **B+** (at the parser,
+  after a three-agent prior-art/idiom/taste study). Roles are written
+  **inline** inside each `system` by default (locality: read one system
+  block, understand that whole desktop); an **optional** top-level
+  `region "name" { monitor; rect }` names geometry once so it can be
+  shared by reference (`role "x" region="name" { … }`). A role uses
+  *either* a `region="…"` reference *or* inline `monitor`+`rect`, never
+  both. Binding kind is the child node's name (`sticky`/`cycle`/`pattern`,
+  or none = flex); `profile=` and `title=` are properties. Rejected: pure
+  shared-slots (A — shatters per-system locality, FancyZones' documented
+  failure) and a role pool (C — worst of both). B+ = "A made optional":
+  share geometry where it repeats, keep bindings local.
 - **Cycle vs tabbed** — *deferred to the Phase 3 engine.* The model only
   stores the candidate list; how a role presents multiple windows (one
   slot holds *its* instance, not all windows of an app) is an engine

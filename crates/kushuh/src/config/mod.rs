@@ -23,10 +23,12 @@ use std::collections::HashSet;
 
 use thiserror::Error;
 
+mod parse;
 mod region;
 mod role;
 mod system;
 
+pub use parse::{ParseError, Span, parse};
 pub use region::{Region, RegionError};
 pub use role::{AppRef, Binding, BindingError, Role, RoleError};
 pub use system::{System, SystemError};
