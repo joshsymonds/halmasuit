@@ -951,6 +951,17 @@
           halmasuit-luks    = self.packages.x86_64-linux.halmasuit-luks;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
         };
+        # Epic #28 boot-suppression: the halmasuit-tty-graphics initrd
+        # oneshot must put /dev/tty1 in KD_GRAPHICS BEFORE halmasuit's
+        # first frame, and the kernel forensics in dmesg must stay
+        # intact (visual suppression only).
+        halmasuit-tty-graphics = import ./tests/halmasuit-tty-graphics.nix {
+          system            = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-luks    = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+        };
         # Phase B hard gate: real LUKS-backed VM, real PAM auth via
         # halmasuit-vm-client over the abstract @halmasuit-greetd
         # socket, full survival + chroot + greeter + auth → session.

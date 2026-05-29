@@ -1541,6 +1541,7 @@ in
      # its data files reachable before any post-pivot Wayland client.
      boot.initrd.systemd.storePaths = [
        "${cfg.package}/bin/halmasuit"
+       "${cfg.package}/bin/halmasuit-tty-graphics"
        "${cfg.luks.package}/bin/halmasuit-luks"
        "${pkgs.libglvnd}"
        "${pkgs.xkeyboard-config}"
@@ -1598,6 +1599,49 @@ in
      ) [
        "${cfg.wallpaper.fallback}"
      ];
+
+     # Plymouth-equivalent TTY graphics-mode switch.
+     #
+     # Issues `KDSETMODE → KD_GRAPHICS` on /dev/tty1 BEFORE the kernel
+     # auto-loads display drivers (notably `nvidia_drm` on H2). Once
+     # tty1 is in graphics mode the kernel framebuffer console stops
+     # rendering printk lines to the visible screen — so the t+1s
+     # `crng init done` and the t+6.6s `nvidia: loading out-of-tree
+     # module ...` lines that gen-399 displayed prominently vanish
+     # from physical-display visibility while remaining in dmesg /
+     # journal / serial console for forensics. Combined with
+     # `loglevel=1 rd.udev.log_priority=3 udev.log_level=3` on the
+     # kernel cmdline (set in `~/nix-config/hosts/gnomon/default.nix`),
+     # this is the boot-suppression mechanism that replaces what
+     # Plymouth does on Plymouth-bearing distros.
+     #
+     # Ordering: `Before=systemd-modules-load.service` puts us ahead
+     # of NVIDIA's nvidia_drm modprobe (driver init is what prints
+     # the visible-line message at t+6.6s). `Before=halmasuit.service`
+     # keeps the ordering strict even though halmasuit doesn't depend
+     # on the VT mode. `DefaultDependencies=no` prevents the unit
+     # being implicit-after'd into the wrong place by initrd's
+     # default dependency graph.
+     boot.initrd.systemd.services.halmasuit-tty-graphics = {
+       description = "Switch /dev/tty1 to KD_GRAPHICS (Plymouth-equivalent)";
+       wantedBy    = [ "initrd.target" ];
+       before      = [
+         "systemd-modules-load.service"
+         "halmasuit.service"
+         "initrd-switch-root.service"
+       ];
+       unitConfig = {
+         DefaultDependencies = false;
+         IgnoreOnIsolate     = true;
+       };
+       serviceConfig = {
+         Type            = "oneshot";
+         RemainAfterExit = true;
+         ExecStart       = "${cfg.package}/bin/halmasuit-tty-graphics";
+         StandardOutput  = "journal+console";
+         StandardError   = "journal+console";
+       };
+     };
 
      # The Phase B unit. Registered ONLY in initramfs systemd; the
      # rootfs side will observe the surviving PID via /proc but not

@@ -89,6 +89,9 @@ test-vm:
     echo "── initrd-survival ──"
     nix build .#checks.x86_64-linux.initrd-survival -L --print-build-logs --no-link
     echo
+    echo "── halmasuit-tty-graphics ──"
+    nix build .#checks.x86_64-linux.halmasuit-tty-graphics -L --print-build-logs --no-link
+    echo
     echo "── halmasuit-shutdown-probe-phase0 ──"
     nix build .#checks.x86_64-linux.halmasuit-shutdown-probe-phase0 -L --print-build-logs --no-link
     echo
