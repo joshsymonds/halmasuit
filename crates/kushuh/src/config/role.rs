@@ -254,9 +254,19 @@ mod tests {
     // --- Binding ---
 
     #[test]
-    fn sticky_binding_holds_one_instance() {
-        let app = AppRef::new("kitty", None).expect("valid");
-        assert_eq!(Binding::Sticky(app.clone()), Binding::Sticky(app));
+    fn sticky_binding_distinguishes_apps_and_profiles() {
+        let code = AppRef::new("firefox", Some("code".to_owned())).expect("valid");
+        let personal = AppRef::new("firefox", Some("personal".to_owned())).expect("valid");
+        // Same app, different profile → distinct bindings (separate state).
+        assert_ne!(
+            Binding::Sticky(code.clone()),
+            Binding::Sticky(personal),
+            "a code Firefox and a personal Firefox must not be equal",
+        );
+        // Equality is by value (app_id + profile), not identity: a freshly
+        // built equal AppRef compares equal — catches a dropped field in eq.
+        let rebuilt = AppRef::new("firefox", Some("code".to_owned())).expect("valid");
+        assert_eq!(Binding::Sticky(code), Binding::Sticky(rebuilt));
     }
 
     #[test]

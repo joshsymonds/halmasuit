@@ -87,25 +87,14 @@ impl ParseError {
     }
 }
 
-impl Config {
-    /// Parse a KDL source string into a validated [`Config`].
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ParseError`] (with a source span where known) for
-    /// malformed KDL, an unrecognised schema, or a config that violates
-    /// the model's invariants (bad region, duplicate names, …).
-    pub fn from_kdl(src: &str) -> Result<Self, ParseError> {
-        parse(src)
-    }
-}
-
-/// Parse a KDL source string into a validated [`Config`]. See
-/// [`Config::from_kdl`].
+/// Parse a KDL source string into a validated [`Config`]. This is the
+/// crate's single config entry point.
 ///
 /// # Errors
 ///
-/// See [`Config::from_kdl`].
+/// Returns a [`ParseError`] (with a source span where known) for malformed
+/// KDL, an unrecognised schema, or a config that violates the model's
+/// invariants (bad region, duplicate names, …).
 pub fn parse(src: &str) -> Result<Config, ParseError> {
     let doc: KdlDocument = src.parse().map_err(|e| kdl_syntax_error(&e))?;
 
