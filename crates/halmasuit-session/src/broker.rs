@@ -179,9 +179,23 @@ impl Relay {
         let (pm, leader_pidfd): (ParentMessage, Option<OwnedFd>) =
             recv_frame_with_fd(slot.current().ok_or(BrokerError::WorkerGone)?.channel())?;
         match pm {
+            // Epic #24 R4: a Prompt frame requires a response — advance
+            // to the greeter-await phase. A Display frame is one-way,
+            // so the broker stays in AwaitWorker because the worker
+            // hasn't blocked (it called `display()` which returns
+            // immediately) and is already processing the next conv
+            // message or PAM step.
             ParentMessage::Conv(prompt @ BrokerToCompositor::ConvPrompt { .. }) => {
                 compositor.send(&prompt)?;
                 self.phase = RelayPhase::AwaitGreeterConvResponse;
+                Ok(RelayStep::Continue)
+            }
+            ParentMessage::Conv(display @ BrokerToCompositor::ConvDisplay { .. }) => {
+                compositor.send(&display)?;
+                // Phase invariant unchanged: still AwaitWorker. The
+                // worker did NOT block in display(); the next worker
+                // frame (another conv, a Success, a Failure, etc.)
+                // may arrive immediately.
                 Ok(RelayStep::Continue)
             }
             ParentMessage::Outcome(WorkerOutcome::AuthOk { username, uid, gid }) => {
@@ -225,11 +239,25 @@ impl Relay {
                 })?;
                 Ok(RelayStep::Finished(Disposition::AuthFailed { reason }))
             }
-            // Out of phase: the worker only ever relays a ConvPrompt
-            // (Success/Failure on the BrokerToCompositor side are
-            // broker→greeter only); and `Success` is the auth-only
-            // worker variant `spawn_session_worker` never emits.
-            ParentMessage::Conv(_) | ParentMessage::Outcome(WorkerOutcome::Success { .. }) => {
+            // Epic #24 R4: nested or-patterns enumerate every non-conv
+            // BrokerToCompositor variant explicitly. NO `_ =>` and NO
+            // `Conv(_)` absorbing pattern: adding a future variant MUST
+            // be a compile error here, not a silent swallow (the
+            // failure mode behind gen 399). The worker only ever emits
+            // ConvPrompt or ConvDisplay inside a Conv; broker→greeter
+            // lifecycle variants are not valid here.
+            // WorkerOutcome::Success is the auth-only variant
+            // `spawn_session_worker` never emits — but if the wire
+            // produced it, it's out of phase too.
+            ParentMessage::Conv(
+                BrokerToCompositor::Success { .. }
+                | BrokerToCompositor::Failure { .. }
+                | BrokerToCompositor::SessionOpened
+                | BrokerToCompositor::SessionEnded { .. }
+                | BrokerToCompositor::RootFd
+                | BrokerToCompositor::GreeterSpawned { .. },
+            )
+            | ParentMessage::Outcome(WorkerOutcome::Success { .. }) => {
                 Err(BrokerError::UnexpectedFrame)
             }
         }
@@ -911,7 +939,7 @@ mod tests {
     use crate::transport::SeqpacketChannel;
     use crate::worker::{WorkerOutcome, spawn_worker};
     use halmasuit_session_ipc::{
-        BrokerToCompositor, CompositorToBroker, PromptStyle, Secret, SessionOutcome,
+        BrokerToCompositor, CompositorToBroker, DisplayStyle, PromptStyle, Secret, SessionOutcome,
     };
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
     use std::thread;
@@ -1565,5 +1593,201 @@ mod tests {
             entry_b.suppressed, 0,
             "first refusal from a different uid must log, not inherit"
         );
+    }
+
+    #[test]
+    fn step_machine_convdisplay_keeps_phase_in_await_worker() {
+        // Epic #24 R4: a `ConvDisplay` from the worker is forwarded to
+        // the compositor but the broker MUST NOT advance phase. The
+        // worker has NOT blocked on a response (display() returns
+        // immediately); the next worker frame may follow immediately.
+        let mut slot = AuthSlot::new(GREETER, 5, Duration::from_secs(10));
+        slot.create(GREETER, || {
+            spawn_worker(|w| {
+                // Worker emits one display frame, then a Success
+                // outcome (the simplest happy path after a display).
+                w.send(&BrokerToCompositor::ConvDisplay {
+                    style: DisplayStyle::Info,
+                    message: "Please touch the device".into(),
+                })
+                .unwrap();
+                w.send(&WorkerOutcome::AuthOk {
+                    username: "alice".into(),
+                    uid: 1001,
+                    gid: 1001,
+                })
+                .unwrap();
+                let _: Result<CompositorToBroker, _> = w.recv();
+            })
+        })
+        .unwrap();
+
+        let (greeter, broker_end) = pair();
+        let gt = thread::spawn(move || {
+            // Greeter receives the display frame. It MUST NOT respond
+            // — the wire contract for display is one-way (the
+            // compositor swallows DMS's greetd-side
+            // PostAuthMessageResponse; that swallow lives in
+            // broker_session.rs, not exercised here).
+            assert_eq!(
+                greeter.recv::<BrokerToCompositor>().unwrap(),
+                BrokerToCompositor::ConvDisplay {
+                    style: DisplayStyle::Info,
+                    message: "Please touch the device".into(),
+                }
+            );
+            // Then the success frame, which IS expected to advance phase.
+            assert!(matches!(
+                greeter.recv::<BrokerToCompositor>().unwrap(),
+                BrokerToCompositor::Success { .. }
+            ));
+        });
+
+        let mut r = Relay::new();
+        assert_eq!(r.phase(), RelayPhase::AwaitWorker);
+        // Worker→broker: ConvDisplay. Forwarded; phase UNCHANGED.
+        assert_eq!(
+            r.on_worker_readable(&slot, &broker_end).unwrap(),
+            RelayStep::Continue
+        );
+        assert_eq!(
+            r.phase(),
+            RelayPhase::AwaitWorker,
+            "ConvDisplay must NOT advance the broker's phase \
+             (Epic #24 R4: worker did not block; broker still waits \
+             on the worker, not on the greeter)"
+        );
+        // Worker→broker: AuthOk. THIS advances phase (existing path).
+        assert_eq!(
+            r.on_worker_readable(&slot, &broker_end).unwrap(),
+            RelayStep::Continue
+        );
+        assert_eq!(r.phase(), RelayPhase::AwaitGreeterStartSession);
+        gt.join().unwrap();
+    }
+
+    #[test]
+    fn step_machine_convdisplay_then_convprompt_in_sequence_advances_to_convresponse() {
+        // Mirrors the production gen-399 conv shape: `pam_u2f cue`
+        // emits a display ("Please touch the device"), and `pam_unix`
+        // emits a prompt ("Password: "). The broker MUST stay in
+        // AwaitWorker through the display and ONLY advance to
+        // AwaitGreeterConvResponse on the prompt.
+        let mut slot = AuthSlot::new(GREETER, 5, Duration::from_secs(10));
+        slot.create(GREETER, || {
+            spawn_worker(|w| {
+                w.send(&BrokerToCompositor::ConvDisplay {
+                    style: DisplayStyle::Info,
+                    message: "Please touch the device".into(),
+                })
+                .unwrap();
+                w.send(&BrokerToCompositor::ConvPrompt {
+                    style: PromptStyle::Secret,
+                    message: "Password: ".into(),
+                })
+                .unwrap();
+                // Wait for the greeter's response then exit.
+                let _: Result<CompositorToBroker, _> = w.recv();
+            })
+        })
+        .unwrap();
+
+        let (greeter, broker_end) = pair();
+        let gt = thread::spawn(move || {
+            assert_eq!(
+                greeter.recv::<BrokerToCompositor>().unwrap(),
+                BrokerToCompositor::ConvDisplay {
+                    style: DisplayStyle::Info,
+                    message: "Please touch the device".into(),
+                }
+            );
+            assert_eq!(
+                greeter.recv::<BrokerToCompositor>().unwrap(),
+                BrokerToCompositor::ConvPrompt {
+                    style: PromptStyle::Secret,
+                    message: "Password: ".into(),
+                }
+            );
+            // Respond to the prompt — display has no response path.
+            greeter
+                .send(&CompositorToBroker::ConvResponse {
+                    response: Secret::new("hunter2".into()),
+                })
+                .unwrap();
+        });
+
+        let mut r = Relay::new();
+        // ConvDisplay → phase stays AwaitWorker.
+        r.on_worker_readable(&slot, &broker_end).unwrap();
+        assert_eq!(r.phase(), RelayPhase::AwaitWorker);
+        // ConvPrompt → NOW advances.
+        r.on_worker_readable(&slot, &broker_end).unwrap();
+        assert_eq!(r.phase(), RelayPhase::AwaitGreeterConvResponse);
+        // Greeter responds → back to AwaitWorker.
+        r.on_greeter_readable(&slot, &broker_end).unwrap();
+        assert_eq!(r.phase(), RelayPhase::AwaitWorker);
+        gt.join().unwrap();
+    }
+
+    #[test]
+    fn step_machine_two_convdisplays_in_sequence_both_stay_in_await_worker() {
+        // Batched display sequence: e.g., an info banner followed by
+        // an error banner before the next conv message. Both must
+        // forward AND both must leave phase AwaitWorker.
+        let mut slot = AuthSlot::new(GREETER, 5, Duration::from_secs(10));
+        slot.create(GREETER, || {
+            spawn_worker(|w| {
+                w.send(&BrokerToCompositor::ConvDisplay {
+                    style: DisplayStyle::Info,
+                    message: "first".into(),
+                })
+                .unwrap();
+                w.send(&BrokerToCompositor::ConvDisplay {
+                    style: DisplayStyle::Error,
+                    message: "second".into(),
+                })
+                .unwrap();
+                w.send(&WorkerOutcome::Failure {
+                    reason: "denied".into(),
+                })
+                .unwrap();
+            })
+        })
+        .unwrap();
+
+        let (greeter, broker_end) = pair();
+        let gt = thread::spawn(move || {
+            for expected in [
+                BrokerToCompositor::ConvDisplay {
+                    style: DisplayStyle::Info,
+                    message: "first".into(),
+                },
+                BrokerToCompositor::ConvDisplay {
+                    style: DisplayStyle::Error,
+                    message: "second".into(),
+                },
+                BrokerToCompositor::Failure {
+                    reason: "denied".into(),
+                },
+            ] {
+                assert_eq!(greeter.recv::<BrokerToCompositor>().unwrap(), expected);
+            }
+        });
+
+        let mut r = Relay::new();
+        r.on_worker_readable(&slot, &broker_end).unwrap();
+        assert_eq!(r.phase(), RelayPhase::AwaitWorker);
+        r.on_worker_readable(&slot, &broker_end).unwrap();
+        assert_eq!(r.phase(), RelayPhase::AwaitWorker);
+        let fin = r.on_worker_readable(&slot, &broker_end).unwrap();
+        assert!(matches!(
+            fin,
+            RelayStep::Finished(Disposition::AuthFailed { .. })
+        ));
+        let RelayStep::Finished(disp) = fin else {
+            unreachable!()
+        };
+        reap_for_disposition(&mut slot, &disp);
+        gt.join().unwrap();
     }
 }
