@@ -24,6 +24,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::Mutex;
+
 use serde::{Deserialize, Serialize};
 
 /// State-transition events emitted by halmasuit during its lifetime.
@@ -456,13 +458,47 @@ pub enum ShutdownReason {
     Internal,
 }
 
-/// Emit a state-transition event through `tracing`.
+/// An in-process listener invoked by [`emit`] after the event is logged.
 ///
-/// Thread-safe: `tracing` is thread-safe by design; `emit` may be called from
-/// any thread without external synchronization.
+/// `Send` (not `Send + Sync`): the production listener captures a
+/// `calloop::channel::Sender`, which wraps `std::sync::mpsc::Sender` and is
+/// `Send` but **not** `Sync`. A [`Mutex`]-guarded registry (vs an `RwLock`)
+/// needs only `Send` from its contents to be `Sync` itself, which is what
+/// lets these live in a `static`.
+type Listener = Box<dyn Fn(&Event) + Send>;
+
+/// Process-global registry of in-process [`Event`] listeners.
 ///
-/// If no `tracing` subscriber is installed, this is a silent no-op (per
-/// `tracing`'s default behavior).
+/// `const`-initialized so the no-listener path costs only an uncontended
+/// lock. Registration happens once at startup ([`register_listener`]);
+/// [`emit`] takes the lock and fans out after logging.
+static LISTENERS: Mutex<Vec<Listener>> = Mutex::new(Vec::new());
+
+/// Register an in-process listener that [`emit`] invokes with each event
+/// AFTER it is logged to tracing.
+///
+/// The listener must be non-blocking and must NOT call [`emit`] (it runs
+/// while the registry lock is held — a synchronous re-entry would
+/// deadlock). The production listener only does a non-blocking channel
+/// send onto the compositor's calloop loop.
+pub fn register_listener(listener: impl Fn(&Event) + Send + 'static) {
+    LISTENERS
+        .lock()
+        .expect("introspect listener registry poisoned")
+        .push(Box::new(listener));
+}
+
+/// Emit a state-transition event: log it through `tracing`, then fan it
+/// out to any registered in-process [`listeners`](register_listener).
+///
+/// Thread-safe: `tracing` is thread-safe by design; `emit` may be called
+/// from any thread without external synchronization.
+///
+/// The tracing log happens FIRST, unconditionally — the journald
+/// observability contract (`login-flash` / `assert_no_flash_stream`) must
+/// never sit behind the fallible in-process fan-out. If no `tracing`
+/// subscriber is installed, the log is a silent no-op (per `tracing`); if
+/// no listener is registered, the fan-out is a no-op over an empty list.
 ///
 /// Serialization failure — which should be unreachable given that all
 /// [`Event`] variants are simple data structures — is logged via
@@ -480,12 +516,50 @@ pub fn emit(event: &Event) {
             );
         }
     }
+    // Fan out AFTER logging. Listeners run while the lock is held; they
+    // must be non-blocking and must not re-enter `emit` (see
+    // `register_listener`).
+    let listeners = LISTENERS
+        .lock()
+        .expect("introspect listener registry poisoned");
+    for listener in listeners.iter() {
+        listener(event);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, Foreground, LayerRole, Phase, SessionExit, ShutdownReason, emit};
+    use super::{
+        Event, Foreground, LayerRole, Phase, SessionExit, ShutdownReason, emit, register_listener,
+    };
     use serde_json::Value;
+    use std::sync::{Arc, Mutex};
+
+    /// A `tracing-subscriber`-compatible writer that accumulates bytes
+    /// into a shared buffer the test can inspect after the fact. Shared by
+    /// the tracing-routing and log-before-fan-out tests.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture lock poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     fn round_trip(event: &Event) -> Value {
         let s = serde_json::to_string(event).expect("Event serialization is infallible");
@@ -817,33 +891,6 @@ mod tests {
 
     #[test]
     fn emit_routes_through_tracing_subscriber() {
-        use std::sync::{Arc, Mutex};
-
-        // A `tracing-subscriber`-compatible writer that accumulates bytes
-        // into a shared buffer the test can inspect after the fact.
-        #[derive(Clone, Default)]
-        struct Capture(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for Capture {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .expect("capture lock poisoned")
-                    .extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-            type Writer = Self;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
         let capture = Capture::default();
         let subscriber = tracing_subscriber::fmt()
             .json()
@@ -876,5 +923,68 @@ mod tests {
             "expected target 'halmasuit::event' in: {captured}"
         );
         assert!(captured.contains("99"), "expected pid '99' in: {captured}");
+    }
+
+    #[test]
+    fn registered_listener_receives_emitted_event() {
+        // The registry is process-global. We assert additively (filter by
+        // the exact event we emit) so the test is order-independent and
+        // tolerant of other tests' emits sharing the process under
+        // `cargo test` (nextest isolates per-process regardless).
+        let received: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        register_listener(move |event| sink.lock().expect("sink poisoned").push(event.clone()));
+
+        // A pid unlikely to collide with any other test's emit.
+        let marker = Event::GreeterSpawned { pid: 31_337 };
+        emit(&marker);
+
+        // Clone out so the registry-sink guard releases before the assert.
+        let got = received.lock().expect("sink poisoned").clone();
+        assert!(
+            got.contains(&marker),
+            "registered listener must receive the emitted event; got {got:?}",
+        );
+    }
+
+    #[test]
+    fn emit_logs_before_fanning_out_to_listeners() {
+        // Prove the journald-observability contract: the tracing line is
+        // written BEFORE listeners run. The listener reads the shared
+        // capture buffer at fire time; if logging happened first, the
+        // buffer is already non-empty. Filtered to our unique marker so
+        // foreign emits (under cargo test) can't set the flag.
+        let capture = Capture::default();
+        let cap_for_listener = capture.clone();
+        let log_present_at_listener_time: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let flag = Arc::clone(&log_present_at_listener_time);
+
+        let marker = Event::Fatal {
+            message: "ordering-probe-7f3a".to_owned(),
+        };
+        let marker_for_listener = marker.clone();
+        register_listener(move |event| {
+            if *event != marker_for_listener {
+                return;
+            }
+            let buffer = cap_for_listener.0.lock().expect("capture poisoned");
+            let mut slot = flag.lock().expect("flag poisoned");
+            if slot.is_none() {
+                *slot = Some(!buffer.is_empty());
+            }
+        });
+
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || emit(&marker));
+
+        let observed = *log_present_at_listener_time.lock().expect("flag poisoned");
+        assert_eq!(
+            observed,
+            Some(true),
+            "listener must run AFTER the tracing log is written (log-first contract)",
+        );
     }
 }
