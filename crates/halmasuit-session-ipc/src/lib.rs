@@ -71,19 +71,52 @@ impl<'de> Deserialize<'de> for Secret {
     }
 }
 
-/// PAM conversation message style — which UI the greeter should present.
-/// Mirrors libpam's four `pam_message` styles (echo-on / echo-off /
-/// text-info / error-msg).
+/// Style of a PAM conversation **prompt** — a message that REQUIRES a greeter response.
+///
+/// Mirrors libpam's two prompt-class `msg_style` codes:
+/// `PAM_PROMPT_ECHO_ON` and `PAM_PROMPT_ECHO_OFF`. Deliberately
+/// narrowed to the prompt class; display-only messages
+/// (`PAM_TEXT_INFO`/`PAM_ERROR_MSG`) use [`DisplayStyle`] and travel as
+/// [`BrokerToCompositor::ConvDisplay`] (one-way, never carries a
+/// response). The split is type-enforced — at compile time a
+/// `Display`-style message cannot accidentally reach a code path that
+/// expects a [`CompositorToBroker::ConvResponse`].
+///
+/// Reference: `pam_conv(3)` and Linux-PAM Application Developers' Guide
+/// §6.2. The asymmetry comes directly from libpam: prompts fill
+/// `pam_response_t.resp`; display-only messages MUST set `resp = NULL`
+/// and the conv MUST still return `PAM_SUCCESS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptStyle {
-    /// Echoing prompt (PAM_PROMPT_ECHO_ON).
+    /// Echoing prompt (`PAM_PROMPT_ECHO_ON`) — usernames, OTPs.
     Visible,
-    /// Non-echoing prompt (PAM_PROMPT_ECHO_OFF) — passwords.
+    /// Non-echoing prompt (`PAM_PROMPT_ECHO_OFF`) — passwords.
     Secret,
-    /// Informational text (PAM_TEXT_INFO); no response collected.
+}
+
+/// Style of a PAM conversation **display-only message** — one-way to the greeter, never carries a response.
+///
+/// Mirrors libpam's two display-class `msg_style` codes:
+/// `PAM_TEXT_INFO` and `PAM_ERROR_MSG`. Display messages travel as
+/// [`BrokerToCompositor::ConvDisplay`] — distinct from
+/// [`BrokerToCompositor::ConvPrompt`] precisely so the type system
+/// makes a `ConvResponse`-for-a-`ConvDisplay` impossible to construct.
+/// The greetd wire protocol DOES mandate a `post_auth_message_response`
+/// per `auth_message` — the compositor translates `ConvDisplay` into a
+/// greetd info/error `auth_message` for the greeter, receives the
+/// greeter's required (but content-empty) response, and **swallows**
+/// that response so it never crosses the broker boundary. Inside the
+/// broker wire, display is strictly one-way.
+///
+/// Reference: `pam_conv(3)`; greetd `protocol.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayStyle {
+    /// Informational text (`PAM_TEXT_INFO`) — e.g. `pam_u2f cue`'s
+    /// "Please touch the device" message.
     Info,
-    /// Error text (PAM_ERROR_MSG); no response collected.
+    /// Error text (`PAM_ERROR_MSG`) — e.g. "Incorrect password".
     Error,
 }
 
@@ -189,8 +222,27 @@ pub enum SessionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrokerToCompositor {
-    /// PAM is prompting; relay to the greeter per `style`.
+    /// PAM is prompting for a response; relay to the greeter per
+    /// `style`. The greeter MUST answer with
+    /// [`CompositorToBroker::ConvResponse`] (or [`CompositorToBroker::Cancel`]).
+    /// The broker advances to its `AwaitGreeterConvResponse` phase on
+    /// this frame.
     ConvPrompt { style: PromptStyle, message: String },
+    /// PAM emitted a display-only message (info banner, error text);
+    /// the greeter MUST show it and MUST NOT respond on the broker
+    /// wire. The compositor handles the greetd-side mandated
+    /// `post_auth_message_response` and swallows it (R5). The broker
+    /// does NOT advance phase on this frame — the worker has not
+    /// blocked and is already processing the next conv message or PAM
+    /// step.
+    ///
+    /// One-way semantics. Distinct from [`Self::ConvPrompt`] precisely
+    /// so the type system rejects any code path that would forward a
+    /// `ConvResponse` for a display message.
+    ConvDisplay {
+        style: DisplayStyle,
+        message: String,
+    },
     /// PAM completed. `username`/`uid`/`gid` are ONE atomic unit
     /// sourced from post-stack `pam_get_user` → pwent inside the
     /// broker (Epic R8). The compositor cannot and must not re-derive
@@ -406,16 +458,70 @@ mod tests {
 
     #[test]
     fn wire_format_prompt_style_all_variants() {
+        // PromptStyle is deliberately narrowed to the two prompt-class
+        // libpam codes (response REQUIRED). Display-only Info/Error
+        // moved to DisplayStyle and travel on a distinct frame; see
+        // `wire_format_display_style_all_variants` below.
         for (raw, variant) in [
             (r#""visible""#, PromptStyle::Visible),
             (r#""secret""#, PromptStyle::Secret),
-            (r#""info""#, PromptStyle::Info),
-            (r#""error""#, PromptStyle::Error),
         ] {
             let parsed: PromptStyle = serde_json::from_str(raw).unwrap();
             assert_eq!(parsed, variant);
             assert_eq!(serde_json::to_string(&parsed).unwrap(), raw);
         }
+    }
+
+    #[test]
+    fn wire_format_display_style_all_variants() {
+        // DisplayStyle covers libpam's two display-class codes:
+        // PAM_TEXT_INFO and PAM_ERROR_MSG. The wire tags MUST match the
+        // greetd `auth_message.type` strings so the compositor's
+        // greetd-side translation is a 1:1 rename, not a remapping.
+        for (raw, variant) in [
+            (r#""info""#, DisplayStyle::Info),
+            (r#""error""#, DisplayStyle::Error),
+        ] {
+            let parsed: DisplayStyle = serde_json::from_str(raw).unwrap();
+            assert_eq!(parsed, variant);
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn wire_format_conv_display() {
+        // ConvDisplay frozen-seam test (mirrors wire_format_conv_prompt).
+        // This frame is the one-way display-only counterpart of
+        // ConvPrompt; the wire tag MUST be `conv_display` and the
+        // payload shape MUST match — drift here breaks every greeter
+        // that has been compiled against this contract.
+        let json = r#"{"type":"conv_display","style":"info","message":"Please touch the device"}"#;
+        let parsed: BrokerToCompositor = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed,
+            BrokerToCompositor::ConvDisplay {
+                style: DisplayStyle::Info,
+                message: "Please touch the device".into(),
+            }
+        );
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn wire_format_conv_display_error() {
+        // Error-class display message: same shape as info, different
+        // tag. Pinned separately so future drift on either variant
+        // gets caught.
+        let json = r#"{"type":"conv_display","style":"error","message":"Authentication failure"}"#;
+        let parsed: BrokerToCompositor = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed,
+            BrokerToCompositor::ConvDisplay {
+                style: DisplayStyle::Error,
+                message: "Authentication failure".into(),
+            }
+        );
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
     }
 
     #[test]
@@ -681,8 +787,16 @@ mod tests {
     fn codec_b2c_roundtrip_every_variant() {
         for msg in [
             BrokerToCompositor::ConvPrompt {
-                style: PromptStyle::Info,
-                message: "one moment".into(),
+                style: PromptStyle::Secret,
+                message: "Password: ".into(),
+            },
+            BrokerToCompositor::ConvDisplay {
+                style: DisplayStyle::Info,
+                message: "Please touch the device".into(),
+            },
+            BrokerToCompositor::ConvDisplay {
+                style: DisplayStyle::Error,
+                message: "Authentication failure".into(),
             },
             BrokerToCompositor::Success {
                 username: "alice.canonical".into(),

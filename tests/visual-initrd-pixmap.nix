@@ -130,7 +130,7 @@ pkgs.testers.runNixOSTest {
     machine.succeed("chmod 600 /tmp/alice.pw")
     machine.succeed(
         "runuser -u halmasuit-greeter -- "
-        "halmasuit-vm-client full-auth @halmasuit-greetd alice "
+        "halmasuit-vm-client full-auth /run/halmasuit/greetd.sock alice "
         "--password-file /tmp/alice.pw "
         "--cmd /run/current-system/sw/bin/true "
         "--timeout 30"

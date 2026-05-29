@@ -92,6 +92,13 @@ pkgs.testers.runNixOSTest {
       # The broker's SO_PEERCRED gate authorizes exactly this uid; the
       # test user is uid 1000 (tests/lib/test-user.nix).
       services.halmasuit.greeterUid = 1000;
+      # The module's broker env resolves HALMASUIT_GREETER_GID from this
+      # group; a broker-only deployment must point it at a group that
+      # exists. Use the test user's group (gid 1000) rather than the
+      # default `halmasuit-greeter` (which this broker-only test, with no
+      # compositor, never creates). This test exercises the PAM
+      # lifecycle, not greeter spawning, so the value is only for eval.
+      services.halmasuit.greeterGroup = "test";
       services.halmasuit.pamService = "halmasuit-pam-test";
 
       environment.systemPackages = [ pkgs.python3 ];

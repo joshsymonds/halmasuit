@@ -92,16 +92,19 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "journalctl -u halmasuit | grep -qF scanout_active", timeout=30
     )
+    # The test client is the broker-spawned greeter (Epic #47 R1.3), so
+    # its stdout lands in the halmasuit-session journal, not halmasuit's
+    # — match the whole boot (`-b`) for the client's markers below.
     # Client bound the wl_seat keyboard …
     machine.wait_until_succeeds(
-        "journalctl -u halmasuit | grep -qF "
+        "journalctl -b | grep -qF "
         "'layer-shell-test-client: keyboard capability acquired'",
         timeout=30,
     )
     # … and halmasuit's focus policy gave it keyboard focus (enter).
     # Waiting for enter avoids racing the keystroke ahead of focus.
     machine.wait_until_succeeds(
-        "journalctl -u halmasuit | grep -qF "
+        "journalctl -b | grep -qF "
         "'layer-shell-test-client: keyboard enter'",
         timeout=30,
     )
@@ -113,7 +116,7 @@ pkgs.testers.runNixOSTest {
         time.sleep(0.4)
 
     machine.wait_until_succeeds(
-        "journalctl -u halmasuit | grep -qF "
+        "journalctl -b | grep -qF "
         "'layer-shell-test-client: key press keysym=0x61'",
         timeout=30,
     )

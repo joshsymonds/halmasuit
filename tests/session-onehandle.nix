@@ -177,6 +177,12 @@ pkgs.testers.runNixOSTest {
         package = halmasuit-session;
       };
       services.halmasuit.greeterUid = 1000;
+      # Broker-only deployment: point HALMASUIT_GREETER_GID at a group
+      # that exists (the test user's, gid 1000) instead of the default
+      # `halmasuit-greeter`, which this compositor-less test never
+      # creates. Eval-only here; this test exercises the PAM handle, not
+      # greeter spawning.
+      services.halmasuit.greeterGroup = "test";
       services.halmasuit.pamService = "halmasuit-onehandle";
 
       environment.systemPackages = [

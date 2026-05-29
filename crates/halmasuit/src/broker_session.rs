@@ -541,12 +541,22 @@ impl BrokerEpisode {
                 }
                 let frame = self.relay.as_mut().unwrap().on_pam_step(response);
                 match frame {
-                    Ok(f) => {
+                    Ok(Some(f)) => {
                         if self.chan.send(&f).is_err() {
                             self.fail_closed(out);
                         }
                         // else: SUSPENDED — the broker reply arrives
                         // via `on_broker_readable` (A7 sans-IO).
+                    }
+                    Ok(None) => {
+                        // Epic #24 R5: the greeter just acked a
+                        // display-class auth_message (DMS sends
+                        // `respond("")` for info/error per greetd
+                        // protocol). The broker is in AwaitWorker —
+                        // sending a ConvResponse here would trigger
+                        // UnexpectedFrame. Swallow: do not touch the
+                        // broker channel; the next worker frame
+                        // arrives via `on_broker_readable`.
                     }
                     Err(RelayError::OutOfPhase) => self.fail_closed(out),
                 }

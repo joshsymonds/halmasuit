@@ -68,6 +68,28 @@ def run(machine, visual, *, cell_name, lukshape, no_flash_mode):
     print("PASS: /dev/vdb formatted with canonical passphrase")
 
     if lukshape == "encrypted-root":
+        # Pre-format the encrypted root with a real ext4 NOW, in the
+        # first boot. systemd 260.1's 99-systemd.rules pins an EMPTY
+        # CRYPT-* device (no partition table, no filesystem usage) to
+        # SYSTEMD_READY=0, so on the second boot a freshly-luksFormat'd
+        # cryptroot's `dev-mapper-cryptroot.device` unit never activates
+        # in the initrd → `autoFormat`'s systemd-makefs + sysroot.mount
+        # never run → no `initrd-switch-root` → the boot wedges (the
+        # compositor keeps painting forever, never pivots). Giving the
+        # device a filesystem here makes blkid report ID_FS_USAGE so the
+        # rule no longer fires and the device unit activates. This also
+        # matches a REAL encrypted-root deployment (e.g. gnomon), whose
+        # root is formatted once at install — `autoFormat`
+        # (format-on-first-boot) was always a test-only convenience that
+        # the systemd-260 rule retroactively broke for CRYPT devices.
+        machine.succeed(
+            "printf 'luks-test-unlock-secret' | "
+            "cryptsetup open /dev/vdb cryptroot-preformat -"
+        )
+        machine.succeed("mkfs.ext4 -F /dev/mapper/cryptroot-preformat")
+        machine.succeed("cryptsetup close cryptroot-preformat")
+        print("PASS: encrypted root pre-formatted ext4 (systemd-260 CRYPT-readiness fix)")
+
         # bootctl set-default the cryptroot specialisation entry. The
         # generation prefix varies with rebuild count, so parse the
         # entry id out of `bootctl list` rather than hardcoding it.

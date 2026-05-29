@@ -49,7 +49,7 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::output::{Mode as OutputMode, Output, OutputModeSource, PhysicalProperties, Subpixel};
 use smithay::reexports::drm::Device as BaseDrmDevice;
 use smithay::reexports::drm::control::Device as ControlDevice;
-use smithay::reexports::drm::control::connector;
+use smithay::reexports::drm::control::{connector, crtc};
 use smithay::utils::DeviceFd;
 
 use crate::wallpaper::{
@@ -548,24 +548,55 @@ struct CachedNamed {
     buffer: MemoryRenderBuffer,
 }
 
-/// The full GLES + GBM + DrmCompositor stack wrapped around a single
-/// DRM device + connector + CRTC. Pinned for the process lifetime in
-/// `HalmasuitState`. Dropping this value releases the master, tears
-/// down EGL, and lets the kernel reset the CRTC.
-pub struct DrmBackend {
-    /// The smithay `DrmCompositor` driving our single CRTC. Owns the
-    /// `DrmSurface` (and through it the `crtc::Handle`), the GBM
-    /// allocator, the framebuffer exporter, and the swapchain. Pinned
-    /// for the process lifetime; dropping it releases the surface
-    /// (which releases the CRTC) and unrefs the GBM device.
-    pub compositor: DrmCompositor<
+/// One physical output: its smithay `Output` (logical — owns the
+/// per-output `LayerMap`, the current mode, and the position in the
+/// global compositor space), the CRTC scanning it out (the vblank
+/// routing key), and the `DrmCompositor` driving that CRTC's surface.
+///
+/// NVIDIA's open kernel module exposes one CRTC ("head") per connector
+/// and never sets `possible_clones`, so binding two connectors to one
+/// CRTC is rejected by the kernel at the first atomic commit (inside
+/// `DrmCompositor::new`'s test commit). Per-CRTC — one of these per
+/// connector — is the only viable multi-output path, and it is what
+/// niri and cosmic-comp do. A single-connector substrate (the headless
+/// VM test matrix, single-monitor laptops) degrades to a Vec of one,
+/// byte-identical to the prior single-output behavior.
+struct OutputSurface {
+    /// Logical output. Cloned into `HalmasuitState.outputs` (Arc bump)
+    /// so the layer-shell / frame-callback / global-advertisement paths
+    /// share the same underlying output (LayerMap is keyed by the
+    /// output's internal id, shared across clones).
+    output: Output,
+    /// The CRTC this output scans out on. `DrmEvent::VBlank(crtc)` is
+    /// routed back to this surface by matching this handle.
+    crtc: crtc::Handle,
+    /// The smithay `DrmCompositor` driving this CRTC's surface. Owns the
+    /// `DrmSurface`, a per-output GBM allocator + framebuffer exporter,
+    /// and its own swapchain. Dropping it releases the surface (and thus
+    /// the CRTC).
+    compositor: DrmCompositor<
         GbmAllocator<DrmDeviceFd>,
         GbmFramebufferExporter<DrmDeviceFd>,
         (),
         DrmDeviceFd,
     >,
-    /// GLES renderer bound to the GBM device's EGL display. Used by
-    /// `render_frame` every vblank to clear + composite.
+}
+
+/// The full GLES + GBM stack plus one `DrmCompositor` per connected
+/// connector (each on its own dedicated CRTC). Pinned for the process
+/// lifetime in `HalmasuitState`. Dropping this value releases master,
+/// tears down EGL, and lets the kernel reset every CRTC.
+pub struct DrmBackend {
+    /// One per connected connector — extended multi-output. The first
+    /// entry is the primary (leftmost, at x=0; honors
+    /// `services.halmasuit.rendering.primaryOutput`). All share the
+    /// `renderer` below and the same GBM device (each holds its own
+    /// allocator/exporter clone of it). Always non-empty (`setup`
+    /// errors if zero outputs initialize).
+    outputs: Vec<OutputSurface>,
+    /// GLES renderer bound to the GBM device's EGL display, SHARED
+    /// across every output's compositor. Used by `render_frame` to
+    /// clear + composite each output's scene every vblank.
     pub renderer: GlesRenderer,
     /// The wallpaper engine — owns the active backend (image / shader
     /// / video) and builds the bottom-most render element every frame
@@ -740,8 +771,8 @@ const fn interface_prefix(
 /// Render a DRM connector's `(interface, interface_id)` as the
 /// canonical Wayland short-name ("DP-3", "HDMI-A-1", "eDP-1", etc.).
 /// Used to match against `services.halmasuit.rendering.primaryOutput`
-/// (env `HALMASUIT_PRIMARY_OUTPUT`) when selecting which connector
-/// should lead the multi-connector clone.
+/// (env `HALMASUIT_PRIMARY_OUTPUT`) when selecting which output is the
+/// primary (leftmost, at x=0 in the global compositor space).
 fn connector_short_name(info: &connector::Info) -> String {
     format!(
         "{}-{}",
@@ -762,25 +793,28 @@ fn connector_short_name(info: &connector::Info) -> String {
 /// and `switch_root` (initramfs→rootfs pivot) when paired with
 /// `SurviveFinalKillSignal=yes`.
 ///
-/// Picks the first connected connector + its preferred mode + first
-/// CRTC, builds a GBM allocator + EGL display + GLES renderer +
-/// DrmCompositor wrapping that surface, registers the DRM event source
-/// with calloop for vblank notifications, and returns the retained
-/// backend plus a smithay `Output` for the caller to register as a
-/// global.
+/// Enumerates every connected connector, builds a shared GBM + EGL +
+/// GLES stack, then gives each connector its own dedicated CRTC +
+/// `DrmSurface` + `DrmCompositor` (extended multi-output, laid out
+/// left-to-right with the `primaryOutput` at x=0), registers the DRM
+/// event source with calloop for vblank notifications, and returns the
+/// retained backend plus one smithay `Output` per connector for the
+/// caller to register as globals.
 ///
 /// The caller is responsible for calling
-/// `output.create_global::<S>(&display_handle)` after this returns —
-/// that call requires `S: GlobalDispatch<WlOutput, …>` which is
-/// implemented at the caller's site, not in this module.
+/// `output.create_global::<S>(&display_handle)` for EACH returned
+/// `Output` after this returns — that call requires
+/// `S: GlobalDispatch<WlOutput, …>` which is implemented at the
+/// caller's site, not in this module.
 ///
 /// `drm_event_handler` is invoked from inside the calloop callback
-/// when `DrmEvent::VBlank` fires.
+/// when `DrmEvent::VBlank(crtc)` fires; `crtc` routes back to the
+/// originating output.
 ///
 /// # Errors
 ///
 /// Bubbles any open / SET_MASTER ioctl / DRM / GBM / EGL / GLES /
-/// calloop failure with context.
+/// calloop failure with context. Errors if zero outputs initialize.
 pub fn setup_drm_direct<S, F>(
     path: &Path,
     loop_handle: &smithay::reexports::calloop::LoopHandle<'static, S>,
@@ -789,7 +823,7 @@ pub fn setup_drm_direct<S, F>(
 ) -> io::Result<(
     DrmBackend,
     smithay::reexports::calloop::RegistrationToken,
-    Output,
+    Vec<Output>,
 )>
 where
     S: 'static,
@@ -827,7 +861,7 @@ fn build_drm_pipeline<S, F>(
 ) -> io::Result<(
     DrmBackend,
     smithay::reexports::calloop::RegistrationToken,
-    Output,
+    Vec<Output>,
 )>
 where
     S: 'static,
@@ -846,23 +880,17 @@ where
     drm.acquire_master_lock()
         .map_err(|e| io::Error::other(format!("DRM SET_MASTER: {e}")))?;
 
-    // Pick connector(s) + mode + CRTC. Multi-monitor support is via
-    // DRM-atomic kernel-side scanout cloning: ALL connected
-    // connectors that share a common mode get bound to a single
-    // CRTC's surface, and the kernel drives all of them from one
-    // framebuffer. Single-connector substrates (the headless VM test
-    // matrix, single-monitor laptops) degrade naturally to the
-    // 1-connector case. The "primary" connector is just the first
-    // in the enumeration order — its first mode becomes the canonical
-    // mode, and other connectors must support it to join the clone.
-    //
-    // Trade-off vs the per-output `Vec<OutputState>` refactor: kernel
-    // clone gives identical pixels on every monitor (mirror), no
-    // per-output workspaces, no `primaryOutput` config knob — but
-    // the change is local to this function instead of a multi-file
-    // refactor. For Phase B's "show login UI on every monitor"
-    // requirement that's enough; niri handles its own per-output
-    // independence post-auth.
+    // Enumerate connected connectors and give EACH its own dedicated
+    // CRTC + DrmSurface + DrmCompositor (extended multi-output). This
+    // is the idiomatic smithay path (niri / cosmic-comp): NVIDIA's
+    // open kernel module exposes one CRTC per connector and never sets
+    // `possible_clones`, so binding multiple connectors to one CRTC is
+    // rejected at the first atomic commit (the prior kernel-clone
+    // approach crash-looped here on real hardware). Single-connector
+    // substrates (the headless VM test matrix, single-monitor laptops)
+    // produce a Vec of one — byte-identical to the prior single-output
+    // behavior, so the login-flash gate and the visual suite are
+    // unaffected.
     let res = drm
         .resource_handles()
         .map_err(|e| io::Error::other(format!("resource_handles: {e}")))?;
@@ -877,11 +905,10 @@ where
     // Honor `services.halmasuit.rendering.primaryOutput` (env
     // HALMASUIT_PRIMARY_OUTPUT). When set to a connector short-name
     // like "DP-3", reorder `connected` so the matching connector is
-    // first. The rest of the pipeline takes its first element as the
-    // canonical mode source AND the lead handle in the clone list, so
-    // a swap-to-front is sufficient. When the env is unset or doesn't
-    // match any connected connector, fall back to enumeration order
-    // (the same single-monitor behavior we always had).
+    // first — it becomes the primary (leftmost, at x=0 in the global
+    // compositor space) and the index-0 output used for frame-audit.
+    // When the env is unset or doesn't match any connected connector,
+    // fall back to enumeration order.
     if let Ok(want) = std::env::var("HALMASUIT_PRIMARY_OUTPUT") {
         if let Some(idx) = connected
             .iter()
@@ -906,77 +933,23 @@ where
         }
     }
 
-    let connector_info = connected
-        .first()
-        .ok_or_else(|| io::Error::other("no connected DRM connector"))?;
+    if connected.is_empty() {
+        return Err(io::Error::other("no connected DRM connector"));
+    }
 
-    let mode = *connector_info
-        .modes()
-        .first()
-        .ok_or_else(|| io::Error::other("connected DRM connector has no modes"))?;
-    let (w, h) = mode.size();
-
-    // Filter to connectors that support the canonical mode (size +
-    // vrefresh). Connectors that don't are silently skipped — the
-    // kernel would reject an atomic commit that included them, and
-    // we prefer to clone fewer than blow up the boot.
-    let cloned_handles: Vec<_> = connected
-        .iter()
-        .filter(|info| {
-            info.modes()
-                .iter()
-                .any(|m| m.size() == mode.size() && m.vrefresh() == mode.vrefresh())
-        })
-        .map(smithay::reexports::drm::control::connector::Info::handle)
-        .collect();
-
-    tracing::info!(
-        target: "halmasuit",
-        total_connectors = connected.len(),
-        cloned_connectors = cloned_handles.len(),
-        mode_w = mode.size().0,
-        mode_h = mode.size().1,
-        mode_hz = mode.vrefresh(),
-        "DRM scanout: binding connectors to single CRTC for kernel-clone"
-    );
-
-    let &crtc_handle = res
-        .crtcs()
-        .first()
-        .ok_or_else(|| io::Error::other("no DRM CRTCs available"))?;
-
-    // Try the multi-connector clone. If the kernel rejects it (e.g.,
-    // a connector's possible_crtcs mask doesn't include this CRTC,
-    // or shared-mode constraints aren't actually met by the
-    // hardware), fall back to driving just the primary connector.
-    // Boot still succeeds; one monitor lights up instead of zero.
-    let surface: DrmSurface = match drm.create_surface(crtc_handle, mode, &cloned_handles) {
-        Ok(s) => s,
-        Err(e) if cloned_handles.len() > 1 => {
-            tracing::warn!(
-                target: "halmasuit",
-                error = %e,
-                "multi-connector clone rejected by kernel; falling back to primary connector only"
-            );
-            drm.create_surface(crtc_handle, mode, &[connector_info.handle()])
-                .map_err(|e| {
-                    io::Error::other(format!("DrmDevice::create_surface (fallback): {e}"))
-                })?
-        }
-        Err(e) => return Err(io::Error::other(format!("DrmDevice::create_surface: {e}"))),
-    };
-
-    // GBM device on the same fd. Allocator pulls SCANOUT-capable
-    // buffers from this device; the framebuffer exporter wraps the
-    // resulting BOs as DRM framebuffer handles.
+    // GBM device on the same fd, SHARED by every output's allocator,
+    // exporter, and compositor (each takes its own clone — GbmDevice is
+    // ref-counted). Allocators pull SCANOUT-capable buffers from this
+    // device; the framebuffer exporters wrap the resulting BOs as DRM
+    // framebuffer handles.
     let gbm =
         GbmDevice::new(device_fd).map_err(|e| io::Error::other(format!("GbmDevice::new: {e}")))?;
 
-    // EGL display + context + GLES renderer. The two `unsafe`s are
-    // smithay's API contracts: EGLDisplay::new takes a native display
-    // pointer and trusts the caller it's a valid GBM device, and
-    // GlesRenderer::new requires the context not be active on another
-    // thread (it isn't — this is the main thread).
+    // EGL display + context + GLES renderer, SHARED across all outputs.
+    // The two `unsafe`s are smithay's API contracts: EGLDisplay::new
+    // takes a native display pointer and trusts the caller it's a valid
+    // GBM device, and GlesRenderer::new requires the context not be
+    // active on another thread (it isn't — this is the main thread).
     #[expect(
         unsafe_code,
         reason = "EGLDisplay::new is unsafe by smithay API contract; gbm is freshly constructed above and not handed to any other thread"
@@ -992,52 +965,6 @@ where
     let mut renderer = unsafe { GlesRenderer::new(egl_context) }
         .map_err(|e| io::Error::other(format!("GlesRenderer::new: {e}")))?;
 
-    // Allocator + framebuffer exporter, both wrapping the same GBM
-    // device. SCANOUT is non-optional (the buffer must be scannable
-    // out by the CRTC); RENDERING marks it as a render target.
-    let allocator = GbmAllocator::new(
-        gbm.clone(),
-        GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-    );
-    // `NodeFilter::None` means "use the GBM device for all framebuffer
-    // exports regardless of source DrmNode" — fine for single-GPU.
-    let exporter = GbmFramebufferExporter::new(
-        gbm.clone(),
-        smithay::backend::drm::exporter::gbm::NodeFilter::None,
-    );
-
-    // Smithay output backed by the real DRM mode (no more synthesized
-    // 1920×1080 placeholder).
-    let output_mode = OutputMode {
-        size: (i32::from(w), i32::from(h)).into(),
-        // smithay's `Mode::refresh` is in mHz; the DRM `vrefresh` is
-        // in Hz. Convert.
-        refresh: i32::try_from(mode.vrefresh()).unwrap_or(60_000) * 1000,
-    };
-    let physical = PhysicalProperties {
-        // (0, 0) signals "unknown" per the wl_output spec — virtio-gpu
-        // doesn't report physical dimensions.
-        size: (0, 0).into(),
-        subpixel: Subpixel::Unknown,
-        make: "halmasuit".to_owned(),
-        model: format!("drm-{w}x{h}"),
-        serial_number: String::new(),
-    };
-    // Output global creation requires `S: GlobalDispatch<WlOutput,
-    // WlOutputData>`. Rather than propagate that bound up through
-    // every caller of `setup_drm_backend`, we hand the Output back to
-    // the caller and let it register the global from a context where
-    // the concrete state type's `GlobalDispatch` impl is visible.
-    let output = Output::new("output-0".to_owned(), physical);
-    output.change_current_state(Some(output_mode), None, None, Some((0, 0).into()));
-    output.set_preferred(output_mode);
-
-    // DrmCompositor: the workhorse. Drives the surface, manages the
-    // GBM-backed swapchain, queues page-flips, owns plane assignment.
-    // The `OutputModeSource::Auto(output.downgrade())` ties the
-    // compositor's working size + scale to the smithay `Output` we
-    // just registered — `change_current_state` updates flow through
-    // automatically.
     let render_formats = renderer
         .egl_context()
         .dmabuf_render_formats()
@@ -1045,30 +972,156 @@ where
         .copied()
         .collect::<Vec<_>>();
     let cursor_size = drm.cursor_size();
-    let compositor = DrmCompositor::<
-        GbmAllocator<DrmDeviceFd>,
-        GbmFramebufferExporter<DrmDeviceFd>,
-        (),
-        DrmDeviceFd,
-    >::new(
-        OutputModeSource::Auto(output.downgrade()),
-        surface,
-        None,
-        allocator,
-        exporter,
-        SUPPORTED_COLOR_FORMATS.iter().copied(),
-        render_formats,
-        cursor_size,
-        Some(gbm),
-    )
-    .map_err(|e| io::Error::other(format!("DrmCompositor::new: {e}")))?;
 
-    // Build the wallpaper engine. Each backend's constructor decodes
-    // / compiles synchronously, so the engine is frame-0 ready when
-    // this returns (epic G1/R3/R6 — every frame the renderer
-    // composites after this is wallpaper-covered). `renderer` is no
-    // longer borrowed (the immutable `render_formats` borrow above
-    // has ended) and is moved into `DrmBackend` just below.
+    // One CRTC + surface + DrmCompositor + Output per connected
+    // connector. Outputs are laid out left-to-right starting at x=0
+    // with the primary (front of `connected`) first.
+    let mut output_surfaces: Vec<OutputSurface> = Vec::with_capacity(connected.len());
+    let mut outputs: Vec<Output> = Vec::with_capacity(connected.len());
+    let mut used_crtcs: Vec<crtc::Handle> = Vec::new();
+    let mut x_offset: i32 = 0;
+
+    for info in &connected {
+        let name = connector_short_name(info);
+        let Some(mode) = info.modes().first().copied() else {
+            tracing::warn!(
+                target: "halmasuit",
+                connector = %name,
+                "connected connector reports no modes; skipping"
+            );
+            continue;
+        };
+
+        // Allocate a free CRTC reachable from one of this connector's
+        // encoders (the `possible_crtcs` mask), not already claimed by
+        // an earlier output. On NVIDIA each connector has exactly one
+        // candidate head, so this is effectively a 1:1 assignment.
+        let crtc_handle = info
+            .encoders()
+            .iter()
+            .filter_map(|&eh| drm.get_encoder(eh).ok())
+            .flat_map(|enc| res.filter_crtcs(enc.possible_crtcs()))
+            .find(|c| !used_crtcs.contains(c));
+        let Some(crtc_handle) = crtc_handle else {
+            tracing::warn!(
+                target: "halmasuit",
+                connector = %name,
+                "no free CRTC reachable from connector; skipping"
+            );
+            continue;
+        };
+
+        // Single-element connector slice — one connector per CRTC. This
+        // is the only shape NVIDIA accepts (see OutputSurface docs).
+        let surface: DrmSurface = match drm.create_surface(crtc_handle, mode, &[info.handle()]) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target: "halmasuit",
+                    connector = %name,
+                    error = %e,
+                    "create_surface failed; skipping connector"
+                );
+                continue;
+            }
+        };
+        used_crtcs.push(crtc_handle);
+
+        let (w, h) = mode.size();
+        let output_mode = OutputMode {
+            size: (i32::from(w), i32::from(h)).into(),
+            // smithay's `Mode::refresh` is in mHz; DRM `vrefresh` is Hz.
+            refresh: i32::try_from(mode.vrefresh()).unwrap_or(60_000) * 1000,
+        };
+        let physical = PhysicalProperties {
+            // (0, 0) signals "unknown" per the wl_output spec.
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "halmasuit".to_owned(),
+            model: format!("drm-{w}x{h}"),
+            serial_number: String::new(),
+        };
+        // Name the Output after the connector short-name ("DP-3") so
+        // the journal + the client-visible wl_output name identify the
+        // physical monitor. Position it at the running x-offset; the
+        // caller registers a wl_output global per returned Output.
+        let output = Output::new(name.clone(), physical);
+        output.change_current_state(Some(output_mode), None, None, Some((x_offset, 0).into()));
+        output.set_preferred(output_mode);
+
+        // Per-output allocator + framebuffer exporter, each wrapping a
+        // clone of the shared GBM device. `NodeFilter::None` = "use this
+        // GBM device for all framebuffer exports" (single-GPU).
+        let allocator = GbmAllocator::new(
+            gbm.clone(),
+            GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+        );
+        let exporter = GbmFramebufferExporter::new(
+            gbm.clone(),
+            smithay::backend::drm::exporter::gbm::NodeFilter::None,
+        );
+
+        // DrmCompositor: drives this CRTC's surface + swapchain.
+        // `OutputModeSource::Auto(output.downgrade())` ties its working
+        // size/scale to this output. `DrmCompositor::new` issues a TEST
+        // atomic commit — the layer the prior kernel-clone approach was
+        // rejected at; per-CRTC it passes.
+        let compositor = DrmCompositor::<
+            GbmAllocator<DrmDeviceFd>,
+            GbmFramebufferExporter<DrmDeviceFd>,
+            (),
+            DrmDeviceFd,
+        >::new(
+            OutputModeSource::Auto(output.downgrade()),
+            surface,
+            None,
+            allocator,
+            exporter,
+            SUPPORTED_COLOR_FORMATS.iter().copied(),
+            render_formats.clone(),
+            cursor_size,
+            Some(gbm.clone()),
+        )
+        .map_err(|e| io::Error::other(format!("DrmCompositor::new ({name}): {e}")))?;
+
+        tracing::info!(
+            target: "halmasuit",
+            connector = %name,
+            crtc = ?crtc_handle,
+            x = x_offset,
+            mode_w = w,
+            mode_h = h,
+            mode_hz = mode.vrefresh(),
+            "DRM output: connector bound to dedicated CRTC"
+        );
+
+        outputs.push(output.clone());
+        output_surfaces.push(OutputSurface {
+            output,
+            crtc: crtc_handle,
+            compositor,
+        });
+        x_offset += i32::from(w);
+    }
+
+    if output_surfaces.is_empty() {
+        return Err(io::Error::other(
+            "no DRM outputs could be initialized (every connected connector failed CRTC allocation or create_surface)",
+        ));
+    }
+
+    tracing::info!(
+        target: "halmasuit",
+        outputs = output_surfaces.len(),
+        "DRM scanout: per-CRTC multi-output initialized"
+    );
+
+    // Build the wallpaper engine ONCE (shared across outputs; each
+    // output's scene renders the wallpaper element at its own size).
+    // Each backend's constructor decodes / compiles synchronously, so
+    // the engine is frame-0 ready when this returns (epic G1/R3/R6).
+    // `renderer` is no longer borrowed by the compositors (they took
+    // `render_formats.clone()`) and is moved into `DrmBackend` below.
     let wallpaper = match wallpaper_config {
         Some(cfg) => {
             let backend: Box<dyn WallpaperBackend> = match cfg {
@@ -1104,7 +1157,7 @@ where
 
     Ok((
         DrmBackend {
-            compositor,
+            outputs: output_surfaces,
             renderer,
             wallpaper,
             cursor: CursorRenderState {
@@ -1130,7 +1183,7 @@ where
             wallpaper_only_buf: crate::dbus::new_buffer(),
         },
         registration_token,
-        output,
+        outputs,
     ))
 }
 
@@ -1156,7 +1209,14 @@ impl DrmBackend {
     /// Bubbles DROP_MASTER ioctl errno. The caller logs and continues —
     /// the VT switch proceeds regardless.
     pub fn pause(&self) -> io::Result<()> {
-        self.compositor
+        // DRM master is per-DEVICE: every per-CRTC `OutputSurface`
+        // shares the one /dev/dri/card0 fd, so releasing once via any
+        // surface drops the device's master designation.
+        let Some(first) = self.outputs.first() else {
+            return Ok(());
+        };
+        first
+            .compositor
             .surface()
             .device_fd()
             .release_master_lock()
@@ -1174,7 +1234,13 @@ impl DrmBackend {
     /// stays blank — the caller (`handle_vt_acqsig`) logs loudly. The
     /// user can switch away + back to retry.
     pub fn resume(&self) -> io::Result<()> {
-        self.compositor
+        // Per-device master (see `pause`): one acquire via any surface
+        // reacquires for the whole device / all CRTCs.
+        let Some(first) = self.outputs.first() else {
+            return Ok(());
+        };
+        first
+            .compositor
             .surface()
             .device_fd()
             .acquire_master_lock()
@@ -1546,87 +1612,88 @@ impl DrmBackend {
     ///
     /// Returns an error if `scene_elements`, `render_frame`, or
     /// `queue_frame` fail.
-    pub fn render_one_frame(
-        &mut self,
-        output: &smithay::output::Output,
-        clear_color: [u8; 4],
-    ) -> io::Result<bool> {
-        let elements = self.scene_elements(output, None)?;
-        self.render_with_elements_inner(output, &elements, clear_color)
+    pub fn render_one_frame(&mut self, clear_color: [u8; 4]) -> io::Result<bool> {
+        self.render_all(None, clear_color)
     }
 
     /// Render a frame composed of the mapped layer-shell surfaces and
-    /// the optional foreground toplevel over the wallpaper plane.
+    /// the optional foreground toplevel over the wallpaper plane, on
+    /// EVERY output (extended multi-output). Each output composites its
+    /// own scene from its own `LayerMap` at its own size.
     /// See [`scene_elements`](Self::scene_elements) for z-order.
     ///
     /// # Errors
     ///
     /// Returns an error if `scene_elements`, `render_frame`, or
-    /// `queue_frame` fail.
+    /// `queue_frame` fail on any output.
     pub fn render_layer_elements(
         &mut self,
-        output: &smithay::output::Output,
         foreground: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
         clear_color: [u8; 4],
     ) -> io::Result<bool> {
-        let elements = self.scene_elements(output, foreground)?;
-        self.render_with_elements_inner(output, &elements, clear_color)
+        self.render_all(foreground, clear_color)
     }
 
-    fn render_with_elements_inner(
+    /// Composite + queue a frame on every output. Returns `Ok(true)` if
+    /// at least one output queued a frame (non-empty damage). The
+    /// always-on `frame_counter` advances once per logical frame (not
+    /// per output); frame-audit (halmasuit-debug only) runs on the
+    /// primary output (index 0), matching the single-output test
+    /// substrate.
+    fn render_all(
         &mut self,
-        output: &smithay::output::Output,
-        elements: &[SceneElement],
+        foreground: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
         clear_color: [u8; 4],
     ) -> io::Result<bool> {
-        let color = xrgb_le_to_color32f(clear_color);
-        let render_res = self
-            .compositor
-            .render_frame::<_, SceneElement>(
-                &mut self.renderer,
-                elements,
-                color,
-                FrameFlags::DEFAULT,
-            )
-            .map_err(|e| io::Error::other(format!("render_frame: {e}")))?;
+        let mut any = false;
+        // Frame-audit needs the PRIMARY output's element set after the
+        // loop; capture it (only built under the feature gate).
+        #[cfg(feature = "frame_audit")]
+        let mut primary_audit: Option<(Output, Vec<SceneElement>)> = None;
 
-        if render_res.is_empty {
-            return Ok(false);
+        for i in 0..self.outputs.len() {
+            let output = self.outputs[i].output.clone();
+            let elements = self.scene_elements(&output, foreground)?;
+            // Split borrow: `self.outputs[i].compositor` and
+            // `self.renderer` are disjoint fields.
+            let queued = {
+                let comp = &mut self.outputs[i].compositor;
+                render_one_output(comp, &mut self.renderer, &elements, clear_color)?
+            };
+            any |= queued;
+            #[cfg(feature = "frame_audit")]
+            if i == 0 && queued {
+                primary_audit = Some((output, elements));
+            }
+            #[cfg(not(feature = "frame_audit"))]
+            let _ = output;
         }
 
-        self.compositor
-            .queue_frame(())
-            .map_err(|e| io::Error::other(format!("queue_frame: {e}")))?;
+        if any {
+            // Advance the always-on render counter once per logical
+            // frame. `audit_frame` reads (counter - 1) for
+            // `Event::FrameRendered.frame_id` so the first emitted frame
+            // is still id=0; production halmasuit exposes the
+            // post-increment value via `frame_counter()` for the
+            // shutdown-liveness line's `frames=N` field AND the
+            // Compositor1 DBus `GetFrameCounter` (R-honest.1: same Arc).
+            // `fetch_add` wraps on u64 overflow. Relaxed: one-way value
+            // flow, no happens-before dependency on other fields.
+            self.frame_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // Advance the always-on render counter. `audit_frame` reads
-        // (counter - 1) for `Event::FrameRendered.frame_id` so the
-        // first emitted frame is still id=0; production halmasuit
-        // exposes the post-increment value via `frame_counter()` for
-        // the shutdown-liveness line's `frames=N` field AND the
-        // Compositor1 DBus `GetFrameCounter` (R-honest.1: same Arc).
-        // `fetch_add` wraps on u64 overflow like the prior
-        // `wrapping_add`. Relaxed: one-way value flow, no
-        // happens-before dependency on other observability fields.
-        self.frame_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        // The frame is now queued for scanout. Under `frame_audit`
-        // (halmasuit-debug only) re-render the identical element set
-        // into an offscreen texture, read it back, analyze it, and
-        // emit `FrameRendered`. This is the per-frame GPU readback the
-        // production binary deliberately omits (Epic #1 req 6/7).
-        #[cfg(feature = "frame_audit")]
-        {
-            // Best-effort: an audit failure must never take down the
-            // compositor. Log and continue.
-            if let Err(e) = self.audit_frame(output, elements, clear_color) {
+            // Best-effort offscreen readback of the PRIMARY output's
+            // scene. An audit failure must never take down the
+            // compositor (Epic #1 req 6/7).
+            #[cfg(feature = "frame_audit")]
+            if let Some((output, elements)) = primary_audit
+                && let Err(e) = self.audit_frame(&output, &elements, clear_color)
+            {
                 tracing::warn!(error = %e, "frame_audit readback failed");
             }
         }
-        #[cfg(not(feature = "frame_audit"))]
-        let _ = output;
 
-        Ok(true)
+        Ok(any)
     }
 
     /// Total frames the render path has queued for scanout. Monotonic,
@@ -1784,21 +1851,60 @@ impl DrmBackend {
         crate::offscreen::read_frame_rgba(&mut self.renderer, output, elements, color)
     }
 
-    /// Acknowledge a page-flip completion. Called from the
-    /// `DrmEvent::VBlank` callback in calloop. Releases the previous
-    /// front buffer for reuse and emits any presentation-time
-    /// feedback (none configured in this slice).
+    /// Acknowledge a page-flip completion for the output scanning out
+    /// on `crtc`. Called from the `DrmEvent::VBlank(crtc)` callback in
+    /// calloop. Releases that output's previous front buffer for reuse.
+    /// Returns the flipped `Output` (cloned) so the caller can drive
+    /// per-output frame-callbacks / presentation feedback, or `None`
+    /// if no output owns that CRTC (should not happen).
     ///
     /// # Errors
     ///
     /// Returns an error if smithay's `frame_submitted` reports an
     /// underlying DRM failure.
-    pub fn frame_submitted(&mut self) -> io::Result<()> {
-        self.compositor
+    pub fn frame_submitted(&mut self, crtc: crtc::Handle) -> io::Result<Option<Output>> {
+        let Some(surface) = self.outputs.iter_mut().find(|o| o.crtc == crtc) else {
+            return Ok(None);
+        };
+        surface
+            .compositor
             .frame_submitted()
             .map_err(|e| io::Error::other(format!("frame_submitted: {e}")))?;
-        Ok(())
+        Ok(Some(surface.output.clone()))
     }
+}
+
+/// Composite `elements` over `clear_color` onto one output's
+/// `DrmCompositor` and queue the resulting frame for scanout. Free
+/// function (not a method) so the caller can pass disjoint `&mut`
+/// borrows of `self.outputs[i].compositor` and `self.renderer`.
+/// Returns `Ok(true)` if a frame was queued, `Ok(false)` if the
+/// composition had no damage (`render_frame` reported empty).
+fn render_one_output(
+    compositor: &mut DrmCompositor<
+        GbmAllocator<DrmDeviceFd>,
+        GbmFramebufferExporter<DrmDeviceFd>,
+        (),
+        DrmDeviceFd,
+    >,
+    renderer: &mut GlesRenderer,
+    elements: &[SceneElement],
+    clear_color: [u8; 4],
+) -> io::Result<bool> {
+    let color = xrgb_le_to_color32f(clear_color);
+    let render_res = compositor
+        .render_frame::<_, SceneElement>(renderer, elements, color, FrameFlags::DEFAULT)
+        .map_err(|e| io::Error::other(format!("render_frame: {e}")))?;
+
+    if render_res.is_empty {
+        return Ok(false);
+    }
+
+    compositor
+        .queue_frame(())
+        .map_err(|e| io::Error::other(format!("queue_frame: {e}")))?;
+
+    Ok(true)
 }
 
 #[cfg(test)]

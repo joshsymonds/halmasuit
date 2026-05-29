@@ -128,13 +128,16 @@ struct HalmasuitState {
     // alive; nothing reads the field directly (delegate_output! handles
     // dispatch via the type), hence the leading underscore.
     _output_manager_state: OutputManagerState,
-    /// The smithay `Output` representing halmasuit's single display.
-    /// Constructed from the real DRM mode in the production path
-    /// (synthesized 1920×1080 only on the SKIP bypass). Read by the
+    /// The smithay `Output`s representing halmasuit's displays — one
+    /// per connected DRM connector (extended multi-output), each on its
+    /// own CRTC. Constructed from the real DRM modes in the production
+    /// path (a single synthesized 1920×1080 on the SKIP bypass). Always
+    /// non-empty; `outputs[0]` is the primary (leftmost, at x=0; honors
+    /// `services.halmasuit.rendering.primaryOutput`). Read by the
     /// `WlrLayerShellHandler` to route new layer surfaces to the
-    /// correct `LayerMap`, and by the commit handler to build render
-    /// elements from those layers.
-    output: Output,
+    /// correct per-output `LayerMap`, and by the commit handler to
+    /// build render elements from those layers.
+    outputs: Vec<Output>,
     shm_state: ShmState,
     /// wlr-layer-shell global state. New layer surfaces (BACKGROUND /
     /// BOTTOM / TOP / OVERLAY) land in `new_layer_surface` and get
@@ -343,25 +346,28 @@ struct HalmasuitState {
     /// Authorised greeter UID; connections from any other uid are
     /// dropped by `handle_listener_ready`.
     greeter_uid: u32,
-    /// Epic #47 R2.1: gates the SIGTERM handler's response.
+    /// Epic #47 R2.1 + Task #21: gates the SIGTERM handler. False until
+    /// halmasuit is fully booted past the boot-pivot kill-spree window;
+    /// true thereafter (when a SIGTERM is a genuine stop/shutdown, not
+    /// the pivot spree).
     ///
-    /// In the fromInitrd deployment, SIGTERM is sent twice in a
-    /// single boot: once during the boot pivot's
-    /// `systemd-shutdown --switch-root` kill spree (which we ignore
-    /// — survival is the whole point of the fromInitrd shape), and
-    /// again during the rootfs→shutdownRamfs pivot at actual system
-    /// shutdown (which SHOULD drive graceful tear-down).
-    /// Distinguishing them needs state: this flag flips true when
-    /// `Phase::RootfsReady` is emitted, which only happens AFTER the
-    /// boot pivot is complete.
-    /// A SIGTERM with this flag false in fromInitrd mode is the boot
-    /// pivot's kill spree (ignored, deferred to the
-    /// SurviveFinalKillSignal directive and the broker root-fd
-    /// handoff); with this flag true, it is the real shutdown signal.
+    /// In the fromInitrd deployment, `systemd-shutdown --switch-root`
+    /// SIGTERMs every initramfs process during the boot pivot. halmasuit
+    /// MUST survive that (the whole point of the fromInitrd shape). The
+    /// subtlety (Task #21): that spree SIGTERM is SENT while we are still
+    /// in the initramfs, but our calloop can PROCESS it shortly after
+    /// `Phase::RootfsReady` — so arming at RootfsReady is too early (the
+    /// spree SIGTERM would be misread as a post-boot stop). The flag is
+    /// therefore flipped true at `Phase::Deprivileged` in
+    /// `run_post_pivot_setup`, which is reached only after the broker
+    /// handshake + greeter spawn + privilege drop — comfortably past the
+    /// spree window. A SIGTERM with this flag false is the boot spree
+    /// (ignored; survival is carried by `SurviveFinalKillSignal` and the
+    /// broker root-fd handoff).
     ///
-    /// In rootfs-only mode (`services.halmasuit.enable=true` with no
-    /// fromInitrd), the flag flips true at startup completion — there's
-    /// no boot pivot to ignore.
+    /// In rootfs-only mode (`services.halmasuit.enable=true`, no
+    /// fromInitrd) there is no boot pivot, so the flag starts true at
+    /// construction.
     shutdown_armed: bool,
     /// Epic #71 R3.1: diagnostic overlay open/closed state.
     /// Toggled by `Ctrl+Alt+Shift+Esc` (the Linux SAK chord). Bare
@@ -395,12 +401,42 @@ struct HalmasuitState {
     /// Epic #47 R2.2: set by `graceful_shutdown` after the wallpaper-
     /// only recomposite. The render path observes this to keep the
     /// wallpaper plane composited (no greeter, no session toplevel)
-    /// from now until the kernel halts the process. halmasuit's main
-    /// loop has no clean-exit termination — it keeps painting through
-    /// the rootfs→shutdownRamfs pivot via SurviveFinalKillSignal +
-    /// the shutdownRamfs storePaths wiring (probe-validated by
-    /// halmasuit-shutdown-probe-phase{0,1,2}).
+    /// from now until the kernel halts the process. On a REAL system
+    /// shutdown halmasuit keeps painting through the
+    /// rootfs→shutdownRamfs pivot via SurviveFinalKillSignal + the
+    /// shutdownRamfs storePaths wiring (probe-validated by
+    /// halmasuit-shutdown-probe-phase{0,1,2}) — it never voluntarily
+    /// blacks the screen mid-shutdown.
+    ///
+    /// This flag is ALSO the discriminator for the SIGTERM handler
+    /// (Task #21): a SIGTERM that arrives with `shutting_down` already
+    /// true was preceded by logind's `PrepareForShutdown` (a real
+    /// shutdown → survive); a SIGTERM with it still false is a plain
+    /// `systemctl stop halmasuit` → clean exit (see `should_exit`).
     shutting_down: bool,
+    /// Task #21: set by the SIGTERM handler on a plain `systemctl stop`
+    /// (a SIGTERM with no preceding `PrepareForShutdown`). The main loop
+    /// breaks when this is true, dropping `HalmasuitState` — which drops
+    /// `DrmBackend`, closing the DRM fd → releasing master → the kernel
+    /// hands scanout back to fbcon, which repaints the tty1 getty. A
+    /// visible blink in that handoff is fine: the no-flash invariant is
+    /// about automatic transitions (boot / greeter→session / real
+    /// shutdown), NOT about a human deliberately stopping the
+    /// compositor. Stopping the display server is supposed to drop you
+    /// to a console.
+    should_exit: bool,
+    /// Task #21: logind delay-inhibitor lock fd, acquired at startup so
+    /// that `PrepareForShutdown(true)` is delivered+latched BEFORE
+    /// systemd proceeds to stop the unit — closing the race where a
+    /// shutdown's SIGTERM could otherwise beat `PrepareForShutdown` and
+    /// be misclassified as a plain stop (→ clean exit → a black screen
+    /// mid-shutdown, the one outcome we must never produce). Dropped
+    /// inside `graceful_shutdown` AFTER `shutting_down` is latched, which
+    /// releases systemd to continue. `None` if the Inhibit call failed
+    /// (e.g. polkit denied / no logind) — the handler then relies on the
+    /// in-practice PrepareForShutdown-before-SIGTERM ordering the
+    /// re-entry-bail already depends on.
+    shutdown_inhibitor: Option<std::os::fd::OwnedFd>,
     /// Held so the registered listener token survives for the lifetime
     /// of the compositor; calloop drops the source on shutdown.
     greetd_listener_token: Option<RegistrationToken>,
@@ -659,8 +695,7 @@ impl HalmasuitState {
             .as_ref()
             .map(|t| t.wl_surface().clone());
         if let Some(backend) = self.drm_backend.as_mut()
-            && let Err(e) =
-                backend.render_layer_elements(&self.output, fg.as_ref(), HALMASUIT_BRAND_CLEAR)
+            && let Err(e) = backend.render_layer_elements(fg.as_ref(), HALMASUIT_BRAND_CLEAR)
         {
             tracing::warn!(error = %e, "render_layer_elements on overlay toggle failed");
         }
@@ -1103,14 +1138,19 @@ impl HalmasuitState {
             _ => None,
         };
         if let Some(backend) = self.drm_backend.as_mut()
-            && let Err(e) = backend.render_layer_elements(
-                &self.output,
-                fg_surface.as_ref(),
-                HALMASUIT_BRAND_CLEAR,
-            )
+            && let Err(e) =
+                backend.render_layer_elements(fg_surface.as_ref(), HALMASUIT_BRAND_CLEAR)
         {
             tracing::warn!(error = %e, "render_layer_elements on swap/revert failed");
         }
+    }
+
+    /// The primary output (leftmost, at x=0). `outputs` is always
+    /// non-empty — both the DRM path and the SKIP path push at least
+    /// one. Used as the default target for layer surfaces that name no
+    /// output and as the anchor for single-output-era call sites.
+    fn primary_output(&self) -> &Output {
+        &self.outputs[0]
     }
 }
 
@@ -1220,7 +1260,20 @@ impl HalmasuitState {
     /// focus-follows-foreground on the first buffered commit per
     /// role.
     fn handle_layer_shell_commit(&mut self, surface: &WlSurface) {
-        let mut map = layer_map_for_output(&self.output);
+        // A layer surface is mapped on exactly one output; find it.
+        let Some(output) = self
+            .outputs
+            .iter()
+            .find(|o| {
+                layer_map_for_output(o)
+                    .layer_for_surface(surface, smithay::desktop::WindowSurfaceType::TOPLEVEL)
+                    .is_some()
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let mut map = layer_map_for_output(&output);
         let Some(layer) = map
             .layer_for_surface(surface, smithay::desktop::WindowSurfaceType::TOPLEVEL)
             .cloned()
@@ -1400,15 +1453,18 @@ impl HalmasuitState {
 
         // Layer-shell surfaces have no title/app_id — their namespace
         // is the closest identity. Reported as app_id with empty title.
-        let map = layer_map_for_output(&self.output);
-        for layer in map.layers() {
-            windows.push((
-                surface_pid(layer.wl_surface()),
-                layer.namespace().to_owned(),
-                String::new(),
-            ));
+        // Enumerate every output's layer map (extended multi-output);
+        // each per-iteration guard drops at scope end.
+        for output in &self.outputs {
+            let map = layer_map_for_output(output);
+            for layer in map.layers() {
+                windows.push((
+                    surface_pid(layer.wl_surface()),
+                    layer.namespace().to_owned(),
+                    String::new(),
+                ));
+            }
         }
-        drop(map);
 
         if let Ok(mut slot) = self.dbus_state.windows.lock() {
             *slot = windows;
@@ -1434,11 +1490,8 @@ impl HalmasuitState {
                 .map(|t| t.wl_surface().clone())
         };
         if let Some(backend) = self.drm_backend.as_mut()
-            && let Err(e) = backend.render_layer_elements(
-                &self.output,
-                fg_surface.as_ref(),
-                HALMASUIT_BRAND_CLEAR,
-            )
+            && let Err(e) =
+                backend.render_layer_elements(fg_surface.as_ref(), HALMASUIT_BRAND_CLEAR)
         {
             tracing::warn!(error = %e, "render_layer_elements on commit failed");
         }
@@ -1453,7 +1506,7 @@ impl WlrLayerShellHandler for HalmasuitState {
     fn new_layer_surface(
         &mut self,
         surface: LayerSurface,
-        _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+        output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
         layer: Layer,
         namespace: String,
     ) {
@@ -1464,10 +1517,12 @@ impl WlrLayerShellHandler for HalmasuitState {
         );
         // smithay distinguishes the wire-type `wlr_layer::LayerSurface`
         // (raw protocol object) from `desktop::LayerSurface` (the
-        // scene-graph helper that `LayerMap` operates on). The
-        // desktop wrapper owns the namespace string. Map onto our
-        // single output's LayerMap; multi-output routing comes later
-        // and would dispatch on the `_output` arg.
+        // scene-graph helper that `LayerMap` operates on). The desktop
+        // wrapper owns the namespace string. Multi-output routing: map
+        // onto the LayerMap of the output the client named (its
+        // `wl_output` arg — Quickshell/DankGreeter creates one layer
+        // surface per screen); when the client names no output, fall
+        // back to the primary.
         //
         // Do NOT send a configure here. The wlr-layer-shell spec
         // mandates the initial configure be sent in response to the
@@ -1477,8 +1532,13 @@ impl WlrLayerShellHandler for HalmasuitState {
         // see an unanchored, zero-size surface and fall back to
         // half-output dimensions. The initial configure is sent from
         // the `commit` handler instead (see `ensure_layer_configured`).
+        let target = output
+            .as_ref()
+            .and_then(Output::from_resource)
+            .filter(|o| self.outputs.contains(o))
+            .unwrap_or_else(|| self.primary_output().clone());
         let desktop_surface = smithay::desktop::LayerSurface::new(surface, namespace);
-        let mut map = layer_map_for_output(&self.output);
+        let mut map = layer_map_for_output(&target);
         if let Err(e) = map.map_layer(&desktop_surface) {
             tracing::warn!(error = ?e, "failed to map layer surface");
         }
@@ -1489,33 +1549,35 @@ impl WlrLayerShellHandler for HalmasuitState {
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
-        let mut map = layer_map_for_output(&self.output);
-        // Find the desktop-wrapped layer with this underlying wire
-        // surface and unmap it. LayerMap doesn't expose a lookup-by-
-        // wire-surface helper, so we walk the layers and match by
+        // The surface is mapped on exactly one output's LayerMap; find
+        // and unmap it. LayerMap doesn't expose a lookup-by-wire-surface
+        // helper, so we walk each output's layers and match by
         // `layer_surface()` equality.
-        let to_remove: Option<smithay::desktop::LayerSurface> = map
-            .layers()
-            .find(|l| l.layer_surface() == &surface)
-            .cloned();
-        if let Some(layer) = to_remove {
-            map.unmap_layer(&layer);
+        for output in &self.outputs {
+            let mut map = layer_map_for_output(output);
+            let to_remove: Option<smithay::desktop::LayerSurface> = map
+                .layers()
+                .find(|l| l.layer_surface() == &surface)
+                .cloned();
+            if let Some(layer) = to_remove {
+                map.unmap_layer(&layer);
+                drop(map);
+                break;
+            }
         }
         // A client going away changes the scene: the layer beneath
         // (e.g. the splash background) must be re-composited now, not
         // only on the next surviving-client commit — otherwise the
         // last frame (the departed client) stays on screen. This is
         // also the no-flash requirement for the real greeter→session
-        // teardown (Epic #1 req 11/17). Drop the LayerMap lock first;
-        // render_layer_elements re-locks it for this output.
-        drop(map);
+        // teardown (Epic #1 req 11/17). The LayerMap locks above are
+        // dropped before render_layer_elements re-locks them per output.
         let fg = self
             .foreground_toplevel
             .as_ref()
             .map(|t| t.wl_surface().clone());
         if let Some(backend) = self.drm_backend.as_mut()
-            && let Err(e) =
-                backend.render_layer_elements(&self.output, fg.as_ref(), HALMASUIT_BRAND_CLEAR)
+            && let Err(e) = backend.render_layer_elements(fg.as_ref(), HALMASUIT_BRAND_CLEAR)
         {
             tracing::warn!(error = %e, "render_layer_elements on layer_destroyed failed");
         }
@@ -1540,7 +1602,7 @@ impl XdgShellHandler for HalmasuitState {
         // pattern; see commit handler R4 block).
         use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
         let (w, h): (i32, i32) = self
-            .output
+            .primary_output()
             .current_mode()
             .map_or((1280, 800), |m| (m.size.w, m.size.h));
         surface.with_pending_state(|state| {
@@ -1550,13 +1612,15 @@ impl XdgShellHandler for HalmasuitState {
         });
         // R6 (convergence epic): emit `wl_surface.enter` for the
         // toplevel so the client picks the correct buffer scale,
-        // transform, and frame timing for this output. Layer-shell
-        // surfaces already receive this via `LayerMap::arrange`;
-        // xdg-toplevels were missing it. Sub-tree walks (subsurfaces
-        // under the toplevel) are out of scope until a client needs
-        // them (the root surface is sufficient for HiDPI / scale
-        // negotiation in Qt 6 / GTK 4).
-        self.output.enter(surface.wl_surface());
+        // transform, and frame timing. The foreground toplevel is
+        // composited at the origin of EVERY output (see
+        // `scene_elements`), so it enters all of them. Sub-tree walks
+        // (subsurfaces) are out of scope until a client needs them (the
+        // root surface is sufficient for HiDPI / scale negotiation in
+        // Qt 6 / GTK 4).
+        for output in &self.outputs {
+            output.enter(surface.wl_surface());
+        }
         tracing::info!(w, h, "xdg_toplevel mapped as fullscreen foreground");
         self.foreground_toplevel = Some(surface);
         // R-honest.4: a new toplevel exists (title/app_id may still be
@@ -1571,7 +1635,9 @@ impl XdgShellHandler for HalmasuitState {
         // with a wl_surface.leave on destruction. Smithay's
         // `Output::leave` is idempotent (no-op if not in the set), so
         // this is safe even when the toplevel never reached mapping.
-        self.output.leave(surface.wl_surface());
+        for output in &self.outputs {
+            output.leave(surface.wl_surface());
+        }
 
         if self.foreground_toplevel.as_ref() == Some(&surface) {
             // The destroyed toplevel was the foreground. If it
@@ -1598,8 +1664,7 @@ impl XdgShellHandler for HalmasuitState {
             // immediately (no stale/black frame; req 11/17).
             self.set_keyboard_focus(None);
             if let Some(backend) = self.drm_backend.as_mut()
-                && let Err(e) =
-                    backend.render_layer_elements(&self.output, None, HALMASUIT_BRAND_CLEAR)
+                && let Err(e) = backend.render_layer_elements(None, HALMASUIT_BRAND_CLEAR)
             {
                 tracing::warn!(error = %e, "render on toplevel_destroyed failed");
             }
@@ -2710,6 +2775,13 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
                 )));
             }
             emit_phase(Phase::Deprivileged);
+            // Task #21: arm shutdown handling now — past the boot-pivot
+            // kill-spree window (the spree SIGTERM is processed shortly
+            // after RootfsReady, well before this point). From here a
+            // SIGTERM is a genuine stop: clean-exit on a plain stop, or
+            // (once PrepareForShutdown has latched `shutting_down`)
+            // paint-until-halt for a real shutdown.
+            state.shutdown_armed = true;
         }
         None if nix::unistd::geteuid().is_root() => {
             return Err(io::Error::other(format!(
@@ -3480,7 +3552,7 @@ fn graceful_shutdown(state: &mut HalmasuitState, reason: ShutdownReason) {
     // Those are logged at WARN and ignored — render_one_frame's
     // existing error path drops the failing frame and continues.
     if let Some(backend) = state.drm_backend.as_mut()
-        && let Err(e) = backend.render_layer_elements(&state.output, None, HALMASUIT_BRAND_CLEAR)
+        && let Err(e) = backend.render_layer_elements(None, HALMASUIT_BRAND_CLEAR)
     {
         tracing::warn!(error = %e, "graceful_shutdown: render_layer_elements failed");
     }
@@ -3498,6 +3570,14 @@ fn graceful_shutdown(state: &mut HalmasuitState, reason: ShutdownReason) {
 
     emit(&Event::Shutdown { reason });
     state.shutting_down = true;
+
+    // Task #21: `shutting_down` is now latched — release the logind delay
+    // inhibitor so the shutdown transaction proceeds. Ordering is the
+    // point: every SIGTERM from here on sees `shutting_down == true` and
+    // is read as real shutdown (keep painting), never as a plain stop
+    // (clean exit). On a plain `systemctl stop` this function never runs,
+    // so the inhibitor simply drops with `state` at process exit.
+    drop(state.shutdown_inhibitor.take());
 
     // R2.2 liveness signal: write one kmsg line on entry so that
     // tests which deliver SIGTERM directly (visual-shutdown-tear-down
@@ -3633,9 +3713,7 @@ fn setup_overlay_journal_channel(
             .map(|t| t.wl_surface().clone());
         if let Some(backend) = state.drm_backend.as_mut() {
             backend.set_overlay_text(text);
-            if let Err(e) =
-                backend.render_layer_elements(&state.output, fg.as_ref(), HALMASUIT_BRAND_CLEAR)
-            {
+            if let Err(e) = backend.render_layer_elements(fg.as_ref(), HALMASUIT_BRAND_CLEAR) {
                 tracing::warn!(error = %e, "render on overlay-journal update failed");
             }
         }
@@ -3714,6 +3792,73 @@ fn spawn_prepare_for_shutdown_watcher(loop_handle: &LoopHandle<'static, Halmasui
     {
         tracing::error!(error = %e, "spawn login1-watcher thread failed");
     }
+}
+
+/// Task #21: acquire a logind **delay** inhibitor on `shutdown`.
+///
+/// Held open (the returned fd) the inhibitor makes logind broadcast
+/// `PrepareForShutdown(true)` and then WAIT (up to `InhibitDelayMaxSec`,
+/// default 5 s, or until we release the fd) before proceeding with the
+/// shutdown transaction. That guarantees our `PrepareForShutdown`
+/// handler latches `shutting_down` BEFORE the unit-stop / systemd-shutdown
+/// SIGTERM arrives — so that SIGTERM is correctly read as "real shutdown,
+/// keep painting" and never misread as a plain `systemctl stop` (which
+/// would clean-exit → black the screen mid-shutdown, the one outcome the
+/// no-flash invariant forbids). `graceful_shutdown` drops the fd right
+/// after latching, releasing logind to continue.
+///
+/// Best-effort: `None` if the system bus or the `Inhibit` call is
+/// unavailable (no logind, polkit denial). The SIGTERM handler then falls
+/// back to the in-practice "PrepareForShutdown arrives ~seconds before
+/// the systemd-shutdown SIGTERM" ordering that the `graceful_shutdown`
+/// re-entry-bail already relies on.
+fn acquire_shutdown_delay_inhibitor() -> Option<std::os::fd::OwnedFd> {
+    let conn = match zbus::blocking::Connection::system() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "shutdown inhibitor: system bus unavailable; relying on PrepareForShutdown ordering"
+            );
+            return None;
+        }
+    };
+    let proxy = match zbus::blocking::Proxy::new(
+        &conn,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "shutdown inhibitor: Proxy::new failed; relying on PrepareForShutdown ordering"
+            );
+            return None;
+        }
+    };
+    // Inhibit(what, who, why, mode) -> h (fd). mode="delay".
+    let fd: zbus::zvariant::OwnedFd = match proxy.call(
+        "Inhibit",
+        &(
+            "shutdown",
+            "halmasuit",
+            "paint wallpaper until halt for flash-free shutdown",
+            "delay",
+        ),
+    ) {
+        Ok(fd) => fd,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "shutdown inhibitor: Inhibit refused; relying on PrepareForShutdown ordering"
+            );
+            return None;
+        }
+    };
+    tracing::info!("shutdown delay inhibitor acquired");
+    Some(std::os::fd::OwnedFd::from(fd))
 }
 
 /// Blocking inner loop for the login1 watcher thread. Connects to the
@@ -4134,17 +4279,28 @@ fn handle_drm_event(
         return;
     }
     match event {
-        smithay::backend::drm::DrmEvent::VBlank(_crtc) => {
+        smithay::backend::drm::DrmEvent::VBlank(crtc) => {
             // R5 (convergence epic): release dead popups before any
             // per-frame work — once per VBlank is the smithay-
             // recommended cadence and keeps the popup tree from
             // accumulating zombies between commits.
             state.popups.cleanup();
-            if let Some(backend) = state.drm_backend.as_mut()
-                && let Err(e) = backend.frame_submitted()
-            {
-                tracing::warn!(error = %e, "DRM frame_submitted failed");
-            }
+            // Acknowledge the page-flip on the output owning this CRTC
+            // and recover WHICH output flipped, so the per-output
+            // frame-callback / presentation-feedback work below targets
+            // that output's surfaces (extended multi-output: each CRTC
+            // flips independently). A frame_submitted error or an
+            // unmatched CRTC skips this cycle's callbacks; the next
+            // vblank recovers.
+            let flipped = state.drm_backend.as_mut().and_then(|backend| {
+                backend.frame_submitted(crtc).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "DRM frame_submitted failed");
+                    None
+                })
+            });
+            let Some(output) = flipped else {
+                return;
+            };
             // R2 (convergence epic): post-present frame-callback
             // emission. Wayland spec Appendix A `wl_surface::frame`
             // requires the server to notify clients when it's a good
@@ -4169,7 +4325,6 @@ fn handle_drm_event(
             // Explicit collect-then-iter drops the LayerMap guard
             // before `send_frame` runs (re-entering the LayerMap
             // inside send_frame would deadlock).
-            let output = state.output.clone();
             let layers: Vec<smithay::desktop::LayerSurface> =
                 smithay::desktop::layer_map_for_output(&output)
                     .layers()
@@ -4192,10 +4347,10 @@ fn handle_drm_event(
             // for any surface that requested it on its last commit.
             // smithay's `take_presentation_feedback_surface_tree` walks
             // the cached feedback per surface; we drive it for the
-            // foreground tree + each layer. The
-            // primary-scanout-output closure unconditionally returns
-            // the single output (halmasuit hosts one output and every
-            // visible surface is on it).
+            // foreground tree + each layer. The primary-scanout-output
+            // closure returns the output that just flipped — the layers
+            // walked here are that output's, and the foreground toplevel
+            // is composited on every output.
             let kind = smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync;
             let mut feedback = smithay::desktop::utils::OutputPresentationFeedback::new(&output);
             if let Some(toplevel) = state.foreground_toplevel.as_ref() {
@@ -4396,10 +4551,13 @@ fn main() -> io::Result<()> {
     //    once `/dev/input/event*` is available on the rootfs.
     // 2. `None`: the dev/test SKIP path — synthesized 1920x1080
     //    placeholder so wl_clients can still discover an output global.
-    let (drm_backend, drm_token, output, libinput_token) = if let Some(path) = &drm_device_path {
-        let (backend, token, real_output) =
+    let (drm_backend, drm_token, outputs, libinput_token) = if let Some(path) = &drm_device_path {
+        let (backend, token, real_outputs) =
             drm::setup_drm_direct(path, &loop_handle, handle_drm_event, wallpaper_config)?;
-        real_output.create_global::<HalmasuitState>(&display_handle);
+        // One wl_output global per connector (extended multi-output).
+        for output in &real_outputs {
+            output.create_global::<HalmasuitState>(&display_handle);
+        }
         emit_phase(Phase::DrmMasterAcquired);
         // Rootfs deployment: enumerate input here. Initramfs deployment:
         // `setup_post_pivot_input` runs the same `setup_libinput_direct`
@@ -4410,7 +4568,7 @@ fn main() -> io::Result<()> {
         } else {
             Some(setup_libinput_direct(&loop_handle)?)
         };
-        (Some(backend), Some(token), real_output, libinput_tok)
+        (Some(backend), Some(token), real_outputs, libinput_tok)
     } else {
         // SKIP path: synthesized placeholder. Geometry is invented;
         // the advertisement exists so clients can discover an output
@@ -4432,7 +4590,7 @@ fn main() -> io::Result<()> {
         synth.create_global::<HalmasuitState>(&display_handle);
         synth.change_current_state(Some(output_mode), None, None, Some((0, 0).into()));
         synth.set_preferred(output_mode);
-        (None, None, synth, None)
+        (None, None, vec![synth], None)
     };
 
     // R10 (convergence): zwp_linux_dmabuf_v1 global. Mesa-EGL
@@ -4647,24 +4805,32 @@ fn main() -> io::Result<()> {
     // Signal source. Register BEFORE the first dispatch so a SIGTERM
     // racing startup is still caught.
     //
-    // SIGTERM has two distinct meanings in the fromInitrd deployment:
-    //   1. During the boot pivot, `initrd-cleanup.service` sends
-    //      SIGTERM to every initramfs unit as systemd-shutdown tears
-    //      down the initramfs and switches root. halmasuit MUST
-    //      survive this (the whole point of the fromInitrd shape) —
-    //      its `SurviveFinalKillSignal=yes` directive prevents the
-    //      kill spree's SIGKILL from landing, and we ignore the
-    //      preceding SIGTERM here.
-    //   2. At actual system shutdown, systemd-shutdown sends SIGTERM
-    //      to halmasuit again BEFORE pivoting to /run/initramfs/
-    //      shutdown. This one drives graceful tear-down: SIGKILL the
-    //      greeter (if alive), composite wallpaper-only, exit cleanly.
+    // A stop signal has THREE distinct meanings, disambiguated by two
+    // flags (`shutdown_armed`, then `shutting_down`):
+    //   1. Boot pivot (fromInitrd, `shutdown_armed=false`): the
+    //      `initrd-cleanup.service` kill spree SIGTERMs every initramfs
+    //      unit as systemd-shutdown switches root. halmasuit MUST survive
+    //      it (the whole point of the fromInitrd shape) — ignored here;
+    //      `SurviveFinalKillSignal=yes` blocks the following SIGKILL.
+    //   2. Real system shutdown (`shutdown_armed=true`, and
+    //      `shutting_down=true` because logind's PrepareForShutdown — held
+    //      by our delay inhibitor — already ran `graceful_shutdown`):
+    //      keep painting the wallpaper plane through the
+    //      rootfs→shutdownRamfs pivot until the kernel halts. NO clean
+    //      exit — that would black the screen mid-shutdown (the flash this
+    //      project deletes).
+    //   3. Plain `systemctl stop halmasuit` / Ctrl-C (`shutdown_armed=
+    //      true`, `shutting_down=false` — no PrepareForShutdown preceded
+    //      it): the system is staying up. Exit cleanly (Task #21) →
+    //      release DRM master → the kernel hands scanout to fbcon → the
+    //      tty1 getty. A blink there is fine; stopping the display server
+    //      is supposed to drop you to a console.
     //
-    // `state.shutdown_armed` distinguishes them: false during the
-    // boot pivot window (until `Phase::RootfsReady` fires the flip),
-    // true thereafter. In rootfs-only (`services.halmasuit.enable=
-    // true`) mode the flag starts true at construction — no boot
-    // pivot to survive.
+    // `state.shutdown_armed` distinguishes them: false during the boot
+    // pivot window (flipped true at `Phase::Deprivileged`, past the
+    // boot-spree kill window — see the field doc), true thereafter. In
+    // rootfs-only (`services.halmasuit.enable=true`) mode the flag
+    // starts true at construction — no boot pivot to survive.
     //
     // The cooperative VT-switch signals (relsig/acqsig) are NOT here —
     // they are realtime signals on a dedicated signalfd registered
@@ -4676,9 +4842,9 @@ fn main() -> io::Result<()> {
         Signal::SIGHUP,
     ])?;
     loop_handle
-        .insert_source(
-            signals,
-            move |event, (), state: &mut HalmasuitState| match event.signal() {
+        .insert_source(signals, move |event, (), state: &mut HalmasuitState| {
+            let sig = event.signal();
+            match sig {
                 Signal::SIGCHLD => reap_zombie_children(state),
                 // R-honest.7 probe + fix: halmasuit TIOCSCTTYs the VT it
                 // switches to, so it becomes subject to controlling-tty
@@ -4690,10 +4856,48 @@ fn main() -> io::Result<()> {
                 Signal::SIGHUP => {
                     tracing::warn!("VT_SIGHUP_received (ignored)");
                 }
-                Signal::SIGTERM if !state.shutdown_armed => {
-                    tracing::info!("SIGTERM ignored (shutdown_armed=false, boot pivot in flight)");
+                // Boot pivot (fromInitrd): ignore stop signals — the
+                // initramfs kill spree must NOT take us down. Survival
+                // is the whole point; `SurviveFinalKillSignal=yes`
+                // blocks the following SIGKILL.
+                Signal::SIGTERM | Signal::SIGINT if !state.shutdown_armed => {
+                    tracing::info!(
+                        "stop signal ignored (shutdown_armed=false, boot pivot in flight)"
+                    );
                 }
-                sig => {
+                // Task #21: a stop signal with NO preceding
+                // PrepareForShutdown (`shutting_down` still false) is a
+                // plain `systemctl stop halmasuit` / Ctrl-C — the
+                // system is staying up. Exit cleanly: the main loop
+                // breaks on `should_exit`, drops DrmBackend → releases
+                // DRM master → the kernel hands scanout back to fbcon,
+                // which repaints the tty1 getty. A blink in that
+                // handoff is fine (this is a deliberate stop, not an
+                // automatic transition). We must NOT do this during a
+                // real shutdown — but there PrepareForShutdown has
+                // already latched `shutting_down` (the delay inhibitor
+                // guarantees that ordering), so such a SIGTERM falls
+                // through to graceful_shutdown below instead.
+                Signal::SIGTERM | Signal::SIGINT if !state.shutting_down => {
+                    let reason = if sig == Signal::SIGTERM {
+                        ShutdownReason::SignalTerm
+                    } else {
+                        ShutdownReason::SignalInt
+                    };
+                    tracing::info!(
+                        ?reason,
+                        "plain stop (no PrepareForShutdown): exiting cleanly; \
+                             DRM master released to the console on loop exit"
+                    );
+                    emit(&Event::Shutdown { reason });
+                    state.should_exit = true;
+                }
+                // A stop signal that arrives while `shutting_down` is
+                // already set: this is the real-shutdown SIGTERM that
+                // follows PrepareForShutdown. graceful_shutdown bails
+                // early (already shutting down) — we keep painting
+                // until the kernel halts (no flash).
+                _ => {
                     let reason = match sig {
                         Signal::SIGTERM => ShutdownReason::SignalTerm,
                         Signal::SIGINT => ShutdownReason::SignalInt,
@@ -4701,8 +4905,8 @@ fn main() -> io::Result<()> {
                     };
                     graceful_shutdown(state, reason);
                 }
-            },
-        )
+            }
+        })
         .map_err(io::Error::other)?;
 
     // Epic #71 R-honest.7: dedicated signalfd for the cooperative
@@ -4880,17 +5084,24 @@ fn main() -> io::Result<()> {
         }
     };
 
-    // Cache output-mode-derived constants once; the mode is stable
-    // across the compositor's lifetime in v1 (no hot-plug), so input
-    // and VBlank hot paths read these cached values rather than
-    // re-locking `output.current_mode()` per event/frame.
-    let output_size = output
+    // Cache output-mode-derived constants once from the PRIMARY output
+    // (outputs[0]); the modes are stable across the compositor's
+    // lifetime in v1 (no hot-plug), so input and VBlank hot paths read
+    // these cached values rather than re-locking `current_mode()` per
+    // event/frame.
+    let primary_output = &outputs[0];
+    let output_size = primary_output
         .current_mode()
         .map_or((1280_i32, 800_i32), |m| (m.size.w, m.size.h));
     let refresh_period = std::time::Duration::from_nanos(
         1_000_000_000_000_u64
-            / u64::try_from(output.current_mode().map_or(60_000, |m| m.refresh).max(1))
-                .expect("refresh clamped to >=1"),
+            / u64::try_from(
+                primary_output
+                    .current_mode()
+                    .map_or(60_000, |m| m.refresh)
+                    .max(1),
+            )
+            .expect("refresh clamped to >=1"),
     );
 
     // Epic #71 R-honest.7 (home-VT model): open our home VT and become
@@ -4923,7 +5134,7 @@ fn main() -> io::Result<()> {
         seat_state,
         seat,
         _output_manager_state: output_manager_state,
-        output,
+        outputs,
         shm_state,
         layer_shell_state,
         dmabuf_state,
@@ -4979,6 +5190,12 @@ fn main() -> io::Result<()> {
         // background thread reads from this via Arc clone.
         dbus_state: dbus_compositor1::CompositorObservability::new(),
         shutting_down: false,
+        should_exit: false,
+        // Task #21: hold a logind delay inhibitor so PrepareForShutdown
+        // latches `shutting_down` before any shutdown SIGTERM — keeping
+        // the plain-stop clean-exit path from ever firing mid-shutdown.
+        // Best-effort; `None` degrades to the in-practice signal ordering.
+        shutdown_inhibitor: acquire_shutdown_delay_inhibitor(),
         greetd_listener_token,
         drm_backend,
         _drm_token: drm_token,
@@ -5029,7 +5246,7 @@ fn main() -> io::Result<()> {
     // Requirement #5 semantics. The SKIP-path state (no `drm_backend`)
     // emits neither event.
     if let Some(backend) = state.drm_backend.as_mut() {
-        let queued = backend.render_one_frame(&state.output, HALMASUIT_BRAND_CLEAR)?;
+        let queued = backend.render_one_frame(HALMASUIT_BRAND_CLEAR)?;
         if queued {
             emit_phase(Phase::ScanoutActive);
         } else {
@@ -5122,8 +5339,7 @@ fn main() -> io::Result<()> {
                     if let Some(backend) = state.drm_backend.as_mut() {
                         let action = backend.tick_wallpaper();
                         if action.wants_render()
-                            && let Err(e) =
-                                backend.render_one_frame(&state.output, HALMASUIT_BRAND_CLEAR)
+                            && let Err(e) = backend.render_one_frame(HALMASUIT_BRAND_CLEAR)
                         {
                             tracing::warn!(
                                 error = %e,
@@ -5270,10 +5486,18 @@ fn main() -> io::Result<()> {
                             TimeoutAction::ToDuration(Duration::from_secs(1))
                         } else {
                             emit_phase(Phase::RootfsReady);
-                            // Epic #47 R2.1: the boot pivot is complete.
-                            // A SIGTERM from this point is the real
-                            // shutdown signal, not the boot kill spree.
-                            state.shutdown_armed = true;
+                            // Task #21: do NOT arm shutdown handling here.
+                            // The boot-pivot kill-spree SIGTERM is SENT
+                            // during switch_root (while we are still in
+                            // the initramfs, shutdown_armed=false) but our
+                            // calloop can PROCESS it right after this
+                            // point — arming at RootfsReady would misread
+                            // that spree SIGTERM as a post-boot stop and
+                            // (with the Task #21 clean-exit path) kill the
+                            // survival. Arming is deferred to
+                            // `Phase::Deprivileged` in
+                            // `run_post_pivot_setup`, reached only after
+                            // the spree window has closed.
                             phase = PivotPhase::Connecting {
                                 deadline: Instant::now() + Duration::from_secs(10),
                                 next_delay: Duration::from_millis(20),
@@ -5409,7 +5633,26 @@ fn main() -> io::Result<()> {
                 .map_err(io::Error::other)?;
             Ok(())
         });
+        // Task #21: a plain `systemctl stop` / Ctrl-C (a stop signal with
+        // no preceding PrepareForShutdown) asked us to exit cleanly. A
+        // real shutdown NEVER sets this — it stays in the paint-until-halt
+        // path so the wallpaper survives the rootfs→shutdownRamfs pivot.
+        if state.should_exit {
+            break;
+        }
     }
+
+    // Clean exit (plain stop). Drop the event loop FIRST — its DRM vblank
+    // notifier holds a clone of the device fd — then the state, whose
+    // DrmBackend holds the rest (compositors, GBM, renderer). Once every
+    // clone of the DRM fd is closed, the kernel drops our master and hands
+    // scanout back to fbcon, which repaints the tty1 getty. A blink in
+    // that handoff is expected and fine: stopping the display server is
+    // supposed to drop you to a console.
+    tracing::info!("releasing DRM master to the console and exiting");
+    drop(event_loop);
+    drop(state);
+    Ok(())
 }
 
 #[cfg(test)]

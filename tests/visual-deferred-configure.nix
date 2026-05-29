@@ -127,11 +127,11 @@ pkgs.testers.runNixOSTest {
     # The test client emits markers in order; PRESENTATION_FEEDBACK_OBSERVED
     # is the last one (R9 needs a VBlank to complete, so ~500ms sleep).
     machine.wait_until_succeeds(
-        "journalctl -u halmasuit | grep -qF PRESENTATION_FEEDBACK_OBSERVED",
+        "journalctl -b | grep -qF PRESENTATION_FEEDBACK_OBSERVED",
         timeout=30,
     )
 
-    journal = machine.succeed("journalctl -u halmasuit --no-pager")
+    journal = machine.succeed("journalctl -b --no-pager")
 
     # PHASE 1 (R4): configure_received MUST be false (compositor MUST
     # NOT send initial configure before client's first commit).
