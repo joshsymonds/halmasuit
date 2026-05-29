@@ -181,10 +181,12 @@ fn first_string_arg(node: &KdlNode, what: &str) -> Result<String, ParseError> {
         })
 }
 
-/// A named string property of `node`, if present.
+/// A named string property of `node`, if present. When a key is repeated,
+/// the rightmost wins, per the KDL v2 spec (so we scan from the back).
 fn string_prop(node: &KdlNode, key: &str) -> Option<String> {
     node.entries()
         .iter()
+        .rev()
         .find(|e| e.name().map(kdl::KdlIdentifier::value) == Some(key))
         .and_then(|e| e.value().as_string())
         .map(ToOwned::to_owned)
@@ -461,6 +463,26 @@ mod tests {
         );
         let role = &config.system("code").unwrap().roles()[0];
         assert_eq!(role.binding(), &Binding::Flex);
+    }
+
+    #[test]
+    fn duplicate_property_resolves_last_wins() {
+        // KDL v2: when a node repeats a property key, the rightmost wins.
+        let config = parse_ok(
+            r#"
+            system "s" {
+                role "r" {
+                    monitor "DP-1"
+                    rect 0 0 100 100
+                    sticky "firefox" profile="first" profile="second"
+                }
+            }
+            "#,
+        );
+        match config.system("s").unwrap().roles()[0].binding() {
+            Binding::Sticky(app) => assert_eq!(app.profile(), Some("second")),
+            other => panic!("expected sticky binding, got {other:?}"),
+        }
     }
 
     #[test]
