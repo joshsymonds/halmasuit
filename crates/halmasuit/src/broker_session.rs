@@ -27,10 +27,12 @@
 //! `halmasuit-session-ipc` codec is shared (the SEQPACKET syscall
 //! wrapper is reimplemented locally).
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
+use halmasuit_greetd::PamStep;
 use halmasuit_greetd::server::{Connection, Demand, SpawnRequest};
 use halmasuit_session_ipc::{
     BrokerToCompositor, CodecError, CompositorToBroker, MAX_MESSAGE_SIZE, SessionOutcome, encode,
@@ -423,6 +425,25 @@ pub struct BrokerEpisode {
     /// NEVER waitid/reap/signals it (the broker is the sole reaper —
     /// R9/A5).
     leader_pidfd: Option<OwnedFd>,
+    /// Epic #28 (gen-400): FIFO of PAM Challenges received from the
+    /// broker but not yet delivered to greetd because greetd is still
+    /// awaiting the greeter's response to a prior Challenge. The
+    /// broker emits `ConvDisplay`+`ConvPrompt` back-to-back when the
+    /// PAM stack composes synchronous modules (e.g. `pam_echo`+
+    /// `pam_unix try_first_pass`) — libpam invokes the next module's
+    /// `conv` immediately after the previous returns, before the
+    /// greeter has seen the first auth_message. Without this queue,
+    /// the driver tries to `resume_pam` the second Challenge while
+    /// `awaiting_pam=false`, which fails with `"resume_pam called
+    /// without an outstanding PAM round"`. Flushed in `act_on_demand`
+    /// on each `Demand::Pam` (greeter response → greetd ready again).
+    pending_challenges: VecDeque<PamStep>,
+    /// Mirrors greetd's internal `awaiting_pam`: `true` between a
+    /// `Demand::Pam` emission and the next `resume_pam`. Set by
+    /// `act_on_demand` on `Demand::Pam`; cleared by every `resume_pam`
+    /// call. Read by `on_broker_readable` to decide whether to deliver
+    /// the incoming Challenge immediately or queue it.
+    greetd_ready_for_challenge: bool,
 }
 
 impl BrokerEpisode {
@@ -437,6 +458,8 @@ impl BrokerEpisode {
             relay: None,
             conn: Connection::new(),
             leader_pidfd: None,
+            pending_challenges: VecDeque::new(),
+            greetd_ready_for_challenge: false,
         }
     }
 
@@ -495,10 +518,22 @@ impl BrokerEpisode {
         }
         let ev = self.relay.as_mut().unwrap().on_broker_frame(frame);
         match ev {
-            Ok(RelayEvent::Pam(step)) => match self.conn.resume_pam(step) {
-                Ok(o) => self.act_on_demand(o.reply, o.demand, &mut out),
-                Err(_codec) => self.fail_closed(&mut out),
-            },
+            Ok(RelayEvent::Pam(step)) => {
+                if self.greetd_ready_for_challenge {
+                    self.greetd_ready_for_challenge = false;
+                    match self.conn.resume_pam(step) {
+                        Ok(o) => self.act_on_demand(o.reply, o.demand, &mut out),
+                        Err(_codec) => self.fail_closed(&mut out),
+                    }
+                } else {
+                    // Epic #28 gen-400: greetd is mid-round (`awaiting_pam
+                    // =false`, greeter hasn't responded to the prior
+                    // Challenge yet). Queue this Challenge; it flushes
+                    // when the next greeter response arrives and
+                    // re-arms greetd via Demand::Pam.
+                    self.pending_challenges.push_back(step);
+                }
+            }
             Ok(RelayEvent::SessionOpened) => {
                 // A5 key 1. Surface it to the compositor's two-key
                 // SwapGate; the episode stays alive for SessionEnded.
@@ -532,6 +567,10 @@ impl BrokerEpisode {
             Demand::Continue => {}
             Demand::Close => out.terminate = true,
             Demand::Pam { response } => {
+                // greetd just emitted Demand::Pam → it set its internal
+                // awaiting_pam=true. Mirror that here so on_broker_readable
+                // knows it's safe to call resume_pam.
+                self.greetd_ready_for_challenge = true;
                 if self.relay.is_none() {
                     // First PAM round: build the relay now that greetd
                     // has parsed CreateSession and surfaces the client
@@ -555,8 +594,20 @@ impl BrokerEpisode {
                         // protocol). The broker is in AwaitWorker —
                         // sending a ConvResponse here would trigger
                         // UnexpectedFrame. Swallow: do not touch the
-                        // broker channel; the next worker frame
-                        // arrives via `on_broker_readable`.
+                        // broker channel.
+                        //
+                        // Epic #28 gen-400: if the broker already sent
+                        // the NEXT Challenge while we were waiting on
+                        // the greeter (back-to-back D+P from a
+                        // composed PAM stack), flush it now — greetd
+                        // is ready for resume_pam again.
+                        if let Some(step) = self.pending_challenges.pop_front() {
+                            self.greetd_ready_for_challenge = false;
+                            match self.conn.resume_pam(step) {
+                                Ok(o) => self.act_on_demand(o.reply, o.demand, out),
+                                Err(_codec) => self.fail_closed(out),
+                            }
+                        }
                     }
                     Err(RelayError::OutOfPhase) => self.fail_closed(out),
                 }

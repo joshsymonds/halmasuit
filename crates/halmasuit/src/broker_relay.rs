@@ -24,6 +24,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::fmt;
 
 use halmasuit_greetd::{AuthMessageType, PamStep};
@@ -101,35 +102,56 @@ impl std::error::Error for RelayError {}
 /// identity is NEVER this `username`: it is the broker's PAM-resolved
 /// `Success{username,uid,gid}`, passed through verbatim (Epic R8).
 ///
-/// Epic #24 invariant: `awaiting_display_ack` names whether the last
-/// frame we forwarded to the greeter was a [`BrokerToCompositor::ConvDisplay`]
-/// (display-class, one-way on the broker wire). When set, the next
-/// `on_pam_step` MUST return `None` — DMS sends a greetd
-/// `PostAuthMessageResponse` for every `auth_message` regardless of
-/// type, and the compositor's job is to swallow that response for
-/// display-class messages so it never crosses the broker boundary
-/// (the broker stays in `AwaitWorker`; see `crates/halmasuit-session/
-/// src/broker.rs` `on_worker_readable`'s `ConvDisplay` arm).
+/// Epic #24 invariant: every greeter response is mapped 1:1 to a
+/// previously-forwarded broker→compositor Challenge. Display-class
+/// Challenges (`ConvDisplay`) demand a *swallow* on the next
+/// `on_pam_step`; prompt-class (`ConvPrompt`) demand a *forward* as
+/// `ConvResponse`. The mapping is a FIFO queue
+/// ([`BrokerRelay::pending_responses`]) — see its field doc.
 #[derive(Debug)]
 pub struct BrokerRelay {
     service: String,
     username: String,
     phase: Phase,
-    /// One-shot: `true` iff the LAST frame forwarded to the greeter
-    /// was a [`BrokerToCompositor::ConvDisplay`]. Set on `ConvDisplay`
-    /// forward, cleared on (a) a `ConvPrompt` forward, or (b) the
-    /// next `on_pam_step` swallow. A boolean (not a counter) is
-    /// sufficient because greetd's own state machine enforces ONE
-    /// outstanding `auth_message` at a time on the compositor↔greeter
-    /// wire: `crates/halmasuit-greetd/src/server.rs::resume_pam`
-    /// fail-closes (`"resume_pam called without an outstanding PAM
-    /// round"`) the moment a second broker auth_message arrives
-    /// before the greeter's `post_auth_message_response` for the
-    /// first. So the pathological ordering D₁ D₂ R₁ R₂ — where two
-    /// `ConvDisplay` frames would be in flight simultaneously and
-    /// the flag would need to count to 2 — cannot occur in
-    /// halmasuit's broker↔compositor protocol stack.
-    awaiting_display_ack: bool,
+    /// FIFO of pending Challenges forwarded to the greeter, each
+    /// tagged with the action the corresponding greeter response
+    /// demands. `Swallow` for `ConvDisplay`-derived Challenges,
+    /// `Forward` for `ConvPrompt`-derived. Pushed by
+    /// `on_broker_frame` on each conv frame from the broker; popped
+    /// by `on_pam_step` in `Authing` to decide swallow vs. forward.
+    ///
+    /// Why a queue (not a boolean): the broker emits `ConvDisplay`
+    /// and `ConvPrompt` back-to-back when the PAM stack is composed
+    /// (`pam_echo` then `pam_unix try_first_pass`) — `pam_echo`'s
+    /// `display()` call returns immediately and libpam invokes
+    /// `pam_unix.conv` on the SAME `pam_authenticate` thread before
+    /// any greeter response has arrived. With a single boolean, the
+    /// `ConvPrompt` arrival would clear the flag set by
+    /// `ConvDisplay`, and the *first* greeter response (intended
+    /// for the display) would be forwarded as `ConvResponse` —
+    /// landing as `pam_unix`'s password and corrupting auth, or
+    /// failing closed with `resume_pam called without an
+    /// outstanding PAM round` (gen-400 Epic #28 e2e regression).
+    /// The queue tracks each pending Challenge independently in
+    /// arrival order, so the i-th greeter response matches the
+    /// i-th broker Challenge unambiguously.
+    pending_responses: VecDeque<PendingResponse>,
+}
+
+/// Per-pending-Challenge mapping: what to do with the corresponding
+/// greeter response when it lands at `on_pam_step`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingResponse {
+    /// The forwarded Challenge was `ConvDisplay`-derived. The greeter's
+    /// `post_auth_message_response` is mandated by greetd but the
+    /// response itself carries no auth content — swallow it (broker
+    /// is in `AwaitWorker`; sending a `ConvResponse` here would
+    /// trigger `UnexpectedFrame`).
+    Swallow,
+    /// The forwarded Challenge was `ConvPrompt`-derived. The greeter's
+    /// response IS the auth token (password, U2F serial, etc.) and
+    /// MUST be forwarded to the broker as `ConvResponse`.
+    Forward,
 }
 
 impl BrokerRelay {
@@ -142,7 +164,7 @@ impl BrokerRelay {
             service,
             username,
             phase: Phase::PreAuth,
-            awaiting_display_ack: false,
+            pending_responses: VecDeque::new(),
         }
     }
 
@@ -153,17 +175,18 @@ impl BrokerRelay {
     /// - `PreAuth`: emits `Some(BeginAuth)` (the greetd state
     ///   machine's initial `step(None)`); `response` is unused here.
     /// - `Authing`:
-    ///   - If `awaiting_display_ack` is set (the last frame the
-    ///     compositor forwarded to the greeter was a `ConvDisplay`),
-    ///     returns `None` — Epic #24 R5: the broker stays in
-    ///     `AwaitWorker`, and DMS's `respond("")` MUST NOT be
-    ///     forwarded as a `ConvResponse`. The flag is cleared.
-    ///   - Otherwise emits `Some(ConvResponse{...})`. `None` content
-    ///     (a greeter that sends a no-payload response for an
-    ///     unrecognized prompt) maps to an empty `Secret`.
+    ///   - Pops the head of [`Self::pending_responses`] — the FIFO
+    ///     decision queue. `Swallow` returns `Ok(None)` (broker stays
+    ///     in `AwaitWorker`; greetd-mandated response to a display
+    ///     does NOT cross the broker boundary). `Forward` returns
+    ///     `Ok(Some(ConvResponse{...}))`. `None` content maps to an
+    ///     empty `Secret`.
+    ///   - Queue empty in `Authing` is a protocol violation (greeter
+    ///     responded without a prior Challenge) — fails closed.
     ///
     /// # Errors
-    /// [`RelayError::OutOfPhase`] if called after auth completed.
+    /// [`RelayError::OutOfPhase`] if called after auth completed OR
+    /// if the greeter response arrived without a matching Challenge.
     pub fn on_pam_step(
         &mut self,
         response: Option<String>,
@@ -176,20 +199,20 @@ impl BrokerRelay {
                     username: self.username.clone(),
                 }))
             }
-            Phase::Authing => {
-                if self.awaiting_display_ack {
+            Phase::Authing => match self.pending_responses.pop_front() {
+                Some(PendingResponse::Swallow) => {
                     // Epic #24 R5: swallow the greetd-side response to
                     // a display-class auth_message. The broker stays
                     // in AwaitWorker; the worker (which is NOT blocked
                     // — `display()` returned immediately) drives the
                     // next conv message or PAM step.
-                    self.awaiting_display_ack = false;
-                    return Ok(None);
+                    Ok(None)
                 }
-                Ok(Some(CompositorToBroker::ConvResponse {
+                Some(PendingResponse::Forward) => Ok(Some(CompositorToBroker::ConvResponse {
                     response: Secret::new(response.unwrap_or_default()),
-                }))
-            }
+                })),
+                None => Err(RelayError::OutOfPhase),
+            },
             Phase::Authed | Phase::Starting | Phase::Running | Phase::Done => {
                 Err(RelayError::OutOfPhase)
             }
@@ -206,10 +229,11 @@ impl BrokerRelay {
         match (self.phase, frame) {
             // Auth conversation: a prompt keeps us in Authing.
             // Greeter MUST answer (greetd post_auth_message_response).
-            // Epic #24 R5: clear the display-ack flag — the next
-            // greeter response is a real ConvResponse to be forwarded.
+            // Epic #24 R5: enqueue Forward — the greeter's response
+            // (when it lands at on_pam_step) is the auth token and
+            // MUST be forwarded to the broker as ConvResponse.
             (Phase::Authing, BrokerToCompositor::ConvPrompt { style, message }) => {
-                self.awaiting_display_ack = false;
+                self.pending_responses.push_back(PendingResponse::Forward);
                 Ok(RelayEvent::Pam(PamStep::Challenge {
                     kind: prompt_to_kind(style),
                     prompt: message,
@@ -218,12 +242,12 @@ impl BrokerRelay {
             // Auth conversation: a display-only message keeps us in
             // Authing too. The greetd wire protocol still mandates a
             // post_auth_message_response from the greeter (DMS sends
-            // `respond("")`); Epic #24 R5: arm the display-ack swallow
-            // so the next `on_pam_step` returns None instead of
-            // forwarding a stale ConvResponse to the broker (which is
-            // in AwaitWorker — see broker.rs's ConvDisplay arm).
+            // `respond("")`); Epic #24 R5: enqueue Swallow so the
+            // matching on_pam_step returns None instead of forwarding
+            // a stale ConvResponse to the broker (which is in
+            // AwaitWorker — see broker.rs's ConvDisplay arm).
             (Phase::Authing, BrokerToCompositor::ConvDisplay { style, message }) => {
-                self.awaiting_display_ack = true;
+                self.pending_responses.push_back(PendingResponse::Swallow);
                 Ok(RelayEvent::Pam(PamStep::Challenge {
                     kind: display_to_kind(style),
                     prompt: message,
@@ -439,6 +463,85 @@ mod tests {
         })
         .unwrap();
         assert_eq!(r.on_pam_step(None).unwrap(), None);
+    }
+
+    #[test]
+    fn back_to_back_display_then_prompt_serializes_swallow_then_forward() {
+        // Epic #28 gen-400 regression: the broker emits ConvDisplay
+        // (pam_echo's PAM_TEXT_INFO) and ConvPrompt (pam_unix's
+        // PAM_PROMPT_ECHO_OFF) BACK-TO-BACK before any greeter
+        // response arrives — `pam_echo` returns `PAM_SUCCESS`
+        // synchronously and libpam immediately invokes the next
+        // module's conv. The compositor's broker_relay receives
+        // both frames, forwards Challenge(Info) then Challenge
+        // (Secret) to the greeter. The greeter responds to each
+        // in order. The FIRST response (to the info Challenge) MUST
+        // be swallowed; the SECOND (to the secret Challenge) MUST be
+        // forwarded as ConvResponse(password).
+        //
+        // The pre-queue boolean implementation got this wrong: the
+        // ConvPrompt arrival cleared the swallow flag set by
+        // ConvDisplay, so the first greeter response was forwarded
+        // as ConvResponse — landing as pam_unix's password and
+        // either corrupting auth or fail-closing with
+        // `resume_pam called without an outstanding PAM round`
+        // (the e2e test's actual failure mode under Q-G1).
+        let mut r = begun();
+        r.on_broker_frame(BrokerToCompositor::ConvDisplay {
+            style: DisplayStyle::Info,
+            message: "Touch your device".into(),
+        })
+        .unwrap();
+        r.on_broker_frame(BrokerToCompositor::ConvPrompt {
+            style: PromptStyle::Secret,
+            message: "Password: ".into(),
+        })
+        .unwrap();
+        // Greeter responds to the FIRST Challenge (the display).
+        assert_eq!(
+            r.on_pam_step(Some(String::new())).unwrap(),
+            None,
+            "first greeter response (to ConvDisplay) MUST be swallowed",
+        );
+        // Greeter responds to the SECOND Challenge (the prompt).
+        match r.on_pam_step(Some("hunter2".into())).unwrap() {
+            Some(CompositorToBroker::ConvResponse { response }) => {
+                assert_eq!(
+                    response.expose(),
+                    "hunter2",
+                    "second greeter response (to ConvPrompt) MUST be forwarded as ConvResponse",
+                );
+            }
+            other => panic!("expected Some(ConvResponse{{hunter2}}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn third_step_after_two_pending_is_out_of_phase() {
+        // After exactly N broker Challenges and N greeter responses,
+        // an (N+1)-th greeter response without a new Challenge is a
+        // protocol violation — fail closed (the queue is empty in
+        // Authing).
+        let mut r = begun();
+        r.on_broker_frame(BrokerToCompositor::ConvDisplay {
+            style: DisplayStyle::Info,
+            message: "info".into(),
+        })
+        .unwrap();
+        r.on_broker_frame(BrokerToCompositor::ConvPrompt {
+            style: PromptStyle::Secret,
+            message: "pw".into(),
+        })
+        .unwrap();
+        r.on_pam_step(Some(String::new())).unwrap(); // swallow display
+        r.on_pam_step(Some("test".into())).unwrap(); // forward prompt
+        // Queue is now empty; a third on_pam_step in Authing has no
+        // matching Challenge.
+        assert_eq!(
+            r.on_pam_step(Some("extra".into())),
+            Err(RelayError::OutOfPhase),
+            "greeter response without matching Challenge MUST fail closed",
+        );
     }
 
     #[test]
