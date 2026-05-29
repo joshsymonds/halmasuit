@@ -113,9 +113,20 @@ pub struct BrokerRelay {
     service: String,
     username: String,
     phase: Phase,
-    /// Set on `ConvDisplay` forward, cleared on `ConvPrompt` forward.
-    /// Read by `on_pam_step` to decide swallow-vs-forward; cleared
-    /// after a swallow so the next conv turn is unambiguous.
+    /// One-shot: `true` iff the LAST frame forwarded to the greeter
+    /// was a [`BrokerToCompositor::ConvDisplay`]. Set on `ConvDisplay`
+    /// forward, cleared on (a) a `ConvPrompt` forward, or (b) the
+    /// next `on_pam_step` swallow. A boolean (not a counter) is
+    /// sufficient because greetd's own state machine enforces ONE
+    /// outstanding `auth_message` at a time on the compositor↔greeter
+    /// wire: `crates/halmasuit-greetd/src/server.rs::resume_pam`
+    /// fail-closes (`"resume_pam called without an outstanding PAM
+    /// round"`) the moment a second broker auth_message arrives
+    /// before the greeter's `post_auth_message_response` for the
+    /// first. So the pathological ordering D₁ D₂ R₁ R₂ — where two
+    /// `ConvDisplay` frames would be in flight simultaneously and
+    /// the flag would need to count to 2 — cannot occur in
+    /// halmasuit's broker↔compositor protocol stack.
     awaiting_display_ack: bool,
 }
 
@@ -426,6 +437,50 @@ mod tests {
         })
         .unwrap();
         assert_eq!(r.on_pam_step(None).unwrap(), None);
+    }
+
+    #[test]
+    fn display_then_prompt_then_display_clears_and_rearms_flag() {
+        // Epic #24 R5: re-arm semantics for the awaiting_display_ack
+        // one-shot flag across a D→P→D interleave (gen-400 review
+        // Q-I1). Each ConvDisplay arms the swallow; the intervening
+        // ConvPrompt clears it (its greeter response is a real
+        // ConvResponse to forward); the second ConvDisplay re-arms
+        // it; the second greeter "respond" must again be swallowed.
+        // Without re-arm, the second display's response would be
+        // forwarded as a ConvResponse against AwaitWorker.
+        let mut r = begun();
+
+        // D₁: arm swallow.
+        r.on_broker_frame(BrokerToCompositor::ConvDisplay {
+            style: DisplayStyle::Info,
+            message: "Please touch the device".into(),
+        })
+        .unwrap();
+        assert_eq!(r.on_pam_step(Some(String::new())).unwrap(), None);
+
+        // P: clear (no-op here; swallow already cleared) and forward.
+        r.on_broker_frame(BrokerToCompositor::ConvPrompt {
+            style: PromptStyle::Visible,
+            message: "login: ".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            r.on_pam_step(Some("alice".into())).unwrap(),
+            Some(CompositorToBroker::ConvResponse { .. })
+        ));
+
+        // D₂: re-arm swallow AFTER the prompt cleared it.
+        r.on_broker_frame(BrokerToCompositor::ConvDisplay {
+            style: DisplayStyle::Error,
+            message: "Touch timed out, retrying".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            r.on_pam_step(Some(String::new())).unwrap(),
+            None,
+            "second ConvDisplay's response MUST be swallowed (re-arm)"
+        );
     }
 
     // ── inbound: BrokerToCompositor → RelayEvent ─────────────────────
