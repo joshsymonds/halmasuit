@@ -31,6 +31,26 @@ surfaces any unsafe rather than silently accepting it.
 
 ---
 
+## Vocabulary
+
+Two registers, deliberately:
+
+- **The config model speaks concrete.** A **`System`** (a whole-desktop
+  layout you switch to — the doc's "perspective", canonically a *system*)
+  holds **roles**, each a **region** on a **monitor** with a **binding**.
+  These are the words you hand-edit, so they name hardware and apps
+  directly.
+- **The navigator / star-map layer speaks astronomical** (a system drawn
+  as a *star*, a monitor as an *orbit*, a live window as a *planet*, a
+  role's stacked windows as a *constellation*), exactly as
+  `ARCHITECTURE.md`'s star-map section designs. `planet`/`orbit` are
+  view/runtime concepts and never appear in the config types.
+
+`System` is the canonical word in both registers — the bridge. `planet`
+(= window) is a runtime concept and does not exist in this crate yet.
+
+---
+
 ## Build sequence
 
 Built bottom-up, test-first (TDD), one type per task. Each task is a
@@ -45,17 +65,19 @@ design pass.
    `Binding` is a four-kind sum type; see the resolved binding fork below.
    App references carry an optional `profile` for separate-state instances
    (a `code` Firefox vs a `personal` Firefox).
-3. **`Perspective`** — a named set of roles. The ambient role is
-   implicit/structural, not a member of the roles list.
-4. **`Config` / `Layout`** — the top-level model. Separates role
-   *definitions* from role *bindings* (see the per-perspective fork).
+3. **`System`** ✅ — a named set of roles: one whole-desktop layout you
+   switch to. The ambient role is implicit/structural, not a member of
+   the roles list. An empty system is valid (visible structure). Roles
+   are owned by their system (isolation).
+4. **`Config` / `Layout`** — the top-level model: the set of systems and
+   the chosen config schema (see the config-schema fork).
 5. **KDL parser** — add the official `kdl` crate (KDL v2 spec) and
    hand-write the `KdlDocument`→types conversion with span-aware,
    actionable errors. The three `ARCHITECTURE.md` example configs
    (`code` / `meeting` / `reading`) become acceptance fixtures.
 6. **Semantic validator** — reject incoherent configs (out-of-bounds /
    zero-area regions caught at `Region` construction; duplicate role
-   names within a perspective; perspectives referencing undefined roles;
+   names within a system; references to slots/roles that do not exist;
    bad monitor refs) with clear messages.
 
 ---
@@ -82,16 +104,19 @@ not a re-derivation of the model.
   the label; the profile→launch mapping (`firefox -P code`) is a Phase 3
   runtime concern. This extends the doc's KDL schema with a `profile=`
   property (finalized at the KDL-parser task).
-- **Per-perspective vs global roles** — semantics RESOLVED, structure
-  pending at `Config`. Roles are **isolated per perspective**: each
-  perspective gets its *own* instance (Code's Firefox ≠ Personal's
-  Firefox), not a shared one. The structural representation (how
-  definitions and bindings are laid out in `Config`) is still decided at
-  the `Config` task.
-- **Two perspective syntaxes** (decided at `Perspective`): roles *by
-  reference* (`perspective "code" { roles "editor" "browser" }`) vs
-  roles *defined inline* (`perspective "meeting" { role "x" { … } }`).
-  The model must support both, or we pick one.
+- **Per-system vs global roles** — semantics RESOLVED, structure pending
+  at `Config`. Roles are **isolated per system**: each system gets its
+  *own* instance (Code's Firefox ≠ Personal's Firefox), not a shared one.
+  A resolved `System` therefore *owns* its `Vec<Role>`. The source
+  *schema* (how that is written — shared slots + per-system bindings, vs
+  fully-inline, vs a role pool by reference) is a parser concern, decided
+  at the `Config`/parser task.
+- **Config schema / two write-forms** — pending at `Config`. The doc
+  shows roles both by reference (`roles "editor" "browser"`) and inline
+  (`role "x" { … }`); separately, the same slot shape may hold a
+  different app/profile per system. Whatever the source syntax, a
+  resolved `System` is `name + Vec<Role>`, so this is a parser/`Config`
+  decision, not a `System`-type one.
 - **Cycle vs tabbed** — *deferred to the Phase 3 engine.* The model only
   stores the candidate list; how a role presents multiple windows (one
   slot holds *its* instance, not all windows of an app) is an engine

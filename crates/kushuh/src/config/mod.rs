@@ -10,9 +10,10 @@
 //!
 //! 1. [`Region`] — the atomic geometry leaf: a rectangle in
 //!    monitor-percentage space.
-//! 2. `Role` — a named position (monitor + [`Region`]) with an optional
-//!    app binding.
-//! 3. `Perspective` — a named set of roles.
+//! 2. [`Role`] — a named position (monitor + [`Region`]) with a
+//!    [`Binding`] that decides what fills it.
+//! 3. [`System`] — a named set of roles: one whole-desktop layout you
+//!    switch to (the project's "perspective", canonically a *system*).
 //! 4. `Config` / `Layout` — the top-level model, separating role
 //!    *definitions* from role *bindings*.
 //! 5. The KDL parser (hand-written over the official `kdl` crate).
@@ -20,6 +21,8 @@
 
 mod region;
 mod role;
+mod system;
 
 pub use region::{Region, RegionError};
 pub use role::{AppRef, Binding, BindingError, Role, RoleError};
+pub use system::{System, SystemError};
