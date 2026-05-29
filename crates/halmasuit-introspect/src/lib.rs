@@ -505,9 +505,14 @@ static LISTENERS: Mutex<Vec<Listener>> = Mutex::new(Vec::new());
 /// deadlock). The production listener only does a non-blocking channel
 /// send onto the compositor's calloop loop.
 pub fn register_listener(listener: impl Fn(&Event) + Send + 'static) {
+    // Poison-tolerant: a listener that panics while `emit` holds this
+    // lock would otherwise poison it and turn the journald observability
+    // path (login-flash / assert_no_flash_stream) into a process-wide
+    // abort on the NEXT emit. The registry is a plain Vec — a poisoned
+    // guard's data is still valid, so recover it.
     LISTENERS
         .lock()
-        .expect("introspect listener registry poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(Box::new(listener));
 }
 
@@ -541,10 +546,14 @@ pub fn emit(event: &Event) {
     }
     // Fan out AFTER logging. Listeners run while the lock is held; they
     // must be non-blocking and must not re-enter `emit` (see
-    // `register_listener`).
+    // `register_listener`). Poison-tolerant: the tracing log above already
+    // happened, so the observability contract is satisfied regardless; a
+    // listener that panicked on a prior call must not wedge the fan-out
+    // (or the journald gate) for every future event. The registry Vec is
+    // valid even through a poisoned guard.
     let listeners = LISTENERS
         .lock()
-        .expect("introspect listener registry poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for listener in listeners.iter() {
         listener(event);
     }

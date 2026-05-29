@@ -206,6 +206,32 @@ fn apply_event(
     written
 }
 
+/// Pre-fire sentinel an `EventTime` uniform reads before its event has
+/// ever fired: a negative time so a shader computing `u_time - eventTime`
+/// reads as fully settled ("happened long ago / never").
+const EVENT_TIME_UNSET: f32 = -1.0;
+/// Pre-fire sentinel an `EventValue` uniform reads before its event has
+/// fired: the latched "not active" gate value.
+const EVENT_VALUE_UNSET: f32 = 0.0;
+
+/// Resolve an `EventTime` uniform: the event's recorded fire time, or the
+/// [`EVENT_TIME_UNSET`] sentinel if it hasn't fired. Pure (no `self`) so
+/// the sentinel contract is unit-testable without a `GlesRenderer`;
+/// `current_uniforms` calls exactly this.
+fn resolve_event_time(event_times: &HashMap<String, f32>, event: &str) -> f32 {
+    event_times.get(event).copied().unwrap_or(EVENT_TIME_UNSET)
+}
+
+/// Resolve an `EventValue` uniform: the event's recorded value, or the
+/// [`EVENT_VALUE_UNSET`] sentinel. Pure; `current_uniforms` calls exactly
+/// this.
+fn resolve_event_value(event_values: &HashMap<String, f32>, event: &str) -> f32 {
+    event_values
+        .get(event)
+        .copied()
+        .unwrap_or(EVENT_VALUE_UNSET)
+}
+
 impl ShaderBackend {
     /// Read the GLSL source from `source`, assemble the final
     /// shader (injecting the Shadertoy preamble if applicable),
@@ -310,10 +336,10 @@ impl ShaderBackend {
                     // settled). `EventValue` carries the event's scalar,
                     // sentinel `0.0` (the latched "not fired" gate).
                     UniformBinding::EventTime { event } => {
-                        UniformValue::_1f(self.event_times.get(event).copied().unwrap_or(-1.0))
+                        UniformValue::_1f(resolve_event_time(&self.event_times, event))
                     }
                     UniformBinding::EventValue { event } => {
-                        UniformValue::_1f(self.event_values.get(event).copied().unwrap_or(0.0))
+                        UniformValue::_1f(resolve_event_value(&self.event_values, event))
                     }
                 };
                 Uniform::new(name.clone(), value).into_owned()
@@ -479,20 +505,25 @@ mod tests {
     }
 
     #[test]
-    fn current_uniforms_uses_sentinels_until_event_fires_then_the_fired_values() {
-        // Pre-fire: EventTime reads -1.0 (never fired), EventValue 0.0.
+    fn event_uniform_resolvers_use_sentinels_until_the_event_fires() {
+        // These call the SAME `resolve_event_time` / `resolve_event_value`
+        // that `current_uniforms` binds into the EventTime/EventValue
+        // uniforms, so a regression flipping a sentinel there fails here.
+        //
+        // Pre-fire: empty maps → the sentinels (-1.0 / 0.0).
         let times: HashMap<String, f32> = HashMap::new();
         let values: HashMap<String, f32> = HashMap::new();
         assert_eq!(
-            times.get("e").copied().unwrap_or(-1.0).to_bits(),
-            (-1.0f32).to_bits(),
+            resolve_event_time(&times, "e").to_bits(),
+            (-1.0f32).to_bits()
         );
         assert_eq!(
-            values.get("e").copied().unwrap_or(0.0).to_bits(),
-            0.0f32.to_bits(),
+            resolve_event_value(&values, "e").to_bits(),
+            0.0f32.to_bits()
         );
 
-        // After apply_event, the fired values are read back.
+        // After apply_event records a fire, the resolvers return the fired
+        // time / value.
         let table = bindings(&[
             (
                 "u_t",
@@ -510,13 +541,10 @@ mod tests {
         let mut times = HashMap::new();
         let mut values = HashMap::new();
         apply_event(&table, "e", 7.0, 1.0, &mut times, &mut values);
+        assert_eq!(resolve_event_time(&times, "e").to_bits(), 7.0f32.to_bits());
         assert_eq!(
-            times.get("e").copied().unwrap_or(-1.0).to_bits(),
-            7.0f32.to_bits(),
-        );
-        assert_eq!(
-            values.get("e").copied().unwrap_or(0.0).to_bits(),
-            1.0f32.to_bits(),
+            resolve_event_value(&values, "e").to_bits(),
+            1.0f32.to_bits()
         );
     }
 
