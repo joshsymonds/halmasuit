@@ -28,7 +28,12 @@ the kernel hands off.
 
 ## The architectural commitment
 
-**One halmasuit process, started in the initramfs, never exits until shutdown.**
+**One halmasuit process, started in the initramfs, owns the display
+continuously from boot through shutdown — it never exits across an
+*automatic* transition.** (A deliberate `systemctl stop halmasuit` is the
+one exception: it releases DRM master and exits cleanly, dropping to the
+text console — see Task #21. The no-flash invariant covers automatic
+transitions, not a human stopping the compositor.)
 
 The entire boot flash exists because of one upstream choice everywhere on
 Linux: Plymouth dies at `graphical.target`, then a display manager

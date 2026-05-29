@@ -1,24 +1,25 @@
-# tests/visual-shutdown-tear-down.nix — Epic #47 R2 graceful tear-down gate.
+# tests/visual-shutdown-tear-down.nix — Task #21 plain-stop clean-exit
+# gate (supersedes the Epic #47 R2.2 "SIGTERM keeps running" gate).
 #
-# Proves the SIGTERM-arming + graceful tear-down path:
+# Proves the plain-stop path with a full session up:
 #   1. Boot halmasuit; broker-spawn greeter; auth → niri up.
-#   2. Send SIGTERM to halmasuit (simulating systemd-shutdown's
-#      shutdown-phase signal, NOT the boot pivot's kill spree).
-#   3. Assert: Event::GreeterTerminated (greeter SIGKILLed by the
-#      tear-down path; broker SIGKILLs the session).
+#   2. assert_no_flash_stream over the OPERATION arc (boot → greeter →
+#      session): the visible content stream had no degenerate/black
+#      frame while halmasuit was running normally.
+#   3. Send SIGTERM to halmasuit (a plain stop — no preceding logind
+#      PrepareForShutdown, so it is NOT a real system shutdown).
 #   4. Assert: Event::Shutdown{ reason: signal_term } emitted.
-#   5. Assert: halmasuit KEEPS RUNNING after SIGTERM. The R2.2
-#      contract is that the main loop never exits on its own —
-#      the wallpaper plane must survive systemd-shutdown's kill
-#      spree and the rootfs→shutdownRamfs pivot until kernel halt.
-#      A clean exit at this stage would black out the wallpaper.
-#   6. Assert: assert_no_flash_stream over the whole arc — the
-#      visible tear-down (greeter+session → wallpaper-only)
-#      doesn't reintroduce the flash invariant.
+#   5. Assert: halmasuit EXITS CLEANLY (Task #21). Restart=on-failure +
+#      exit 0 ⇒ no restart ⇒ the unit deactivates and the PID is gone.
+#      Releasing DRM master hands scanout back to fbcon (the tty1
+#      getty); a blink there is fine — the no-flash invariant covers
+#      automatic transitions, not a human stopping the compositor.
 #
-# This is the in-unit tear-down gate; pivot survival under an
-# actual `systemctl poweroff` is covered by
-# tests/visual-shutdown-pivot-survival.nix.
+# Real-shutdown survival (paint until halt across the
+# rootfs→shutdownRamfs pivot, where halmasuit must NOT exit) is the
+# OPPOSITE path and is covered by the
+# halmasuit-shutdown-probe-phase{0,1,2} gates under real
+# `systemctl poweroff`.
 
 {
   system,
@@ -184,19 +185,26 @@ pkgs.testers.runNixOSTest {
     ).strip()
     print(f"PASS: halmasuit pid {halmasuit_pid} with niri session up")
 
-    # ── Trigger shutdown via SIGTERM ────────────────────────────────
-    # Sent directly to halmasuit's main PID (NOT via `systemctl stop`,
-    # which would tear the unit down differently). This exercises the
-    # state.shutdown_armed=true path: rootfs-only mode (no fromInitrd),
-    # so shutdown_armed is true from startup.
+    # No-flash invariant over the OPERATION arc (boot → greeter →
+    # session), while halmasuit is still running and serving Snapshot().
+    # The wallpaper plane was visible throughout; no degenerate / all-
+    # black frame. The deliberate stop below is allowed to blink.
+    visual.assert_no_flash_stream(machine)
+    print("PASS: no-flash invariant held over the operation arc")
+
+    # ── Plain stop via SIGTERM (Task #21) ──────────────────────────
+    # A SIGTERM with NO preceding logind PrepareForShutdown is a plain
+    # `systemctl stop` / manual stop — the system is staying up. Sent
+    # directly to the main PID; shutdown_armed is true from startup
+    # (rootfs-only mode), and shutting_down is false (no
+    # PrepareForShutdown), so this takes the clean-exit path.
     machine.succeed(f"kill -TERM {halmasuit_pid}")
     print(f"PASS: sent SIGTERM to halmasuit pid {halmasuit_pid}")
 
-    # The journal should record the graceful tear-down events.
-    # halmasuit's events go through tracing-subscriber's JSON
-    # formatter; the event payload is itself a JSON-encoded string
-    # field, so the quotes are double-escaped in the log line.
-    # Match on the bare token instead of the verbatim shape.
+    # Event::Shutdown{reason=signal_term} is emitted before exit.
+    # halmasuit's events go through tracing-subscriber's JSON formatter;
+    # the payload is itself a JSON-encoded string field, so quotes are
+    # double-escaped — match on the bare token.
     machine.wait_until_succeeds(
         "journalctl -u halmasuit -o cat | grep -qE 'event.*shutdown'",
         timeout=10,
@@ -206,37 +214,25 @@ pkgs.testers.runNixOSTest {
     )
     print("PASS: Event::Shutdown{reason=signal_term} emitted")
 
-    # R2.2 contract: halmasuit's main loop never exits on its own.
-    # After SIGTERM it has run the wallpaper-only tear-down but must
-    # keep painting through what would otherwise be the shutdown
-    # kill spree, so the wallpaper plane survives across the
-    # rootfs→shutdownRamfs pivot to kernel halt. Verify the unit is
-    # still active and the same PID is still alive a beat after
-    # the Shutdown event lands.
-    machine.sleep(1)
-    still_active = machine.succeed(
-        "systemctl is-active halmasuit.service"
-    ).strip()
-    assert still_active == "active", (
-        f"R2.2 regression: halmasuit.service is {still_active!r} after "
-        "SIGTERM — expected 'active'. The main loop must keep painting "
-        "the wallpaper plane through the shutdown pivot."
+    # Task #21 contract: a plain stop EXITS CLEANLY. halmasuit catches
+    # SIGTERM, releases DRM master (→ kernel fbcon → tty1 getty) and
+    # exits 0. Restart=on-failure + exit 0 ⇒ no restart ⇒ the unit
+    # deactivates and the PID is gone. (Real shutdown is the opposite:
+    # it would keep painting — but that path needs PrepareForShutdown,
+    # which a bare SIGTERM does not carry.)
+    machine.wait_until_succeeds(
+        '[ "$(systemctl is-active halmasuit.service)" != active ]',
+        timeout=15,
     )
-    pid_after = machine.succeed(
-        "systemctl show -p MainPID --value halmasuit.service"
+    machine.succeed(f"! test -d /proc/{halmasuit_pid}")
+    active_state = machine.succeed(
+        "systemctl show -p ActiveState --value halmasuit.service"
     ).strip()
-    assert pid_after == halmasuit_pid, (
-        f"R2.2 regression: halmasuit PID changed across SIGTERM "
-        f"({halmasuit_pid} → {pid_after}). The same PID must carry the "
-        "wallpaper plane through the shutdown pivot."
+    assert active_state in ("inactive", "deactivating"), (
+        f"Task #21: halmasuit must exit cleanly on a plain SIGTERM, "
+        f"ActiveState={active_state!r} (expected inactive)"
     )
-    machine.succeed(f"test -d /proc/{halmasuit_pid}")
-    print(f"PASS: halmasuit pid {halmasuit_pid} still running post-SIGTERM")
-
-    # No-flash invariant must hold across the entire arc, including
-    # the SIGTERM-driven tear-down recomposite. The wallpaper plane
-    # was visible throughout; no degenerate or all-black frame.
-    visual.assert_no_flash_stream(machine)
+    print(f"PASS: halmasuit exited cleanly on SIGTERM (ActiveState={active_state})")
 
     print("visual-shutdown-tear-down: ALL ASSERTIONS PASSED")
   '';

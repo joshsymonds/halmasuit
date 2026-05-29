@@ -9,11 +9,18 @@
 //! envelope (timestamp, level, target, fields). Our inner JSON sits in
 //! `fields.json` as a string. These helpers parse both layers.
 //!
-//! Epic #47 R2.2 contract: SIGTERM emits `Event::Shutdown` and runs the
-//! graceful tear-down, but halmasuit KEEPS RUNNING — it does NOT exit.
-//! Survival through kernel halt is what carries the wallpaper plane
-//! through systemd-shutdown's rootfs→shutdownRamfs pivot. These tests
-//! therefore observe the event then SIGKILL to clean up the child.
+//! Shutdown contract (Task #21, supersedes the Epic #47 R2.2
+//! "always keep running" contract): a stop signal (SIGTERM/SIGINT) with
+//! NO preceding logind `PrepareForShutdown` is a plain `systemctl stop`
+//! / Ctrl-C — halmasuit emits `Event::Shutdown` and then EXITS CLEANLY
+//! (releasing DRM master so the kernel drops to the tty1 getty). Only a
+//! REAL system shutdown — where `PrepareForShutdown` (held by a logind
+//! delay inhibitor) latches the graceful path first — keeps painting
+//! through the rootfs→shutdownRamfs pivot until the kernel halts. There
+//! is no logind in this standalone test harness, so the signals here
+//! always take the clean-exit path; the survive-through-shutdown path is
+//! covered by the VM `halmasuit-shutdown-probe-phase{0,1,2}` gates (real
+//! `systemctl poweroff`).
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -106,35 +113,40 @@ fn send_signal(child: &Child, sig: Signal) {
     signal::kill(Pid::from_raw(pid), sig).expect("kill(2) failed");
 }
 
-/// Epic #47 R2.2 contract: halmasuit's main loop never exits on its
-/// own — survival through systemd-shutdown's kill spree is what
-/// preserves the wallpaper plane across the rootfs→shutdownRamfs
-/// pivot. Tests that observe a `Shutdown` event must SIGKILL the
-/// child to terminate it, never wait on a clean exit.
+/// Best-effort cleanup for tests that don't assert on exit: SIGKILL +
+/// reap. Safe whether the child already exited cleanly (Task #21
+/// plain-stop path) or is still running.
 fn kill_and_reap(mut child: Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
 
-/// Assert that the child is STILL running a brief moment after a
-/// SIGTERM. The R2.2 contract is that SIGTERM emits the Shutdown
-/// event and runs the wallpaper-only tear-down but does NOT exit
-/// the main loop. A zero exit at this point would mean halmasuit
-/// regressed back to the R2.1 contract and the wallpaper would
-/// black out during the pivot.
-fn assert_still_running(child: &mut Child) {
-    // 50ms is enough for graceful_shutdown to have unwound from
-    // the signal handler — the calloop dispatch returns
-    // immediately after — but well under any plausible exit window
-    // if the contract were broken.
-    thread::sleep(Duration::from_millis(50));
-    match child.try_wait().expect("try_wait failed") {
-        None => {} // still running — correct
-        Some(status) => panic!(
-            "halmasuit exited ({status:?}) after SIGTERM — R2.2 contract \
-             requires the process to keep painting wallpaper until \
-             external SIGKILL / kernel halt"
-        ),
+/// Assert the child EXITS CLEANLY (success) within a short window after
+/// a plain stop signal (Task #21 contract). A bare SIGTERM/SIGINT with
+/// no preceding `PrepareForShutdown` — all this standalone harness can
+/// deliver — is a plain `systemctl stop`, so halmasuit releases the
+/// display and exits 0. A timeout here means the clean-exit path
+/// regressed back to paint-until-halt (and `systemctl stop` would hang
+/// until SIGKILL → the unit lands in `failed`).
+fn assert_clean_exit(child: &mut Child) {
+    let deadline = Instant::now() + TIMEOUT_EVENT;
+    loop {
+        match child.try_wait().expect("try_wait failed") {
+            Some(status) => {
+                assert!(
+                    status.success(),
+                    "halmasuit must exit cleanly (status 0) on a plain stop \
+                     signal, got {status:?}"
+                );
+                return;
+            }
+            None if Instant::now() >= deadline => panic!(
+                "halmasuit did not exit within {TIMEOUT_EVENT:?} after a plain \
+                 stop signal — clean-exit path (Task #21) regressed to \
+                 paint-until-halt"
+            ),
+            None => thread::sleep(Duration::from_millis(20)),
+        }
     }
 }
 
@@ -199,7 +211,7 @@ fn emits_started_init_then_wayland_ready_within_one_second() {
 }
 
 #[test]
-fn sigterm_emits_shutdown_signal_term_and_keeps_running() {
+fn sigterm_emits_shutdown_signal_term_and_exits_cleanly() {
     let (mut child, rx, _runtime_dir) = spawn();
 
     // Drain startup events.
@@ -217,12 +229,13 @@ fn sigterm_emits_shutdown_signal_term_and_keeps_running() {
         "SIGTERM must map to signal_term: {shutdown}"
     );
 
-    assert_still_running(&mut child);
-    kill_and_reap(child);
+    // Task #21: no PrepareForShutdown in this harness → plain stop →
+    // clean exit (release the display to the console).
+    assert_clean_exit(&mut child);
 }
 
 #[test]
-fn sigint_emits_shutdown_signal_int_and_keeps_running() {
+fn sigint_emits_shutdown_signal_int_and_exits_cleanly() {
     let (mut child, rx, _runtime_dir) = spawn();
 
     let _ = next_event(&rx); // started
@@ -239,8 +252,7 @@ fn sigint_emits_shutdown_signal_int_and_keeps_running() {
         "SIGINT must map to signal_int: {shutdown}"
     );
 
-    assert_still_running(&mut child);
-    kill_and_reap(child);
+    assert_clean_exit(&mut child);
 }
 
 #[test]
