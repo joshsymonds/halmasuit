@@ -647,6 +647,13 @@ pub struct DrmBackend {
     /// The rebuild happens only while the overlay is open, so a closed
     /// overlay costs nothing.
     overlay_buffer: Option<MemoryRenderBuffer>,
+    /// Whether halmasuit is running in the Phase-B initramfs. When set,
+    /// the single foreground toplevel (the `halmasuit-luks` prompt) is
+    /// composited as a centered, self-sized window over the wallpaper
+    /// rather than fullscreen at the origin. `false` in the rootfs
+    /// deployment, where the greeter/session toplevel stays fullscreen.
+    /// Set once via [`Self::set_in_initramfs`] before the render loop.
+    in_initramfs: bool,
 
     /// Latest composited frame, published every audited frame for the
     /// D-Bus `Snapshot()` method to read. Only exists in
@@ -660,6 +667,18 @@ pub struct DrmBackend {
     /// xdg-toplevel overlay. Only exists in `halmasuit-debug`.
     #[cfg(feature = "frame_audit")]
     wallpaper_only_buf: crate::dbus::SnapshotBuffer,
+}
+
+/// Top-left origin that centers a `surface`-sized window on an
+/// `output`-sized screen. Clamped to a non-negative origin: a surface
+/// at least as large as the output is pinned to `(0, 0)` rather than
+/// offset off the top-left. Pure (integer math) so it is unit-tested
+/// without a renderer; used to place the initramfs LUKS prompt.
+fn centered_origin(output: (i32, i32), surface: (i32, i32)) -> (i32, i32) {
+    (
+        ((output.0 - surface.0) / 2).max(0),
+        ((output.1 - surface.1) / 2).max(0),
+    )
 }
 
 impl DrmBackend {
@@ -1186,6 +1205,9 @@ where
             overlay_visible: false,
             overlay_text: String::new(),
             overlay_buffer: None,
+            // Set by `main` via `set_in_initramfs` before the render
+            // loop, once the boot context is known.
+            in_initramfs: false,
             #[cfg(feature = "frame_audit")]
             snapshot_buf: crate::dbus::new_buffer(),
             #[cfg(feature = "frame_audit")]
@@ -1489,9 +1511,28 @@ impl DrmBackend {
             }
         }
         if let Some(top) = foreground {
-            // Single fullscreen toplevel at the origin (v1: one
-            // output, no window management).
-            push_surface_at(&mut self.renderer, top, (0, 0).into());
+            // Rootfs: a single fullscreen toplevel (greeter/session) at
+            // the origin (v1: one output, no window management).
+            // Initramfs: the LUKS prompt is a self-sized window centered
+            // over the wallpaper, which shows (and reacts) around it.
+            let loc = if self.in_initramfs {
+                let output_size = output
+                    .current_mode()
+                    .map_or((0, 0), |m| (m.size.w, m.size.h));
+                // surface_size() is logical; at the single-output scale
+                // of 1.0 it maps 1:1 to physical (same convention the
+                // layer-geometry placement above uses).
+                let surface_size =
+                    smithay::backend::renderer::utils::with_renderer_surface_state(top, |s| {
+                        s.surface_size()
+                    })
+                    .flatten()
+                    .map_or((0, 0), |s| (s.w, s.h));
+                centered_origin(output_size, surface_size).into()
+            } else {
+                (0, 0).into()
+            };
+            push_surface_at(&mut self.renderer, top, loc);
         }
         for which in [WlrLayer::Bottom, WlrLayer::Background] {
             for layer in map.layers_on(which) {
@@ -1727,6 +1768,14 @@ impl DrmBackend {
         self.frame_counter = shared;
     }
 
+    /// Record whether halmasuit is running in the Phase-B initramfs.
+    /// When set, the foreground toplevel (the LUKS prompt) is centered
+    /// as a self-sized window rather than fullscreened. Called by `main`
+    /// after state construction and BEFORE the render loop starts.
+    pub const fn set_in_initramfs(&mut self, in_initramfs: bool) {
+        self.in_initramfs = in_initramfs;
+    }
+
     /// Re-render `elements` (+ the clear color) into an offscreen
     /// texture, read the pixels back to the CPU, analyze them, and
     /// emit `Event::FrameRendered`. Test-only — see Epic #1 req 6/7.
@@ -1919,6 +1968,20 @@ fn render_one_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn centered_origin_centers_a_smaller_window() {
+        // 480x240 prompt on a 1920x1080 output → ((1920-480)/2, (1080-240)/2).
+        assert_eq!(centered_origin((1920, 1080), (480, 240)), (720, 420));
+    }
+
+    #[test]
+    fn centered_origin_clamps_when_surface_exceeds_output() {
+        // A surface at least as large as the output pins to the origin,
+        // never a negative (off-screen top-left) offset.
+        assert_eq!(centered_origin((100, 100), (200, 200)), (0, 0));
+        assert_eq!(centered_origin((800, 600), (800, 600)), (0, 0));
+    }
 
     /// Pin the `xrgb_le` byte ordering. The visual goldens depend on
     /// `[B, G, R, X]` little-endian; a refactor that transposes

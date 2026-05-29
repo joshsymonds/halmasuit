@@ -246,6 +246,15 @@ pub enum Event {
     /// remains the authoritative signal when the broker is alive; the
     /// swap gate makes whichever trigger arrives later inert.
     SessionLeaderExitedViaPidfd,
+    /// The LUKS unlock prompt came up: the `halmasuit-luks` password
+    /// agent (a nested Wayland client spawned in the Phase-B initramfs)
+    /// mapped its prompt toplevel. Emitted by the compositor when a
+    /// toplevel maps while running in the initramfs — where the LUKS
+    /// agent is the only client. Semantics are "the unlock screen is
+    /// up", not "a specific passphrase is being asked" (the agent maps
+    /// one surface and reuses it across asks). Journald-observable, and
+    /// reaches the wallpaper as `halmasuit.luks.prompt`.
+    LuksPromptShown,
     /// The reactive wallpaper wrote a bus-driven value into a named
     /// shader uniform in response to a lifecycle event. Pure
     /// observability: this is the journald marker the headless VM gate
@@ -580,6 +589,21 @@ mod tests {
         serde_json::from_str(&s).expect("round-trip parse should succeed")
     }
 
+    /// Serializes the tests that exercise the process-global `emit()`
+    /// fan-out / listener registry. Under `cargo test` they share one
+    /// process and the registry persists across tests, so concurrent
+    /// emits + leftover listeners can interleave; this guard makes them
+    /// mutually exclusive. (nextest isolates each test in its own
+    /// process and never contends this.) Poison-tolerant so one test's
+    /// panic doesn't wedge the rest.
+    static EMIT_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    fn emit_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        EMIT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn event_started_serializes_with_tag() {
         let v = round_trip(&Event::Started {
@@ -879,6 +903,7 @@ mod tests {
             },
             Event::SessionLeaderPidfdArmed,
             Event::SessionLeaderExitedViaPidfd,
+            Event::LuksPromptShown,
             Event::WallpaperUniformApplied {
                 event_name: "halmasuit.session.opened".to_owned(),
                 uniform: "u_login_time".to_owned(),
@@ -893,6 +918,7 @@ mod tests {
 
     #[test]
     fn emit_without_subscriber_does_not_panic() {
+        let _guard = emit_test_guard();
         // No subscriber installed; tracing events become no-ops by design.
         emit(&Event::Started {
             pid: 1,
@@ -909,6 +935,7 @@ mod tests {
 
     #[test]
     fn emit_routes_through_tracing_subscriber() {
+        let _guard = emit_test_guard();
         let capture = Capture::default();
         let subscriber = tracing_subscriber::fmt()
             .json()
@@ -945,6 +972,7 @@ mod tests {
 
     #[test]
     fn registered_listener_receives_emitted_event() {
+        let _guard = emit_test_guard();
         // The registry is process-global. We assert additively (filter by
         // the exact event we emit) so the test is order-independent and
         // tolerant of other tests' emits sharing the process under
@@ -967,6 +995,7 @@ mod tests {
 
     #[test]
     fn emit_logs_before_fanning_out_to_listeners() {
+        let _guard = emit_test_guard();
         // Prove the journald-observability contract: the tracing line is
         // written BEFORE listeners run. The listener reads the shared
         // capture buffer at fire time; if logging happened first, the

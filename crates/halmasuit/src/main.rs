@@ -437,6 +437,13 @@ struct HalmasuitState {
     /// in-practice PrepareForShutdown-before-SIGTERM ordering the
     /// re-entry-bail already depends on.
     shutdown_inhibitor: Option<std::os::fd::OwnedFd>,
+    /// Whether halmasuit is running in the Phase-B initramfs. Drives the
+    /// LUKS-prompt path: `new_toplevel` emits `LuksPromptShown` and
+    /// configures the toplevel as a centered self-sized window (vs the
+    /// rootfs greeter/session, which is fullscreened). Cached from
+    /// `context::is_initramfs()` at construction so the per-map handler
+    /// needn't stat `/etc/initrd-release`.
+    in_initramfs: bool,
     /// Held so the registered listener token survives for the lifetime
     /// of the compositor; calloop drops the source on shutdown.
     greetd_listener_token: Option<RegistrationToken>,
@@ -1601,15 +1608,31 @@ impl XdgShellHandler for HalmasuitState {
         // wl_surface.commit, per xdg-shell spec (smithay smallvil
         // pattern; see commit handler R4 block).
         use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-        let (w, h): (i32, i32) = self
-            .primary_output()
-            .current_mode()
-            .map_or((1280, 800), |m| (m.size.w, m.size.h));
-        surface.with_pending_state(|state| {
-            state.size = Some((w, h).into());
-            state.states.set(xdg_toplevel::State::Activated);
-            state.states.set(xdg_toplevel::State::Fullscreen);
-        });
+        if self.in_initramfs {
+            // The LUKS prompt is a self-sized window the compositor
+            // centers over the wallpaper (see `DrmBackend::scene_elements`)
+            // — NOT fullscreen, so the reactive wallpaper shows and reacts
+            // around it. Leave `size` unset so the agent declares its own
+            // content size; keep Activated for keyboard focus.
+            surface.with_pending_state(|state| {
+                state.states.set(xdg_toplevel::State::Activated);
+            });
+            // In the initramfs, halmasuit-luks is the only client, so a
+            // mapped toplevel here IS the unlock prompt appearing.
+            emit(&Event::LuksPromptShown);
+            tracing::info!("luks prompt toplevel mapped (centered, self-sized)");
+        } else {
+            let (w, h): (i32, i32) = self
+                .primary_output()
+                .current_mode()
+                .map_or((1280, 800), |m| (m.size.w, m.size.h));
+            surface.with_pending_state(|state| {
+                state.size = Some((w, h).into());
+                state.states.set(xdg_toplevel::State::Activated);
+                state.states.set(xdg_toplevel::State::Fullscreen);
+            });
+            tracing::info!(w, h, "xdg_toplevel mapped as fullscreen foreground");
+        }
         // R6 (convergence epic): emit `wl_surface.enter` for the
         // toplevel so the client picks the correct buffer scale,
         // transform, and frame timing. The foreground toplevel is
@@ -1621,7 +1644,6 @@ impl XdgShellHandler for HalmasuitState {
         for output in &self.outputs {
             output.enter(surface.wl_surface());
         }
-        tracing::info!(w, h, "xdg_toplevel mapped as fullscreen foreground");
         self.foreground_toplevel = Some(surface);
         // R-honest.4: a new toplevel exists (title/app_id may still be
         // unset until first commit; the focus path re-snapshots once
@@ -5232,6 +5254,8 @@ fn main() -> io::Result<()> {
         // this true on `Phase::RootfsReady` — before that, SIGTERM is
         // the boot kill spree and stays ignored.
         shutdown_armed: !in_initramfs,
+        // Drives the LUKS-prompt windowing/emit path in `new_toplevel`.
+        in_initramfs,
         // Epic #71 R3.1: overlay starts closed. Toggled by chord.
         diag_overlay_open: false,
         // Epic #71 R-honest.6: overlay journal cache + channel sender.
@@ -5268,6 +5292,9 @@ fn main() -> io::Result<()> {
     // never incremented.
     if let Some(backend) = state.drm_backend.as_mut() {
         backend.set_frame_counter(state.dbus_state.frame_counter.clone());
+        // Center the foreground toplevel (LUKS prompt) over the
+        // wallpaper in the initramfs; fullscreen it in the rootfs.
+        backend.set_in_initramfs(state.in_initramfs);
     }
 
     // The wallpaper plane is composited from frame 0 (epic G1/R3/R6):

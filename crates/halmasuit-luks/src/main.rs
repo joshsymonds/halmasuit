@@ -78,6 +78,15 @@ const PROMPT_BGRA: [u8; 4] = [0x66, 0x4C, 0x0A, 0xFF];
 /// family, just brighter.
 const ACTIVE_BGRA: [u8; 4] = [0xAA, 0x88, 0x22, 0xFF];
 
+/// The prompt window's self-chosen size. halmasuit (the host
+/// compositor) centers this window over the wallpaper rather than
+/// dictating a size — the client owns its content size (proper Wayland),
+/// and the reactive wallpaper shows around the box. A fixed size is the
+/// MVP (solid-color box, no text yet); real prompt UI will size to its
+/// content here.
+const PROMPT_W: u32 = 480;
+const PROMPT_H: u32 = 240;
+
 /// Polling cadence for the ask-password directory and the
 /// `/etc/initrd-release` pivot marker. systemd-cryptsetup writes the
 /// ask file once and waits; 200ms is fast enough that the prompt
@@ -527,13 +536,15 @@ impl WindowHandler for State {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _window: &Window,
-        configure: WindowConfigure,
+        _configure: WindowConfigure,
         _serial: u32,
     ) {
-        let w = configure.new_size.0.map_or(1280, std::num::NonZeroU32::get);
-        let h = configure.new_size.1.map_or(800, std::num::NonZeroU32::get);
-        self.width = w;
-        self.height = h;
+        // Self-size to the fixed prompt box, ignoring the compositor's
+        // suggested size: halmasuit leaves `size` unset (it centers the
+        // window rather than dictating its size). The wallpaper shows
+        // around this box.
+        self.width = PROMPT_W;
+        self.height = PROMPT_H;
         self.configured = true;
         self.paint();
     }

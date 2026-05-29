@@ -49,6 +49,7 @@ pub const fn canonical_name(event: &Event) -> Option<&'static str> {
         Event::SessionOpened => "halmasuit.session.opened",
         Event::SessionClientFirstFrame => "halmasuit.session.client_first_frame",
         Event::SessionEnded { .. } => "halmasuit.session.ended",
+        Event::LuksPromptShown => "halmasuit.luks.prompt",
         // Not bindable: per-frame churn, internal-diagnostic markers, and
         // crash/error paths a wallpaper has no business animating.
         // WallpaperUniformApplied is the observability marker the wallpaper
@@ -206,6 +207,7 @@ mod tests {
             ),
             (Event::SessionLeaderPidfdArmed, None),
             (Event::SessionLeaderExitedViaPidfd, None),
+            (Event::LuksPromptShown, Some("halmasuit.luks.prompt")),
             (
                 Event::WallpaperUniformApplied {
                     event_name: "halmasuit.session.opened".to_owned(),
