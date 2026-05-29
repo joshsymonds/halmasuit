@@ -51,12 +51,15 @@ pub const fn canonical_name(event: &Event) -> Option<&'static str> {
         Event::SessionEnded { .. } => "halmasuit.session.ended",
         // Not bindable: per-frame churn, internal-diagnostic markers, and
         // crash/error paths a wallpaper has no business animating.
+        // WallpaperUniformApplied is the observability marker the wallpaper
+        // itself emits — giving it a name would let it re-trigger a write.
         Event::FrameRendered { .. }
         | Event::Fatal { .. }
         | Event::GreeterKillFailed { .. }
         | Event::GreeterDiedPreAuth { .. }
         | Event::SessionLeaderPidfdArmed
-        | Event::SessionLeaderExitedViaPidfd => return None,
+        | Event::SessionLeaderExitedViaPidfd
+        | Event::WallpaperUniformApplied { .. } => return None,
     })
 }
 
@@ -203,6 +206,13 @@ mod tests {
             ),
             (Event::SessionLeaderPidfdArmed, None),
             (Event::SessionLeaderExitedViaPidfd, None),
+            (
+                Event::WallpaperUniformApplied {
+                    event_name: "halmasuit.session.opened".to_owned(),
+                    uniform: "u_login_time".to_owned(),
+                },
+                None,
+            ),
         ]
     }
 

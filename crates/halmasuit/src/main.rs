@@ -3861,6 +3861,55 @@ fn acquire_shutdown_delay_inhibitor() -> Option<std::os::fd::OwnedFd> {
     Some(std::os::fd::OwnedFd::from(fd))
 }
 
+/// Wire the reactive-wallpaper event consumer: a calloop channel fed by
+/// a single `halmasuit-introspect` listener, drained on the main loop
+/// with `&mut HalmasuitState`.
+///
+/// `emit()` logs first, then hands each `Event` to the registered
+/// listener, which does a non-blocking send onto the channel (the
+/// `&mut state` reentrancy trap is sidestepped: delivery is deferred to
+/// the next loop turn). The handler resolves the event's wallpaper-facing
+/// canonical name; for a bound `EventTime`/`EventValue` uniform it writes
+/// the fire time / value and emits a `WallpaperUniformApplied` marker per
+/// uniform. Events with no canonical name (per-frame churn, diagnostics,
+/// and `WallpaperUniformApplied` itself) are cheap no-ops — the latter is
+/// why the marker cannot re-trigger a write.
+///
+/// Live-only by design: events emitted before this registration are not
+/// replayed (matching the bus's documented semantics).
+fn spawn_wallpaper_event_consumer(loop_handle: &LoopHandle<'static, HalmasuitState>) {
+    let (tx, channel) = calloop::channel::channel::<Event>();
+    if let Err(e) = loop_handle.insert_source(channel, |event, (), state: &mut HalmasuitState| {
+        let calloop::channel::Event::Msg(event) = event else {
+            return;
+        };
+        let Some(event_name) = halmasuit_events::canonical_name(&event) else {
+            return;
+        };
+        let Some(backend) = state.drm_backend.as_mut() else {
+            return;
+        };
+        let value = halmasuit_events::event_value(&event);
+        for uniform in backend.notify_wallpaper_event(event_name, value) {
+            emit(&Event::WallpaperUniformApplied {
+                event_name: event_name.to_owned(),
+                uniform,
+            });
+        }
+    }) {
+        tracing::error!(error = %e, "insert wallpaper-event calloop channel failed");
+        return;
+    }
+
+    // The Sender lives for the process lifetime inside the global
+    // listener registry. Send is non-blocking; a closed channel (only at
+    // teardown, once the loop source is gone) drops the event silently —
+    // the observability path must never block or panic the emitter.
+    halmasuit_introspect::register_listener(move |event| {
+        let _ = tx.send(event.clone());
+    });
+}
+
 /// Blocking inner loop for the login1 watcher thread. Connects to the
 /// system bus, builds a signal stream on
 /// `org.freedesktop.login1.Manager.PrepareForShutdown`, and forwards
@@ -5029,6 +5078,11 @@ fn main() -> io::Result<()> {
     // greeter killed, wallpaper-only recomposite, `DrmDevice::pause`,
     // and the rest of the wallpaper-only paint-until-halt path.
     spawn_prepare_for_shutdown_watcher(&loop_handle);
+
+    // Reactive wallpaper: forward lifecycle events to the wallpaper's
+    // EventTime/EventValue uniforms. Registered here so it is live as
+    // early as possible (earlier lifecycle events are not replayed).
+    spawn_wallpaper_event_consumer(&loop_handle);
 
     // Epic #71 R-honest.6: overlay-journal channel (registered before
     // state construction; the Sender is stashed on HalmasuitState).

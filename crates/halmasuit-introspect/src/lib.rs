@@ -246,6 +246,20 @@ pub enum Event {
     /// remains the authoritative signal when the broker is alive; the
     /// swap gate makes whichever trigger arrives later inert.
     SessionLeaderExitedViaPidfd,
+    /// The reactive wallpaper wrote a bus-driven value into a named
+    /// shader uniform in response to a lifecycle event. Pure
+    /// observability: this is the journald marker the headless VM gate
+    /// keys off, since pixels are unobservable under `virtio-gpu-pci`.
+    /// Emitted once per uniform actually written. It is NOT itself a
+    /// wallpaper-bindable event (no canonical name), so it cannot
+    /// re-trigger a write.
+    WallpaperUniformApplied {
+        /// The canonical dotted event name that drove the write
+        /// (e.g. `halmasuit.session.opened`).
+        event_name: String,
+        /// The GLSL uniform name that received the value.
+        uniform: String,
+    },
 }
 
 /// How the session leader process terminated (Amendment A5.2).
@@ -865,6 +879,10 @@ mod tests {
             },
             Event::SessionLeaderPidfdArmed,
             Event::SessionLeaderExitedViaPidfd,
+            Event::WallpaperUniformApplied {
+                event_name: "halmasuit.session.opened".to_owned(),
+                uniform: "u_login_time".to_owned(),
+            },
         ];
         for e in samples {
             let s = serde_json::to_string(&e).expect("serialize");

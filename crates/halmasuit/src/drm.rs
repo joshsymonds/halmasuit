@@ -695,6 +695,15 @@ impl DrmBackend {
             (false, false) => WallpaperTickAction::Idle,
         }
     }
+
+    /// Forward a fired system event to the wallpaper backend; returns
+    /// the GLSL uniform names updated (empty if the backend has no
+    /// binding for `event_name`). The continuous wallpaper tick picks
+    /// up the mutated uniform values on its next fire — no explicit
+    /// redraw needed. See [`WallpaperEngine::notify_event`].
+    pub fn notify_wallpaper_event(&mut self, event_name: &str, value: f32) -> Vec<String> {
+        self.wallpaper.notify_event(event_name, value)
+    }
 }
 
 /// Outcome of `DrmBackend::tick_wallpaper` — encodes both the

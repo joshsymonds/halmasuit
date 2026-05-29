@@ -101,6 +101,20 @@ pub trait WallpaperBackend: Send {
     fn wants_continuous_render(&self) -> bool {
         false
     }
+
+    /// Notify the backend that a system event named `event_name` fired,
+    /// carrying scalar `value`. A backend with event-bound uniforms
+    /// records the fire (the shader backend stamps the time in its own
+    /// `AutoTime` epoch and the value) and returns the GLSL uniform
+    /// names it updated, so the caller can emit one
+    /// `WallpaperUniformApplied` marker per uniform. Default: no
+    /// event-bound uniforms, so nothing is updated.
+    /// [`super::ImageBackend`] and the video backend keep the default;
+    /// [`super::ShaderBackend`] overrides it.
+    fn notify_event(&mut self, event_name: &str, value: f32) -> Vec<String> {
+        let _ = (event_name, value);
+        Vec::new()
+    }
 }
 
 #[cfg(test)]

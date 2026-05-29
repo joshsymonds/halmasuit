@@ -3,10 +3,9 @@
 // Compiles a user-supplied GLSL ES 100 fragment shader via smithay's
 // `GlesRenderer::compile_custom_pixel_shader` and runs it per-frame
 // with declared uniforms wired to their config-specified sources
-// (auto-* engine values, static constants, event-time/event-value
-// bus markers — only auto and static fire in Phase-A; the event-*
-// kinds parse cleanly and log a one-time warning that the bus is
-// not yet connected).
+// (auto-* engine values, static constants, and event-time/event-value
+// uniforms driven by the lifecycle bus: `notify_event` records a
+// fired event's time/value, which `current_uniforms` reads each frame).
 //
 // Shadertoy-shape shaders (`void mainImage(out vec4, in vec2)`) are
 // supported via a thin GLSL preamble that pre-declares the
@@ -16,7 +15,7 @@
 // substring match (`mainImage(`); declared-uniforms shaders that
 // write `void main()` directly bypass the preamble entirely.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::time::Instant;
@@ -106,17 +105,14 @@ fn assemble_source(user_src: &str) -> String {
     }
 }
 
-/// The UniformType smithay expects for each kind of binding. Phase-A
-/// `Event*` kinds default to `_1f` since they never fire and the
-/// user shader chooses the slot's actual GLSL type — the location
-/// query in `compile_custom_pixel_shader` only needs a type for
-/// validation when `update_uniforms` is called, and Phase-A never
-/// supplies an Event* value.
+/// The UniformType smithay expects for each kind of binding.
+/// `EventTime`/`EventValue` are scalar `_1f`: `EventTime` carries the
+/// fire timestamp (same epoch as `AutoTime`) and `EventValue` the
+/// event's scalar payload.
 const fn uniform_type_for(binding: &UniformBinding) -> UniformType {
     match binding {
-        // `_1f` covers `AutoTime`, `AutoDelta`, and the Phase-A
-        // default for `EventTime`/`EventValue` (which never fire
-        // — see the type's doc).
+        // `_1f` covers `AutoTime`, `AutoDelta`, and the bus-driven
+        // `EventTime`/`EventValue` (both scalar floats).
         UniformBinding::AutoTime
         | UniformBinding::AutoDelta
         | UniformBinding::EventTime { .. }
@@ -167,6 +163,47 @@ pub struct ShaderBackend {
     /// `PixelShaderElement` area when nothing changed (a small
     /// optimization; the element is cheap to clone anyway).
     last_output_size: Size<i32, Logical>,
+    /// Last fire time (seconds in the `frame_start` epoch, same as
+    /// `AutoTime`) per canonical event name, for `EventTime` uniforms.
+    /// Absent = never fired → the `-1.0` sentinel.
+    event_times: HashMap<String, f32>,
+    /// Last fired value per canonical event name, for `EventValue`
+    /// uniforms. Absent = never fired → the `0.0` sentinel.
+    event_values: HashMap<String, f32>,
+}
+
+/// Record a fired event into the per-event time/value maps for any
+/// binding whose `EventTime`/`EventValue` `event` matches `event_name`,
+/// and return the GLSL uniform names that were updated (one
+/// `WallpaperUniformApplied` marker is emitted per returned name).
+///
+/// Pure (no `self`, no clock) so it is unit-testable without a
+/// `GlesRenderer`: the caller supplies `time_secs` (the shader's
+/// `frame_start` epoch). `EventTime` bindings record the time;
+/// `EventValue` bindings record the value.
+fn apply_event(
+    bindings: &[(String, UniformBinding)],
+    event_name: &str,
+    time_secs: f32,
+    value: f32,
+    event_times: &mut HashMap<String, f32>,
+    event_values: &mut HashMap<String, f32>,
+) -> Vec<String> {
+    let mut written = Vec::new();
+    for (uniform, binding) in bindings {
+        match binding {
+            UniformBinding::EventTime { event } if event == event_name => {
+                event_times.insert(event.clone(), time_secs);
+                written.push(uniform.clone());
+            }
+            UniformBinding::EventValue { event } if event == event_name => {
+                event_values.insert(event.clone(), value);
+                written.push(uniform.clone());
+            }
+            _ => {}
+        }
+    }
+    written
 }
 
 impl ShaderBackend {
@@ -174,9 +211,9 @@ impl ShaderBackend {
     /// shader (injecting the Shadertoy preamble if applicable),
     /// compile via smithay's `compile_custom_pixel_shader`, and
     /// resolve the declared-uniforms config into the per-frame
-    /// binding list. Phase-A: any `EventTime` / `EventValue`
-    /// binding emits a one-time `tracing::warn!` that the wallpaper
-    /// bus is not yet connected (the bus-event epic wires them).
+    /// binding list. `EventTime` / `EventValue` bindings are driven by
+    /// the lifecycle bus via [`WallpaperBackend::notify_event`]; their
+    /// uniforms read the `-1.0` / `0.0` sentinel until the event fires.
     ///
     /// # Errors
     ///
@@ -232,29 +269,6 @@ impl ShaderBackend {
                 ))
             })?;
 
-        // One-time bus warning per unique event name. Phase-A: the
-        // bus is not wired, so any `Event*` binding's uniform will
-        // never receive a fired value — the user shader should
-        // tolerate the default-zero initial value. The bus-event
-        // follow-up epic wires the actual delivery.
-        let event_names: BTreeSet<String> = bindings
-            .iter()
-            .filter_map(|(_, binding)| match binding {
-                UniformBinding::EventTime { event } | UniformBinding::EventValue { event } => {
-                    Some(event.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        for event in &event_names {
-            tracing::warn!(
-                target: "halmasuit::wallpaper",
-                shader = %source.display(),
-                event = %event,
-                "wallpaper bus not yet connected; event-driven uniforms will never fire in Phase-A"
-            );
-        }
-
         let now = Instant::now();
         Ok(Self {
             program,
@@ -263,6 +277,8 @@ impl ShaderBackend {
             last_frame: now,
             frame_counter: 0,
             last_output_size: Size::from((0, 0)),
+            event_times: HashMap::new(),
+            event_values: HashMap::new(),
         })
     }
 
@@ -287,12 +303,17 @@ impl ShaderBackend {
                     UniformBinding::AutoDelta => UniformValue::_1f(delta_secs),
                     UniformBinding::AutoMouse => UniformValue::_4f(0.0, 0.0, 0.0, 0.0),
                     UniformBinding::Static { value: v } => static_to_uniform_value(v),
-                    // Phase-A: bus is not connected. Bind a default
-                    // value the user shader can guard against (a
-                    // sentinel `0.0`); the bus-event epic will fire
-                    // real values.
-                    UniformBinding::EventTime { .. } | UniformBinding::EventValue { .. } => {
-                        UniformValue::_1f(0.0)
+                    // Bus-driven. `EventTime` carries the fire time in
+                    // the same epoch as `AutoTime` (so `u_time -
+                    // eventTime` is valid), sentinel `-1.0` until the
+                    // event first fires (a shader's decay reads as fully
+                    // settled). `EventValue` carries the event's scalar,
+                    // sentinel `0.0` (the latched "not fired" gate).
+                    UniformBinding::EventTime { event } => {
+                        UniformValue::_1f(self.event_times.get(event).copied().unwrap_or(-1.0))
+                    }
+                    UniformBinding::EventValue { event } => {
+                        UniformValue::_1f(self.event_values.get(event).copied().unwrap_or(0.0))
                     }
                 };
                 Uniform::new(name.clone(), value).into_owned()
@@ -312,6 +333,20 @@ impl WallpaperBackend for ShaderBackend {
     /// whichever frame the last Wayland client commit produced.
     fn wants_continuous_render(&self) -> bool {
         true
+    }
+
+    fn notify_event(&mut self, event_name: &str, value: f32) -> Vec<String> {
+        // Stamp the time in OUR `frame_start` epoch — the same clock
+        // `AutoTime` uses — so a shader's `u_time - eventTime` is valid.
+        let time_secs = self.frame_start.elapsed().as_secs_f32();
+        apply_event(
+            &self.bindings,
+            event_name,
+            time_secs,
+            value,
+            &mut self.event_times,
+            &mut self.event_values,
+        )
     }
 
     fn render_element(
@@ -357,6 +392,133 @@ impl WallpaperBackend for ShaderBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a binding table the way `ShaderBackend::new` would (name →
+    /// binding), for the pure `apply_event` tests.
+    fn bindings(entries: &[(&str, UniformBinding)]) -> Vec<(String, UniformBinding)> {
+        entries
+            .iter()
+            .map(|(name, b)| ((*name).to_owned(), b.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn apply_event_writes_matching_event_time_and_value_uniforms() {
+        let table = bindings(&[
+            (
+                "u_login_time",
+                UniformBinding::EventTime {
+                    event: "halmasuit.session.opened".to_owned(),
+                },
+            ),
+            (
+                "u_login_active",
+                UniformBinding::EventValue {
+                    event: "halmasuit.session.opened".to_owned(),
+                },
+            ),
+        ]);
+        let mut times = HashMap::new();
+        let mut values = HashMap::new();
+
+        let written = apply_event(
+            &table,
+            "halmasuit.session.opened",
+            12.5,
+            1.0,
+            &mut times,
+            &mut values,
+        );
+
+        // Both uniforms updated; markers would be emitted for each.
+        assert_eq!(written.len(), 2);
+        assert!(written.contains(&"u_login_time".to_owned()));
+        assert!(written.contains(&"u_login_active".to_owned()));
+        // EventTime recorded the time; EventValue recorded the value,
+        // each keyed by canonical event name. Bit-compare to assert exact
+        // f32 equality without tripping clippy::float_cmp.
+        assert_eq!(
+            times
+                .get("halmasuit.session.opened")
+                .copied()
+                .map(f32::to_bits),
+            Some(12.5f32.to_bits()),
+        );
+        assert_eq!(
+            values
+                .get("halmasuit.session.opened")
+                .copied()
+                .map(f32::to_bits),
+            Some(1.0f32.to_bits()),
+        );
+    }
+
+    #[test]
+    fn apply_event_is_a_noop_for_unmatched_event_name() {
+        let table = bindings(&[(
+            "u_login_time",
+            UniformBinding::EventTime {
+                event: "halmasuit.session.opened".to_owned(),
+            },
+        )]);
+        let mut times = HashMap::new();
+        let mut values = HashMap::new();
+
+        let written = apply_event(
+            &table,
+            "halmasuit.foreground.greeter",
+            3.0,
+            1.0,
+            &mut times,
+            &mut values,
+        );
+
+        assert!(written.is_empty(), "no binding matches; nothing written");
+        assert!(times.is_empty());
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn current_uniforms_uses_sentinels_until_event_fires_then_the_fired_values() {
+        // Pre-fire: EventTime reads -1.0 (never fired), EventValue 0.0.
+        let times: HashMap<String, f32> = HashMap::new();
+        let values: HashMap<String, f32> = HashMap::new();
+        assert_eq!(
+            times.get("e").copied().unwrap_or(-1.0).to_bits(),
+            (-1.0f32).to_bits(),
+        );
+        assert_eq!(
+            values.get("e").copied().unwrap_or(0.0).to_bits(),
+            0.0f32.to_bits(),
+        );
+
+        // After apply_event, the fired values are read back.
+        let table = bindings(&[
+            (
+                "u_t",
+                UniformBinding::EventTime {
+                    event: "e".to_owned(),
+                },
+            ),
+            (
+                "u_v",
+                UniformBinding::EventValue {
+                    event: "e".to_owned(),
+                },
+            ),
+        ]);
+        let mut times = HashMap::new();
+        let mut values = HashMap::new();
+        apply_event(&table, "e", 7.0, 1.0, &mut times, &mut values);
+        assert_eq!(
+            times.get("e").copied().unwrap_or(-1.0).to_bits(),
+            7.0f32.to_bits(),
+        );
+        assert_eq!(
+            values.get("e").copied().unwrap_or(0.0).to_bits(),
+            1.0f32.to_bits(),
+        );
+    }
 
     #[test]
     fn shadertoy_shape_detection_recognizes_canonical_signature() {
