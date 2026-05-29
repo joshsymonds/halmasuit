@@ -85,8 +85,10 @@ design pass.
    duplicate regions/systems (parser + `Config::new`). The B+ schema has
    no role-by-reference and no monitor registry, so "undefined role" and
    "bad monitor ref" do not apply. The one genuinely-uncovered coherence
-   check is **region overlap within a system on the same monitor** — not
-   in the epic's listed checks; in-scope vs deferred is an open question.
+   check is **region overlap within a system on the same monitor** —
+   **deferred to Phase 3**: overlap may be intentional (a floating/HUD/PiP
+   role over a base), and the correct policy depends on the engine's
+   layering model, which does not exist yet. Not an epic requirement.
 
 ---
 
