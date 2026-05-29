@@ -69,8 +69,9 @@ design pass.
    switch to. The ambient role is implicit/structural, not a member of
    the roles list. An empty system is valid (visible structure). Roles
    are owned by their system (isolation).
-4. **`Config` / `Layout`** — the top-level model: the set of systems and
-   the chosen config schema (see the config-schema fork).
+4. **`Config`** ✅ — the top-level model: a non-empty, uniquely-named set
+   of systems, with `system(name)` lookup. Schema-agnostic resolved form;
+   no default/startup-system concept yet (add when the engine needs it).
 5. **KDL parser** — add the official `kdl` crate (KDL v2 spec) and
    hand-write the `KdlDocument`→types conversion with span-aware,
    actionable errors. The three `ARCHITECTURE.md` example configs
