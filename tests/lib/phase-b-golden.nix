@@ -121,15 +121,15 @@ let
     exec ${niri}/bin/niri --config ${niriConfig}
   '';
 
-  # Custom Phase B wayland-session .desktop file. DMS's
-  # GreeterContent.qml discovers .desktop files by scanning each
-  # entry of XDG_DATA_DIRS for `share/wayland-sessions/*.desktop`
-  # and indexes the FIRST one as `selectedSession[0]` (no other
-  # selection signal in headless — no saved session, no UI nav).
-  # By putting OUR dir first in XDG_DATA_DIRS (greeter wrapper
-  # below) and provisioning only this one file, DMS picks our
-  # wrapped niri as the default session — no niri.desktop override,
-  # no upstream patch.
+  # Custom Phase B wayland-session .desktop file — Exec=niriCmd runs
+  # niri DIRECTLY (not niri-session; see the pathsToLink note below for
+  # why that distinction is load-bearing). DMS's GreeterContent.qml
+  # loads every discovered `wayland-sessions/*.desktop` ASYNCHRONOUSLY
+  # and defaults `selectedSession` to whichever finishes loading first,
+  # deduping only by `Name=` (no saved session / UI nav in headless).
+  # There is no reliable "ours first" ordering — so determinism comes
+  # from making this the ONLY discoverable session (we keep niri-flake's
+  # niri.desktop out of the search path; see below), NOT from priority.
   testSessions = pkgs.writeTextDir "share/wayland-sessions/phase-b-niri.desktop" ''
     [Desktop Entry]
     Name=phase-b-niri
@@ -332,11 +332,26 @@ in
     "d /run/halmasuit-niri 0700 alice alice -"
   ];
 
-  # niri.desktop needs to be discoverable via XDG_DATA_DIRS for the
-  # niri-flake module's full session integration; testSessions
-  # provides ours first in priority order.
-  environment.pathsToLink = [ "/share/wayland-sessions" ];
-
+  # Do NOT link niri-flake's `/share/wayland-sessions/niri.desktop`
+  # into the system path. It is `Exec=niri-session`, the niri-flake
+  # wrapper that runs `dbus-update-activation-environment` +
+  # `systemctl --user import-environment` — both fatal in this headless
+  # session (no $DISPLAY, no reachable user bus), so niri-session exits
+  # 1 *before* ever exec'ing niri.
+  #
+  # DMS's greeter (GreeterContent.qml) discovers every
+  # `*.desktop` across XDG_DATA_DIRS/wayland-sessions, loads each
+  # ASYNCHRONOUSLY via FileView, and defaults `selectedSession` to
+  # `sessionExecs[0]` = whichever async load finishes FIRST. Its only
+  # dedup is by `Name=`, and ours (`phase-b-niri`) ≠ niri-flake's
+  # (`Niri`), so both coexist and race for slot 0. If niri.desktop wins
+  # that race, the broker launches niri-session and the session dies
+  # silently mid-startup — a coin-flip, not a load effect.
+  #
+  # `/share/wayland-sessions` is NOT in NixOS's baseline pathsToLink, so
+  # simply not adding it here means `testSessions`' phase-b-niri.desktop
+  # (Exec=niriCmd, direct) is the SOLE discoverable session: sessionExecs
+  # has one entry, [0] is deterministically our direct-niri command.
   environment.systemPackages = [ halmasuit-vm-client pkgs.cryptsetup ];
 
   # ── LUKS wiring ───────────────────────────────────────────────────
