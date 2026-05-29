@@ -9,7 +9,9 @@
 //! This is hand-written over the official `kdl` crate (no derive-macro
 //! KDL, no serde-KDL — the repo owns its parsing boundaries). Every
 //! malformed or incoherent input is a returned [`ParseError`] carrying a
-//! source [`Span`]; nothing here panics on user input.
+//! source [`Span`]; nothing here panics on user input. Adversarially deep
+//! or oversized input is rejected by a pre-parse guard (`guard_input`)
+//! before it can overflow the recursive `kdl` parser.
 //!
 //! Coverage: `region` definitions, `system`/`role` nodes, inline geometry
 //! (`monitor` + `rect`) or a shared `region="…"` reference, and all four
@@ -87,6 +89,65 @@ impl ParseError {
     }
 }
 
+/// Maximum accepted config size in bytes. A desktop-layout config is
+/// tiny; anything past this is almost certainly hostile or corrupt. Guards
+/// against handing a huge document to the recursive `kdl` parser.
+const MAX_CONFIG_BYTES: usize = 256 * 1024;
+
+/// Maximum accepted `{`-nesting depth. The `kdl` parser recurses per
+/// nested block with no depth bound of its own — a deeply-nested document
+/// would overflow the stack before our code runs. A real config nests only
+/// a few levels (system → role → cycle → app), so this is far above any
+/// legitimate input.
+const MAX_NESTING_DEPTH: usize = 32;
+
+/// Reject pathological input *before* the recursive `kdl` parse: oversized
+/// documents, and excessive `{`-nesting that would otherwise overflow the
+/// stack inside `kdl` (which a returned error cannot catch). Brace counting
+/// skips the contents of `"…"` strings so a brace inside a title regex
+/// doesn't inflate the depth; raw/multi-line strings are counted
+/// conservatively — this is a safety cap, not a second parser.
+fn guard_input(src: &str) -> Result<(), ParseError> {
+    if src.len() > MAX_CONFIG_BYTES {
+        return Err(ParseError::spanless(format!(
+            "config is {} bytes, over the {MAX_CONFIG_BYTES}-byte limit",
+            src.len()
+        )));
+    }
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, byte) in src.bytes().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else {
+            match byte {
+                b'"' => in_string = true,
+                b'{' => {
+                    depth += 1;
+                    if depth > MAX_NESTING_DEPTH {
+                        return Err(ParseError::at(
+                            format!(
+                                "config nesting exceeds the depth limit of {MAX_NESTING_DEPTH}"
+                            ),
+                            Span { offset, len: 1 },
+                        ));
+                    }
+                }
+                b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse a KDL source string into a validated [`Config`]. This is the
 /// crate's single config entry point.
 ///
@@ -96,6 +157,7 @@ impl ParseError {
 /// KDL, an unrecognised schema, or a config that violates the model's
 /// invariants (bad region, duplicate names, …).
 pub fn parse(src: &str) -> Result<Config, ParseError> {
+    guard_input(src)?;
     let doc: KdlDocument = src.parse().map_err(|e| kdl_syntax_error(&e))?;
 
     // Pass 1: collect top-level `region "name" { monitor; rect }` anchors.
@@ -536,6 +598,40 @@ mod tests {
         let _ = parse("]]] not kdl \u{0}\u{1} ===");
         let _ = parse("");
         let _ = parse("system");
+    }
+
+    #[test]
+    fn deeply_nested_input_is_rejected_not_crashed() {
+        // Far past MAX_NESTING_DEPTH: the guard must reject this with an
+        // error (not recurse into kdl and overflow the stack).
+        let deep = "{".repeat(super::MAX_NESTING_DEPTH + 50);
+        let err = parse_err(&deep);
+        assert!(err.message().contains("depth"), "got: {}", err.message());
+        assert!(err.span().is_some());
+    }
+
+    #[test]
+    fn oversized_input_is_rejected() {
+        let huge = "a".repeat(super::MAX_CONFIG_BYTES + 1);
+        let err = parse_err(&huge);
+        assert!(err.message().contains("limit"), "got: {}", err.message());
+    }
+
+    #[test]
+    fn many_flat_systems_parse_within_limits() {
+        // Large-ish but shallow (depth 3) and within the byte limit: the
+        // guard must NOT reject legitimate flat input.
+        use std::fmt::Write as _;
+        let mut src = String::new();
+        for i in 0..50 {
+            writeln!(
+                src,
+                "system \"s{i}\" {{ role \"r\" {{ monitor \"DP-1\"; rect 0 0 100 100; sticky \"kitty\" }} }}"
+            )
+            .expect("writing to a String is infallible");
+        }
+        let config = parse_ok(&src);
+        assert_eq!(config.systems().len(), 50);
     }
 
     #[test]
