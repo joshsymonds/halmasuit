@@ -1161,6 +1161,30 @@ impl HalmasuitState {
     fn primary_output(&self) -> &Output {
         &self.outputs[0]
     }
+
+    /// Plain-stop graceful close: ask the session client's toplevel to
+    /// close via `xdg_toplevel.close`. The session is a NESTED Wayland
+    /// compositor (niri); its winit backend turns this into a
+    /// `CloseRequested` and shuts itself down, so it disconnects cleanly
+    /// instead of being stranded when we subsequently drop the Wayland
+    /// socket. Dropping the socket from under a still-running nested
+    /// compositor leaves it spinning on `EPIPE` writes — a journal/serial
+    /// flood that can starve our own exit. Returns whether a session
+    /// toplevel was actually asked to close; `false` means there is no
+    /// session client to drain (greeter-only / already gone), so the
+    /// caller can exit immediately without burning the grace window.
+    fn begin_graceful_session_close(&mut self) -> bool {
+        if self.foreground != halmasuit_introspect::Foreground::Session {
+            return false;
+        }
+        let Some(toplevel) = self.foreground_toplevel.as_ref() else {
+            return false;
+        };
+        toplevel.send_close();
+        let _ = self.display_handle.flush_clients();
+        tracing::info!("graceful session close requested (xdg_toplevel.close)");
+        true
+    }
 }
 
 impl CompositorHandler for HalmasuitState {
@@ -1692,10 +1716,14 @@ impl XdgShellHandler for HalmasuitState {
             {
                 tracing::warn!(error = %e, "render on toplevel_destroyed failed");
             }
-            if was_session {
+            if was_session && !self.should_exit {
                 let a = self.swap.session_client_gone();
                 self.apply_swap_action(a);
             }
+            // On a plain stop (`should_exit`) the session client closing
+            // is the EXPECTED end of the graceful-exit handshake — do NOT
+            // revert/respawn the greeter; just let the loop observe the
+            // now-empty `foreground_toplevel` and exit.
         }
         // R-honest.4: toplevel gone — refresh regardless of whether it
         // was the foreground (it left `toplevel_surfaces()`).
@@ -3304,6 +3332,14 @@ fn drm_device_path_from_env() -> io::Result<Option<PathBuf>> {
 /// deactivating); short enough that a missing GPU fails the boot
 /// reasonably fast.
 const DRM_RESOLVE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long a plain-stop exit waits for the session client (the nested
+/// session compositor) to disconnect after we ask its toplevel to close,
+/// before dropping the Wayland socket anyway. Generous enough for a
+/// healthy nested compositor to process `xdg_toplevel.close` and exit
+/// (observed well under 1 s), bounded so a wedged client cannot hold our
+/// exit past systemd's stop timeout.
+const GRACEFUL_SESSION_CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// Resolve compositor uid from env. `HALMASUIT_COMPOSITOR_UID` is
 /// the operator's contract: when set to a valid `u32`, halmasuit
@@ -5726,6 +5762,11 @@ fn main() -> io::Result<()> {
     // rootfs→shutdownRamfs pivot. External SIGKILL or kernel halt is
     // what stops the process.
     let mut consecutive_errors = 0u32;
+    // Plain-stop graceful-exit window. `None` until a stop signal
+    // latches `should_exit`; then we ask the session client to close and
+    // pump the loop until it disconnects or `GRACEFUL_SESSION_CLOSE_GRACE`
+    // elapses.
+    let mut graceful_deadline: Option<Instant> = None;
     loop {
         run_loop_iteration(&mut consecutive_errors, || {
             event_loop
@@ -5748,8 +5789,28 @@ fn main() -> io::Result<()> {
         // no preceding PrepareForShutdown) asked us to exit cleanly. A
         // real shutdown NEVER sets this — it stays in the paint-until-halt
         // path so the wallpaper survives the rootfs→shutdownRamfs pivot.
+        //
+        // Before dropping the Wayland socket, ask the session client (the
+        // nested session compositor) to close via `xdg_toplevel.close`
+        // and keep dispatching so it can disconnect gracefully. Yanking
+        // the socket from under a nested compositor instead strands it in
+        // an EPIPE write-loop that floods the journal/serial console and
+        // can starve our own clean exit past systemd's stop timeout.
         if state.should_exit {
-            break;
+            match graceful_deadline {
+                None => {
+                    if state.begin_graceful_session_close() {
+                        graceful_deadline = Some(Instant::now() + GRACEFUL_SESSION_CLOSE_GRACE);
+                    } else {
+                        break;
+                    }
+                }
+                Some(deadline) => {
+                    if state.foreground_toplevel.is_none() || Instant::now() >= deadline {
+                        break;
+                    }
+                }
+            }
         }
     }
 
