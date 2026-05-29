@@ -18,7 +18,7 @@
 //! binding kinds — `sticky "app" [profile="…"]`, `cycle { app … }`,
 //! `pattern app="…" [title="…"]`, and flex (no binding node).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use kdl::{KdlDocument, KdlNode, KdlValue};
 use thiserror::Error;
@@ -163,6 +163,7 @@ pub fn parse(src: &str) -> Result<Config, ParseError> {
     // Pass 1: collect top-level `region "name" { monitor; rect }` anchors.
     let mut regions: HashMap<String, (String, Region)> = HashMap::new();
     let mut systems: Vec<System> = Vec::new();
+    let mut seen_systems: HashSet<String> = HashSet::new();
 
     for node in doc.nodes() {
         match node.name().value() {
@@ -175,7 +176,16 @@ pub fn parse(src: &str) -> Result<Config, ParseError> {
                     ));
                 }
             }
-            "system" => systems.push(parse_system(node, &regions)?),
+            "system" => {
+                let system = parse_system(node, &regions)?;
+                if !seen_systems.insert(system.name().to_owned()) {
+                    return Err(ParseError::at(
+                        format!("duplicate system: {}", system.name()),
+                        span_of(node),
+                    ));
+                }
+                systems.push(system);
+            }
             other => {
                 return Err(ParseError::at(
                     format!("unexpected top-level node `{other}` (expected `region` or `system`)"),
@@ -607,6 +617,25 @@ mod tests {
             err.message()
         );
         assert!(err.span().is_some());
+    }
+
+    #[test]
+    fn duplicate_system_name_is_a_spanned_error() {
+        let err = parse_err(
+            r#"
+            system "code" { role "a" { monitor "DP-1"; rect 0 0 100 100 } }
+            system "code" { role "b" { monitor "DP-1"; rect 0 0 100 100 } }
+            "#,
+        );
+        assert!(
+            err.message().contains("duplicate system"),
+            "got: {}",
+            err.message()
+        );
+        assert!(
+            err.span().is_some(),
+            "duplicate-system error must carry a span, like duplicate region/role"
+        );
     }
 
     #[test]
