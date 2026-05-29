@@ -114,10 +114,10 @@ pkgs.testers.runNixOSTest {
         "journalctl -u halmasuit | grep -qF scanout_active", timeout=30
     )
     machine.wait_until_succeeds(
-        "journalctl -u halmasuit | grep -qF POPUP_CONFIGURE", timeout=30
+        "journalctl -b | grep -qF POPUP_CONFIGURE", timeout=30
     )
 
-    journal = machine.succeed("journalctl -u halmasuit --no-pager")
+    journal = machine.succeed("journalctl -b --no-pager")
     line = next(
         (l for l in journal.splitlines() if "POPUP_CONFIGURE:" in l),
         None,

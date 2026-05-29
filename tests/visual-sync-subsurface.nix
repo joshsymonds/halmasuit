@@ -129,7 +129,7 @@ pkgs.testers.runNixOSTest {
     # the introspection event stream. No timing race with the client.
 
     machine.wait_until_succeeds(
-        "journalctl -u halmasuit | grep -qF "
+        "journalctl -b | grep -qF "
         "'subsurface-test-client: initial mapping committed'",
         timeout=30,
     )
@@ -143,7 +143,7 @@ pkgs.testers.runNixOSTest {
     print(f"PHASE 1 (initial mapping done): frame_rendered count = {phase1}")
 
     machine.wait_until_succeeds(
-        "journalctl -u halmasuit | grep -qF "
+        "journalctl -b | grep -qF "
         "'subsurface-test-client: PHASE 2'",
         timeout=30,
     )
@@ -167,7 +167,7 @@ pkgs.testers.runNixOSTest {
     )
 
     machine.wait_until_succeeds(
-        "journalctl -u halmasuit | grep -qF "
+        "journalctl -b | grep -qF "
         "'subsurface-test-client: PHASE 3'",
         timeout=30,
     )

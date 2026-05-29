@@ -113,8 +113,11 @@ pkgs.testers.runNixOSTest {
         "journalctl -u halmasuit | grep -qF 'scanout_active'",
         timeout=30,
     )
+    # The test client is the broker-spawned greeter (Epic #47 R1.3), so
+    # its stdout lands in the halmasuit-session journal, not halmasuit's.
+    # Match the whole boot to find the client's marker regardless of unit.
     machine.wait_until_succeeds(
-        "journalctl -u halmasuit | grep -qF 'layer-shell-test-client: painted'",
+        "journalctl -b | grep -qF 'layer-shell-test-client: painted'",
         timeout=30,
     )
     machine.wait_until_succeeds(

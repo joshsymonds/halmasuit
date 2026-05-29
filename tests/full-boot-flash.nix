@@ -8,11 +8,13 @@
 #   2. Post-pivot, halmasuit migrates into rootfs's mount-namespace
 #      view via the broker SCM_RIGHTS root-fd handoff
 #      (RequestRootFd / RootFd protocol), spawns the configured
-#      greeter, drops privileges, binds the abstract @halmasuit-greetd
-#      socket.
-#   3. A halmasuit-vm-client connects to @halmasuit-greetd from the
-#      rootfs and drives a full PAM auth → SessionOpened arc through
-#      real `pam_unix` via the broker.
+#      greeter, drops privileges, binds the greetd socket at
+#      /run/halmasuit/greetd.sock (POST-CHROOT: since the broker
+#      root-fd migration in 831fe50 the listener is the filesystem
+#      socket, not the old abstract @halmasuit-greetd name).
+#   3. A halmasuit-vm-client connects to /run/halmasuit/greetd.sock
+#      from the rootfs and drives a full PAM auth → SessionOpened arc
+#      through real `pam_unix` via the broker.
 #
 # Scope notes:
 # - LUKS-encrypted root is a NixOS-test-infra concern (custom disk
@@ -82,7 +84,7 @@ pkgs.testers.runNixOSTest {
       system.extraDependencies = [ testGreeter ];
 
       # Tools the testScript needs:
-      # - halmasuit-vm-client: drives the abstract @halmasuit-greetd
+      # - halmasuit-vm-client: drives the /run/halmasuit/greetd.sock
       #   socket for the full-auth arc post-pivot.
       environment.systemPackages = [ halmasuit-vm-client ];
 
@@ -150,9 +152,9 @@ pkgs.testers.runNixOSTest {
         assert required in phases_seen, f"phase {required!r} missing"
     print("PASS: all post-pivot phases observed")
 
-    # Phase 4: full auth via the abstract socket. halmasuit-vm-client
-    # connects to @halmasuit-greetd, drives a real-pam_unix auth as
-    # alice, hits SessionOpened.
+    # Phase 4: full auth via the greetd socket. halmasuit-vm-client
+    # connects to /run/halmasuit/greetd.sock, drives a real-pam_unix
+    # auth as alice, hits SessionOpened.
     # Mirror tests/halmasuit-vm.nix's auth setup precisely.
     machine.succeed("printf 'testpassword' > /tmp/alice.pw")
     machine.succeed("chown halmasuit-greeter:halmasuit-greeter /tmp/alice.pw")
@@ -161,7 +163,7 @@ pkgs.testers.runNixOSTest {
     # greeter uid via SO_PEERCRED — run vm-client AS that user.
     machine.succeed(
         "runuser -u halmasuit-greeter -- "
-        "halmasuit-vm-client full-auth @halmasuit-greetd alice "
+        "halmasuit-vm-client full-auth /run/halmasuit/greetd.sock alice "
         "--password-file /tmp/alice.pw "
         "--cmd /run/current-system/sw/bin/true "
         "--timeout 30"

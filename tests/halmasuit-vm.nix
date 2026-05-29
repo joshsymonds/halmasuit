@@ -422,21 +422,35 @@ pkgs.testers.runNixOSTest {
         assert uid_parts == ["999", "999", "999", "999"], (
             f"greeter uid components must all be 999 (greeterUid), got {uid_parts}"
         )
-        # Greeter's parent must be halmasuit. Catches a regression where
-        # the fork lifecycle goes wrong and the greeter ends up
-        # reparented to init.
+        # Greeter's parent must be the halmasuit-session BROKER, not
+        # halmasuit. Epic #47 R1.3 (commit 7748475) moved greeter spawn
+        # from a halmasuit fork-exec to the privileged broker: halmasuit
+        # (uid 998) cannot setuid to the greeter uid, so the broker forks
+        # the greeter from its main loop and hands halmasuit a poll-only
+        # pidfd. The greeter is therefore the broker's child.
+        #
+        # Catches two real regressions: a parent of halmasuit's MainPID
+        # means a reversion to the old in-compositor fork-exec model; a
+        # parent of init (pid 1) means the greeter was orphaned.
+        #
+        # Timing: the broker idle-exits 30s after going idle (IDLE_EXIT
+        # in halmasuit-session/src/broker.rs), after which the greeter
+        # reparents. This subtest runs ~14s into boot — comfortably
+        # inside that window — so the broker is still alive and is the
+        # parent. If this ever flakes on a very slow runner, that 30s
+        # window is why.
         ppid_line = next(
             (l for l in status.splitlines() if l.startswith("PPid:")),
             None,
         )
         assert ppid_line is not None, f"no PPid: line in greeter status: {status}"
         ppid = ppid_line.split()[1]
-        halmasuit_pid = machine.succeed(
-            "systemctl show -p MainPID --value halmasuit.service"
+        broker_pid = machine.succeed(
+            "systemctl show -p MainPID --value halmasuit-session.service"
         ).strip()
-        assert ppid == halmasuit_pid, (
-            f"greeter's parent must be halmasuit (pid {halmasuit_pid}), "
-            f"got ppid {ppid!r}"
+        assert ppid == broker_pid, (
+            f"greeter's parent must be the halmasuit-session broker "
+            f"(pid {broker_pid}), got ppid {ppid!r}"
         )
 
     # ──────────────────────────────────────────────────────────────────

@@ -1290,7 +1290,16 @@ in
      # process + its DRM master to survive the pivot. nix-store
      # closure resolution via storePaths picks up the transitive
      # deps automatically.
-     systemd.shutdownRamfs.storePaths = [ "${cfg.package}/bin/halmasuit" ];
+     # Gate on the COMPOSITOR being enabled: this ships the compositor
+     # binary into the shutdown initramfs, which is meaningless for a
+     # broker-only deployment (services.halmasuit.session.enable without
+     # services.halmasuit.enable). Without the gate, a broker-only
+     # config (e.g. the session-r5r6 / session-onehandle gates) forces
+     # cfg.package's default (pkgs.halmasuit, absent from those tests'
+     # pkgs) and fails module evaluation. mkIf keeps cfg.package unforced
+     # when neither compositor path is enabled.
+     systemd.shutdownRamfs.storePaths =
+       lib.mkIf (cfg.enable || cfg.fromInitrd.enable) [ "${cfg.package}/bin/halmasuit" ];
 
      systemd.sockets."halmasuit-session" = {
        description = "halmasuit-session privileged PAM-lifecycle broker socket";
