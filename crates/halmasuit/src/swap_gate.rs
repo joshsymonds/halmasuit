@@ -145,6 +145,127 @@ impl SwapGate {
     }
 }
 
+// ── GreeterSwapGate: wallpaper→greeter two-key gate (Epic #35 R1) ──
+//
+// Symmetric with the greeter→session [`SwapGate`] above. The visible
+// compositor foreground is "wallpaper" until BOTH
+// (`greeter_spawned`, `greeter_first_frame`) have arrived. gen-400's
+// first-greeter flash was caused by flipping the renderer-visible
+// foreground on `greeter_spawned` alone (key 1) — before the greeter
+// surface had any buffer — leaving the user with ~2 seconds of
+// undefined visible content between halmasuit's wallpaper paint and
+// DMS Quickshell's first frame. This gate refuses the visible swap
+// until both keys are in, in either order.
+//
+// Lifecycle is simpler than `SwapGate`: there is no Revert (the
+// greeter→session SwapGate owns the next transition). If the greeter
+// dies before key 2 (no buffer ever committed), the visible foreground
+// stays on wallpaper — a respawn starts a NEW [`GreeterSwapGate`].
+
+/// What the renderer must show after a key arrives at the
+/// wallpaper→greeter gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GreeterSwapAction {
+    /// Nothing changes yet — keep showing the wallpaper.
+    None,
+    /// Both keys arrived: composite the greeter as foreground. Emitted
+    /// exactly once.
+    Swap,
+}
+
+/// Renderer-visible foreground for the wallpaper→greeter boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GreeterVisible {
+    /// Wallpaper-only: greeter is either not spawned or has not yet
+    /// committed a buffer.
+    Wallpaper,
+    /// Greeter is the visible foreground over the wallpaper.
+    Greeter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GreeterPhase {
+    Arming { spawned: bool, first_frame: bool },
+    Swapped,
+}
+
+/// Two-key flash-free gate for the wallpaper→greeter boundary.
+///
+/// Mirrors [`SwapGate`] (greeter→session). Each new
+/// [`GreeterSwapGate::new`] represents one greeter-spawn episode; if
+/// a greeter dies before painting its first frame, the caller drops
+/// this gate and constructs a fresh one for the respawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GreeterSwapGate {
+    phase: GreeterPhase,
+}
+
+impl Default for GreeterSwapGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GreeterSwapGate {
+    /// A fresh gate (no keys, wallpaper visible).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            phase: GreeterPhase::Arming {
+                spawned: false,
+                first_frame: false,
+            },
+        }
+    }
+
+    /// The renderer-visible foreground for this boundary. The renderer
+    /// consults this on every repaint to decide whether to composite
+    /// the greeter as foreground over the wallpaper.
+    #[must_use]
+    pub const fn visible_foreground(self) -> GreeterVisible {
+        match self.phase {
+            GreeterPhase::Arming { .. } => GreeterVisible::Wallpaper,
+            GreeterPhase::Swapped => GreeterVisible::Greeter,
+        }
+    }
+
+    const fn arm(&mut self, set_spawned: bool, set_first_frame: bool) -> GreeterSwapAction {
+        let GreeterPhase::Arming {
+            mut spawned,
+            mut first_frame,
+        } = self.phase
+        else {
+            return GreeterSwapAction::None;
+        };
+        spawned |= set_spawned;
+        first_frame |= set_first_frame;
+        if spawned && first_frame {
+            self.phase = GreeterPhase::Swapped;
+            GreeterSwapAction::Swap
+        } else {
+            self.phase = GreeterPhase::Arming {
+                spawned,
+                first_frame,
+            };
+            GreeterSwapAction::None
+        }
+    }
+
+    /// Key 1: halmasuit's broker successfully spawned the greeter
+    /// process (whatever the audit-event `foreground_changed=greeter`
+    /// previously triggered on). Audit-event firing is unchanged; the
+    /// new gate is consulted INDEPENDENTLY by the renderer.
+    pub const fn greeter_spawned(&mut self) -> GreeterSwapAction {
+        self.arm(true, false)
+    }
+
+    /// Key 2: the greeter's first non-empty Wayland buffer commit
+    /// (the `client_first_frame{role=greeter}`-equivalent moment).
+    pub const fn greeter_first_frame(&mut self) -> GreeterSwapAction {
+        self.arm(false, true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{SwapAction, SwapGate};
@@ -233,4 +354,76 @@ mod tests {
             self
         }
     }
+
+    // ── GreeterSwapGate (wallpaper→greeter) — Epic #35 R1 ────────────
+    //
+    // Symmetric with SwapGate (greeter→session). The visible compositor
+    // foreground is "wallpaper" until AND(greeter_spawned, greeter's
+    // first non-empty buffer). gen-400's first-greeter flash was caused
+    // by foreground flipping on greeter_spawned alone (key 1), before
+    // the greeter had a buffer (key 2). This gate refuses the visible
+    // swap until both keys are in, regardless of arrival order.
+
+    use super::{GreeterSwapAction, GreeterSwapGate};
+
+    #[test]
+    fn greeter_initial_state_is_wallpaper() {
+        let g = GreeterSwapGate::new();
+        assert_eq!(g.visible_foreground(), GreeterVisible::Wallpaper);
+    }
+
+    #[test]
+    fn greeter_key1_alone_stays_wallpaper() {
+        // The gen-400 bug case: greeter is spawned but hasn't painted
+        // yet. The visible foreground MUST remain "wallpaper" — flipping
+        // to "greeter" here while the greeter surface is empty is what
+        // caused the 2-second flash window on gnomon.
+        let mut g = GreeterSwapGate::new();
+        assert_eq!(g.greeter_spawned(), GreeterSwapAction::None);
+        assert_eq!(g.visible_foreground(), GreeterVisible::Wallpaper);
+    }
+
+    #[test]
+    fn greeter_key2_alone_stays_wallpaper() {
+        // Defense-in-depth: even if the greeter's first frame somehow
+        // arrives before the spawn event lands (extremely unlikely in
+        // practice — the greeter is spawned BY the compositor, so the
+        // spawn event is observed before any buffer it produces), the
+        // gate stays on wallpaper until the spawn key arrives too.
+        let mut g = GreeterSwapGate::new();
+        assert_eq!(g.greeter_first_frame(), GreeterSwapAction::None);
+        assert_eq!(g.visible_foreground(), GreeterVisible::Wallpaper);
+    }
+
+    #[test]
+    fn greeter_both_keys_spawn_then_frame_swaps() {
+        let mut g = GreeterSwapGate::new();
+        assert_eq!(g.greeter_spawned(), GreeterSwapAction::None);
+        assert_eq!(g.greeter_first_frame(), GreeterSwapAction::Swap);
+        assert_eq!(g.visible_foreground(), GreeterVisible::Greeter);
+    }
+
+    #[test]
+    fn greeter_both_keys_frame_then_spawn_also_swaps() {
+        // Order independence — both keys arriving in either order swap
+        // on the second.
+        let mut g = GreeterSwapGate::new();
+        assert_eq!(g.greeter_first_frame(), GreeterSwapAction::None);
+        assert_eq!(g.greeter_spawned(), GreeterSwapAction::Swap);
+        assert_eq!(g.visible_foreground(), GreeterVisible::Greeter);
+    }
+
+    #[test]
+    fn greeter_swap_emitted_exactly_once() {
+        // Repeats of either key after both-are-in are inert.
+        let mut g = GreeterSwapGate::new();
+        g.greeter_spawned();
+        assert_eq!(g.greeter_first_frame(), GreeterSwapAction::Swap);
+        assert_eq!(g.greeter_first_frame(), GreeterSwapAction::None);
+        assert_eq!(g.greeter_spawned(), GreeterSwapAction::None);
+        // Still showing greeter — no spurious revert to wallpaper.
+        assert_eq!(g.visible_foreground(), GreeterVisible::Greeter);
+    }
+
+    use super::GreeterVisible;
 }

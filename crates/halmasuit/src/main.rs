@@ -494,6 +494,16 @@ struct HalmasuitState {
     /// the session client commits many frames; the introspect marker
     /// and the gate input fire on the first non-empty one only.
     session_first_frame_emitted: bool,
+    /// Epic #35 R1: two-key gate for the wallpaper→greeter visible
+    /// swap, symmetric with [`swap`] (greeter→session). The renderer-
+    /// visible foreground is `Wallpaper` until BOTH
+    /// (`greeter_spawned`, `greeter_first_frame`) arrive. Reset to a
+    /// fresh gate at each `broker_spawn_greeter` (a respawn starts a
+    /// new episode). gen-400's first-greeter flash was caused by the
+    /// absence of this gate — the audit event `ForegroundChanged{
+    /// to: Greeter}` fired immediately on `broker_spawn_greeter`, and
+    /// the project had no symmetric second-key gate for this boundary.
+    greeter_swap: swap_gate::GreeterSwapGate,
     /// Compositor-monotonic baseline for `wl_callback.done(uint time)`.
     /// `start_time.elapsed()` is `CLOCK_MONOTONIC`-by-construction, so
     /// the timestamps we hand to `wl_surface.frame` callbacks satisfy
@@ -1099,6 +1109,9 @@ impl HalmasuitState {
                 // from succeeding. Clear and re-arm.
                 self.session_uid = None;
                 self.swap = swap_gate::SwapGate::new();
+                // Epic #35 R1: fresh wallpaper→greeter gate for the
+                // respawned greeter's episode.
+                self.greeter_swap = swap_gate::GreeterSwapGate::new();
                 // Respawn the greeter so the user can log back in. The
                 // SIGKILL at swap time left `state.greeter = None`;
                 // ask the broker (uid 998 compositor cannot setuid
@@ -1113,6 +1126,8 @@ impl HalmasuitState {
                             "greeter respawned via broker after session end"
                         );
                         emit(&Event::GreeterSpawned { pid: handle.pid });
+                        // Epic #35 R1: key 1 — greeter spawned.
+                        let _ = self.greeter_swap.greeter_spawned();
                         self.greeter = Some(handle);
                     }
                     Err(e) => {
@@ -1318,6 +1333,19 @@ impl HalmasuitState {
         };
         if self.seen_layer_roles.insert(role) {
             emit(&Event::ClientFirstFrame { role });
+            // Epic #35 R1: when an Overlay layer surface commits its
+            // first non-empty buffer DURING the greeter epoch, that's
+            // key 2 of the wallpaper→greeter gate. DMS Quickshell's
+            // greeter is a WlrLayer::Overlay surface (see DMS
+            // GreeterSurface.qml). Other roles (Background, Bottom,
+            // Top) are not the greeter; ignore for the gate. After
+            // the session epoch the gate is in Swapped state and any
+            // further greeter_first_frame() calls are inert.
+            if role == halmasuit_introspect::LayerRole::Overlay
+                && self.foreground == halmasuit_introspect::Foreground::Greeter
+            {
+                let _ = self.greeter_swap.greeter_first_frame();
+            }
         }
         // Focus-follows-foreground (req 17): a keyboard-interactive
         // layer client (the greeter) gets keyboard focus only while
@@ -1482,6 +1510,19 @@ impl HalmasuitState {
     /// is wallpaper-only — exactly the frame stream the user sees
     /// from PrepareForShutdown to kernel halt.
     fn repaint(&mut self) {
+        // Epic #35 R1 observability: the wallpaper→greeter gate's
+        // current visible-foreground decision is consulted on every
+        // repaint. For now this is a trace-level diagnostic — the
+        // renderer's existing layer-compositing path already only
+        // draws surfaces with committed buffers, so the gate state
+        // and the actual composite are aligned by construction. The
+        // follow-up task in Epic #35 may add a render-side filter
+        // (e.g. skip a half-painted greeter layer if the gate still
+        // says Wallpaper); when it does, this is the consumer site.
+        tracing::trace!(
+            greeter_visible = ?self.greeter_swap.visible_foreground(),
+            "repaint"
+        );
         let fg_surface = if self.shutting_down {
             None
         } else {
@@ -2707,6 +2748,12 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
             emit(&Event::ForegroundChanged {
                 to: halmasuit_introspect::Foreground::Greeter,
             });
+            // Epic #35 R1: arm wallpaper→greeter gate. ForegroundChanged
+            // above is the audit/state-machine event; the visible swap
+            // is gated on AND(greeter_spawned, greeter_first_frame) via
+            // greeter_swap.
+            state.greeter_swap = swap_gate::GreeterSwapGate::new();
+            let _ = state.greeter_swap.greeter_spawned();
             state.greeter = Some(handle);
         }
         Err(e) => {
@@ -5076,6 +5123,10 @@ fn main() -> io::Result<()> {
                     to: halmasuit_introspect::Foreground::Greeter,
                 });
                 Some(handle)
+                // Epic #35 R1: the gate is initialized in State::new
+                // and is armed for the initial-spawn epoch right here
+                // via greeter_swap.greeter_spawned() on the assembled
+                // state (see line ~5210 — post-state-construction).
             }
             Err(e) => {
                 tracing::error!(error = %e, "broker_spawn_greeter failed");
@@ -5203,8 +5254,18 @@ fn main() -> io::Result<()> {
         session_uid: None,
         swap: swap_gate::SwapGate::new(),
         session_first_frame_emitted: false,
+        greeter_swap: swap_gate::GreeterSwapGate::new(),
         start_time: std::time::Instant::now(),
     };
+
+    // Epic #35 R1: arm wallpaper→greeter gate key 1 if the initial
+    // greeter was spawned successfully. The audit event
+    // `ForegroundChanged{to: Greeter}` was emitted at the spawn site
+    // above; this arms the parallel two-key gate that the renderer
+    // will eventually use to decide visible foreground.
+    if state.greeter.is_some() {
+        let _ = state.greeter_swap.greeter_spawned();
+    }
 
     // Epic #71 R-honest.1: share the Compositor1 observability frame
     // counter into the render backend so `GetFrameCounter` (DBus) and
