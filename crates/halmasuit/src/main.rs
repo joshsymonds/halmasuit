@@ -4546,6 +4546,25 @@ fn main() -> io::Result<()> {
         .as_ref()
         .is_some_and(crate::wallpaper::WallpaperConfig::needs_tick);
 
+    // Epic #42 R3 diagnostic: pin which wallpaper backend the compositor
+    // selected + whether the tick timer will register. A gen-404 user
+    // report ("shader visible but static") is ambiguous between (a)
+    // animated backend with frozen iTime and (b) static backend being
+    // mistaken for a shader. This event resolves the ambiguity on the
+    // next boot's journal without RUST_LOG=debug.
+    tracing::info!(
+        target: "halmasuit::wallpaper::diag",
+        wallpaper_configured = wallpaper_configured,
+        wallpaper_kind = match wallpaper_config.as_ref() {
+            None => "none",
+            Some(crate::wallpaper::WallpaperConfig::Image { .. }) => "image",
+            Some(crate::wallpaper::WallpaperConfig::Shader { .. }) => "shader",
+            Some(crate::wallpaper::WallpaperConfig::Video { .. }) => "video",
+        },
+        needs_tick = wallpaper_needs_tick,
+        "wallpaper config resolved",
+    );
+
     // Initialize the Wayland display + protocol state.
     let display: Display<HalmasuitState> = Display::new().map_err(io::Error::other)?;
     let display_handle = display.handle();
@@ -5382,10 +5401,16 @@ fn main() -> io::Result<()> {
     // Wraps around forever via `TimeoutAction::ToDuration(period)`.
     if wallpaper_needs_tick {
         let wallpaper_tick = calloop::timer::Timer::immediate();
+        // Epic #42 R3 diagnostic: tick counter + timer-start instant for
+        // the 100-tick heartbeat. Wraps in u64; production won't reach the
+        // wrap point this side of decades of continuous uptime.
+        let mut tick_count: u64 = 0;
+        let timer_start = std::time::Instant::now();
         loop_handle
             .insert_source(
                 wallpaper_tick,
-                |_deadline, &mut (), state: &mut HalmasuitState| {
+                move |_deadline, &mut (), state: &mut HalmasuitState| {
+                    tick_count = tick_count.wrapping_add(1);
                     // `DrmBackend::tick_wallpaper` returns a
                     // [`WallpaperTickAction`] encoding both the fallback-
                     // swap state-machine step AND whether the backend
@@ -5397,7 +5422,7 @@ fn main() -> io::Result<()> {
                     // backends (shader, video) return `RenderContinuous`
                     // every tick — shader's `iTime` advances + video's
                     // decoder frames reach the screen until kernel halt.
-                    if let Some(backend) = state.drm_backend.as_mut() {
+                    let action = state.drm_backend.as_mut().map(|backend| {
                         let action = backend.tick_wallpaper();
                         if action.wants_render()
                             && let Err(e) = backend.render_one_frame(HALMASUIT_BRAND_CLEAR)
@@ -5408,6 +5433,22 @@ fn main() -> io::Result<()> {
                                 "wallpaper-tick: render failed",
                             );
                         }
+                        action
+                    });
+                    // Epic #42 R3: every ~10s emit a heartbeat showing
+                    // elapsed wall time and the tick's render action.
+                    // On real hardware this distinguishes "timer fires
+                    // and shader renders animated" from "timer fires but
+                    // action is Idle (= shader frozen)" — the central
+                    // ambiguity from the gen-404 user report.
+                    if tick_count.is_multiple_of(100) {
+                        tracing::info!(
+                            target: "halmasuit::wallpaper::tick",
+                            tick_count = tick_count,
+                            elapsed_secs = timer_start.elapsed().as_secs_f32(),
+                            ?action,
+                            "wallpaper-tick heartbeat",
+                        );
                     }
                     calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(100))
                 },
