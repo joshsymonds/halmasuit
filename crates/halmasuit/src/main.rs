@@ -1311,11 +1311,34 @@ impl HalmasuitState {
             layer.layer_surface().send_configure();
         }
 
-        let has_buffer =
+        let (has_buffer, buffer_size) =
             smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
-                s.buffer().is_some()
+                (s.buffer().is_some(), s.buffer_size())
             })
-            .unwrap_or(false);
+            .unwrap_or((false, None));
+        // Epic #42 R3 (gen-406): emit per-commit diagnostic so we can
+        // see whether Quickshell ever attaches a buffer to its overlay
+        // surfaces. gen-405 had two `new layer surface` events but
+        // zero `client_first_frame{overlay}`. This event fires on
+        // EVERY commit (including buffer-less initial commits that
+        // only carry anchor/exclusive-zone state) so we see the path
+        // from "surface registered" through "buffer attached" in
+        // sequence. Layer roles are non-secret and bounded volume.
+        let role_for_log = match layer.layer() {
+            Layer::Background => "background",
+            Layer::Bottom => "bottom",
+            Layer::Top => "top",
+            Layer::Overlay => "overlay",
+        };
+        tracing::info!(
+            target: "halmasuit::wallpaper::diag",
+            role = role_for_log,
+            has_buffer,
+            buffer_w = buffer_size.map(|s| s.w),
+            buffer_h = buffer_size.map(|s| s.h),
+            foreground = ?self.foreground,
+            "layer-shell commit",
+        );
         if !has_buffer {
             return;
         }
@@ -5435,13 +5458,13 @@ fn main() -> io::Result<()> {
                         }
                         action
                     });
-                    // Epic #42 R3: every ~10s emit a heartbeat showing
-                    // elapsed wall time and the tick's render action.
-                    // On real hardware this distinguishes "timer fires
-                    // and shader renders animated" from "timer fires but
-                    // action is Idle (= shader frozen)" — the central
-                    // ambiguity from the gen-404 user report.
-                    if tick_count.is_multiple_of(100) {
+                    // Epic #42 R3 (gen-406 tightening): every ~1s emit a
+                    // heartbeat showing elapsed wall time and the tick's
+                    // render action. Previously every 100 ticks (~10s)
+                    // which missed the diagnostic window when the user
+                    // rebooted at +12s. 10 ticks → one heartbeat per
+                    // wall-clock second, bounded volume.
+                    if tick_count.is_multiple_of(10) {
                         tracing::info!(
                             target: "halmasuit::wallpaper::tick",
                             tick_count = tick_count,
