@@ -84,6 +84,7 @@ use thiserror::Error;
 
 use crate::slot::{AuthSlot, SlotError};
 use crate::transport::{SeqpacketChannel, TransportError, peer_uid};
+use crate::wire_trace;
 use crate::worker::{
     BorrowedSourceFd, ParentMessage, WorkerOutcome, accept_seqpacket, own_raw_fd,
     recv_frame_with_fd, send_frame_with_fd, spawn_session_worker,
@@ -227,11 +228,13 @@ impl Relay {
             // immediately) and is already processing the next conv
             // message or PAM step.
             ParentMessage::Conv(prompt @ BrokerToCompositor::ConvPrompt { .. }) => {
+                wire_trace::emit(wire_trace::Direction::Send, &prompt);
                 compositor.send(&prompt)?;
                 self.phase = RelayPhase::AwaitGreeterConvResponse;
                 Ok(RelayStep::Continue)
             }
             ParentMessage::Conv(display @ BrokerToCompositor::ConvDisplay { .. }) => {
+                wire_trace::emit(wire_trace::Direction::Send, &display);
                 compositor.send(&display)?;
                 // Phase invariant unchanged: still AwaitWorker. The
                 // worker did NOT block in display(); the next worker
@@ -241,7 +244,9 @@ impl Relay {
             }
             ParentMessage::Outcome(WorkerOutcome::AuthOk { username, uid, gid }) => {
                 // R8: identity is the worker's PAM-resolved one.
-                compositor.send(&BrokerToCompositor::Success { username, uid, gid })?;
+                let frame = BrokerToCompositor::Success { username, uid, gid };
+                wire_trace::emit(wire_trace::Direction::Send, &frame);
+                compositor.send(&frame)?;
                 self.phase = RelayPhase::AwaitGreeterStartSession;
                 Ok(RelayStep::Continue)
             }
@@ -262,6 +267,10 @@ impl Relay {
             // backstop is an accelerator, not the authoritative
             // signal (that is `SessionEnded`).
             ParentMessage::Outcome(WorkerOutcome::SessionOpened { .. }) => {
+                wire_trace::emit(
+                    wire_trace::Direction::Send,
+                    &BrokerToCompositor::SessionOpened,
+                );
                 send_frame_with_fd(
                     compositor,
                     &BrokerToCompositor::SessionOpened,
@@ -271,13 +280,17 @@ impl Relay {
                 Ok(RelayStep::Continue)
             }
             ParentMessage::Outcome(WorkerOutcome::SessionEnded { outcome }) => {
-                compositor.send(&BrokerToCompositor::SessionEnded { outcome })?;
+                let frame = BrokerToCompositor::SessionEnded { outcome };
+                wire_trace::emit(wire_trace::Direction::Send, &frame);
+                compositor.send(&frame)?;
                 Ok(RelayStep::Finished(Disposition::Completed { outcome }))
             }
             ParentMessage::Outcome(WorkerOutcome::Failure { reason }) => {
-                compositor.send(&BrokerToCompositor::Failure {
+                let frame = BrokerToCompositor::Failure {
                     reason: reason.clone(),
-                })?;
+                };
+                wire_trace::emit(wire_trace::Direction::Send, &frame);
+                compositor.send(&frame)?;
                 Ok(RelayStep::Finished(Disposition::AuthFailed { reason }))
             }
             // Epic #24 R4: nested or-patterns enumerate every non-conv
@@ -324,6 +337,7 @@ impl Relay {
             }
         };
         let frame = compositor.recv::<CompositorToBroker>()?;
+        wire_trace::emit(wire_trace::Direction::Recv, &frame);
         match (&frame, expect_start) {
             (CompositorToBroker::ConvResponse { .. }, false)
             | (CompositorToBroker::StartSession { .. }, true) => {
@@ -571,6 +585,7 @@ fn serve_root_fd_request(
     match std::fs::File::open("/proc/self/root") {
         Ok(root) => {
             use std::os::fd::AsFd;
+            wire_trace::emit(wire_trace::Direction::Send, &BrokerToCompositor::RootFd);
             if let Err(e) =
                 send_frame_with_fd(greeter, &BrokerToCompositor::RootFd, Some(root.as_fd()))
             {
@@ -602,7 +617,11 @@ enum FirstFrame {
 /// (`RequestRootFd`, `SpawnGreeter`) run inline; the `BeginAuth` path
 /// returns up so the caller can proceed to slot creation.
 fn dispatch_first_frame(greeter: &SeqpacketChannel, puid: u32, bl: &mut BrokerLoop) -> FirstFrame {
-    match greeter.recv::<CompositorToBroker>() {
+    let received = greeter.recv::<CompositorToBroker>();
+    if let Ok(ref incoming) = received {
+        wire_trace::emit(wire_trace::Direction::Recv, incoming);
+    }
+    match received {
         Ok(CompositorToBroker::BeginAuth { service, username }) => {
             FirstFrame::BeginAuth { service, username }
         }
@@ -680,6 +699,10 @@ fn serve_spawn_greeter_request(
             // SCM_RIGHTS pidfd). i32 narrowing: pids are positive
             // 31-bit values on linux; the wire type is i32.
             let pid = i32::try_from(handle.pid).unwrap_or(-1);
+            wire_trace::emit(
+                wire_trace::Direction::Send,
+                &BrokerToCompositor::GreeterSpawned { pid },
+            );
             if let Err(e) = send_frame_with_fd(
                 greeter,
                 &BrokerToCompositor::GreeterSpawned { pid },

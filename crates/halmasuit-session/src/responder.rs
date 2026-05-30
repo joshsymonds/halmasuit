@@ -29,6 +29,7 @@ use halmasuit_session_ipc::{
 
 use crate::pam_ffi::{ConvResponder, ResponderError};
 use crate::transport::SeqpacketChannel;
+use crate::wire_trace;
 
 /// A [`ConvResponder`] backed by the broker's SEQPACKET channel.
 ///
@@ -51,11 +52,16 @@ impl ConvResponder for ChannelResponder<'_> {
             style,
             message: message.to_owned(),
         };
+        wire_trace::emit(wire_trace::Direction::Send, &frame);
         self.ch.send(&frame).map_err(|_| ResponderError)?;
         // Block for exactly one well-formed ConvResponse. Greeter
         // Cancel, any other variant, or a closed/garbled socket all
         // fail closed → conv_trampoline returns PAM_CONV_ERR.
-        match self.ch.recv::<CompositorToBroker>() {
+        let received = self.ch.recv::<CompositorToBroker>();
+        if let Ok(ref incoming) = received {
+            wire_trace::emit(wire_trace::Direction::Recv, incoming);
+        }
+        match received {
             Ok(CompositorToBroker::ConvResponse { response }) => Ok(response),
             _ => Err(ResponderError),
         }
@@ -72,6 +78,7 @@ impl ConvResponder for ChannelResponder<'_> {
             style,
             message: message.to_owned(),
         };
+        wire_trace::emit(wire_trace::Direction::Send, &frame);
         self.ch.send(&frame).map_err(|_| ResponderError)?;
         Ok(())
     }

@@ -39,6 +39,7 @@ pub mod session;
 pub mod session_leader;
 pub mod slot;
 pub mod transport;
+pub mod wire_trace;
 pub mod worker;
 
 pub use auth::{AuthError, ResolvedIdentity, run_pam_auth};
