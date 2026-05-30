@@ -569,6 +569,29 @@ in
       '';
     };
 
+    diagnostic = {
+      brokerTraceFrames = lib.mkOption {
+        type        = lib.types.bool;
+        default     = false;
+        description = ''
+          Epic #42 R4: when `true`, sets
+          `HALMASUIT_BROKER_TRACE_FRAMES=1` on
+          `halmasuit-session.service`. The broker then logs every
+          compositor↔broker frame (direction + Debug form) to stderr /
+          the unit journal. `Secret`-bearing frames are safe — the
+          `halmasuit-session-ipc::Secret` type's `Debug` is
+          `Secret(<redacted>)`, pinned by the `secret_is_not_in_formatted_line`
+          test in `crates/halmasuit-session/src/wire_trace.rs`.
+
+          Intended for one diagnostic boot to capture the exact PAM
+          conv byte sequence when signin fails on real hardware.
+          Disable once the relevant frames are captured — the
+          captured journal is the analysis artifact, not a thing to
+          keep producing.
+        '';
+      };
+    };
+
     session = {
       enable = lib.mkEnableOption ''
         the socket-activated privileged `halmasuit-session` PAM-lifecycle
@@ -1432,6 +1455,36 @@ in
          HALMASUIT_GREETD_SOCKET = "/run/halmasuit/greetd.sock";
        } // lib.optionalAttrs (cfg.greeterCommand != null) {
          HALMASUIT_GREETER_COMMAND = cfg.greeterCommand;
+       } // lib.optionalAttrs (cfg.rendering.backend == "nvidia") {
+         # Epic #42 R2: greeter spawn happens here, via execve with an
+         # EXPLICIT envv (`worker::greeter_child_exec`). execve does NOT
+         # inherit the broker's process environment — the worker
+         # `harvest_passthrough_env` helper reads these from the
+         # broker's env and copies them into the greeter's envv. That
+         # bridge only works if the keys are present here on the broker
+         # unit. Until gen-405 this block was missing and the gnomon
+         # boot produced "libEGL warning: failed to get driver name for
+         # fd -1" because Quickshell on the greeter side fell through
+         # to MESA-LOADER when NVIDIA's ICD wasn't discoverable.
+         #
+         # Mirrors the same block on `halmasuit.service` (the
+         # compositor's own env above) — drift between the two units
+         # would mean the greeter's EGL stack differs from the
+         # compositor's, which is exactly what we got on gen-404.
+         __GLX_VENDOR_LIBRARY_NAME = "nvidia";
+         __EGL_VENDOR_LIBRARY_FILENAMES =
+           "${cfg.rendering.nvidiaPackage}/share/glvnd/egl_vendor.d/10_nvidia.json";
+         __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS =
+           lib.makeSearchPath "share/egl/egl_external_platform.d"
+             cfg.rendering.extraInitrdStorePaths;
+       } // lib.optionalAttrs cfg.diagnostic.brokerTraceFrames {
+         # Epic #42 R4: env-gated broker wire-frame trace. Off by
+         # default (`services.halmasuit.diagnostic.brokerTraceFrames =
+         # false`). The user enables it for one diagnostic boot to
+         # capture the exact PAM conv byte sequence from a failing
+         # signin, then disables it again — the Rust code stays
+         # in place gated off so the lever is available next time.
+         HALMASUIT_BROKER_TRACE_FRAMES = "1";
        };
      };
 

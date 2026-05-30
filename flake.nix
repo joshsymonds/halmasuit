@@ -103,6 +103,8 @@
               # General CLI niceties used by recipes.
               jq
               git
+              # `just vis-selftest` runs tests/lib/visual.py.
+              python3
             ];
 
             # Native libraries smithay links against. smithay's

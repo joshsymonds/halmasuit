@@ -67,6 +67,10 @@ let
           greeterCommand = "${pkgs.writeShellScript "halmasuit-test-greeter" ''
             exec ${pkgs.coreutils}/bin/sleep infinity
           ''}";
+
+          # Epic #42 R4: assert the diagnostic trace option wires onto
+          # the broker's systemd Environment= when enabled.
+          diagnostic.brokerTraceFrames = true;
         };
 
         users.users.halmasuit-greeter = {
@@ -91,6 +95,18 @@ let
 
   cfg = testEval.config;
   svc = cfg.boot.initrd.systemd.services.halmasuit;
+
+  # Epic #42 R2: the privileged broker unit ALSO needs the NVIDIA EGL
+  # env, because the broker is the process that fork-then-execve's the
+  # greeter with an EXPLICIT envv. The compositor's env doesn't
+  # propagate to the greeter — `worker::greeter_child_env_pairs`
+  # harvests from the broker's own env. Pre-gen-405 this was the bug:
+  # halmasuit.service had the env, halmasuit-session.service didn't,
+  # and the greeter's libEGL fell through to MESA-LOADER.
+  brokerSvc = cfg.systemd.services."halmasuit-session";
+  brokerEnv = brokerSvc.environment;
+  brokerEnvFlat = builtins.concatStringsSep "\n"
+    (pkgs.lib.mapAttrsToList (k: v: "${k}=${toString v}") brokerEnv);
 
   # The initramfs closure ROOTS. Each entry is a submodule attrset
   # `{ source, target, enable, dlopen }` — `.source` is the /nix/store
@@ -136,6 +152,10 @@ EOF
 ${builtins.concatStringsSep "\n" initrdStorePaths}
 EOF
 
+  cat > $out/broker.env <<'EOF'
+${brokerEnvFlat}
+EOF
+
   fail() {
     echo "──── halmasuit.service environment ──"
     cat $out/service.env
@@ -158,6 +178,37 @@ EOF
     || fail "__EGL_VENDOR_LIBRARY_FILENAMES env missing"
   grep -qF '__GLX_VENDOR_LIBRARY_NAME=nvidia' $out/service.env \
     || fail '__GLX_VENDOR_LIBRARY_NAME=nvidia missing'
+
+  # ── (2b) Epic #42 R2: SAME env on the privileged broker unit ─────
+  # The broker forks-then-execve's the greeter with an explicit envv
+  # (worker::greeter_child_env_pairs). It harvests its OWN env to
+  # bridge NVIDIA EGL into the greeter's envv — that bridge only
+  # works if the keys are present on this unit. Pre-gen-405, this
+  # block was on halmasuit.service but missing from
+  # halmasuit-session.service, and the greeter logged
+  # "libEGL warning: failed to get driver name for fd -1" because
+  # NVIDIA's ICD wasn't discoverable in its env. This gate fails fast
+  # on a future regression of the same shape.
+  echo "── broker.env ──────────────────────────────────────────────"
+  cat $out/broker.env
+  echo "────────────────────────────────────────────────────────────"
+  grep -qF '__EGL_VENDOR_LIBRARY_FILENAMES=' $out/broker.env \
+    || fail "Epic #42 R2: __EGL_VENDOR_LIBRARY_FILENAMES missing on halmasuit-session.service env"
+  grep -qF '__GLX_VENDOR_LIBRARY_NAME=nvidia' $out/broker.env \
+    || fail "Epic #42 R2: __GLX_VENDOR_LIBRARY_NAME=nvidia missing on halmasuit-session.service env"
+  grep -qF '__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=' $out/broker.env \
+    || fail "Epic #42 R2: __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS missing on halmasuit-session.service env"
+
+  # ── (2c) Epic #42 R4: brokerTraceFrames option wires Environment= ─
+  # The option `services.halmasuit.diagnostic.brokerTraceFrames` is
+  # set to `true` in the test config above; the unit's Environment=
+  # MUST therefore carry `HALMASUIT_BROKER_TRACE_FRAMES=1` so the
+  # broker's `wire_trace` module reads it at startup and turns on
+  # frame logging. Defends against a future refactor that renames
+  # the env key, or moves the wire into a drop-in that doesn't get
+  # rendered, etc.
+  grep -qF 'HALMASUIT_BROKER_TRACE_FRAMES=1' $out/broker.env \
+    || fail "Epic #42 R4: HALMASUIT_BROKER_TRACE_FRAMES=1 missing on halmasuit-session.service env (option wired but not propagated)"
 
   # ── (3) Descriptor dirs actually contain *.json plugins ──────────
   for d in $(echo '${expectedConfigDirs}' | tr ':' ' '); do
