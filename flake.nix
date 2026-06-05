@@ -796,6 +796,16 @@
           system = "x86_64-linux";
           inherit nixpkgs;
         };
+        # Epic #45 rung 2: halmasuit composites its wallpaper on the
+        # REAL passed-through 5070 Ti (NVIDIA EGL/GBM, not llvmpipe).
+        # RUNNER-ONLY (driver path on stygian); journal assertions only
+        # — Snapshot/golden + KMS scanout come in later rungs.
+        visual-nvidia-wallpaper = import ./tests/visual-nvidia-wallpaper.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+        };
         # Epic #1 R12: first real-PAM gate. run_pam_auth against the
         # real libpam stack with the real test user — NO mock.
         run-pam-auth = import ./tests/run-pam-auth.nix {

@@ -488,9 +488,11 @@ test-vm-drive-stop:
 # `.driver` output ON stygian, which has the GPU bound to vfio-pci + the
 # memlock / vfio-group perms (nix-config hosts/stygianlibrary).
 #
-# We rsync the working tree to a throwaway runner checkout and `git add -A`
-# there so untracked/new test files are visible to the flake (nix flake eval
-# only sees git-tracked content; staging is enough, no commit needed).
+# We BUILD the driver here (gnomon: warm caches, working flake-input fetch)
+# and `nix copy` its closure to stygian, then run the pre-built driver there.
+# Building on stygian is a non-starter: its headless git rewrites GitHub
+# HTTPS→SSH with no key, so it can't fetch flake inputs (e.g. smithay). This
+# split also keeps stygian from needing to compile anything.
 #
 # Usage: just test-vm-nvidia nvidia-passthrough-smoke
 #        just test-vm-nvidia <name> joshsymonds@<other-host>
@@ -498,14 +500,14 @@ test-vm-nvidia name host="joshsymonds@172.31.0.99":
     #!/usr/bin/env bash
     set -euo pipefail
     HOST="{{host}}"
-    DEST="/home/joshsymonds/halmasuit-runner"
-    echo "── syncing working tree to $HOST:$DEST ──"
-    ssh "$HOST" "mkdir -p $DEST"
-    rsync -a --delete \
-      --exclude target/ --exclude result --exclude 'result-*' \
-      ./ "$HOST:$DEST/"
-    echo "── running .#checks.x86_64-linux.{{name}}.driver on $HOST ──"
-    ssh "$HOST" "cd $DEST && git add -A && nix run .#checks.x86_64-linux.{{name}}.driver"
+    echo "── build .#checks.x86_64-linux.{{name}}.driver locally ──"
+    DRV=$(nix build --no-link --print-out-paths ".#checks.x86_64-linux.{{name}}.driver")
+    echo "  driver: $DRV"
+    echo "── copy closure to $HOST ──"
+    nix copy --no-check-sigs --to "ssh://$HOST" "$DRV"
+    echo "── run driver on $HOST (GPU on vfio-pci there) ──"
+    # Run from a scratch cwd: the driver writes vm-state-* + logs there.
+    ssh "$HOST" "rm -rf /tmp/htest-{{name}} && mkdir -p /tmp/htest-{{name}} && cd /tmp/htest-{{name}} && $DRV/bin/nixos-test-driver"
 
 # RustSec advisory check only (subset of `cargo deny check`).
 audit:

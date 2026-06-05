@@ -62,6 +62,19 @@ in
   # the nixosTest framework pins nixpkgs.config read-only, so we must
   # NOT set it again here.)
   hardware.graphics.enable = true;
+
+  # The NVIDIA userspace EGL/GBM stack in the /run/opengl-driver farm.
+  # The inert videoDrivers path never adds it, so libEGL finds no GBM
+  # platform for the nvidia device ("Unable to find suitable EGL
+  # platform", "driver (null)"). Replicate nixpkgs nvidia.nix's
+  # `hardware.graphics.extraPackages`: the driver's GL/EGL/GBM libs
+  # (libnvidia-allocator GBM backend, libEGL_nvidia) + the egl-wayland
+  # / egl-gbm external-platform descriptors.
+  hardware.graphics.extraPackages = [
+    config.boot.kernelPackages.nvidiaPackages.production
+    pkgs.egl-wayland
+    pkgs.egl-gbm
+  ];
   hardware.nvidia = {
     open = true;
     modesetting.enable = true;
