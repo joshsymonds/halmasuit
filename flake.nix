@@ -815,6 +815,15 @@
           halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
         };
+        # Epic #45 rung 4: post-NVIDIA (KMS CRC) scanout flicker +
+        # refresh check on a constant color — the anti-tautology
+        # centerpiece. RUNNER-ONLY.
+        visual-nvidia-flicker = import ./tests/visual-nvidia-flicker.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+        };
         # Epic #1 R12: first real-PAM gate. run_pam_auth against the
         # real libpam stack with the real test user — NO mock.
         run-pam-auth = import ./tests/run-pam-auth.nix {
