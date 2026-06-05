@@ -123,8 +123,8 @@ pkgs.testers.runNixOSTest {
     # Confirmation watch (Epic #45 rung-4): with 8-bit scanout forced,
     # does the physical monitor now show solid gray (vs black on 10-bit)?
     import time as _t
-    print("=== WATCH THE PHYSICAL MONITOR NOW for ~120s — expect SOLID MID-GRAY (was black on 10-bit) ===")
-    _t.sleep(120)
+    print("=== WATCH THE PHYSICAL MONITOR NOW for ~30s — expect SOLID MID-GRAY, rock-steady ===")
+    _t.sleep(30)
     print("=== watch window done ===")
 
     bdf = "0000:00:09.0"  # the passed-through 5070 Ti (drmDevice pin)
@@ -145,26 +145,80 @@ pkgs.testers.runNixOSTest {
     for cid in crtcs:
         out = machine.succeed(f"{POLL} {cid} 3 {card}")
         print(f"=== crtc {cid} CRC poll ===\n{out}")
-        fields = dict(
-            line.split("=", 1) for line in out.splitlines() if "=" in line
-        )
+        # The poller emits space-separated `key=val` tokens; tokenize on
+        # whitespace (NOT first-`=`-per-line, which breaks multi-pair
+        # lines like `comp_supported=1 comp_distinct=1 comp_values=0x...`).
+        fields = {}
+        for line in out.splitlines():
+            for tok in line.split():
+                if "=" in tok:
+                    k, v = tok.split("=", 1)
+                    fields[k] = v
         polled[cid] = fields
         assert "ioctl_err" not in fields, f"crtc {cid}: ioctl error {fields.get('ioctl_err')}"
         # The vblank-wait patch slows each ioctl to ~one frame, so ~30
         # samples in 3s is expected (was ~90 with the no-op one-shot).
         assert int(fields.get("samples", "0")) >= 10, f"crtc {cid}: too few samples"
 
-    # Anti-tautology check across the two DIFFERENT-resolution crtcs: a
-    # genuine content CRC must differ between them. Report which taps are
-    # supported, stable (distinct==1), non-zero, and crtc-distinguishing.
     for tap in ("comp", "rg", "out"):
-        per = {cid: polled[cid] for cid in crtcs}
-        sup = {cid: per[cid].get(f"{tap}_supported") for cid in crtcs}
-        dist = {cid: per[cid].get(f"{tap}_distinct") for cid in crtcs}
-        vals = {cid: per[cid].get(f"{tap}_values") for cid in crtcs}
-        print(f"TAP {tap}: supported={sup} distinct={dist} values={vals}")
+        for cid in crtcs:
+            p = polled[cid]
+            print(f"TAP {tap} crtc {cid}: distinct={p.get(f'{tap}_distinct')} "
+                  f"values={p.get(f'{tap}_values')}")
 
-    print("visual-nvidia-flicker: DIAGNOSTIC — taps dumped above; "
-          "assertion will lock onto the content-sensitive stable tap next.")
+    # === THE ANTI-TAUTOLOGY GATE (Epic #45 req 4) ===
+    # Lock onto compositorCrc32: pre-dither, so a CONSTANT color yields
+    # exactly ONE hardware CRC per head WHEN the pipeline genuinely scans
+    # it out. (The rg/out taps legitimately vary per frame from dithering,
+    # so they are NOT used for the no-flicker check.)
+    comp_crc = {}
+    for cid in crtcs:
+        p = polled[cid]
+        vals = p.get("comp_values", "")
+        distinct = int(p.get("comp_distinct", "0"))
+        # 1. NON-ZERO: 0x0 = driver dropped the frame / no real scanout —
+        #    the exact "rendered then dropped on the floor" tautology this
+        #    gate exists to catch (req 4).
+        assert vals and vals != "0x0", (
+            f"crtc {cid}: compositor CRC is {vals!r} — scanout produced no "
+            f"real content (driver-drop / black scanout)."
+        )
+        # 2. NO FLICKER: a static color must hash to exactly one value over
+        #    the sampling window.
+        assert distinct == 1, (
+            f"crtc {cid}: FLICKER — compositor CRC varied ({distinct} "
+            f"distinct: {vals}); a constant color must be scanout-stable."
+        )
+        comp_crc[cid] = vals
+
+    # 3. CONTENT-SENSITIVE (anti-tautology): the two DIFFERENT-resolution
+    #    heads must produce DIFFERENT compositor CRCs. Identical values
+    #    would mean the CRC is content-independent and proves nothing.
+    if len(crtcs) >= 2:
+        assert len(set(comp_crc.values())) == len(crtcs), (
+            f"anti-tautology FAIL: heads share a compositor CRC ({comp_crc}) "
+            f"— the CRC is not tracking scanned content."
+        )
+
+    print(f"visual-nvidia-flicker: PASS — flicker-free scanout, "
+          f"content-sensitive compositor CRCs {comp_crc}")
+
+    # GRACEFUL GPU teardown — load-bearing for iterative runs on Blackwell.
+    # The RTX 50-series reset wedge (GSP/WPR2 survives FLR/SBR/rescan; no
+    # host-side recovery short of a power-cycle) is triggered by the
+    # nvidia-drm MODESET teardown when qemu dies / the guest powers off
+    # without the driver quiescing first. The Level1Techs fix is
+    # `nvidia-drm modeset=0`, but halmasuit REQUIRES KMS modeset, so instead
+    # we tear the modeset state down cleanly while the guest is fully alive:
+    # stop the compositor (release DRM master) → unload the nvidia modeset
+    # modules in order → THEN power off. This quiesces GSP/WPR2 so the next
+    # run works without rebooting stygian. (Epic #45 rung-4 iterative fix.)
+    machine.succeed("systemctl stop halmasuit || true")
+    machine.succeed("sleep 1")
+    machine.execute(
+        "modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia 2>&1 | tail -3"
+    )
+    machine.execute("cat /proc/driver/nvidia/version 2>/dev/null | head -1 || true")
+    machine.shutdown()
   '';
 }

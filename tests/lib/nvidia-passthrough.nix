@@ -45,6 +45,17 @@ let
   patchedNvidiaOpen =
     config.boot.kernelPackages.nvidiaPackages.production.open.overrideAttrs
       (o: { patches = (o.patches or [ ]) ++ [ ./crc-vblank-wait.patch ]; });
+
+  # The 5070 Ti is the HOST's boot/primary display (boot_vga=1), so the
+  # firmware POSTs it and the guest inherits a half-initialized display
+  # engine + tainted on-card vBIOS. Compute/render then work but SCANOUT
+  # is black (Epic #45 rung-4 root cause). romfile= gives the guest a
+  # clean UEFI vBIOS (x86 + code-type-3 EFI/GOP image) so OVMF can run
+  # the display-init path itself. The ROM was live-dumped from the card
+  # on stygian (card unbound from vfio, ROM BAR read, rebound) and
+  # persisted at this host path; qemu reads it from the host fs (the
+  # .driver path runs non-sandboxed on stygian). RUNNER-SPECIFIC path.
+  vfioRomFile = "/home/joshsymonds/halmasuit-5070ti-vbios.rom";
 in
 {
   # OVMF/UEFI — the GPU's vbios is UEFI; SeaBIOS can't init it.
@@ -57,10 +68,9 @@ in
     [
       "-machine" "q35,kernel_irqchip=on"
       "-cpu" "host,kvm=on"
+      "-device"
+      "vfio-pci,host=${builtins.head hostBdfs},multifunction=on,romfile=${vfioRomFile}"
     ]
-    ++ lib.concatMap
-      (bdf: [ "-device" "vfio-pci,host=${bdf},multifunction=on" ])
-      [ (builtins.head hostBdfs) ]
     ++ lib.concatMap
       (bdf: [ "-device" "vfio-pci,host=${bdf}" ])
       (builtins.tail hostBdfs);
