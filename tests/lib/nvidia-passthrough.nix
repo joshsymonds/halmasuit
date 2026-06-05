@@ -34,6 +34,17 @@ let
   #   0000:01:00.0 — GB203 [RTX 5070 Ti] VGA
   #   0000:01:00.1 — GB203 HDMI audio (same group; must pass together)
   hostBdfs = [ "0000:01:00.0" "0000:01:00.1" ];
+
+  # Patched open kernel module (Epic #45 req 9): adds a bounded wait for
+  # one real scanout vblank inside nvReadCRC32Evo so the HW per-head
+  # scanout CRC (read via DRM_IOCTL_NVIDIA_GET_CRTC_CRC32_V2) reflects a
+  # fully scanned-out frame. Without it the one-shot read latches the
+  # notifier before scanout and returns 0x0 for every tap. Contained to
+  # src/nvidia-modeset (nvidia-modeset.ko) — no GSP/firmware change. This
+  # is what gives rung 4 a true, content-sensitive post-NVIDIA signal.
+  patchedNvidiaOpen =
+    config.boot.kernelPackages.nvidiaPackages.production.open.overrideAttrs
+      (o: { patches = (o.patches or [ ]) ++ [ ./crc-vblank-wait.patch ]; });
 in
 {
   # OVMF/UEFI — the GPU's vbios is UEFI; SeaBIOS can't init it.
@@ -96,9 +107,7 @@ in
   #     the guest kernel and add it to the module set,
   #   - force-load the nvidia stack at boot (no udev/X trigger here).
   boot.blacklistedKernelModules = [ "nouveau" "nvidiafb" ];
-  boot.extraModulePackages = [
-    config.boot.kernelPackages.nvidiaPackages.production.open
-  ];
+  boot.extraModulePackages = [ patchedNvidiaOpen ];
   boot.kernelModules = [ "nvidia" "nvidia_modeset" "nvidia_uvm" "nvidia_drm" ];
 
   # Blackwell's open module needs the GSP firmware blob

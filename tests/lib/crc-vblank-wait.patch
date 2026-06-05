@@ -1,0 +1,52 @@
+diff --git a/src/nvidia-modeset/src/nvkms-evo.c b/src/nvidia-modeset/src/nvkms-evo.c
+index 9c14aad..91fa85f 100644
+--- a/src/nvidia-modeset/src/nvkms-evo.c
++++ b/src/nvidia-modeset/src/nvkms-evo.c
+@@ -9242,6 +9242,47 @@ NvBool nvReadCRC32Evo(NVDispEvoPtr pDispEvo, NvU32 head,
+     // This update should generate one CRC value.
+     nvEvoUpdateAndKickOff(pDispEvo, TRUE, &updateState, TRUE /* releaseElv */);
+ 
++    /*
++     * Wait for one real scanout vblank before stopping capture.
++     *
++     * nvEvoUpdateAndKickOff(sync=TRUE) only waits on the core-channel
++     * completion notifier (method processing), not on a scanout vblank. The
++     * nvdisplay CRC controller writes one CRC entry per vblank, so if we Stop
++     * immediately the notifier's first/only entry is captured before the
++     * RG/compositor has hashed an active frame and its value is 0. Block here
++     * until we observe an active->blanking->active transition (one full frame)
++     * so hardware populates a CRC for a fully scanned-out buffer. Bounded so a
++     * head that is not actually advancing (e.g. stalled) still returns rather
++     * than hanging; on timeout we fall through and Query whatever is present,
++     * preserving the pre-patch behavior.
++     */
++    if (pDevEvo->hal->GetScanLine != NULL) {
++        NvU64 startTime = 0;
++        /* ~2 frames @ 30Hz worst case; generous upper bound, poll is cheap. */
++        const NvU32 vblankTimeoutUSec = 66667;
++        NvU16 scanLine = 0;
++        NvBool inBlank = FALSE;
++        NvBool sawActive = FALSE;
++
++        do {
++            pDevEvo->hal->GetScanLine(pDispEvo, head, &scanLine, &inBlank);
++
++            if (!inBlank) {
++                /* In active scanout of the current frame. */
++                sawActive = TRUE;
++            } else if (sawActive) {
++                /*
++                 * Entered vertical blanking after having been in active
++                 * scanout: a full frame has now been scanned out and the CRC
++                 * controller has had a frame to hash. Done waiting.
++                 */
++                break;
++            }
++
++            nvkms_yield();
++        } while (!nvExceedsTimeoutUSec(pDevEvo, &startTime, vblankTimeoutUSec));
++    }
++
+     pDevEvo->hal->StopCRC32Capture(pDevEvo,
+                                    head,
+                                    &updateState);

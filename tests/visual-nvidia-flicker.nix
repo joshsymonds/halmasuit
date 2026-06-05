@@ -114,7 +114,9 @@ pkgs.testers.runNixOSTest {
         )
         polled[cid] = fields
         assert "ioctl_err" not in fields, f"crtc {cid}: ioctl error {fields.get('ioctl_err')}"
-        assert int(fields.get("samples", "0")) >= 50, f"crtc {cid}: too few samples"
+        # The vblank-wait patch slows each ioctl to ~one frame, so ~30
+        # samples in 3s is expected (was ~90 with the no-op one-shot).
+        assert int(fields.get("samples", "0")) >= 10, f"crtc {cid}: too few samples"
 
     # Anti-tautology check across the two DIFFERENT-resolution crtcs: a
     # genuine content CRC must differ between them. Report which taps are
