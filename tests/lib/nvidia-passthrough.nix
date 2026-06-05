@@ -64,14 +64,17 @@ in
   hardware.graphics.enable = true;
 
   # The NVIDIA userspace EGL/GBM stack in the /run/opengl-driver farm.
-  # The inert videoDrivers path never adds it, so libEGL finds no GBM
-  # platform for the nvidia device ("Unable to find suitable EGL
-  # platform", "driver (null)"). Replicate nixpkgs nvidia.nix's
-  # `hardware.graphics.extraPackages`: the driver's GL/EGL/GBM libs
-  # (libnvidia-allocator GBM backend, libEGL_nvidia) + the egl-wayland
-  # / egl-gbm external-platform descriptors.
+  # The inert videoDrivers path never adds it, so libgbm finds only
+  # mesa's dri_gbm.so for the nvidia device — "driver (null)", then
+  # "Unable to find suitable EGL platform". The DRIVER's `.out` output
+  # carries the load-bearing piece: lib/gbm/nvidia-drm_gbm.so (the
+  # nvidia GBM backend, → libnvidia-allocator) + libEGL_nvidia. The
+  # package's DEFAULT output does NOT have lib/gbm/, which is why an
+  # earlier attempt without `.out` left the backend dir mesa-only.
+  # Mirrors nixpkgs nvidia.nix, which uses `nvidia_x11.out`. egl-wayland
+  # / egl-gbm supply the external-platform JSON descriptors.
   hardware.graphics.extraPackages = [
-    config.boot.kernelPackages.nvidiaPackages.production
+    config.boot.kernelPackages.nvidiaPackages.production.out
     pkgs.egl-wayland
     pkgs.egl-gbm
   ];
