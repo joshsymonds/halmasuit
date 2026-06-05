@@ -824,6 +824,12 @@
           halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
         };
+        # Epic #45 rung-4 isolation: kmscube (no halmasuit) to test the
+        # GBM/EGL/KMS→monitor present path under VFIO. RUNNER-ONLY.
+        nvidia-kmscube = import ./tests/nvidia-kmscube.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+        };
         # Epic #1 R12: first real-PAM gate. run_pam_auth against the
         # real libpam stack with the real test user — NO mock.
         run-pam-auth = import ./tests/run-pam-auth.nix {

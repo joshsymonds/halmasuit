@@ -107,6 +107,36 @@ pkgs.testers.runNixOSTest {
     # (vblanks frozen → need a monitor/dummy plug on the GPU).
     print("=== DRM vblank rate per pipe ===\n" + machine.succeed(f"{VBLANK} {card}"))
 
+    # Which connectors halmasuit lit (so the human knows which port).
+    lit = machine.succeed(
+        "journalctl -u halmasuit -o cat | grep -oE 'connector bound to dedicated CRTC\",\"connector\":\"[A-Z0-9-]+' "
+        "| grep -oE '[A-Z]+-[A-Z0-9-]+' | sort -u || true"
+    )
+    print("=== connectors halmasuit lit ===\n" + lit)
+
+    # Root-cause the black scanout (gambit:debugging): the eyeball already
+    # confirmed BLACK on DP-2/DP-3. Dump the live DRM atomic state to see
+    # whether a real content FB (size/format/MODIFIER) is on the primary
+    # scanout plane, and any nvidia flip/atomic errors. Prime suspect:
+    # a scanout buffer modifier the NVIDIA display engine accepts at
+    # modeset but cannot actually scan out (drm.rs:79/968 format negotiation).
+    # Confirmation watch (Epic #45 rung-4): with 8-bit scanout forced,
+    # does the physical monitor now show solid gray (vs black on 10-bit)?
+    import time as _t
+    print("=== WATCH THE PHYSICAL MONITOR NOW for ~120s — expect SOLID MID-GRAY (was black on 10-bit) ===")
+    _t.sleep(120)
+    print("=== watch window done ===")
+
+    bdf = "0000:00:09.0"  # the passed-through 5070 Ti (drmDevice pin)
+    print("=== DRM atomic state (planes/fbs/format/modifier/crtc) ===\n" +
+          machine.execute(f"cat /sys/kernel/debug/dri/{bdf}/state 2>&1 | head -120")[1])
+    print("=== framebuffers ===\n" +
+          machine.execute(f"cat /sys/kernel/debug/dri/{bdf}/framebuffer 2>&1 | head -40")[1])
+    print("=== halmasuit journal: render/flip/modifier/format ===\n" +
+          machine.execute("journalctl -u halmasuit -o cat | grep -iE 'modifier|format|plane|flip|scanout|queue|present|render_frame|primary' | tail -40 || true")[1])
+    print("=== dmesg: nvidia/drm/flip/atomic/fault ===\n" +
+          machine.execute("dmesg | grep -iE 'nvidia|nvrm|drm|modifier|flip|atomic|fault|EVO|head' | tail -50 || true")[1])
+
     # Read the post-NVIDIA hardware scanout CRC for ~3s per crtc, all
     # three taps. DIAGNOSTIC pass: print everything so we can see which
     # tap carries a real, content-sensitive value (anti-tautology: a
