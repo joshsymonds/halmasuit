@@ -481,6 +481,32 @@ test-vm-drive-stop:
     @pkill -f "tail -f /tmp/halmasuit-drive-cmds" 2>/dev/null || true
     @echo "stopped"
 
+# Run a VFIO-passthrough test on the stygianlibrary NVIDIA runner (Epic #45).
+#
+# These tests own the real RTX 5070 Ti via passthrough, so they CANNOT run
+# in the `nix build` sandbox (no /dev/vfio). They run via the non-sandboxed
+# `.driver` output ON stygian, which has the GPU bound to vfio-pci + the
+# memlock / vfio-group perms (nix-config hosts/stygianlibrary).
+#
+# We rsync the working tree to a throwaway runner checkout and `git add -A`
+# there so untracked/new test files are visible to the flake (nix flake eval
+# only sees git-tracked content; staging is enough, no commit needed).
+#
+# Usage: just test-vm-nvidia nvidia-passthrough-smoke
+#        just test-vm-nvidia <name> joshsymonds@<other-host>
+test-vm-nvidia name host="joshsymonds@172.31.0.99":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    HOST="{{host}}"
+    DEST="/home/joshsymonds/halmasuit-runner"
+    echo "── syncing working tree to $HOST:$DEST ──"
+    ssh "$HOST" "mkdir -p $DEST"
+    rsync -a --delete \
+      --exclude target/ --exclude result --exclude 'result-*' \
+      ./ "$HOST:$DEST/"
+    echo "── running .#checks.x86_64-linux.{{name}}.driver on $HOST ──"
+    ssh "$HOST" "cd $DEST && git add -A && nix run .#checks.x86_64-linux.{{name}}.driver"
+
 # RustSec advisory check only (subset of `cargo deny check`).
 audit:
     cargo deny check advisories

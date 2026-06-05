@@ -786,6 +786,16 @@
           halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-luks       = self.packages.x86_64-linux.halmasuit-luks;
         };
+        # Epic #45 rung 1: bare VFIO-passthrough smoke. RUNNER-ONLY —
+        # runs via `.driver` on stygianlibrary (GPU on vfio-pci), NEVER
+        # via `nix build` (the sandbox has no /dev/vfio). Deliberately
+        # NOT added to the `just test-vm` portable sweep. Asserts the
+        # real 5070 Ti binds the nvidia driver + nvidia-smi inside a
+        # passthrough guest, before any halmasuit is layered on.
+        nvidia-passthrough-smoke = import ./tests/nvidia-passthrough-smoke.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+        };
         # Epic #1 R12: first real-PAM gate. run_pam_auth against the
         # real libpam stack with the real test user — NO mock.
         run-pam-auth = import ./tests/run-pam-auth.nix {
