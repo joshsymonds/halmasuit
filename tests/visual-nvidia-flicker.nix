@@ -82,6 +82,7 @@ pkgs.testers.runNixOSTest {
     import re
 
     POLL = "${pkgs.python3}/bin/python3 ${./lib/nvidia-crc-poll.py}"
+    VBLANK = "${pkgs.python3}/bin/python3 ${./lib/nvidia-vblank-probe.py}"
 
     machine.start()
     machine.wait_for_unit("multi-user.target")
@@ -100,6 +101,11 @@ pkgs.testers.runNixOSTest {
     crtcs = sorted(set(int(m) for m in re.findall(r'crtc::Handle\((\d+)\)', journal)))
     print(f"card={card} crtc_ids={crtcs}")
     assert crtcs, "no crtc::Handle(N) found in halmasuit journal"
+
+    # Is the GPU actually scanning out (real vblanks)? Decides whether a
+    # 0x0 CRC is a patch-timing issue (vblanks live) or a no-sink issue
+    # (vblanks frozen → need a monitor/dummy plug on the GPU).
+    print("=== DRM vblank rate per pipe ===\n" + machine.succeed(f"{VBLANK} {card}"))
 
     # Read the post-NVIDIA hardware scanout CRC for ~3s per crtc, all
     # three taps. DIAGNOSTIC pass: print everything so we can see which
