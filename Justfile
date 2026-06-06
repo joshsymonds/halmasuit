@@ -207,6 +207,9 @@ test-vm:
     echo "── visual-frame-callbacks ──"
     nix build .#checks.x86_64-linux.visual-frame-callbacks -L --print-build-logs --no-link
     echo
+    echo "── visual-wallpaper-render-rate ──"
+    nix build .#checks.x86_64-linux.visual-wallpaper-render-rate -L --print-build-logs --no-link
+    echo
     # Convergence epic R3: sync-subsurface commits aggregate to parent.
     echo "── visual-sync-subsurface ──"
     nix build .#checks.x86_64-linux.visual-sync-subsurface -L --print-build-logs --no-link

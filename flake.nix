@@ -1343,6 +1343,15 @@
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
           ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        # Epic #53: animated wallpaper must render at the display refresh
+        # (vblank-driven), NOT a fixed-interval timer cap. Hermetic — the
+        # throttle is GPU-agnostic. RED until vblank-driven render lands.
+        visual-wallpaper-render-rate = import ./tests/visual-wallpaper-render-rate.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+        };
         # Convergence epic R3: sync wl_subsurface commits are
         # aggregated to the parent atomic state, NOT applied
         # immediately (smithay smallvil pattern).
