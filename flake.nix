@@ -830,6 +830,16 @@
           system = "x86_64-linux";
           inherit nixpkgs;
         };
+        # Epic #45 rung-6: shader-PATH flicker. Drives halmasuit's
+        # continuously-rendered SHADER backend (constant output) on real
+        # NVIDIA — the actual path the gnomon flicker lives in, which the
+        # static-image flicker test does NOT exercise. RUNNER-ONLY.
+        visual-nvidia-shader = import ./tests/visual-nvidia-shader.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+        };
         # Epic #1 R12: first real-PAM gate. run_pam_auth against the
         # real libpam stack with the real test user — NO mock.
         run-pam-auth = import ./tests/run-pam-auth.nix {
