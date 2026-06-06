@@ -179,7 +179,7 @@ pkgs.testers.runNixOSTest {
 
     # Graceful GPU teardown so the next run works without a host reboot
     # (Blackwell reset wedge — see tests/lib/nvidia-teardown.sh).
-    machine.execute("sh ${./lib/nvidia-teardown.sh}")
+    print(machine.execute("sh ${./lib/nvidia-teardown.sh}")[1])
     machine.shutdown()
   '';
 }
