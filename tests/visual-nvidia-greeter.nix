@@ -155,5 +155,10 @@ pkgs.testers.runNixOSTest {
         "journalctl -u halmasuit -o cat | grep -iE 'client_first_frame.*(overlay|top)|layer-shell commit.*has_buffer: true' | head"
     ))
     print("visual-nvidia-greeter: DankGreeter attached a buffer on real NVIDIA. PASS")
+
+    # Graceful GPU teardown so the next run works without a host reboot
+    # (Blackwell reset wedge — see tests/lib/nvidia-teardown.sh).
+    machine.execute("sh ${./lib/nvidia-teardown.sh}")
+    machine.shutdown()
   '';
 }

@@ -203,22 +203,9 @@ pkgs.testers.runNixOSTest {
     print(f"visual-nvidia-flicker: PASS — flicker-free scanout, "
           f"content-sensitive compositor CRCs {comp_crc}")
 
-    # GRACEFUL GPU teardown — load-bearing for iterative runs on Blackwell.
-    # The RTX 50-series reset wedge (GSP/WPR2 survives FLR/SBR/rescan; no
-    # host-side recovery short of a power-cycle) is triggered by the
-    # nvidia-drm MODESET teardown when qemu dies / the guest powers off
-    # without the driver quiescing first. The Level1Techs fix is
-    # `nvidia-drm modeset=0`, but halmasuit REQUIRES KMS modeset, so instead
-    # we tear the modeset state down cleanly while the guest is fully alive:
-    # stop the compositor (release DRM master) → unload the nvidia modeset
-    # modules in order → THEN power off. This quiesces GSP/WPR2 so the next
-    # run works without rebooting stygian. (Epic #45 rung-4 iterative fix.)
-    machine.succeed("systemctl stop halmasuit || true")
-    machine.succeed("sleep 1")
-    machine.execute(
-        "modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia 2>&1 | tail -3"
-    )
-    machine.execute("cat /proc/driver/nvidia/version 2>/dev/null | head -1 || true")
+    # Graceful GPU teardown so the next run works without a host reboot
+    # (Blackwell reset wedge — see tests/lib/nvidia-teardown.sh).
+    print(machine.execute("sh ${./lib/nvidia-teardown.sh}")[1])
     machine.shutdown()
   '';
 }

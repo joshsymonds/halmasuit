@@ -66,5 +66,10 @@ pkgs.testers.runNixOSTest {
     out = machine.execute("timeout 90 kmscube-nvidia 2>&1 | tail -50")[1]
     print("=== kmscube output ===\n" + out)
     print("=== kmscube watch done ===")
+
+    # Graceful GPU teardown so the next run works without a host reboot
+    # (Blackwell reset wedge — see tests/lib/nvidia-teardown.sh).
+    machine.execute("sh ${./lib/nvidia-teardown.sh}")
+    machine.shutdown()
   '';
 }

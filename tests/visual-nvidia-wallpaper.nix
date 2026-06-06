@@ -176,5 +176,10 @@ pkgs.testers.runNixOSTest {
         "journalctl -u halmasuit | grep -E 'client_first_frame|scanout_active' | head"
     ))
     print("visual-nvidia-wallpaper: halmasuit composited the wallpaper on real NVIDIA. PASS")
+
+    # Graceful GPU teardown so the next run works without a host reboot
+    # (Blackwell reset wedge — see tests/lib/nvidia-teardown.sh).
+    machine.execute("sh ${./lib/nvidia-teardown.sh}")
+    machine.shutdown()
   '';
 }

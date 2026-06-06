@@ -70,5 +70,10 @@ pkgs.testers.runNixOSTest {
     machine.succeed("test -e /dev/nvidia0")
 
     print("nvidia-passthrough-smoke: GPU passed through and bound. PASS")
+
+    # Graceful GPU teardown so the next run works without a host reboot
+    # (Blackwell reset wedge — see tests/lib/nvidia-teardown.sh).
+    machine.execute("sh ${./lib/nvidia-teardown.sh}")
+    machine.shutdown()
   '';
 }
