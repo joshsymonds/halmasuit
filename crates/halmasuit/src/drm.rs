@@ -630,6 +630,13 @@ pub struct DrmBackend {
     /// `set_frame_counter` before the render loop starts, so there is
     /// exactly ONE counter (epic anti-pattern: no second copy).
     frame_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Epic #53: timestamp of the most recent observed vblank (any
+    /// output). The wallpaper keepalive timer reads this to render
+    /// ONLY as a stall backstop — when the vblank-driven render loop
+    /// has gone quiet (no recent flip: relay-dead, or a no-damage
+    /// shutdown gap) — so it never double-renders against a healthy
+    /// per-vblank render loop. `None` until the first vblank.
+    last_vblank: Option<std::time::Instant>,
     /// Epic #71 R3.2: whether to composite the diagnostic overlay
     /// element this frame. Toggled by `set_overlay_visible` from
     /// `HalmasuitState::handle_chord_action` in response to
@@ -715,14 +722,6 @@ pub enum WallpaperTickAction {
     /// freshly-installed fallback must reach the screen, so the
     /// caller queues a render.
     RenderAndSwapped,
-}
-
-impl WallpaperTickAction {
-    /// `true` iff this action wants the caller to invoke `render_one_frame`.
-    #[must_use]
-    pub const fn wants_render(self) -> bool {
-        !matches!(self, Self::Idle)
-    }
 }
 
 /// Map a drm-rs `Interface` enum variant to the canonical Wayland
@@ -1173,6 +1172,8 @@ where
             // (before the render loop starts, so this initial Arc is
             // never incremented).
             frame_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // Epic #53: no vblank observed yet.
+            last_vblank: None,
             // Epic #71 R3.2: overlay starts hidden; chord toggles it.
             overlay_visible: false,
             overlay_text: String::new(),
@@ -1694,6 +1695,73 @@ impl DrmBackend {
         }
 
         Ok(any)
+    }
+
+    /// Epic #53: render ONLY the output whose CRTC matches `crtc` — the
+    /// single-output analog of [`render_all`], for the per-vblank render
+    /// loop. The VBlank handler calls this for the just-flipped output so
+    /// an animated wallpaper re-renders at the display refresh (vsync),
+    /// not a fixed-interval timer. Damage-gated; bumps `frame_counter`
+    /// and runs the primary-output frame-audit exactly as `render_all`
+    /// does, but for the single matching output. Returns whether a frame
+    /// was queued; `Ok(false)` if no output matches `crtc` or there was
+    /// no damage (constant content → the loop idles, correctly).
+    pub fn render_output(
+        &mut self,
+        crtc: crtc::Handle,
+        foreground: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+        clear_color: [u8; 4],
+    ) -> io::Result<bool> {
+        let Some(i) = self.outputs.iter().position(|o| o.crtc == crtc) else {
+            return Ok(false);
+        };
+        let output = self.outputs[i].output.clone();
+        let elements = self.scene_elements(&output, foreground)?;
+        let queued = {
+            // Split borrow: `self.outputs[i].compositor` and
+            // `self.renderer` are disjoint fields (mirrors render_all).
+            let comp = &mut self.outputs[i].compositor;
+            render_one_output(comp, &mut self.renderer, &elements, clear_color)?
+        };
+        if queued {
+            self.frame_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Frame-audit runs on the PRIMARY output only (matches
+            // render_all). Best-effort: an audit failure never takes
+            // down the compositor.
+            #[cfg(feature = "frame_audit")]
+            if i == 0
+                && let Err(e) = self.audit_frame(&output, &elements, clear_color)
+            {
+                tracing::warn!(error = %e, "frame_audit readback failed");
+            }
+        }
+        Ok(queued)
+    }
+
+    /// Epic #53: does the active wallpaper backend want continuous
+    /// (per-frame) renders? The VBlank handler gates the per-vblank
+    /// re-render on this, so static (image / no) wallpapers never drive
+    /// a render loop. A pure query — does NOT run the wallpaper tick.
+    #[must_use]
+    pub fn wallpaper_wants_continuous(&self) -> bool {
+        self.wallpaper.wants_continuous_render()
+    }
+
+    /// Epic #53: record that a vblank was just observed. Called from the
+    /// VBlank handler so the keepalive timer can distinguish a healthy
+    /// per-vblank render loop from a stalled one.
+    pub fn note_vblank(&mut self) {
+        self.last_vblank = Some(std::time::Instant::now());
+    }
+
+    /// Epic #53: has the per-vblank render loop stalled — no vblank
+    /// within `threshold`? `true` before the first vblank. The keepalive
+    /// timer renders (re-primes the loop) ONLY when this is `true`, so it
+    /// never double-renders against a healthy vblank loop.
+    #[must_use]
+    pub fn vblank_stale(&self, threshold: std::time::Duration) -> bool {
+        self.last_vblank.is_none_or(|t| t.elapsed() >= threshold)
     }
 
     /// Total frames the render path has queued for scanout. Monotonic,

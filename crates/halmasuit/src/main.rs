@@ -4447,6 +4447,37 @@ fn handle_drm_event(
                 state.presentation_seq,
                 smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync,
             );
+
+            // Epic #53: VBLANK-DRIVEN continuous render. Re-render the
+            // just-flipped output so an animated wallpaper (shader/video)
+            // advances at the DISPLAY REFRESH — one render per vblank,
+            // vsync-locked — instead of the fixed-interval keepalive
+            // timer that previously capped it at 10 fps. render_output is
+            // damage-gated, so a constant frame queues nothing and the
+            // loop idles (no busy-loop); the keepalive timer re-primes
+            // any stall. Compute the foreground + want-flag under
+            // immutable borrows first, then the single mutable backend
+            // borrow (disjoint fields).
+            let fg = if state.shutting_down {
+                None
+            } else {
+                state
+                    .foreground_toplevel
+                    .as_ref()
+                    .map(|t| t.wl_surface().clone())
+            };
+            let wants_continuous = state
+                .drm_backend
+                .as_ref()
+                .is_some_and(drm::DrmBackend::wallpaper_wants_continuous);
+            if let Some(backend) = state.drm_backend.as_mut() {
+                backend.note_vblank();
+                if wants_continuous
+                    && let Err(e) = backend.render_output(crtc, fg.as_ref(), HALMASUIT_BRAND_CLEAR)
+                {
+                    tracing::warn!(error = %e, "vblank render_output failed");
+                }
+            }
         }
         smithay::backend::drm::DrmEvent::Error(e) => {
             tracing::warn!(error = %e, "DRM device error");
@@ -5383,45 +5414,42 @@ fn main() -> io::Result<()> {
         dbus::serve(backend.snapshot_handle());
     }
 
-    // Wallpaper-engine background tick: a calloop timer at 100 ms
-    // drives [`DrmBackend::tick_wallpaper`] AND
-    // [`DrmBackend::wallpaper_wants_continuous`]-gated renders for
-    // animated wallpaper backends (shader, video). Three
-    // responsibilities:
+    // Wallpaper-engine KEEPALIVE tick: a calloop timer at 100 ms.
+    //
+    // Animation rendering is NOT driven from here — Epic #53 moved that
+    // to the per-vblank render loop (the VBlank handler re-renders the
+    // just-flipped output via `render_output` when the wallpaper wants
+    // continuous render), so animated shader/video wallpapers advance at
+    // the DISPLAY REFRESH (vsync), not a fixed 10 fps cap. This timer
+    // keeps only the duties that genuinely CANNOT ride vblanks, plus a
+    // render backstop:
     // (1) call the active backend's
     //     [`WallpaperBackend::poll_pending`] — `VideoBackend` drains
     //     the decoder's IPC socket independently of the render path;
-    //     other backends no-op.
-    // (2) check whether the active backend has requested a
-    //     fallback swap (e.g. relay-dead after the restart budget
-    //     exhausted) and execute it — load-bearing for VM-test
-    //     Gate 6 / Epic #12 Req 10's "fallback after N forced
-    //     crashes" criterion.
-    // (3) for `wants_continuous_render` backends, drive
-    //     `render_one_frame` every tick so animation advances even
-    //     when no Wayland client commits are firing repaints. THIS
-    //     IS LOAD-BEARING through shutdown — once niri exits during
-    //     `graceful_shutdown`, there are no client commits, and the
-    //     tick is the only path that keeps shader/video frames
-    //     advancing all the way to kernel halt (Epic #61 R3.1).
+    //     other backends no-op. MUST be timer-driven: a dead decoder
+    //     produces no frames → no flip → no vblank, so vblank-gating
+    //     this would never observe the death.
+    // (2) check whether the active backend has requested a fallback
+    //     swap (relay-dead after the restart budget exhausted) and
+    //     execute it — load-bearing for VM-test Gate 6 / Epic #12 Req
+    //     10. Same reason: no vblanks in the relay-dead state.
+    // (3) RENDER BACKSTOP: render only when a fallback just swapped
+    //     (new content must reach the screen) OR the per-vblank loop
+    //     has STALLED (continuous backend, no vblank within 2 ticks —
+    //     relay-dead, or a no-damage gap). When the vblank loop is
+    //     healthy this renders nothing → no double-render. This is also
+    //     what keeps shader/video frames advancing through shutdown if
+    //     the vblank chain ever hits a no-damage gap (Epic #61 R3.1).
     //
-    // For image/no-wallpaper configurations, registering the timer
-    // would wake the compositor 10× per second forever for a no-op
-    // — preventing deep-idle CPU states on battery-backed hardware.
-    // Gate the registration on `wallpaper_needs_tick`, which mirrors
-    // `WallpaperBackend::wants_continuous_render` at config-time.
+    // For image/no-wallpaper configurations the timer is not registered
+    // at all (gated on `wallpaper_needs_tick`, mirroring
+    // `wants_continuous_render` at config-time), so a static-wallpaper
+    // compositor still reaches deep idle.
     //
-    // 100 ms is a deliberate compromise: low enough to bound
-    // crash-recovery latency below human-perceptible levels and to
-    // animate a shader at 10 fps (visible motion), high enough that
-    // an idle compositor stays mostly asleep when the wallpaper is
-    // static. Frame-delivery latency for active playback is
-    // unaffected because `render_element` ALSO polls when the render
-    // path fires; the timer is the keepalive for periods when the
-    // render loop has stopped (wallpaper content stabilized → no new
-    // vblanks).
-    //
-    // Wraps around forever via `TimeoutAction::ToDuration(period)`.
+    // 100 ms is the keepalive cadence: fast enough to bound
+    // crash-recovery / fallback latency and to detect a vblank-loop
+    // stall promptly, slow enough to stay near-idle. It does NOT set the
+    // animation rate any more. Wraps forever via `ToDuration(period)`.
     if wallpaper_needs_tick {
         let wallpaper_tick = calloop::timer::Timer::immediate();
         // Epic #42 R3 diagnostic: tick counter + timer-start instant for
@@ -5447,13 +5475,33 @@ fn main() -> io::Result<()> {
                     // decoder frames reach the screen until kernel halt.
                     let action = state.drm_backend.as_mut().map(|backend| {
                         let action = backend.tick_wallpaper();
-                        if action.wants_render()
+                        // Epic #53: the per-vblank render loop (VBlank
+                        // handler → render_output) is now the normal
+                        // driver for continuous wallpapers. This keepalive
+                        // timer renders ONLY as a backstop: when a
+                        // fallback just swapped (RenderAndSwapped — the new
+                        // content must reach the screen) OR when the vblank
+                        // loop has STALLED (RenderContinuous but no vblank
+                        // within 2 keepalive ticks — relay-dead, or a
+                        // no-damage gap incl. through shutdown). When the
+                        // vblank loop is healthy this renders NOTHING → no
+                        // double-render. (tick_wallpaper itself still runs
+                        // every tick for poll_pending + the fallback-swap
+                        // state machine — those can't ride vblanks.)
+                        let should_render = match action {
+                            drm::WallpaperTickAction::RenderAndSwapped => true,
+                            drm::WallpaperTickAction::RenderContinuous => {
+                                backend.vblank_stale(Duration::from_millis(200))
+                            }
+                            drm::WallpaperTickAction::Idle => false,
+                        };
+                        if should_render
                             && let Err(e) = backend.render_one_frame(HALMASUIT_BRAND_CLEAR)
                         {
                             tracing::warn!(
                                 error = %e,
                                 ?action,
-                                "wallpaper-tick: render failed",
+                                "wallpaper-tick backstop render failed",
                             );
                         }
                         action
