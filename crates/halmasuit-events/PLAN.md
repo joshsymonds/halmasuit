@@ -12,6 +12,214 @@ This document is a plan for a crate that does not yet exist.
 When implementation lands, it should be supplemented or replaced
 by a normal README.md describing the shipped crate.
 
+The **v1 epic** below is the authoritative, approved contract for
+the first landing (the in-process reactive-wallpaper slice). The
+remainder of this document — sockets, the CLI, `UserSignal`,
+system-health publishers, the compositor/DMS consumers — is the
+broader vision and the roadmap for later acts; it is NOT in v1
+scope and its types are not added until their publishers exist.
+
+---
+
+## v1 epic — in-process reactive-wallpaper slice (approved 2026-05-28)
+
+The smallest vertical slice that ships reactive wallpaper
+end-to-end: a calloop-native in-process bus carrying the events
+halmasuit already emits, wired to the wallpaper's existing
+`EventTime` / `EventValue` uniform bindings. No socket, no CLI, no
+new privileged surface.
+
+### Requirements (IMMUTABLE)
+
+1. New library crate `crates/halmasuit-events/` (dual
+   MIT-OR-Apache) exposing `BusEvent` and the publish/subscribe
+   primitives. It depends on `halmasuit-introspect`, `serde`,
+   `serde_json` ONLY — NO calloop, smithay, wayland, or tokio.
+2. `BusEvent` embeds `halmasuit_introspect::Event` as a single
+   `Lifecycle(Event)` variant and adds only genuinely-new
+   bus-native signals: `BootStage(u8)`, `Idle { duration_seconds:
+   u64 }`, `ActivityResumed`, `LuksPrompt`. `introspect::Event` is
+   NOT restated as a `SystemPhase`, and `Phase::as_u32`
+   discriminants are NOT renumbered.
+3. `introspect::Event` gains `Deserialize` + `Clone` (it already
+   derives `Serialize`). `halmasuit-introspect` gains a
+   runtime-agnostic in-process subscriber registry of
+   `Box<dyn Fn(&Event) + Send + Sync>` callbacks. `emit()` logs to
+   tracing/journald FIRST (byte-for-byte unchanged), THEN fans out
+   to registered callbacks. With no callback registered, `emit()`
+   behaves exactly as today.
+4. The calloop adapter lives in `halmasuit`, NOT in the bus crate:
+   one registered introspect callback wraps each `Event` as
+   `BusEvent::Lifecycle(_)` and pushes it onto a
+   `calloop::channel::Sender`. New bus-native signals publish onto
+   the same channel from their emission sites.
+5. A consumer subscribes by registering its own
+   `calloop::channel::Channel<BusEvent>` as a loop source; its
+   handler runs with `&mut HalmasuitState`. No synchronous registry
+   invoked inside `publish()` (the `&mut state` reentrancy trap).
+6. The wallpaper `ShaderBackend`'s existing `EventTime { event }`
+   and `EventValue { event }` bindings are wired: on a matching
+   `BusEvent`, `EventTime` writes the transition's `current_time`
+   into the named uniform; `EventValue` writes the event's payload.
+   The "wallpaper bus not yet connected" warning in `shader.rs` is
+   DELETED.
+7. Every `BusEvent` has a canonical, stable, dotted-lowercase name
+   (e.g. `halmasuit.session.opened`, `halmasuit.foreground.session`,
+   `halmasuit.phase.scanout_active`, `halmasuit.boot.stage`),
+   matching the convention already used in `wallpaper/config.rs`
+   tests. That name is the match key against
+   `EventTime`/`EventValue`'s `event` field.
+8. `BootStage(N)` is emitted at a small, configurable set (2–3) of
+   startup milestones. `LuksPrompt` is defined but NOT emitted in
+   v1 (it is a Phase-B initramfs state; Phase B is not started).
+   Greeter / Session / Shutdown reactions require NO new emission
+   points — they flow via the wrapped `ForegroundChanged`,
+   `SessionOpened`, `SessionClientFirstFrame`, `SessionEnded`, and
+   `Shutdown` lifecycle events.
+9. A new `introspect::Event::WallpaperUniformApplied { event_name,
+   uniform }` is emitted when the wallpaper writes a bus-driven
+   value into a uniform. It is the journald observability signal
+   the headless VM gate keys off (pixels are unobservable under
+   `virtio-gpu-pci`).
+
+### Success criteria (MUST ALL BE TRUE)
+
+- [ ] `just check` green (rustfmt, clippy `-D warnings`,
+      cargo-deny, cargo-machete, typos, nextest).
+- [ ] Unit tests cover: bus fan-out to multiple subscribers; the
+      introspect callback registry (fan-out, and no-op when empty);
+      `BusEvent` serde round-trip; `BusEvent` → canonical-name
+      mapping; `EventTime`/`EventValue` binding lookup writes the
+      correct uniform value.
+- [ ] A targeted VM test drives a real lifecycle transition (to
+      session-active) and asserts the matching
+      `wallpaper_uniform_applied` marker via `introspect_events`.
+- [ ] `login-flash` and the full `just test-vm` sweep stay green
+      (no regression to the flash gate).
+- [ ] `emit()`'s journald output is unchanged for every existing
+      event (the `introspect_events` parsing contract holds).
+
+### Anti-patterns (FORBIDDEN)
+
+- NO tokio / `tokio::broadcast` / any async runtime (reason: the
+  daemon is pure calloop; a runtime is the wrong fit and dead
+  weight).
+- NO `SystemPhase` parallel to `Phase`, and NO renumbering
+  `Phase::as_u32` (reason: one vocabulary; the discriminants are a
+  frozen wire contract — append-only).
+- NO Unix socket, SO_PEERCRED auth, `halmasuit-event` CLI,
+  `UserSignal`, or system-health publishers in this slice (reason:
+  out of scope; they land WITH their publishers, never
+  speculatively).
+- NO future variants (`UserSignal`, `CpuLoad`, `MemoryPressure`,
+  `NetworkChange`, compositor events) added before their publishers
+  exist (reason: dead enum arms rot).
+- NO calloop / smithay / wayland / tokio dependency in
+  `halmasuit-events` (reason: it is a pure types + fan-out layer;
+  runtime coupling defeats reuse by kushuh / external consumers).
+- NO making `emit()` fan out BEFORE it logs to tracing (reason: the
+  journald observability contract — `login-flash`,
+  `assert_no_flash_stream` — must never sit behind a fallible
+  in-process step).
+- NO blocking the render/calloop thread on bus delivery; NO
+  bounded-channel drop logic in v1 (reason: in-process, low-volume,
+  single-thread; backpressure is a socket-era concern).
+- NO mocking the bus in the VM test (reason: real fan-out, real
+  wallpaper, real journald marker — same posture as the rest of the
+  suite).
+
+### Approach
+
+The bus is fed from the single `emit()` fan-out point rather than
+by dual-publishing at every call site, so "the wiring lives in one
+place" is literally true: `halmasuit-introspect` gains a
+runtime-agnostic callback registry, `emit()` logs to journald then
+fans out, and `halmasuit` registers one callback that marshals each
+`Event` onto a `calloop::channel` as `BusEvent::Lifecycle`. Every
+lifecycle event already emitted thus reaches the bus for free, and
+the load-bearing journald contract is untouched because logging
+still happens first.
+
+The taxonomy is hybrid: `BusEvent` wraps `introspect::Event` for
+everything already emitted and adds only the genuinely-new
+bus-native signals. `introspect::Event` stays the frozen journald
+state-transition schema; the new signals (`BootStage`, `Idle`,
+`LuksPrompt`) live at the bus layer, not inside it.
+
+The wallpaper subscribes by registering a `calloop::channel`
+source whose handler runs with `&mut HalmasuitState` — the same
+pattern `PrepareForShutdown` already uses, which sidesteps the
+`&mut state` reentrancy a synchronous registry would hit. On each
+`BusEvent` it resolves the event's canonical dotted name, finds
+matching `EventTime`/`EventValue` bindings, and writes the
+transition time or payload into the uniform, emitting a
+`WallpaperUniformApplied` marker for the VM gate.
+
+### Approaches considered
+
+#### Separate `SystemEvent` / `SystemPhase` taxonomy (PLAN.md as written) — REJECTED
+REJECTED BECAUSE: duplicates `Phase` + `Foreground` + the session
+lifecycle events already emitted; forces the wallpaper to reconcile
+two vocabularies against one set of real transitions.
+DO NOT REVISIT UNLESS: the bus is split out for a non-halmasuit
+consumer that genuinely cannot depend on `halmasuit-introspect`.
+
+#### Reuse + extend `introspect::Event` directly (append new variants to it) — REJECTED
+REJECTED BECAUSE: the new bus-native signals (`Idle`, future
+`UserSignal`/health) are not compositor state-transitions and don't
+belong in the frozen journald schema; `Lifecycle(Event)` wraps
+without polluting it.
+DO NOT REVISIT UNLESS: a specific new signal is genuinely a
+compositor state-transition worth journald emission on its own.
+
+#### tokio broadcast channel (PLAN.md open question) — REJECTED
+REJECTED BECAUSE: there is no tokio in the daemon; it is pure
+calloop. DO NOT REVISIT.
+
+#### Explicit dual-publish (`emit()` + `bus.publish()` at each site) — REJECTED
+REJECTED BECAUSE: call-site churn and easy to miss a site; the
+`emit()` fan-out centralizes the wiring in one place.
+DO NOT REVISIT UNLESS: the callback-registry approach proves
+unworkable in practice.
+
+#### Synchronous subscriber registry invoked inside `publish()` — REJECTED
+REJECTED BECAUSE: the consumer needs `&mut HalmasuitState`, which
+`publish()` already borrows — a reentrancy/borrow conflict.
+`calloop::channel` defers delivery to the next loop turn and
+sidesteps it idiomatically. DO NOT REVISIT.
+
+### First task
+
+**Scaffold `halmasuit-events` + `BusEvent` + introspect
+`Deserialize`/`Clone` (pure types, no I/O).** PLAN steps 1–2.
+
+- Study `crates/halmasuit-introspect/src/lib.rs` (the `Event`
+  enum, derives, serde tagging) and `crates/halmasuit/Cargo.toml`
+  (workspace dep conventions, `[workspace.lints]`).
+- `cargo new --lib crates/halmasuit-events`; wire it into the
+  workspace `Cargo.toml` members; `[lints] workspace = true`;
+  license/edition/rust-version from `.workspace`.
+- Add `Deserialize` + `Clone` to `introspect::Event` and the types
+  it carries (`Phase`, `Foreground`, `LayerRole`, `ShutdownReason`,
+  `SessionExit`); keep existing `Serialize` derives. Update the
+  existing round-trip tests to also exercise deserialize.
+- Define `BusEvent` with the `Lifecycle(Event)`, `BootStage(u8)`,
+  `Idle { duration_seconds: u64 }`, `ActivityResumed`, `LuksPrompt`
+  variants; derive `Debug, Clone, Serialize, Deserialize`.
+- Implement `BusEvent::canonical_name(&self) -> Option<String>`
+  (or `&'static str` + formatted) with the dotted scheme; unit-test
+  the mapping for every variant, asserting `halmasuit.session.opened`
+  matches the string already used in `wallpaper/config.rs` tests.
+- No transport, no fan-out, no calloop yet — pure types + names.
+
+Success criteria for the first task:
+- [ ] `cargo build -p halmasuit-events` and the introspect crate
+      both build.
+- [ ] `BusEvent` serde round-trips for every variant (unit test).
+- [ ] `canonical_name` covers every variant and matches the
+      established dotted convention (unit test).
+- [ ] `just check` green.
+
 ---
 
 ## Why this exists
