@@ -1,0 +1,22 @@
+[package]
+name        = "kushuh"
+description = "Role/perspective-based nested Wayland compositor for halmasuit. This crate currently hosts the config domain model (Phase 1); the smithay compositor binary lands in Phase 2. See ARCHITECTURE.md and PLAN.md."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Error enums for config-model validation (Region bounds, and the
+# Role/System/Config validation). smithay / wayland deps arrive in
+# Phase 2; the domain model is pure data.
+thiserror.workspace = true
+# KDL v2 config parser. Hand-written KdlDocument→types conversion lives in
+# `src/config/parse.rs`; the `span` feature (kept on by default) carries
+# source spans into our `ParseError` for actionable diagnostics.
+kdl.workspace = true

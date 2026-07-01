@@ -24,7 +24,9 @@
 
 #![forbid(unsafe_code)]
 
-use serde::Serialize;
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
 
 /// State-transition events emitted by halmasuit during its lifetime.
 ///
@@ -35,7 +37,7 @@ use serde::Serialize;
 /// Future variants carrying user-controlled text (e.g., a `PamChallenge`
 /// variant) must redact the text at construction time in the consuming crate;
 /// see the crate-level documentation.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     /// Process startup. Emitted once at `main()` line 1.
@@ -44,7 +46,10 @@ pub enum Event {
         /// `u32` is the correct domain type.
         pid: u32,
         /// Compositor crate version, typically `env!("CARGO_PKG_VERSION")`.
-        version: &'static str,
+        /// Owned `String` (not `&'static str`) so the schema is
+        /// `Deserialize`-able for out-of-process consumers — a value
+        /// reconstructed from JSON cannot borrow `'static`.
+        version: String,
     },
     /// Phase transition. Emitted on every state change in the compositor's
     /// phase state machine.
@@ -241,6 +246,29 @@ pub enum Event {
     /// remains the authoritative signal when the broker is alive; the
     /// swap gate makes whichever trigger arrives later inert.
     SessionLeaderExitedViaPidfd,
+    /// The LUKS unlock prompt came up: the `halmasuit-luks` password
+    /// agent (a nested Wayland client spawned in the Phase-B initramfs)
+    /// mapped its prompt toplevel. Emitted by the compositor when a
+    /// toplevel maps while running in the initramfs — where the LUKS
+    /// agent is the only client. Semantics are "the unlock screen is
+    /// up", not "a specific passphrase is being asked" (the agent maps
+    /// one surface and reuses it across asks). Journald-observable, and
+    /// reaches the wallpaper as `halmasuit.luks.prompt`.
+    LuksPromptShown,
+    /// The reactive wallpaper wrote a bus-driven value into a named
+    /// shader uniform in response to a lifecycle event. Pure
+    /// observability: this is the journald marker the headless VM gate
+    /// keys off, since pixels are unobservable under `virtio-gpu-pci`.
+    /// Emitted once per uniform actually written. It is NOT itself a
+    /// wallpaper-bindable event (no canonical name), so it cannot
+    /// re-trigger a write.
+    WallpaperUniformApplied {
+        /// The canonical dotted event name that drove the write
+        /// (e.g. `halmasuit.session.opened`).
+        event_name: String,
+        /// The GLSL uniform name that received the value.
+        uniform: String,
+    },
 }
 
 /// How the session leader process terminated (Amendment A5.2).
@@ -249,7 +277,7 @@ pub enum Event {
 /// `halmasuit_session_ipc::SessionOutcome`; duplicated here so the
 /// introspect schema crate stays dependency-light, like
 /// [`LayerRole`]/[`Foreground`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionExit {
     /// The leader `_exit`ed with this status code (clean — GDM
@@ -269,7 +297,7 @@ pub enum SessionExit {
 /// Which client halmasuit treats as the foreground (composited above
 /// the splash background, keyboard focus target). Decided by the
 /// greetd lifecycle, never by which client connected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Foreground {
     /// The greeter is foreground (pre-auth).
@@ -292,7 +320,7 @@ pub enum Foreground {
 /// wallpaper plane, below normal windows). Duplicated here so
 /// `halmasuit-introspect` needs no smithay dependency; halmasuit
 /// maps the smithay layer value onto this at the emission site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayerRole {
     /// The wallpaper plane — halmasuit's internal bottom-most
@@ -317,7 +345,7 @@ pub enum LayerRole {
 ///
 /// Further variants (`Greeter`, `Session`, `Locked`, `Shutdown`) land
 /// alongside the code that enters them.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     /// Compositor initialization completed: smithay protocol state
@@ -432,7 +460,7 @@ impl Phase {
 }
 
 /// Reason a clean shutdown was initiated.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShutdownReason {
     /// SIGTERM from systemd or another external signal source.
@@ -453,13 +481,52 @@ pub enum ShutdownReason {
     Internal,
 }
 
-/// Emit a state-transition event through `tracing`.
+/// An in-process listener invoked by [`emit`] after the event is logged.
 ///
-/// Thread-safe: `tracing` is thread-safe by design; `emit` may be called from
-/// any thread without external synchronization.
+/// `Send` (not `Send + Sync`): the production listener captures a
+/// `calloop::channel::Sender`, which wraps `std::sync::mpsc::Sender` and is
+/// `Send` but **not** `Sync`. A [`Mutex`]-guarded registry (vs an `RwLock`)
+/// needs only `Send` from its contents to be `Sync` itself, which is what
+/// lets these live in a `static`.
+type Listener = Box<dyn Fn(&Event) + Send>;
+
+/// Process-global registry of in-process [`Event`] listeners.
 ///
-/// If no `tracing` subscriber is installed, this is a silent no-op (per
-/// `tracing`'s default behavior).
+/// `const`-initialized so the no-listener path costs only an uncontended
+/// lock. Registration happens once at startup ([`register_listener`]);
+/// [`emit`] takes the lock and fans out after logging.
+static LISTENERS: Mutex<Vec<Listener>> = Mutex::new(Vec::new());
+
+/// Register an in-process listener that [`emit`] invokes with each event
+/// AFTER it is logged to tracing.
+///
+/// The listener must be non-blocking and must NOT call [`emit`] (it runs
+/// while the registry lock is held — a synchronous re-entry would
+/// deadlock). The production listener only does a non-blocking channel
+/// send onto the compositor's calloop loop.
+pub fn register_listener(listener: impl Fn(&Event) + Send + 'static) {
+    // Poison-tolerant: a listener that panics while `emit` holds this
+    // lock would otherwise poison it and turn the journald observability
+    // path (login-flash / assert_no_flash_stream) into a process-wide
+    // abort on the NEXT emit. The registry is a plain Vec — a poisoned
+    // guard's data is still valid, so recover it.
+    LISTENERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(Box::new(listener));
+}
+
+/// Emit a state-transition event: log it through `tracing`, then fan it
+/// out to any registered in-process [`listeners`](register_listener).
+///
+/// Thread-safe: `tracing` is thread-safe by design; `emit` may be called
+/// from any thread without external synchronization.
+///
+/// The tracing log happens FIRST, unconditionally — the journald
+/// observability contract (`login-flash` / `assert_no_flash_stream`) must
+/// never sit behind the fallible in-process fan-out. If no `tracing`
+/// subscriber is installed, the log is a silent no-op (per `tracing`); if
+/// no listener is registered, the fan-out is a no-op over an empty list.
 ///
 /// Serialization failure — which should be unreachable given that all
 /// [`Event`] variants are simple data structures — is logged via
@@ -477,23 +544,80 @@ pub fn emit(event: &Event) {
             );
         }
     }
+    // Fan out AFTER logging. Listeners run while the lock is held; they
+    // must be non-blocking and must not re-enter `emit` (see
+    // `register_listener`). Poison-tolerant: the tracing log above already
+    // happened, so the observability contract is satisfied regardless; a
+    // listener that panicked on a prior call must not wedge the fan-out
+    // (or the journald gate) for every future event. The registry Vec is
+    // valid even through a poisoned guard.
+    let listeners = LISTENERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for listener in listeners.iter() {
+        listener(event);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, Foreground, LayerRole, Phase, ShutdownReason, emit};
+    use super::{
+        Event, Foreground, LayerRole, Phase, SessionExit, ShutdownReason, emit, register_listener,
+    };
     use serde_json::Value;
+    use std::sync::{Arc, Mutex};
+
+    /// A `tracing-subscriber`-compatible writer that accumulates bytes
+    /// into a shared buffer the test can inspect after the fact. Shared by
+    /// the tracing-routing and log-before-fan-out tests.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture lock poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     fn round_trip(event: &Event) -> Value {
         let s = serde_json::to_string(event).expect("Event serialization is infallible");
         serde_json::from_str(&s).expect("round-trip parse should succeed")
     }
 
+    /// Serializes the tests that exercise the process-global `emit()`
+    /// fan-out / listener registry. Under `cargo test` they share one
+    /// process and the registry persists across tests, so concurrent
+    /// emits + leftover listeners can interleave; this guard makes them
+    /// mutually exclusive. (nextest isolates each test in its own
+    /// process and never contends this.) Poison-tolerant so one test's
+    /// panic doesn't wedge the rest.
+    static EMIT_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    fn emit_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        EMIT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn event_started_serializes_with_tag() {
         let v = round_trip(&Event::Started {
             pid: 42,
-            version: "0.1.0",
+            version: "0.1.0".to_owned(),
         });
         assert_eq!(v["event"], "started");
         assert_eq!(v["pid"], 42);
@@ -735,12 +859,79 @@ mod tests {
         }
     }
 
+    /// Every `Event` variant must survive a serialize → deserialize
+    /// round-trip back into a typed `Event` (not just `serde_json::Value`).
+    /// This pins the `Deserialize` half of the schema contract that
+    /// out-of-process consumers (and the bus's owned-event channel) rely
+    /// on, and exercises `PartialEq` for the equality assertion.
+    #[test]
+    fn every_variant_round_trips_through_deserialize() {
+        let samples = [
+            Event::Started {
+                pid: 1,
+                version: "0.1.0".to_owned(),
+            },
+            Event::PhaseEntered {
+                phase: Phase::ScanoutActive,
+            },
+            Event::Shutdown {
+                reason: ShutdownReason::PrepareForShutdown,
+            },
+            Event::Fatal {
+                message: "boom".to_owned(),
+            },
+            Event::SessionRequested {
+                uid: 1000,
+                gid: 1000,
+            },
+            Event::GreeterSpawned { pid: 2 },
+            Event::GreeterTerminated { pid: 2 },
+            Event::GreeterKillFailed {
+                pid: 2,
+                error: "No such process (os error 3)".to_owned(),
+            },
+            Event::GreeterDiedPreAuth { pid: 2 },
+            Event::FrameRendered {
+                frame_id: 1,
+                pixel_count: 4,
+                clear_pixel_count: 0,
+                black_pixel_count: 0,
+                degenerate: false,
+                phash: 7,
+            },
+            Event::ClientFirstFrame {
+                role: LayerRole::Overlay,
+            },
+            Event::ForegroundChanged {
+                to: Foreground::Session,
+            },
+            Event::SessionOpened,
+            Event::SessionClientFirstFrame,
+            Event::SessionEnded {
+                outcome: SessionExit::Signaled { signal: 9 },
+            },
+            Event::SessionLeaderPidfdArmed,
+            Event::SessionLeaderExitedViaPidfd,
+            Event::LuksPromptShown,
+            Event::WallpaperUniformApplied {
+                event_name: "halmasuit.session.opened".to_owned(),
+                uniform: "u_login_time".to_owned(),
+            },
+        ];
+        for e in samples {
+            let s = serde_json::to_string(&e).expect("serialize");
+            let back: Event = serde_json::from_str(&s).expect("deserialize back into Event");
+            assert_eq!(e, back, "round-trip mismatch for {e:?}");
+        }
+    }
+
     #[test]
     fn emit_without_subscriber_does_not_panic() {
+        let _guard = emit_test_guard();
         // No subscriber installed; tracing events become no-ops by design.
         emit(&Event::Started {
             pid: 1,
-            version: "test",
+            version: "test".to_owned(),
         });
         emit(&Event::PhaseEntered { phase: Phase::Init });
         emit(&Event::Shutdown {
@@ -753,33 +944,7 @@ mod tests {
 
     #[test]
     fn emit_routes_through_tracing_subscriber() {
-        use std::sync::{Arc, Mutex};
-
-        // A `tracing-subscriber`-compatible writer that accumulates bytes
-        // into a shared buffer the test can inspect after the fact.
-        #[derive(Clone, Default)]
-        struct Capture(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for Capture {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .expect("capture lock poisoned")
-                    .extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-            type Writer = Self;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
+        let _guard = emit_test_guard();
         let capture = Capture::default();
         let subscriber = tracing_subscriber::fmt()
             .json()
@@ -789,7 +954,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             emit(&Event::Started {
                 pid: 99,
-                version: "0.1.0",
+                version: "0.1.0".to_owned(),
             });
         });
 
@@ -812,5 +977,70 @@ mod tests {
             "expected target 'halmasuit::event' in: {captured}"
         );
         assert!(captured.contains("99"), "expected pid '99' in: {captured}");
+    }
+
+    #[test]
+    fn registered_listener_receives_emitted_event() {
+        let _guard = emit_test_guard();
+        // The registry is process-global. We assert additively (filter by
+        // the exact event we emit) so the test is order-independent and
+        // tolerant of other tests' emits sharing the process under
+        // `cargo test` (nextest isolates per-process regardless).
+        let received: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        register_listener(move |event| sink.lock().expect("sink poisoned").push(event.clone()));
+
+        // A pid unlikely to collide with any other test's emit.
+        let marker = Event::GreeterSpawned { pid: 31_337 };
+        emit(&marker);
+
+        // Clone out so the registry-sink guard releases before the assert.
+        let got = received.lock().expect("sink poisoned").clone();
+        assert!(
+            got.contains(&marker),
+            "registered listener must receive the emitted event; got {got:?}",
+        );
+    }
+
+    #[test]
+    fn emit_logs_before_fanning_out_to_listeners() {
+        let _guard = emit_test_guard();
+        // Prove the journald-observability contract: the tracing line is
+        // written BEFORE listeners run. The listener reads the shared
+        // capture buffer at fire time; if logging happened first, the
+        // buffer is already non-empty. Filtered to our unique marker so
+        // foreign emits (under cargo test) can't set the flag.
+        let capture = Capture::default();
+        let cap_for_listener = capture.clone();
+        let log_present_at_listener_time: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let flag = Arc::clone(&log_present_at_listener_time);
+
+        let marker = Event::Fatal {
+            message: "ordering-probe-7f3a".to_owned(),
+        };
+        let marker_for_listener = marker.clone();
+        register_listener(move |event| {
+            if *event != marker_for_listener {
+                return;
+            }
+            let buffer = cap_for_listener.0.lock().expect("capture poisoned");
+            let mut slot = flag.lock().expect("flag poisoned");
+            if slot.is_none() {
+                *slot = Some(!buffer.is_empty());
+            }
+        });
+
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || emit(&marker));
+
+        let observed = *log_present_at_listener_time.lock().expect("flag poisoned");
+        assert_eq!(
+            observed,
+            Some(true),
+            "listener must run AFTER the tracing log is written (log-first contract)",
+        );
     }
 }

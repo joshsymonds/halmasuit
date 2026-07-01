@@ -32,6 +32,7 @@ frame_audit = ["dep:png"]
 
 [dependencies]
 halmasuit-introspect = { path = "../halmasuit-introspect", version = "0.1" }
+halmasuit-events = { path = "../halmasuit-events", version = "0.1" }
 # greetd-protocol server building blocks: Listener, Connection,
 # PamSessionFactory. Compositor binds the socket and drives the
 # per-connection state machine from calloop callbacks.

@@ -4,6 +4,11 @@ members = [
     "crates/halmasuit",
     "crates/halmasuit-protocols",
     "crates/halmasuit-introspect",
+    # Wallpaper-facing projection of halmasuit-introspect events: maps
+    # each Event to a stable dotted canonical name and the f32 value the
+    # wallpaper's EventTime/EventValue uniform bindings write. Pure types
+    # over halmasuit-introspect; no runtime deps.
+    "crates/halmasuit-events",
     "crates/halmasuit-greetd",
     "crates/halmasuit-ipc",
     # Pure wire contract for the compositor↔halmasuit-session PAM relay
@@ -61,6 +66,11 @@ members = [
     # user via a fullscreen xdg_toplevel, writes the response to the
     # agent socket. Spawned by halmasuit when started from initramfs.
     "crates/halmasuit-luks",
+    # Role/perspective-based nested Wayland compositor (see
+    # crates/kushuh/ARCHITECTURE.md). Currently lib-only: the config
+    # domain model (Phase 1). The smithay compositor binary lands in
+    # Phase 2.
+    "crates/kushuh",
     "xtask",
 ]
 
@@ -81,6 +91,12 @@ authors       = ["Josh Symonds <veraticus@gmail.com>"]
 # `thiserror` for error enums that benefit from Display derives. Used
 # by halmasuit-greetd's StateMachineError.
 thiserror          = "2"
+# KDL v2 config parser for `kushuh` (Epic: kushuh domain model + KDL config).
+# kushuh hand-writes the `KdlDocument`→types conversion (no derive-macro KDL,
+# no serde-KDL — the repo owns its parsing boundaries). Default features keep
+# the `span` feature on (source spans → actionable parse/validation errors);
+# the v1 features stay off, as kushuh's config is KDL v2.
+kdl                = "6"
 # pam-sys: dev-dependencies-only audit lever (Epic #5).
 #
 # Production libpam FFI for the halmasuit-session broker is hand-rolled

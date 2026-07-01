@@ -113,6 +113,9 @@ test-vm:
     echo "── visual-phase-b-side-image ──"
     nix build .#checks.x86_64-linux.visual-phase-b-side-image -L --print-build-logs --no-link
     echo
+    echo "── visual-phase-b-luks-interactive ──"
+    nix build .#checks.x86_64-linux.visual-phase-b-luks-interactive -L --print-build-logs --no-link
+    echo
     echo "── visual-phase-b-side-shader ──"
     nix build .#checks.x86_64-linux.visual-phase-b-side-shader -L --print-build-logs --no-link
     echo
@@ -145,6 +148,9 @@ test-vm:
     echo
     echo "── login-flash ──"
     nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link
+    echo
+    echo "── visual-wallpaper-event ──"
+    nix build .#checks.x86_64-linux.visual-wallpaper-event -L --print-build-logs --no-link
     echo
     echo "── halmasuit-input ──"
     nix build .#checks.x86_64-linux.halmasuit-input -L --print-build-logs --no-link
