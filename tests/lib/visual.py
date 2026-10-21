@@ -343,16 +343,18 @@ def introspect_events(machine) -> list:
 
 
 def wait_greeter_settled(machine, quiet: float = 2.0, timeout: float = 90.0) -> None:
-    """Block until the greeter has painted and its frames have gone quiet.
+    """Block until the greeter has painted and its frames have settled.
 
     The greeter's surface maps and gets keyboard focus before its UI
     finishes its first burst of renders, and keys sent during that
     burst can be lost. Wait for halmasuit to composite the greeter's
-    first frame, then for `quiet` seconds with no new frame.
+    first frame, then for the latest frame's phash to hold for `quiet`
+    seconds. DankGreeter is opaque, so an animated wallpaper behind it
+    keeps frames coming without changing their phash.
     """
     import time
 
-    def greeter_frames():
+    def latest_greeter_phash():
         events = introspect_events(machine)
         start = next(
             (
@@ -363,24 +365,28 @@ def wait_greeter_settled(machine, quiet: float = 2.0, timeout: float = 90.0) -> 
             None,
         )
         if start is None:
-            return 0
-        return sum(1 for e in events[start:] if e.get("event") == "frame_rendered")
+            return None
+        frames = [
+            e["phash"] for e in events[start:]
+            if e.get("event") == "frame_rendered"
+        ]
+        return frames[-1] if frames else None
 
     deadline = time.monotonic() + timeout
-    seen = greeter_frames()
-    while seen == 0:
+    phash = latest_greeter_phash()
+    while phash is None:
         assert time.monotonic() < deadline, "the greeter never painted a frame"
         time.sleep(0.5)
-        seen = greeter_frames()
-    changed = time.monotonic()
-    while time.monotonic() - changed < quiet:
+        phash = latest_greeter_phash()
+    held_since = time.monotonic()
+    while time.monotonic() - held_since < quiet:
         assert time.monotonic() < deadline, (
-            f"the greeter's frames never went quiet for {quiet}s"
+            f"the greeter's frames never held still for {quiet}s"
         )
         time.sleep(0.5)
-        now_seen = greeter_frames()
-        if now_seen != seen:
-            seen, changed = now_seen, time.monotonic()
+        now = latest_greeter_phash()
+        if now != phash:
+            phash, held_since = now, time.monotonic()
 
 
 def assert_no_flash_stream(machine, events=None) -> None:
