@@ -753,10 +753,15 @@ specialized to a process-continuous system compositor. Three tiers:
   driven over a `SOCK_SEQPACKET` socketpair (SIGKILL directly, no
   SIGTERM grace — it is blocked in libpam with no cancellation point).
   The broker is one calloop **event-loop** process multiplexing the
-  listener fd, the in-flight worker, and signals — so a reconnect can
-  **evict** the in-flight attempt — and **idle-exits** so no standing
-  root process exists when nothing is in flight (PID 1's retained
-  socket re-activates it losslessly). A single global slot
+  listener fd, connections awaiting their first frame, the in-flight
+  worker, and signals — so a reconnect can **evict** the in-flight
+  attempt — and **idle-exits** so no standing root process exists
+  when no connection is open (PID 1's retained socket re-activates it
+  losslessly). The compositor connects when a greeter connects to it
+  and sends `BeginAuth` only when the user submits; that connection
+  keeps the broker up while it waits and is read only when readable,
+  never blocking the loop (at most 8 such connections, oldest evicted,
+  and only from root or the relay peer). A single global slot
   (system-wide one-seat) with evict-old gated to the `SO_PEERCRED`
   greeter peer plus a churn throttle.
 - **(A) Session leader — fork-then-drop in a non-setuid child.** After

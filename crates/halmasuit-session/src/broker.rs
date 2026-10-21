@@ -73,6 +73,7 @@
 //! scripted worker child (process/relay testing is not a PAM mock).
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
@@ -90,11 +91,10 @@ use crate::worker::{
     recv_frame_with_fd, send_frame_with_fd, spawn_session_worker,
 };
 
-/// Idle window (Amendment A2.2): with no connection in flight and the
-/// slot empty for this long, the broker `exit(0)`s so the unit
-/// deactivates — systemd's PID1-retained socket re-activates it on the
-/// next connection. Interactive-scale; a real greeter reconnects in
-/// well under this.
+/// Idle window (Amendment A2.2): with no connection in flight (active
+/// or pending) and the slot empty for this long, the broker `exit(0)`s
+/// so the unit deactivates — systemd's PID1-retained socket
+/// re-activates it on the next connection.
 const IDLE_EXIT: Duration = Duration::from_secs(30);
 
 /// Whether the broker should idle-exit now (Amendment A2.2). Pure so
@@ -389,6 +389,26 @@ struct Active {
     worker_token: RegistrationToken,
 }
 
+/// A connection past the SO_PEERCRED gate that has not sent its first
+/// frame. The compositor connects as soon as a greeter connects to it
+/// and sends `BeginAuth` only when the user submits, so a pending
+/// connection can wait indefinitely; the broker reads its first frame
+/// only once the fd is readable and never blocks the loop on it.
+/// Only root or the relay peer gets this far; [`MAX_PENDING`] bounds
+/// what even that peer can hold open.
+struct Pending {
+    id: u64,
+    chan: SeqpacketChannel,
+    puid: u32,
+    token: RegistrationToken,
+}
+
+/// Cap on simultaneously pending connections. The compositor holds at
+/// most one per greetd connection (it caps those at 4) plus short-lived
+/// `RequestRootFd`/`SpawnGreeter` connections. Past the cap the oldest
+/// pending connection is dropped.
+const MAX_PENDING: usize = 8;
+
 /// Broker event-loop state (Amendment A2.1): ONE loop multiplexing the
 /// systemd listener, the in-flight worker, the greeter, and an
 /// idle-exit timer. `slot` is the R5 global single slot; a new
@@ -399,8 +419,13 @@ struct BrokerLoop {
     slot: AuthSlot,
     listener_fd: RawFd,
     active: Option<Active>,
-    /// `Some(t)` since the slot went idle; `None` while a connection
-    /// is in flight. Drives the A2.2 idle-exit.
+    /// Admitted connections whose first frame has not arrived yet,
+    /// oldest first. See [`Pending`].
+    pending: VecDeque<Pending>,
+    next_pending_id: u64,
+    /// `Some(t)` since the broker last had nothing in flight (no
+    /// active or pending connection); `None` while a connection is in
+    /// flight. Drives the A2.2 idle-exit.
     idle_since: Option<Instant>,
     loop_handle: calloop::LoopHandle<'static, Self>,
     loop_signal: LoopSignal,
@@ -491,7 +516,40 @@ impl BrokerLoop {
             self.loop_handle.remove(a.greeter_token);
             self.loop_handle.remove(a.worker_token);
         }
-        self.idle_since = Some(Instant::now());
+        self.arm_idle_if_quiet();
+    }
+
+    /// Whether any connection is in flight (active or pending).
+    fn has_connection(&self) -> bool {
+        self.active.is_some() || !self.pending.is_empty()
+    }
+
+    /// Start the idle window if nothing is in flight.
+    fn arm_idle_if_quiet(&mut self) {
+        if !self.has_connection() {
+            self.idle_since = Some(Instant::now());
+        }
+    }
+
+    /// A pending connection's fd became readable: take it out of
+    /// `pending`, read its first frame, and activate it if that frame
+    /// is `BeginAuth`. Runs as an idle callback, after calloop has
+    /// unregistered the connection's pending source (A8.2: the source
+    /// is gone before the fd is closed or registered again).
+    fn first_frame_ready(&mut self, id: u64) {
+        let Some(pos) = self.pending.iter().position(|p| p.id == id) else {
+            return;
+        };
+        let Some(p) = self.pending.remove(pos) else {
+            return;
+        };
+        if let FirstFrame::BeginAuth { service, username } =
+            dispatch_first_frame(&p.chan, p.puid, self)
+            && let Err(e) = activate(self, p.chan, p.puid, &service, &username)
+        {
+            tracing_log(&format!("activating connection failed: {e}"));
+        }
+        self.arm_idle_if_quiet();
     }
 
     /// Drive one relay step for whichever side fired; on a terminal
@@ -598,24 +656,22 @@ fn serve_root_fd_request(
     }
 }
 
-/// Outcome of the first-frame dispatch inside [`admit_one`].
+/// Outcome of the first-frame dispatch in [`BrokerLoop::first_frame_ready`].
 enum FirstFrame {
     /// The frame is `BeginAuth` — the caller proceeds to slot creation.
     BeginAuth { service: String, username: String },
     /// The frame was a transient request (`RequestRootFd` /
     /// `SpawnGreeter`), fully served by its handler, OR the frame was
     /// unexpected / unreadable. Either way, the connection has been
-    /// handled and the caller should just return `Ok(true)`.
+    /// handled and the caller drops it.
     Handled,
 }
 
-/// Read and dispatch the first frame on a newly-admitted connection.
-///
-/// Splits the per-frame routing out of [`admit_one`] so the latter
-/// fits the workspace clippy `too_many_lines` cap (additive R1
-/// dispatch arms pushed it over). All transient-connection handlers
-/// (`RequestRootFd`, `SpawnGreeter`) run inline; the `BeginAuth` path
-/// returns up so the caller can proceed to slot creation.
+/// Read and dispatch the first frame of a pending connection; called
+/// only once its fd is readable, so the `recv` never blocks. All
+/// transient-connection handlers (`RequestRootFd`, `SpawnGreeter`) run
+/// inline; the `BeginAuth` path returns up so the caller can proceed
+/// to slot creation.
 fn dispatch_first_frame(greeter: &SeqpacketChannel, puid: u32, bl: &mut BrokerLoop) -> FirstFrame {
     let received = greeter.recv::<CompositorToBroker>();
     if let Ok(ref incoming) = received {
@@ -771,43 +827,15 @@ fn greeter_spec_from_env() -> Result<crate::worker::GreeterSpec, String> {
 /// Accept and admit ONE pending connection on `listener_fd`.
 ///
 /// `listener_fd` is already O_NONBLOCK. `Ok(true)` = a connection was
-/// admitted (or cleanly rejected); `Ok(false)` = nothing pending
-/// (`EWOULDBLOCK`).
-///
-/// Admitting calls [`AuthSlot::create`] which EVICTS any in-flight
-/// worker (Amendment A2.3); the prior connection's loop sources are
-/// torn down first so they cannot fire against the evicted worker.
+/// admitted as [`Pending`] (or cleanly rejected); `Ok(false)` = nothing
+/// to accept (`EWOULDBLOCK`). The first frame is read later, when the
+/// connection is readable ([`BrokerLoop::first_frame_ready`]).
 fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
     let greeter = match accept_seqpacket(bl.listener_fd) {
         Ok(c) => c,
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
         Err(e) => return Err(e),
     };
-    // Slow-loris guard: cap the first-frame recv at 30s via
-    // SO_RCVTIMEO so an unprivileged peer that connects without
-    // sending cannot wedge the broker calloop for an unbounded
-    // window. Originally 5s on the assumption that the compositor
-    // sends BeginAuth within ms of connect; Phase B's greetd flow
-    // changes that — halmasuit connects to the broker EAGERLY on
-    // greeter accept, but the actual BeginAuth payload requires the
-    // greeter's `CreateSession` (R8 hint username), which is gated
-    // on user input. Real users can take longer than 5s to type a
-    // username. 30s keeps the defense intact (single-slot serialisation
-    // + per-uid refusal-log rate-limiter + idle-exit still bound the
-    // broker's total exposure) while accommodating human-paced auth.
-    // setsockopt failures are logged but don't abort the admission:
-    // a failed setsockopt is a defense weakness, not a correctness
-    // break.
-    if let Err(e) = nix::sys::socket::setsockopt(
-        &greeter,
-        nix::sys::socket::sockopt::ReceiveTimeout,
-        &nix::sys::time::TimeVal::new(30, 0),
-    ) {
-        tracing_log(&format!(
-            "setsockopt(SO_RCVTIMEO) failed: {e}; \
-             accepted connection without slow-loris timeout"
-        ));
-    }
     let puid = match peer_uid(&greeter) {
         Ok(u) => u,
         Err(e) => {
@@ -815,16 +843,13 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
             return Ok(true);
         }
     };
-    // Pre-recv uid gate (slow-loris amplification fix). The socket is
-    // mode 0666 (defence-in-depth — SO_PEERCRED is the load-bearing
-    // gate) so any local uid can `connect(2)`. The slow-loris timeout
-    // (SO_RCVTIMEO 30s above) is the wedge cap, but a peer that
-    // connects-and-stalls still blocks the broker's single-threaded
-    // calloop for the full window. Reject unauthorized peers IMMEDIATELY
-    // — before the blocking recv — so an attacker connecting from a
-    // non-{root, relay_peer_uid} uid costs only an accept+getsockopt
-    // round-trip instead of 30 wall-clock seconds. Per-uid refusal-log
-    // bounds the matching log spam.
+    // Pre-recv uid gate. The socket is mode 0666 (defence-in-depth —
+    // SO_PEERCRED is the load-bearing gate) so any local uid can
+    // `connect(2)`. Reject unauthorized peers IMMEDIATELY, before the
+    // connection gets a loop source or a pending slot, so a peer
+    // outside {root, relay_peer_uid} costs only an accept+getsockopt
+    // round-trip and can never occupy one of the MAX_PENDING slots.
+    // Per-uid refusal-log bounds the matching log spam.
     //
     // Root is permitted because the pre-drop in-process compositor
     // setup runs as root, and so does the relay_peer_uid configurator
@@ -840,21 +865,64 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
         bl.refusal_log.record_refusal(puid, relay_uid);
         return Ok(true);
     }
-    let begin = match dispatch_first_frame(&greeter, puid, bl) {
-        FirstFrame::BeginAuth { service, username } => (service, username),
-        FirstFrame::Handled => return Ok(true),
-    };
+    if bl.pending.len() >= MAX_PENDING
+        && let Some(old) = bl.pending.pop_front()
+    {
+        bl.loop_handle.remove(old.token);
+        tracing_log("pending connection cap reached; dropped the oldest");
+    }
+    let id = bl.next_pending_id;
+    bl.next_pending_id += 1;
+    // A8.3: a NON-owning borrowed-fd source; `Pending` owns the fd and
+    // its token is removed before the fd closes (A8.2).
+    let token = bl
+        .loop_handle
+        .insert_source(
+            Generic::new(
+                BorrowedSourceFd::new(greeter.as_fd().as_raw_fd()),
+                Interest::READ,
+                Mode::Level,
+            ),
+            move |_, _, bl: &mut BrokerLoop| {
+                // A source that removes itself is unregistered only
+                // after its callback returns, so the connection is
+                // handled in an idle callback, which runs after that.
+                bl.loop_handle
+                    .insert_idle(move |bl: &mut BrokerLoop| bl.first_frame_ready(id));
+                Ok(PostAction::Remove)
+            },
+        )
+        .map_err(|e| io::Error::other(format!("insert pending source: {e}")))?;
+    bl.pending.push_back(Pending {
+        id,
+        chan: greeter,
+        puid,
+        token,
+    });
+    bl.idle_since = None;
+    Ok(true)
+}
+
+/// Make `greeter` the in-flight connection for its `BeginAuth`: spawn
+/// the session worker in the slot (evicting any prior one, A2.3) and
+/// arm the relay's worker and greeter sources.
+fn activate(
+    bl: &mut BrokerLoop,
+    greeter: SeqpacketChannel,
+    puid: u32,
+    service: &str,
+    username: &str,
+) -> io::Result<()> {
     // A new connection supersedes any in-flight one. Drop the old
     // loop sources BEFORE create() so a stale readiness can't fire
     // against the worker create() is about to SIGKILL.
     bl.drop_active();
-    let (service, username) = begin;
     if let Err(e) = bl
         .slot
-        .create(puid, || spawn_session_worker(&service, &username))
+        .create(puid, || spawn_session_worker(service, username))
     {
         tracing_log(&format!("auth slot refused: {e:?}"));
-        return Ok(true);
+        return Ok(());
     }
     // A8.3: hand calloop NON-owning borrowed-fd sources — the broker
     // never dups a privilege-crossing fd. The slot's worker channel
@@ -864,7 +932,7 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
     let Some(worker_raw) = bl.slot.current().map(|i| i.channel().as_fd().as_raw_fd()) else {
         tracing_log("worker vanished immediately after create");
         let _ = bl.slot.cancel_current();
-        return Ok(true);
+        return Ok(());
     };
     let worker_src = BorrowedSourceFd::new(worker_raw);
     let greeter_src = BorrowedSourceFd::new(greeter.as_fd().as_raw_fd());
@@ -898,7 +966,7 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
         greeter_token,
         worker_token,
     });
-    Ok(true)
+    Ok(())
 }
 
 /// Run the Epic-R6 / Amendment-A2 broker event loop.
@@ -914,6 +982,12 @@ fn admit_one(bl: &mut BrokerLoop) -> io::Result<bool> {
 /// [`io::Error`] on event-loop construction / source registration /
 /// a fatal `accept` errno.
 pub fn run_broker(listener_fd: RawFd, relay_peer_uid: u32) -> io::Result<()> {
+    run_broker_loop(listener_fd, relay_peer_uid, IDLE_EXIT)
+}
+
+/// [`run_broker`] with the idle window as a parameter, so tests can
+/// observe the idle exit without waiting the production window.
+fn run_broker_loop(listener_fd: RawFd, relay_peer_uid: u32, idle_exit: Duration) -> io::Result<()> {
     let mut event_loop: EventLoop<'static, BrokerLoop> =
         EventLoop::try_new().map_err(io::Error::other)?;
     let loop_handle = event_loop.handle();
@@ -968,6 +1042,8 @@ pub fn run_broker(listener_fd: RawFd, relay_peer_uid: u32) -> io::Result<()> {
         slot: AuthSlot::with_defaults(relay_peer_uid),
         listener_fd,
         active: None,
+        pending: VecDeque::new(),
+        next_pending_id: 0,
         idle_since: Some(Instant::now()),
         loop_handle,
         loop_signal,
@@ -979,8 +1055,8 @@ pub fn run_broker(listener_fd: RawFd, relay_peer_uid: u32) -> io::Result<()> {
         event_loop
             .dispatch(Some(Duration::from_secs(1)), &mut bl)
             .map_err(io::Error::other)?;
-        let elapsed = bl.idle_since.is_some_and(|t| t.elapsed() >= IDLE_EXIT);
-        if should_idle_exit(bl.active.is_some(), elapsed) {
+        let elapsed = bl.idle_since.is_some_and(|t| t.elapsed() >= idle_exit);
+        if should_idle_exit(bl.has_connection(), elapsed) {
             // Race-drain (Amendment A2.2): one last non-blocking
             // accept; if a connection slipped in, service it and stay.
             match admit_one(&mut bl) {
@@ -1607,37 +1683,99 @@ mod tests {
         );
     }
 
-    /// Slow-loris guard: the SO_RCVTIMEO that admit_one sets on the
-    /// accepted greeter fd MUST cause `recv` to return EAGAIN/
-    /// ETIMEDOUT (TransportError::Io kind WouldBlock or TimedOut) if
-    /// no first-frame arrives within the timeout window. Without
-    /// this, an attacker can connect-and-stall to wedge the broker.
-    /// Test uses a 100ms timeout (vs the 30s production value) so it
-    /// can complete promptly.
+    /// A connection that has not sent its first frame never holds up
+    /// the broker: other connections are served meanwhile, and the
+    /// broker does not idle-exit under it. The compositor connects as
+    /// soon as the greeter does and sends `BeginAuth` only once the
+    /// user submits, which can be any time later.
     #[test]
-    fn accepted_fd_recv_times_out_when_peer_stalls() {
-        use std::time::Instant;
-        let (a, b) = pair();
-        // Set 100ms recv timeout on `a`.
-        nix::sys::socket::setsockopt(
-            &a,
-            nix::sys::socket::sockopt::ReceiveTimeout,
-            &nix::sys::time::TimeVal::new(0, 100_000),
+    fn broker_serves_others_and_stays_up_while_a_connection_awaits_its_first_frame() {
+        use nix::sys::socket::{Backlog, UnixAddr, bind, connect, listen, socket};
+        use std::os::fd::{IntoRawFd, OwnedFd};
+
+        let addr = UnixAddr::new_abstract(
+            format!("halmasuit-broker-test-{}", std::process::id()).as_bytes(),
         )
-        .expect("setsockopt SO_RCVTIMEO");
-        // `b` never sends. `a.recv` must return Err within ~100ms.
-        let start = Instant::now();
-        let r: Result<CompositorToBroker, _> = a.recv();
-        let elapsed = start.elapsed();
+        .expect("abstract address");
+        let listener = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("listener socket");
+        bind(listener.as_raw_fd(), &addr).expect("bind");
+        listen(&listener, Backlog::new(8).expect("backlog")).expect("listen");
+        let uid = nix::unistd::getuid().as_raw();
+        let idle = Duration::from_millis(200);
+        let listener_fd = listener.into_raw_fd();
+        let broker = thread::spawn(move || run_broker_loop(listener_fd, uid, idle));
+
+        let open = || {
+            let s = socket(
+                AddressFamily::Unix,
+                SockType::SeqPacket,
+                SockFlag::SOCK_CLOEXEC,
+                None,
+            )
+            .expect("client socket");
+            connect(s.as_raw_fd(), &addr).expect("connect");
+            nix::sys::socket::setsockopt(
+                &s,
+                nix::sys::socket::sockopt::ReceiveTimeout,
+                &nix::sys::time::TimeVal::new(5, 0),
+            )
+            .expect("client SO_RCVTIMEO");
+            SeqpacketChannel::new(s)
+        };
+        let root_fd_round_trip = |chan: &SeqpacketChannel, what: &str| {
+            chan.send(&CompositorToBroker::RequestRootFd)
+                .expect("send RequestRootFd");
+            let (frame, fd): (BrokerToCompositor, Option<OwnedFd>) =
+                recv_frame_with_fd(chan).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            assert!(
+                matches!(frame, BrokerToCompositor::RootFd) && fd.is_some(),
+                "{what}: expected RootFd with an fd, got {frame:?}"
+            );
+        };
+
+        let silent = open();
+        let other = open();
+        root_fd_round_trip(&other, "served while another connection is silent");
+
+        thread::sleep(idle * 5);
+        root_fd_round_trip(&silent, "served after outliving the idle window");
+
+        // A `BeginAuth` that arrives after a wait becomes the in-flight
+        // auth: the broker answers it (PAM's first frame, whatever this
+        // host's stack makes of an unknown service) instead of closing
+        // the connection.
+        let auth = open();
+        thread::sleep(idle * 5);
+        auth.send(&CompositorToBroker::BeginAuth {
+            service: "halmasuit-broker-test".into(),
+            username: "nobody".into(),
+        })
+        .expect("send BeginAuth");
+        let (frame, _fd): (BrokerToCompositor, Option<OwnedFd>) = recv_frame_with_fd(&auth)
+            .unwrap_or_else(|e| panic!("BeginAuth after a wait got no answer: {e:?}"));
         assert!(
-            r.is_err(),
-            "recv must error after SO_RCVTIMEO elapses, got {r:?}"
+            matches!(
+                frame,
+                BrokerToCompositor::ConvPrompt { .. }
+                    | BrokerToCompositor::ConvDisplay { .. }
+                    | BrokerToCompositor::Failure { .. }
+            ),
+            "expected the auth's first frame, got {frame:?}"
         );
-        assert!(
-            elapsed >= Duration::from_millis(80) && elapsed < Duration::from_millis(500),
-            "recv should have blocked ~100ms, actually {elapsed:?}"
-        );
-        drop(b);
+        drop(auth);
+
+        drop(silent);
+        drop(other);
+        broker
+            .join()
+            .expect("broker thread")
+            .expect("broker idle-exits cleanly once no connection is left");
     }
 
     /// Suppression is per-peer-uid: a refusal from a different uid

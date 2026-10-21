@@ -236,6 +236,14 @@ pkgs.testers.runNixOSTest {
     # if/when DMS or halmasuit emits a structured log line at
     # password-mode entry — would need an upstream change to DMS or
     # a new halmasuit-greetd log emission.
+    #
+    # The user waits at the greeter before typing, longer than the
+    # broker's 30s idle window (IDLE_EXIT in halmasuit-session's
+    # broker.rs). halmasuit connected to the broker when the greeter
+    # connected to it; that connection must still carry the login.
+    # The condition is elapsed guest time itself, so this is a
+    # guest-side sleep rather than a state wait.
+    machine.succeed("sleep 35")
     machine.send_chars("alice")
     machine.send_key("ret")
     time.sleep(1)
