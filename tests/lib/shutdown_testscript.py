@@ -144,6 +144,7 @@ def run(
     # post-pivot binary's output and any kmsg lines halmasuit wrote via
     # its journal+kmsg-routed stdout. Read the console once it ends.
     machine.shutdown()
+    assert machine.serial_thread is not None
     machine.serial_thread.join()
     console = machine.get_console_log()
 

@@ -187,6 +187,7 @@ pkgs.testers.runNixOSTest {
     # shutdown() returns once QEMU exits; the driver's serial
     # reader may still be draining QEMU's last output, which holds
     # the shutdown markers. Read the console only after it ends.
+    assert machine.serial_thread is not None
     machine.serial_thread.join()
     console = machine.get_console_log()
 

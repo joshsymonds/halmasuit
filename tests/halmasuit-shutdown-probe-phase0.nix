@@ -134,6 +134,7 @@ pkgs.testers.runNixOSTest {
     # its last output. Once the reader ends, machine.get_console_log()
     # holds everything qemu wrote to stdio (the kernel console,
     # including /dev/kmsg writes from the probe) from boot to halt.
+    assert machine.serial_thread is not None
     machine.serial_thread.join()
     console = machine.get_console_log()
 
