@@ -3389,6 +3389,18 @@ fn drm_device_path_from_env() -> io::Result<Option<PathBuf>> {
 /// reasonably fast.
 const DRM_RESOLVE_DEADLINE: Duration = Duration::from_secs(10);
 
+/// How long the post-pivot step keeps trying to reach the
+/// socket-activated broker. Giving up skips the rootfs migration and
+/// leaves halmasuit without a greeter, so the bound is systemd's own
+/// default unit start timeout: a rootfs that slow to bind
+/// `halmasuit-session.socket` has failed for every service. halmasuit is
+/// still root here, as it was for the whole initramfs phase.
+const BROKER_CONNECT_DEADLINE: Duration = Duration::from_secs(90);
+
+/// Interval between "still waiting for the broker" warnings while the
+/// post-pivot step retries.
+const BROKER_CONNECT_WARN_EVERY: Duration = Duration::from_secs(10);
+
 /// How long a plain-stop exit waits for the session client (the nested
 /// session compositor) to disconnect after we ask its toplevel to close,
 /// before dropping the Wayland socket anyway. Generous enough for a
@@ -5775,8 +5787,8 @@ fn main() -> io::Result<()> {
         // compositor never blocks the render/calloop thread on
         // broker IPC" — every prior synchronous send/recv is now
         // driven from the timer callback. The cumulative window
-        // (10s connect + 5s recv) is unchanged; the difference is
-        // that DRM page-flip events, wallpaper-tick callbacks, and
+        // (BROKER_CONNECT_DEADLINE connect + 5s recv) runs while DRM
+        // page-flip events, wallpaper-tick callbacks, and
         // any other calloop source service NORMALLY during the
         // migration. The longest single tick is one connect attempt
         // + one send (both non-blocking on Unix-domain abstract
@@ -5786,11 +5798,13 @@ fn main() -> io::Result<()> {
             /// Cadence: 1s. Transitions to `Connecting` on disappear.
             Awaiting,
             /// Pivot happened; attempting to reach the broker.
-            /// Cadence: exponential backoff 20ms → 200ms cap, 10s
-            /// total deadline.
+            /// Cadence: exponential backoff 20ms → 200ms cap, up to
+            /// `BROKER_CONNECT_DEADLINE`, warning every
+            /// `BROKER_CONNECT_WARN_EVERY` while it waits.
             Connecting {
                 deadline: Instant,
                 next_delay: Duration,
+                next_warn: Instant,
             },
             /// Broker reached; `RequestRootFd` sent; waiting for the
             /// SCM_RIGHTS reply. Cadence: 50ms, 5s deadline.
@@ -5833,9 +5847,11 @@ fn main() -> io::Result<()> {
                             if let Some(backend) = state.drm_backend.as_mut() {
                                 backend.set_in_initramfs(false);
                             }
+                            let now = Instant::now();
                             phase = PivotPhase::Connecting {
-                                deadline: Instant::now() + Duration::from_secs(10),
+                                deadline: now + BROKER_CONNECT_DEADLINE,
                                 next_delay: Duration::from_millis(20),
+                                next_warn: now + BROKER_CONNECT_WARN_EVERY,
                             };
                             // Re-arm immediately for the first
                             // connect attempt.
@@ -5845,6 +5861,7 @@ fn main() -> io::Result<()> {
                     PivotPhase::Connecting {
                         deadline,
                         next_delay,
+                        next_warn,
                     } => match try_connect_and_request_root_fd(&state.broker_socket) {
                         Ok(chan) => {
                             phase = PivotPhase::AwaitingReply {
@@ -5855,11 +5872,13 @@ fn main() -> io::Result<()> {
                             TimeoutAction::ToDuration(Duration::from_millis(50))
                         }
                         Err(e) => {
-                            if Instant::now() >= deadline {
+                            let now = Instant::now();
+                            if now >= deadline {
                                 tracing::error!(
                                     error = %e,
                                     socket = ?state.broker_socket,
-                                    "post-pivot: broker connect timed out (10s); skipping migration"
+                                    deadline = ?BROKER_CONNECT_DEADLINE,
+                                    "post-pivot: broker connect timed out; skipping migration"
                                 );
                                 phase = PivotPhase::Setup;
                                 // ToDuration(0): calloop schedules the
@@ -5872,12 +5891,26 @@ fn main() -> io::Result<()> {
                                 // "fire-next-tick" idiom for this loop.
                                 TimeoutAction::ToDuration(Duration::from_millis(0))
                             } else {
+                                // A slow rootfs boot (the broker's socket
+                                // not bound yet) is worth seeing in the
+                                // journal before it becomes the deadline.
+                                let next_warn = if now >= next_warn {
+                                    tracing::warn!(
+                                        error = %e,
+                                        socket = ?state.broker_socket,
+                                        "post-pivot: broker not reachable yet; still waiting"
+                                    );
+                                    now + BROKER_CONNECT_WARN_EVERY
+                                } else {
+                                    next_warn
+                                };
                                 // Exponential backoff capped at 200ms.
                                 let new_delay =
                                     std::cmp::min(next_delay * 2, Duration::from_millis(200));
                                 phase = PivotPhase::Connecting {
                                     deadline,
                                     next_delay: new_delay,
+                                    next_warn,
                                 };
                                 TimeoutAction::ToDuration(next_delay)
                             }

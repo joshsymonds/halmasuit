@@ -1096,6 +1096,15 @@
           halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
         };
+        full-boot-flash-slow-broker = import ./tests/full-boot-flash.nix {
+          system              = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit           = self.packages.x86_64-linux.halmasuit;
+          halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-vm-client = self.packages.x86_64-linux.halmasuit-vm-client;
+          brokerSocketDelay = 20;
+        };
         # Phase B LUKS unlock gate: real cryptsetup, real
         # systemd-cryptsetup ask-password producer, real
         # systemd password-agent wire. halmasuit-luks runs in

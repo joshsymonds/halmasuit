@@ -91,6 +91,7 @@ test-vm jobs="":
         halmasuit-shutdown-probe-phase1
         halmasuit-shutdown-probe-phase2
         full-boot-flash
+        full-boot-flash-slow-broker
         luks-unlock
         visual-initrd-pixmap
         visual-phase-b-side-image

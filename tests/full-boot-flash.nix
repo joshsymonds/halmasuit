@@ -37,13 +37,18 @@
   halmasuit-luks,
   halmasuit-session,
   halmasuit-vm-client,
+  # Seconds the rootfs's halmasuit-session.socket waits before binding.
+  # Non-zero builds the slow-boot variant: halmasuit must keep trying to
+  # reach the broker across the delay instead of giving up and staying
+  # greeter-less.
+  brokerSocketDelay ? 0,
 }:
 
 let
   pkgs = import nixpkgs { inherit system; };
 in
 pkgs.testers.runNixOSTest {
-  name = "full-boot-flash";
+  name = if brokerSocketDelay == 0 then "full-boot-flash" else "full-boot-flash-slow-broker";
 
   nodes.machine =
     { config, lib, pkgs, ... }:
@@ -97,6 +102,10 @@ pkgs.testers.runNixOSTest {
         password     = "testpassword";
       };
       users.groups.alice.gid = 1000;
+
+      systemd.sockets."halmasuit-session".socketConfig.ExecStartPre =
+        lib.mkIf (brokerSocketDelay > 0)
+          "${pkgs.coreutils}/bin/sleep ${toString brokerSocketDelay}";
     };
 
   testScript = ''
@@ -114,6 +123,14 @@ pkgs.testers.runNixOSTest {
         timeout=30,
     )
     print("PASS: greeter spawned post-pivot")
+
+    # The post-pivot root-fd migration reached the broker rather than
+    # timing out and skipping it.
+    machine.succeed(
+        "journalctl -b --output=cat --no-pager "
+        "| grep -F 'post-pivot: chrooted into broker'"
+    )
+    print("PASS: post-pivot migration into the rootfs view completed")
 
     # Collect halmasuit's emitted events.
     raw = machine.succeed("journalctl -b --output=cat --no-pager")
