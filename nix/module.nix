@@ -2042,6 +2042,23 @@ in
      # halmasuit's Wayland socket is not used, so the Wayland-readiness
      # ordering relaxes to a no-op (the agent ignores WAYLAND_DISPLAY
      # and reads the passphrase file directly).
+     # The rootfs's view of the halmasuit process that crossed the
+     # pivot. After switch-root, PID 1 reloads units from the rootfs;
+     # without this file the running unit loses IgnoreOnIsolate and the
+     # boot-time isolate to the default target stops it, SIGKILLing the
+     # compositor at TimeoutStopSec. Nothing in the rootfs wants it, so
+     # it is adopted, never started, and a switch never restarts it.
+     systemd.services.halmasuit = let
+       initrdUnit = config.boot.initrd.systemd.services.halmasuit;
+     in {
+       inherit (initrdUnit) description serviceConfig environment;
+       unitConfig = {
+         inherit (initrdUnit.unitConfig)
+           DefaultDependencies IgnoreOnIsolate SurviveFinalKillSignal;
+       };
+       restartIfChanged = false;
+     };
+
      boot.initrd.systemd.contents = lib.mkIf (cfg.luks.passphraseFile != null) {
        "/etc/halmasuit-luks-passphrase".source = cfg.luks.passphraseFile;
      };

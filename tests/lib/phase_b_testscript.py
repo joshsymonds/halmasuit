@@ -115,6 +115,21 @@ def run(machine, visual, *, cell_name, lukshape, no_flash_mode):
     machine.wait_for_unit("multi-user.target")
     print("PASS: second boot reached multi-user.target")
 
+    # The rootfs adopts the compositor that crossed the pivot: its unit
+    # is loaded and active, and no job (the boot isolate's stop) is
+    # queued against it.
+    unit = machine.succeed(
+        "systemctl show -p LoadState -p ActiveState halmasuit.service"
+    )
+    assert "LoadState=loaded" in unit and "ActiveState=active" in unit, (
+        f"halmasuit.service not adopted by the rootfs:\n{unit}"
+    )
+    jobs = machine.succeed("systemctl list-jobs --no-legend --no-pager")
+    assert "halmasuit.service" not in jobs, (
+        f"a job is queued against the compositor:\n{jobs}"
+    )
+    print("PASS: rootfs adopted halmasuit.service with no job queued")
+
     # ── LUKS unlock assertion ────────────────────────────────────────
     if lukshape == "side-volume":
         mapper = machine.succeed("ls /dev/mapper").strip()
