@@ -52,6 +52,7 @@
   halmasuit-decoder ? null,
   niri-flake,
   dms,
+  dank-greeter,
   wallpaperStorePaths ? [ ],
 }:
 
@@ -223,7 +224,7 @@ in
 {
   imports = [
     niri-flake.nixosModules.niri
-    dms.nixosModules.greeter
+    dank-greeter.nixosModules.default
   ];
 
   # Niri is the session command (wrapped above). Module-managed so
@@ -240,7 +241,7 @@ in
   # XDG_DATA_DIRS scan — see testSessions above). DMS constrains
   # the value to a fixed enum, so we pick "niri" — accurate since
   # our test session DOES wrap upstream niri.
-  programs.dank-material-shell.greeter = {
+  programs.dms-greeter = {
     enable = true;
     compositor.name = "niri";
   };

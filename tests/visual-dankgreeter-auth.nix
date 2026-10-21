@@ -35,6 +35,7 @@
   nixpkgs,
   niri-flake,
   dms,
+  dank-greeter,
   halmasuit,
   halmasuit-session,
   ssimulacra2-cli,
@@ -98,13 +99,13 @@ pkgs.testers.runNixOSTest {
         ../nix/module.nix
         ./lib/test-user.nix
         niri-flake.nixosModules.niri
-        dms.nixosModules.greeter
+        dank-greeter.nixosModules.default
       ];
 
       programs.niri.enable = true;
       programs.niri.package = niri;
 
-      programs.dank-material-shell.greeter = {
+      programs.dms-greeter = {
         enable = true;
         compositor.name = "niri";
       };

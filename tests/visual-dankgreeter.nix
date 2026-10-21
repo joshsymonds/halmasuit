@@ -26,6 +26,7 @@
   nixpkgs,
   niri-flake,
   dms,
+  dank-greeter,
   halmasuit,
   halmasuit-session,
   ssimulacra2-cli,
@@ -65,7 +66,7 @@ pkgs.testers.runNixOSTest {
         ./lib/test-user.nix
         # The real, unmodified greeter stack (exactly what gnomon runs).
         niri-flake.nixosModules.niri
-        dms.nixosModules.greeter
+        dank-greeter.nixosModules.default
       ];
 
       # niri-flake provides programs.niri.{enable,package}; the dms
@@ -74,7 +75,7 @@ pkgs.testers.runNixOSTest {
       programs.niri.package = niri;
 
       # Build the real DankGreeter (dms-greeter script + assets).
-      programs.dank-material-shell.greeter = {
+      programs.dms-greeter = {
         enable = true;
         compositor.name = "niri";
       };
@@ -113,6 +114,19 @@ pkgs.testers.runNixOSTest {
           export QT_QUICK_BACKEND=software
           exec ${config.services.greetd.settings.default_session.command}
         ''}";
+      };
+
+      # The greeter's clock label must read the same in every capture
+      # (the golden has no mask). Set the wall clock before halmasuit
+      # spawns the greeter: Quickshell reads it at startup and repaints
+      # on its own minute timer, and the capture happens seconds after
+      # the greeter's first paint.
+      services.timesyncd.enable = false;
+      systemd.services.pin-wall-clock = {
+        wantedBy = [ "halmasuit.service" ];
+        before = [ "halmasuit.service" ];
+        serviceConfig.Type = "oneshot";
+        script = "${pkgs.coreutils}/bin/date -s '2026-05-22 15:30:00'";
       };
 
       # The authenticated user the broker would fork-drop to (real
@@ -201,16 +215,47 @@ pkgs.testers.runNixOSTest {
     )
     assert "greeter" in fg_events(), f"expected greeter foreground; got {fg_events()}"
 
-    # Pin VM clock to a fixed instant before snapshot. The DMS
-    # Quickshell UI binds Date.now() into the clock + date labels,
-    # which would otherwise drift every test run and make a stable
-    # perceptual golden impossible. Disable NTP, force the wall
-    # clock to a known moment, sleep enough for Quickshell's QML
-    # Timer to tick the new value into the bound text, then capture.
-    machine.succeed("timedatectl set-ntp false || true")
-    machine.succeed("date -s '2026-05-22 15:30:00'")
-    time.sleep(3)  # let the Quickshell UI settle into the snapshot buffer
-    visual.assert_matches_golden(machine, "dankgreeter")
+    # The wall clock was pinned before the greeter started
+    # (pin-wall-clock), so the only remaining variable is how long
+    # Quickshell takes to paint. halmasuit's frame stream goes: wallpaper-only frames, then
+    # the greeter's nested niri as pure #000000 until Quickshell's first
+    # frame, then the greeter UI. Wait for exactly that — a mostly-black
+    # frame seen, and the latest two frames neither mostly black nor the
+    # wallpaper-only fingerprint, with the same phash (painted and
+    # settled) — then capture. Regen mode captures once, after this.
+    def greeter_painted() -> bool:
+        frames = [
+            e for e in visual.introspect_events(machine)
+            if e.get("event") == "frame_rendered"
+        ]
+        def mostly_black(f):
+            return f["black_pixel_count"] * 2 >= f["pixel_count"]
+        if len(frames) < 3 or not any(mostly_black(f) for f in frames):
+            return False
+        wallpaper_phash = frames[0]["phash"]
+        a, b = frames[-2], frames[-1]
+        return (
+            not mostly_black(a) and not mostly_black(b)
+            and a["phash"] == b["phash"] != wallpaper_phash
+        )
+
+    deadline = time.monotonic() + 60
+    while not greeter_painted():
+        assert time.monotonic() < deadline, (
+            "greeter UI never painted over its nested niri: "
+            f"{[(e['black_pixel_count'], e['phash']) for e in visual.introspect_events(machine) if e.get('event') == 'frame_rendered'][-6:]}"
+        )
+        time.sleep(1)
+
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            visual.assert_matches_golden(machine, "dankgreeter")
+            break
+        except AssertionError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(1)
 
     # No black/uncovered/degenerate frame across boot→wallpaper→real
     # DankGreeter — 100% of the frame_rendered stream, frame-0

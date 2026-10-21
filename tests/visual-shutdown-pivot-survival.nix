@@ -90,16 +90,12 @@ pkgs.testers.runNixOSTest {
   nodes.machine = import ./lib/shutdown-rig.nix {
     inherit halmasuit halmasuit-session halmasuit-vm-client
       halmasuit-layer-shell-test-client;
-    # 60-second sine on the R channel; the post-pivot window is wide
-    # enough (~700 ms-ish, plus all the System-Power-Off → kernel-halt
-    # frames before that) for the 8x8-average phash to flip enough
-    # threshold bits to register 3+ distinct buckets. Empirically
-    # passes phash_progression(min_distinct=3, min_hamming_max=8)
-    # with 3 distinct phashes across ~55 frame_rendered events. A 1s
-    # fast variant was tried and proved LESS reliable: faster hue
-    # rotation washes out as a global brightness shift, and the
-    # perceptual-hash design is robust to that — defeating the test.
-    wallpaper = { type = "shader"; source = ./fixtures/wallpaper-shader.glsl; };
+    # A bright band sweeping across the screen every 4 s. The 8x8
+    # average phash is blind to uniform brightness changes but sees
+    # spatial motion: the band crosses one hash column every 0.5 s, so
+    # the shutdown window (several seconds of frames) always spans
+    # several distinct phashes, whatever the animation's phase.
+    wallpaper = { type = "shader"; source = ./fixtures/wallpaper-shader-motion.glsl; };
     extraStorePaths = [ sessionCmd niri ];
   };
 
@@ -120,9 +116,9 @@ pkgs.testers.runNixOSTest {
         # different across frames (phash progression — closes the
         # "render same frame N times" gap).
         assert_frame_advancement=True,
-        # The 1s-period shader gives ~7 distinct phashes across the
-        # shutdown window with pairwise Hamming spread up to ~12;
-        # thresholds chosen below the empirical floor for stability.
+        # The sweeping band moves through a new hash column every
+        # 0.5 s; these floors sit well below what the shutdown window
+        # produces.
         phash_min_distinct=3,
         phash_min_hamming_max=8,
     )

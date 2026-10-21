@@ -26,6 +26,16 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
+    # DankGreeter's NixOS module (`programs.dms-greeter`). DMS 2.0 split
+    # the greeter into its own repo; DMS's `nixosModules.greeter` is a
+    # warn-only stub. Same wiring as nix-config: upstream, sharing DMS's
+    # dank-qml-common pin.
+    dank-greeter = {
+      url = "github:duxlabs-dev/dux-greeter";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.dank-qml-common.follows = "dms/dank-qml-common";
+    };
+
     # rust-toolchain.toml is the single source of truth for halmasuit's
     # toolchain. rust-overlay reads it so Nix builds and the devShell
     # compile with the same rustc. Without this, nixpkgs's rustc lags
@@ -42,6 +52,7 @@
     , nixpkgs
     , niri-flake
     , dms
+    , dank-greeter
     , rust-overlay
     }:
     let
@@ -56,6 +67,32 @@
       pkgsFor = system: import nixpkgs {
         inherit system;
         overlays = [ rust-overlay.overlays.default ];
+      };
+
+      # niri-flake's make-niri still asks callPackage for
+      # `libdisplay-info_0_2` and asserts its version is 0.2.0; nixpkgs
+      # turned that attribute into a throw on 2026-08-04 and niri-flake
+      # has been frozen since. Build niri-unstable through niri-flake's
+      # own package set with libdisplay-info_0_3 substituted (nixpkgs'
+      # niri and the fork's Cargo.lock both use 0.3; the version override
+      # only satisfies the assert) — the same fix as nix-config's
+      # overlay. The VM tests receive this in place of the raw input.
+      # Drop once niri-flake moves to libdisplay-info_0_3.
+      niriFlake = niri-flake // {
+        packages = niri-flake.packages // {
+          x86_64-linux = niri-flake.packages.x86_64-linux // {
+            niri-unstable =
+              let
+                pkgs = nixpkgs.legacyPackages.x86_64-linux;
+                niriPkgs = pkgs // {
+                  callPackage = pkgs.lib.callPackageWith (pkgs // {
+                    libdisplay-info_0_2 = pkgs.libdisplay-info_0_3 // { version = "0.2.0"; };
+                  });
+                };
+              in
+              (niri-flake.lib.internal.make-package-set niriPkgs).niri-unstable;
+          };
+        };
       };
 
       # Toolchain derived from rust-toolchain.toml. Single source of truth
@@ -1071,7 +1108,8 @@
         # broker-launched session; per-variant per-scene goldens.
         visual-phase-b-side-image = import ./tests/visual-phase-b-side-image.nix {
           system              = "x86_64-linux";
-          inherit nixpkgs niri-flake dms;
+          niri-flake = niriFlake;
+          inherit nixpkgs dms dank-greeter;
           halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
           halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
@@ -1084,7 +1122,8 @@
         # (epic req 11) + the centered/windowed prompt + LuksPromptShown.
         visual-phase-b-luks-interactive = import ./tests/visual-phase-b-luks-interactive.nix {
           system              = "x86_64-linux";
-          inherit nixpkgs niri-flake dms;
+          niri-flake = niriFlake;
+          inherit nixpkgs dms dank-greeter;
           halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
           halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
@@ -1094,7 +1133,8 @@
         # fragment-shader wallpaper (tests/fixtures/wallpaper-shader.glsl).
         visual-phase-b-side-shader = import ./tests/visual-phase-b-side-shader.nix {
           system              = "x86_64-linux";
-          inherit nixpkgs niri-flake dms;
+          niri-flake = niriFlake;
+          inherit nixpkgs dms dank-greeter;
           halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
           halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
@@ -1108,7 +1148,8 @@
         # default test-vm sweep; opt-in via `just test-vm-virtio-gpu-gl`.
         visual-phase-b-side-shader-gl = import ./tests/visual-phase-b-side-shader-gl.nix {
           system              = "x86_64-linux";
-          inherit nixpkgs niri-flake dms;
+          niri-flake = niriFlake;
+          inherit nixpkgs dms dank-greeter;
           halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
           halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
@@ -1127,7 +1168,8 @@
         # responds to the cryptroot-mount ask-password prompt.
         visual-phase-b-enc-image = import ./tests/visual-phase-b-enc-image.nix {
           system              = "x86_64-linux";
-          inherit nixpkgs niri-flake dms;
+          niri-flake = niriFlake;
+          inherit nixpkgs dms dank-greeter;
           halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
           halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
@@ -1137,7 +1179,8 @@
         # Epic #35 cell (enc, shader): LUKS rootfs + GLSL shader wallpaper.
         visual-phase-b-enc-shader = import ./tests/visual-phase-b-enc-shader.nix {
           system              = "x86_64-linux";
-          inherit nixpkgs niri-flake dms;
+          niri-flake = niriFlake;
+          inherit nixpkgs dms dank-greeter;
           halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
           halmasuit-session   = self.packages.x86_64-linux.halmasuit-session;
@@ -1148,7 +1191,8 @@
         # Final matrix cell.
         visual-phase-b-enc-video = import ./tests/visual-phase-b-enc-video.nix {
           system              = "x86_64-linux";
-          inherit nixpkgs niri-flake dms;
+          niri-flake = niriFlake;
+          inherit nixpkgs dms dank-greeter;
           halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-decoder   = self.packages.x86_64-linux.halmasuit-decoder;
           halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
@@ -1158,7 +1202,8 @@
         };
         visual-phase-b-side-video = import ./tests/visual-phase-b-side-video.nix {
           system              = "x86_64-linux";
-          inherit nixpkgs niri-flake dms;
+          niri-flake = niriFlake;
+          inherit nixpkgs dms dank-greeter;
           halmasuit-debug     = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-decoder   = self.packages.x86_64-linux.halmasuit-decoder;
           halmasuit-luks      = self.packages.x86_64-linux.halmasuit-luks;
@@ -1226,7 +1271,8 @@
         # session (niri-flake pinned via halmasuit; unpatched).
         visual-niri-session = import ./tests/visual-niri-session.nix {
           system = "x86_64-linux";
-          inherit nixpkgs niri-flake;
+          niri-flake = niriFlake;
+          inherit nixpkgs;
           halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
@@ -1240,7 +1286,8 @@
         # reaches Swapped under headless rendering.
         visual-logout-respawn = import ./tests/visual-logout-respawn.nix {
           system = "x86_64-linux";
-          inherit nixpkgs niri-flake;
+          niri-flake = niriFlake;
+          inherit nixpkgs;
           halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
@@ -1256,7 +1303,8 @@
         # flash across the tear-down.
         visual-shutdown-tear-down = import ./tests/visual-shutdown-tear-down.nix {
           system = "x86_64-linux";
-          inherit nixpkgs niri-flake;
+          niri-flake = niriFlake;
+          inherit nixpkgs;
           halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
@@ -1274,7 +1322,8 @@
         # AFTER the post-pivot `shutdown[1]:` marker.
         visual-shutdown-pivot-survival = import ./tests/visual-shutdown-pivot-survival.nix {
           system = "x86_64-linux";
-          inherit nixpkgs niri-flake;
+          niri-flake = niriFlake;
+          inherit nixpkgs;
           halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
@@ -1287,7 +1336,8 @@
         # (PID continuity, no coredump, liveness past pivot marker).
         visual-shutdown-image = import ./tests/visual-shutdown-image.nix {
           system = "x86_64-linux";
-          inherit nixpkgs niri-flake;
+          niri-flake = niriFlake;
+          inherit nixpkgs;
           halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
@@ -1301,7 +1351,8 @@
         # end through the shutdown sequence.
         visual-shutdown-video = import ./tests/visual-shutdown-video.nix {
           system = "x86_64-linux";
-          inherit nixpkgs niri-flake;
+          niri-flake = niriFlake;
+          inherit nixpkgs;
           halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-decoder                 = self.packages.x86_64-linux.halmasuit-decoder;
           halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
@@ -1315,7 +1366,8 @@
         # landed in this convergence epic.
         visual-dankgreeter = import ./tests/visual-dankgreeter.nix {
           system = "x86_64-linux";
-          inherit nixpkgs niri-flake dms;
+          niri-flake = niriFlake;
+          inherit nixpkgs dms dank-greeter;
           halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
           ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
@@ -1326,7 +1378,8 @@
         # actually deploy with on gnomon.
         visual-dankgreeter-auth = import ./tests/visual-dankgreeter-auth.nix {
           system = "x86_64-linux";
-          inherit nixpkgs niri-flake dms;
+          niri-flake = niriFlake;
+          inherit nixpkgs dms dank-greeter;
           halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
           ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
@@ -1339,7 +1392,8 @@
         # conv. The test the gen-400 deploy needed.
         halmasuit-live-signin = import ./tests/halmasuit-live-signin.nix {
           system = "x86_64-linux";
-          inherit nixpkgs niri-flake dms;
+          niri-flake = niriFlake;
+          inherit nixpkgs dms dank-greeter;
           halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
           ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
@@ -1359,7 +1413,8 @@
         # Mesa-EGL clients don't wedge in dri2_wl_surface_throttle.
         visual-frame-callbacks = import ./tests/visual-frame-callbacks.nix {
           system = "x86_64-linux";
-          inherit nixpkgs niri-flake;
+          niri-flake = niriFlake;
+          inherit nixpkgs;
           halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
           ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;

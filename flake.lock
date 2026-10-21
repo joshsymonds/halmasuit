@@ -1,5 +1,29 @@
 {
   "nodes": {
+    "dank-greeter": {
+      "inputs": {
+        "dank-qml-common": [
+          "dms",
+          "dank-qml-common"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792524306,
+        "narHash": "sha256-b9S8kVbAWgynkuYcKLAittwfUr26jaE3VDlvkhqva1o=",
+        "owner": "duxlabs-dev",
+        "repo": "dux-greeter",
+        "rev": "39d3c17ba4349e6ac3af041805132807cd60a056",
+        "type": "github"
+      },
+      "original": {
+        "owner": "duxlabs-dev",
+        "repo": "dux-greeter",
+        "type": "github"
+      }
+    },
     "dank-qml-common": {
       "flake": false,
       "locked": {
@@ -148,6 +172,7 @@
     },
     "root": {
       "inputs": {
+        "dank-greeter": "dank-greeter",
         "dms": "dms",
         "niri-flake": "niri-flake",
         "nixpkgs": "nixpkgs",

@@ -36,7 +36,7 @@ rootfs mount-ns view). 6/6 visual matrix cells green
 LUKS shapes × 3 wallpaper variants); `tests/full-boot-flash.nix`
 green; `tests/luks-unlock.nix` green.
 
-`just check` is 377/377; `just test-vm` is a 49-gate sweep.
+`just check` is 547/547; `just test-vm` is a 50-gate sweep (parallel).
 Empirical foundations for Phase B are in [RESEARCH.md](RESEARCH.md)
 (drm-master-probe Phases 0–3 on DRM master persistence across
 `setresuid`, fork, and `switch_root` + `execve`).
@@ -130,8 +130,8 @@ Requires Nix with flakes enabled.
 ```bash
 nix develop          # rust + cargo tooling + qemu + lints
 just check           # rustfmt + clippy -D warnings + cargo-deny +
-                     # cargo-machete + typos + nextest (377)
-just test-vm         # NixOS VM gates (48): halmasuit-vm,
+                     # cargo-machete + typos + nextest (547)
+just test-vm         # NixOS VM gates (50, run in parallel): halmasuit-vm,
                      # initrd-survival, full-boot-flash, luks-unlock,
                      # visual-initrd-pixmap, visual-phase-b-* (6-cell
                      # matrix), run-pam-auth, session-r5r6,

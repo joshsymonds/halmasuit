@@ -12,6 +12,7 @@
   nixpkgs,
   niri-flake,
   dms,
+  dank-greeter,
   halmasuit-debug,
   halmasuit-decoder,
   halmasuit-luks,
@@ -71,7 +72,7 @@ pkgs.testers.runNixOSTest {
         };
         lukshape = "encrypted-root";
         inherit halmasuit-debug halmasuit-decoder halmasuit-luks
-                halmasuit-session halmasuit-vm-client niri-flake dms;
+                halmasuit-session halmasuit-vm-client niri-flake dms dank-greeter;
         wallpaperStorePaths = [ videoFixture fallbackFixture ];
       })
     ];

@@ -64,174 +64,100 @@ fmt:
 test:
     cargo nextest run --workspace --all-features --no-fail-fast --no-tests=pass
 
-# NixOS VM tests (headless, CI-style). All gates are hard gates now —
-# login-flash is GREEN under halmasuit v2 (the long-lived compositor
-# preserves PID continuity across greeter→session). The inversion that
-# the v1 baseline depended on is gone.
-test-vm:
+# NixOS VM tests (headless, CI-style). Every gate is a hard gate,
+# including login-flash (halmasuit holds PID and frame continuity
+# across greeter→session).
+#
+# All gates build in ONE `nix build`, so Nix boots independent VMs in
+# parallel. `jobs` caps the concurrency; it defaults to a quarter of
+# the host's CPUs because each VM takes 1–4 cores and up to 4 GiB.
+# `--keep-going` reports every failing gate in one pass; a gate's full
+# log is `nix log .#checks.x86_64-linux.<gate>`. Passing gates are
+# cached in the store, so a re-run only boots what changed.
+test-vm jobs="":
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "── halmasuit-vm ──"
-    nix build .#checks.x86_64-linux.halmasuit-vm -L --print-build-logs --no-link
-    echo
-    echo "── halmasuit-multi-drm-path ──"
-    nix build .#checks.x86_64-linux.halmasuit-multi-drm-path -L --print-build-logs --no-link
-    echo
-    echo "── halmasuit-multi-drm-pci ──"
-    nix build .#checks.x86_64-linux.halmasuit-multi-drm-pci -L --print-build-logs --no-link
-    echo
-    echo "── halmasuit-multi-drm-auto ──"
-    nix build .#checks.x86_64-linux.halmasuit-multi-drm-auto -L --print-build-logs --no-link
-    echo
-    echo "── halmasuit-multi-output ──"
-    nix build .#checks.x86_64-linux.halmasuit-multi-output -L --print-build-logs --no-link
-    echo
-    echo "── initrd-survival ──"
-    nix build .#checks.x86_64-linux.initrd-survival -L --print-build-logs --no-link
-    echo
-    echo "── halmasuit-tty-graphics ──"
-    nix build .#checks.x86_64-linux.halmasuit-tty-graphics -L --print-build-logs --no-link
-    echo
-    echo "── halmasuit-shutdown-probe-phase0 ──"
-    nix build .#checks.x86_64-linux.halmasuit-shutdown-probe-phase0 -L --print-build-logs --no-link
-    echo
-    echo "── halmasuit-shutdown-probe-phase1 ──"
-    nix build .#checks.x86_64-linux.halmasuit-shutdown-probe-phase1 -L --print-build-logs --no-link
-    echo
-    echo "── halmasuit-shutdown-probe-phase2 ──"
-    nix build .#checks.x86_64-linux.halmasuit-shutdown-probe-phase2 -L --print-build-logs --no-link
-    echo
-    echo "── full-boot-flash ──"
-    nix build .#checks.x86_64-linux.full-boot-flash -L --print-build-logs --no-link
-    echo
-    echo "── luks-unlock ──"
-    nix build .#checks.x86_64-linux.luks-unlock -L --print-build-logs --no-link
-    echo
-    echo "── visual-initrd-pixmap ──"
-    nix build .#checks.x86_64-linux.visual-initrd-pixmap -L --print-build-logs --no-link
-    echo
-    echo "── visual-phase-b-side-image ──"
-    nix build .#checks.x86_64-linux.visual-phase-b-side-image -L --print-build-logs --no-link
-    echo
-    echo "── visual-phase-b-luks-interactive ──"
-    nix build .#checks.x86_64-linux.visual-phase-b-luks-interactive -L --print-build-logs --no-link
-    echo
-    echo "── visual-phase-b-side-shader ──"
-    nix build .#checks.x86_64-linux.visual-phase-b-side-shader -L --print-build-logs --no-link
-    echo
-    echo "── visual-phase-b-side-video ──"
-    nix build .#checks.x86_64-linux.visual-phase-b-side-video -L --print-build-logs --no-link
-    echo
-    echo "── visual-phase-b-enc-image ──"
-    nix build .#checks.x86_64-linux.visual-phase-b-enc-image -L --print-build-logs --no-link
-    echo
-    echo "── visual-phase-b-enc-shader ──"
-    nix build .#checks.x86_64-linux.visual-phase-b-enc-shader -L --print-build-logs --no-link
-    echo
-    echo "── visual-phase-b-enc-video ──"
-    nix build .#checks.x86_64-linux.visual-phase-b-enc-video -L --print-build-logs --no-link
-    echo
-    echo "── run-pam-auth ──"
-    nix build .#checks.x86_64-linux.run-pam-auth -L --print-build-logs --no-link
-    echo
-    echo "── session-r5r6 ──"
-    nix build .#checks.x86_64-linux.session-r5r6 -L --print-build-logs --no-link
-    echo
-    echo "── session-onehandle ──"
-    nix build .#checks.x86_64-linux.session-onehandle -L --print-build-logs --no-link
-    echo
-    echo "── session-conv-shapes ──"
-    nix build .#checks.x86_64-linux.session-conv-shapes -L --print-build-logs --no-link
-    echo
-    echo "── halmasuit-conv-e2e ──"
-    nix build .#checks.x86_64-linux.halmasuit-conv-e2e -L --print-build-logs --no-link
-    echo
-    echo "── login-flash ──"
-    nix build .#checks.x86_64-linux.login-flash -L --print-build-logs --no-link
-    echo
-    echo "── visual-wallpaper-event ──"
-    nix build .#checks.x86_64-linux.visual-wallpaper-event -L --print-build-logs --no-link
-    echo
-    echo "── halmasuit-input ──"
-    nix build .#checks.x86_64-linux.halmasuit-input -L --print-build-logs --no-link
-    echo
-    echo "── visual-halmasuit-clear ──"
-    nix build .#checks.x86_64-linux.visual-halmasuit-clear -L --print-build-logs --no-link
-    echo
-    echo "── visual-halmasuit-layer ──"
-    nix build .#checks.x86_64-linux.visual-halmasuit-layer -L --print-build-logs --no-link
-    echo
-    echo "── visual-halmasuit-splash ──"
-    nix build .#checks.x86_64-linux.visual-halmasuit-splash -L --print-build-logs --no-link
-    echo
-    echo "── visual-backdrop ──"
-    nix build .#checks.x86_64-linux.visual-backdrop -L --print-build-logs --no-link
-    echo
-    echo "── visual-halmasuit-toplevel ──"
-    nix build .#checks.x86_64-linux.visual-halmasuit-toplevel -L --print-build-logs --no-link
-    echo
-    echo "── visual-foreground ──"
-    nix build .#checks.x86_64-linux.visual-foreground -L --print-build-logs --no-link
-    echo
-    echo "── visual-revert ──"
-    nix build .#checks.x86_64-linux.visual-revert -L --print-build-logs --no-link
-    echo
-    echo "── visual-pidfd-revert ──"
-    nix build .#checks.x86_64-linux.visual-pidfd-revert -L --print-build-logs --no-link
-    echo
-    # Real broker-launched niri, software-rendered headless (llvmpipe).
-    echo "── visual-niri-session ──"
-    nix build .#checks.x86_64-linux.visual-niri-session -L --print-build-logs --no-link
-    echo
-    echo "── visual-logout-respawn ──"
-    nix build .#checks.x86_64-linux.visual-logout-respawn -L --print-build-logs --no-link
-    echo
-    echo "── visual-shutdown-tear-down ──"
-    nix build .#checks.x86_64-linux.visual-shutdown-tear-down -L --print-build-logs --no-link
-    echo
-    echo "── visual-shutdown-pivot-survival ──"
-    nix build .#checks.x86_64-linux.visual-shutdown-pivot-survival -L --print-build-logs --no-link
-    echo
-    # R13 forcing function: real DMS DankGreeter (Quickshell+Qt6) as
-    # halmasuit's greeter over the wallpaper, no-flash invariant intact.
-    echo "── visual-dankgreeter ──"
-    nix build .#checks.x86_64-linux.visual-dankgreeter -L --print-build-logs --no-link
-    echo
-    # R12 (GTK4 half): minimal GTK4 wayland client end-to-end.
-    echo "── visual-gtk4-smoke ──"
-    nix build .#checks.x86_64-linux.visual-gtk4-smoke -L --print-build-logs --no-link
-    echo
-    # R13(b): G3 keystroke auth arc end-to-end through real DMS
-    # DankGreeter → broker → real pam_unix → session_opened.
-    echo "── visual-dankgreeter-auth ──"
-    nix build .#checks.x86_64-linux.visual-dankgreeter-auth -L --print-build-logs --no-link
-    echo
-    echo "── halmasuit-live-signin ──"
-    nix build .#checks.x86_64-linux.halmasuit-live-signin -L --print-build-logs --no-link
-    echo
-    # Convergence epic R2: wl_surface.frame callbacks (no Mesa-EGL wedge).
-    echo "── visual-frame-callbacks ──"
-    nix build .#checks.x86_64-linux.visual-frame-callbacks -L --print-build-logs --no-link
-    echo
-    echo "── visual-wallpaper-render-rate ──"
-    nix build .#checks.x86_64-linux.visual-wallpaper-render-rate -L --print-build-logs --no-link
-    echo
-    # Convergence epic R3: sync-subsurface commits aggregate to parent.
-    echo "── visual-sync-subsurface ──"
-    nix build .#checks.x86_64-linux.visual-sync-subsurface -L --print-build-logs --no-link
-    echo
-    # Convergence epic R4: initial xdg_surface.configure deferred to commit handler.
-    echo "── visual-deferred-configure ──"
-    nix build .#checks.x86_64-linux.visual-deferred-configure -L --print-build-logs --no-link
-    echo
-    # Convergence epic R5: smithay PopupManager + positioner-driven popup geometry.
-    echo "── visual-popup ──"
-    nix build .#checks.x86_64-linux.visual-popup -L --print-build-logs --no-link
-    echo
-    # Epic #12: real halmasuit-decoder sandbox + crash-recovery +
-    # budget-exhaustion + login-flash continuity under video wallpaper.
-    echo "── visual-wallpaper-video ──"
-    nix build .#checks.x86_64-linux.visual-wallpaper-video -L --print-build-logs --no-link
+    jobs="{{jobs}}"
+    [ -n "$jobs" ] || jobs=$(( ($(nproc) + 3) / 4 ))
+    gates=(
+        halmasuit-vm
+        halmasuit-multi-drm-path
+        halmasuit-multi-drm-pci
+        halmasuit-multi-drm-auto
+        halmasuit-multi-output
+        initrd-survival
+        halmasuit-tty-graphics
+        halmasuit-shutdown-probe-phase0
+        halmasuit-shutdown-probe-phase1
+        halmasuit-shutdown-probe-phase2
+        full-boot-flash
+        luks-unlock
+        visual-initrd-pixmap
+        visual-phase-b-side-image
+        visual-phase-b-luks-interactive
+        visual-phase-b-side-shader
+        visual-phase-b-side-video
+        visual-phase-b-enc-image
+        visual-phase-b-enc-shader
+        visual-phase-b-enc-video
+        run-pam-auth
+        session-r5r6
+        session-onehandle
+        session-conv-shapes
+        halmasuit-conv-e2e
+        login-flash
+        visual-wallpaper-event
+        halmasuit-input
+        visual-halmasuit-clear
+        visual-halmasuit-layer
+        visual-halmasuit-splash
+        visual-backdrop
+        visual-halmasuit-toplevel
+        visual-foreground
+        visual-revert
+        visual-pidfd-revert
+        # Real broker-launched niri, software-rendered headless (llvmpipe).
+        visual-niri-session
+        visual-logout-respawn
+        visual-shutdown-tear-down
+        visual-shutdown-pivot-survival
+        # R13 forcing function: real DMS DankGreeter (Quickshell+Qt6) as
+        # halmasuit's greeter over the wallpaper, no-flash invariant intact.
+        visual-dankgreeter
+        # R12 (GTK4 half): minimal GTK4 wayland client end-to-end.
+        visual-gtk4-smoke
+        # R13(b): G3 keystroke auth arc end-to-end through real DMS
+        # DankGreeter → broker → real pam_unix → session_opened.
+        visual-dankgreeter-auth
+        halmasuit-live-signin
+        # Convergence epic R2: wl_surface.frame callbacks (no Mesa-EGL wedge).
+        visual-frame-callbacks
+        # Convergence epic R3: sync-subsurface commits aggregate to parent.
+        visual-sync-subsurface
+        # Convergence epic R4: initial xdg_surface.configure deferred to commit handler.
+        visual-deferred-configure
+        # Convergence epic R5: smithay PopupManager + positioner-driven popup geometry.
+        visual-popup
+        # Epic #12: real halmasuit-decoder sandbox + crash-recovery +
+        # budget-exhaustion + login-flash continuity under video wallpaper.
+        visual-wallpaper-video
+    )
+    # Throughput gates measure a render rate inside the VM, so they run
+    # alone after the parallel batch: sharing the host with other
+    # llvmpipe VMs cuts the measured rate (42 fps among 8 VMs vs 75 alone
+    # for visual-wallpaper-render-rate, whose bar is 50).
+    solo=(
+        visual-wallpaper-render-rate
+    )
+    rc=0
+    echo "── test-vm: ${#gates[@]} gates, up to $jobs VMs at once ──"
+    nix build --keep-going --max-jobs "$jobs" --no-link -L \
+        "${gates[@]/#/.#checks.x86_64-linux.}" || rc=$?
+    for gate in "${solo[@]}"; do
+        echo "── test-vm: $gate (alone) ──"
+        nix build --no-link -L ".#checks.x86_64-linux.$gate" || rc=$?
+    done
+    exit "$rc"
 
 # Regenerate one or all visual-test goldens. Runs the named test
 # interactively (driverInteractive), with HALMASUIT_GOLDEN_REGEN=1 and

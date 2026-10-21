@@ -63,7 +63,7 @@ epics have shipped:
 session** (PID + frame continuity across the real greeter→session
 transition). `tests/full-boot-flash.nix`, `tests/initrd-survival.nix`,
 `tests/luks-unlock.nix`, and the 6-cell Phase B matrix are all GREEN.
-`just check` is 377/377; `just test-vm` is a 49-gate sweep.
+`just check` is 547/547; `just test-vm` is a 50-gate sweep (parallel).
 
 **What's left** is cross-repo deployment to gnomon: DankGreeter
 launcher patch in DMS, switchover from `services.greetd.enable` to

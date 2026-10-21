@@ -24,6 +24,7 @@
   nixpkgs,
   niri-flake,
   dms,
+  dank-greeter,
   halmasuit-debug,
   halmasuit-luks,
   halmasuit-session,
@@ -52,7 +53,7 @@ pkgs.testers.runNixOSTest {
         lukshape    = "side-volume";
         interactive = true;
         inherit halmasuit-debug halmasuit-luks halmasuit-session
-                halmasuit-vm-client niri-flake dms;
+                halmasuit-vm-client niri-flake dms dank-greeter;
         wallpaperStorePaths = [ ./fixtures/wallpaper.png ];
       })
     ];

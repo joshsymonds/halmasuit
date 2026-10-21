@@ -90,14 +90,20 @@ def run(machine, visual, *, cell_name, lukshape, no_flash_mode):
         machine.succeed("cryptsetup close cryptroot-preformat")
         print("PASS: encrypted root pre-formatted ext4 (systemd-260 CRYPT-readiness fix)")
 
-        # bootctl set-default the cryptroot specialisation entry. The
-        # generation prefix varies with rebuild count, so parse the
-        # entry id out of `bootctl list` rather than hardcoding it.
+        # bootctl set-default the cryptroot specialisation entry. Entry
+        # ids are content hashes (nixos-<hash>.conf); the specialisation
+        # name appears only in the title, so find the one entry block
+        # titled "(cryptroot)" and take its id.
         import re
         entries = machine.succeed("bootctl list --no-pager")
-        m = re.search(r"id:\s+(\S*cryptroot\S*\.conf)", entries)
-        assert m, f"could not find cryptroot specialisation entry:\n{entries}"
-        cryptroot_entry = m.group(1)
+        ids = [
+            m.group(1)
+            for block in re.split(r"\n\s*\n", entries)
+            if re.search(r"title:.*\(cryptroot\)", block)
+            and (m := re.search(r"id:\s+(\S+\.conf)", block))
+        ]
+        assert len(ids) == 1, f"expected one cryptroot specialisation entry, got {ids}:\n{entries}"
+        cryptroot_entry = ids[0]
         machine.succeed(f"bootctl set-default {cryptroot_entry}")
         print(f"PASS: bootctl default → {cryptroot_entry}")
 
