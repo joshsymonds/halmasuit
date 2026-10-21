@@ -753,7 +753,18 @@
       # would either invoke qemu-aarch64 user-mode emulation (multi-minute
       # slowdown) or fail outright. Add aarch64-linux here when we have a
       # native runner for it.
-      checks.x86_64-linux = {
+      #
+      # Every VM test gets a 10-minute global timeout instead of the
+      # driver's 1-hour default. The slowest test script finishes in
+      # about 95s under a full parallel sweep, so 600s is far above any
+      # healthy run while a hung driver (e.g. a VM that never starts)
+      # costs 10 minutes, not an hour. Interactive drivers do not start
+      # this timer.
+      checks.x86_64-linux = nixpkgs.lib.mapAttrs (_: check:
+        if check ? extend
+        then check.extend { modules = [ { globalTimeout = 600; } ]; }
+        else check
+      ) {
         login-flash = import ./tests/login-flash.nix {
           system               = "x86_64-linux";
           inherit nixpkgs;
