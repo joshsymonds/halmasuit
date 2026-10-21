@@ -1089,11 +1089,18 @@ impl HalmasuitState {
                         Ok(()) => emit(&Event::GreeterTerminated { pid }),
                         Err(e) => {
                             let error = format!("{e}");
-                            tracing::warn!(
-                                %error,
-                                greeter_pid = pid,
-                                "pidfd_send_signal greeter SIGKILL failed; session proceeds"
-                            );
+                            // A greetd client exits by itself once
+                            // `start_session` succeeds, and the broker
+                            // reaps it, so ESRCH is the normal case.
+                            if e.raw_os_error() == Some(libc::ESRCH) {
+                                tracing::debug!(greeter_pid = pid, "greeter already exited");
+                            } else {
+                                tracing::warn!(
+                                    %error,
+                                    greeter_pid = pid,
+                                    "pidfd_send_signal greeter SIGKILL failed; session proceeds"
+                                );
+                            }
                             emit(&Event::GreeterKillFailed { pid, error });
                         }
                     }

@@ -133,6 +133,15 @@ pkgs.testers.runNixOSTest {
         f"Snapshot method missing from Introspect interface:\n{introspect}"
     )
 
+    # The test client is the greeter the broker forked. The broker
+    # idle-exits while it runs; the greeter must outlive it and stay
+    # on screen.
+    machine.wait_until_succeeds(
+        "journalctl -u halmasuit-session -o cat | grep -qF 'idle window elapsed'",
+        timeout=90,
+    )
+    machine.succeed("pgrep -u halmasuit-greeter -x halmasuit-layer")
+
     visual.assert_matches_golden(machine, "halmasuit-layer-green")
 
     print("visual-halmasuit-layer: ALL ASSERTIONS PASSED")

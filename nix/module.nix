@@ -1437,6 +1437,13 @@ in
          # broker's per-worker RLIMIT_CPU + SIGKILL-anytime + idle
          # exit; this just caps a pathologically stuck instance).
          RuntimeMaxSec = "12h";
+         # The greeter the broker forks for `SpawnGreeter` lives in this
+         # unit's cgroup and must survive the broker's idle exit; the
+         # compositor owns its lifetime. Only the broker's own process
+         # is signalled on stop. Auth workers left behind by a broker
+         # crash fail closed on their closed channel and exit; session
+         # leaders and their workers live in logind session scopes.
+         KillMode = "process";
          # DELIBERATELY NO NoNewPrivileges-implying directives
          # (MemoryDenyWriteExecute, RestrictNamespaces, RestrictRealtime,
          # SystemCallFilter, LockPersonality, ProtectKernelTunables,

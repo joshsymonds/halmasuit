@@ -761,7 +761,10 @@ specialized to a process-continuous system compositor. Three tiers:
   and sends `BeginAuth` only when the user submits; that connection
   keeps the broker up while it waits and is read only when readable,
   never blocking the loop (at most 8 such connections, oldest evicted,
-  and only from root or the relay peer). A single global slot
+  and only from root or the relay peer). The greeter the broker forks
+  for `SpawnGreeter` is its child but never keeps it up: the broker
+  reaps it if it exits first, and the unit's `KillMode=process` leaves
+  it running when the broker idle-exits. A single global slot
   (system-wide one-seat) with evict-old gated to the `SO_PEERCRED`
   greeter peer plus a churn throttle.
 - **(A) Session leader — fork-then-drop in a non-setuid child.** After

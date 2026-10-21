@@ -61,6 +61,12 @@
 //! SIGCHLD/`waitid(P_PIDFD)` reaper exists (R9 anti-pattern); reaping
 //! stays slot-owned and synchronous.
 //!
+//! Greeters the broker forks for `SpawnGreeter` are not slot workers:
+//! the broker keeps each one's pidfd as a loop source and reaps that
+//! greeter when it exits. A greeter is never in flight, so the broker
+//! idle-exits while one runs; the unit's `KillMode=process` leaves the
+//! greeter running, and it reparents to PID 1.
+//!
 //! The relay is the step-driven `Relay` state machine (Amendment A2):
 //! the calloop loop in `run_broker` pumps `on_worker_readable`/
 //! `on_greeter_readable` on FD readiness, never blocking the thread.
@@ -87,7 +93,7 @@ use crate::slot::{AuthSlot, SlotError};
 use crate::transport::{SeqpacketChannel, TransportError, peer_uid};
 use crate::wire_trace;
 use crate::worker::{
-    BorrowedSourceFd, ParentMessage, WorkerOutcome, accept_seqpacket, own_raw_fd,
+    BorrowedSourceFd, ParentMessage, WorkerHandle, WorkerOutcome, accept_seqpacket, own_raw_fd,
     recv_frame_with_fd, send_frame_with_fd, spawn_session_worker,
 };
 
@@ -403,6 +409,14 @@ struct Pending {
     token: RegistrationToken,
 }
 
+/// A greeter the broker forked for `SpawnGreeter`. The broker is its
+/// parent and reaps it once its pidfd turns readable. It never counts
+/// as in flight (see the module doc).
+struct SpawnedGreeter {
+    handle: WorkerHandle,
+    token: RegistrationToken,
+}
+
 /// Cap on simultaneously pending connections. The compositor holds at
 /// most one per greetd connection (it caps those at 4) plus short-lived
 /// `RequestRootFd`/`SpawnGreeter` connections. Past the cap the oldest
@@ -423,6 +437,8 @@ struct BrokerLoop {
     /// oldest first. See [`Pending`].
     pending: VecDeque<Pending>,
     next_pending_id: u64,
+    /// Greeters forked for `SpawnGreeter` that have not exited yet.
+    greeters: Vec<SpawnedGreeter>,
     /// `Some(t)` since the broker last had nothing in flight (no
     /// active or pending connection); `None` while a connection is in
     /// flight. Drives the A2.2 idle-exit.
@@ -504,6 +520,66 @@ impl RefusalLog {
 }
 
 impl BrokerLoop {
+    fn new(
+        listener_fd: RawFd,
+        relay_peer_uid: u32,
+        loop_handle: calloop::LoopHandle<'static, Self>,
+        loop_signal: LoopSignal,
+    ) -> Self {
+        Self {
+            slot: AuthSlot::with_defaults(relay_peer_uid),
+            listener_fd,
+            active: None,
+            pending: VecDeque::new(),
+            next_pending_id: 0,
+            greeters: Vec::new(),
+            idle_since: Some(Instant::now()),
+            loop_handle,
+            loop_signal,
+            running: true,
+            refusal_log: RefusalLog::default(),
+        }
+    }
+
+    /// Watch a greeter forked for `SpawnGreeter` so it is reaped when
+    /// it exits. A8.3: the source borrows the pidfd `handle` owns, and
+    /// its token is removed before the handle drops (A8.2).
+    fn track_greeter(&mut self, handle: WorkerHandle) -> io::Result<()> {
+        let pid = handle.pid;
+        let token = self
+            .loop_handle
+            .insert_source(
+                Generic::new(
+                    BorrowedSourceFd::new(handle.pidfd().as_raw_fd()),
+                    Interest::READ,
+                    Mode::Level,
+                ),
+                move |_, _, bl: &mut Self| {
+                    // Reap after calloop unregisters this source, as in
+                    // `admit_one`.
+                    bl.loop_handle
+                        .insert_idle(move |bl: &mut Self| bl.reap_greeter(pid));
+                    Ok(PostAction::Remove)
+                },
+            )
+            .map_err(|e| io::Error::other(format!("insert greeter pidfd source: {e}")))?;
+        self.greeters.push(SpawnedGreeter { handle, token });
+        Ok(())
+    }
+
+    /// A tracked greeter exited: reap it. The pid is a unique key
+    /// because an unreaped child's pid cannot be reused.
+    fn reap_greeter(&mut self, pid: u32) {
+        let Some(pos) = self.greeters.iter().position(|g| g.handle.pid == pid) else {
+            return;
+        };
+        let g = self.greeters.swap_remove(pos);
+        match g.handle.wait() {
+            Ok(status) => tracing_log(&format!("greeter {pid} exited: {status:?}")),
+            Err(e) => tracing_log(&format!("reaping greeter {pid} failed: {e}")),
+        }
+    }
+
     /// Tear down the in-flight connection's calloop sources (epoll
     /// del) and clear `active`. A8.2: the source tokens are removed
     /// HERE, strictly before the worker fd is closed — `step()` calls
@@ -543,11 +619,18 @@ impl BrokerLoop {
         let Some(p) = self.pending.remove(pos) else {
             return;
         };
-        if let FirstFrame::BeginAuth { service, username } =
-            dispatch_first_frame(&p.chan, p.puid, self)
-            && let Err(e) = activate(self, p.chan, p.puid, &service, &username)
-        {
-            tracing_log(&format!("activating connection failed: {e}"));
+        match dispatch_first_frame(&p.chan, p.puid, self) {
+            FirstFrame::BeginAuth { service, username } => {
+                if let Err(e) = activate(self, p.chan, p.puid, &service, &username) {
+                    tracing_log(&format!("activating connection failed: {e}"));
+                }
+            }
+            FirstFrame::GreeterSpawned(handle) => {
+                if let Err(e) = self.track_greeter(handle) {
+                    tracing_log(&format!("tracking spawned greeter failed: {e}"));
+                }
+            }
+            FirstFrame::Handled => {}
         }
         self.arm_idle_if_quiet();
     }
@@ -586,6 +669,23 @@ impl BrokerLoop {
                 self.drop_active();
                 let _ = self.slot.cancel_current();
             }
+        }
+    }
+}
+
+impl Drop for BrokerLoop {
+    /// A8.2 on exit: unregister every source before the fields that own
+    /// their fds drop. Greeters are not reaped; they outlive the broker.
+    fn drop(&mut self) {
+        if let Some(a) = self.active.take() {
+            self.loop_handle.remove(a.greeter_token);
+            self.loop_handle.remove(a.worker_token);
+        }
+        for p in self.pending.drain(..) {
+            self.loop_handle.remove(p.token);
+        }
+        for g in self.greeters.drain(..) {
+            self.loop_handle.remove(g.token);
         }
     }
 }
@@ -660,8 +760,11 @@ fn serve_root_fd_request(
 enum FirstFrame {
     /// The frame is `BeginAuth` — the caller proceeds to slot creation.
     BeginAuth { service: String, username: String },
-    /// The frame was a transient request (`RequestRootFd` /
-    /// `SpawnGreeter`), fully served by its handler, OR the frame was
+    /// The frame was `SpawnGreeter` and a greeter was forked; the
+    /// caller tracks it until it exits.
+    GreeterSpawned(WorkerHandle),
+    /// The frame was a transient request (`RequestRootFd`, or a
+    /// refused `SpawnGreeter`), fully served by its handler, OR the frame was
     /// unexpected / unreadable. Either way, the connection has been
     /// handled and the caller drops it.
     Handled,
@@ -685,15 +788,13 @@ fn dispatch_first_frame(greeter: &SeqpacketChannel, puid: u32, bl: &mut BrokerLo
             serve_root_fd_request(greeter, puid, bl.slot.relay_peer_uid(), &mut bl.refusal_log);
             FirstFrame::Handled
         }
-        Ok(CompositorToBroker::SpawnGreeter) => {
-            serve_spawn_greeter_request(
-                greeter,
-                puid,
-                bl.slot.relay_peer_uid(),
-                &mut bl.refusal_log,
-            );
-            FirstFrame::Handled
-        }
+        Ok(CompositorToBroker::SpawnGreeter) => serve_spawn_greeter_request(
+            greeter,
+            puid,
+            bl.slot.relay_peer_uid(),
+            &mut bl.refusal_log,
+        )
+        .map_or(FirstFrame::Handled, FirstFrame::GreeterSpawned),
         Ok(_) => {
             tracing_log("first frame was not BeginAuth; dropping connection");
             FirstFrame::Handled
@@ -711,7 +812,8 @@ fn dispatch_first_frame(greeter: &SeqpacketChannel, puid: u32, bl: &mut BrokerLo
 /// broker's OWN env (NEVER from the frame — compositor is the
 /// unprivileged peer and asserts no policy), fork-then-drop a child
 /// to the greeter uid, return a `BrokerToCompositor::GreeterSpawned`
-/// reply with the spawned pid AND its pidfd attached via SCM_RIGHTS.
+/// reply with the spawned pid AND its pidfd attached via SCM_RIGHTS,
+/// and return the greeter's handle so the broker reaps it on exit.
 ///
 /// Errors are logged + the connection is closed (compositor's spawn
 /// request just doesn't get fulfilled). No further frames are
@@ -728,14 +830,14 @@ fn serve_spawn_greeter_request(
     puid: u32,
     relay_peer_uid: u32,
     refusal_log: &mut RefusalLog,
-) {
+) -> Option<WorkerHandle> {
     use std::os::fd::AsFd;
 
     use crate::worker::spawn_greeter;
 
     if puid != 0 && puid != relay_peer_uid {
         refusal_log.record_refusal(puid, relay_peer_uid);
-        return;
+        return None;
     }
 
     let spec = match greeter_spec_from_env() {
@@ -744,7 +846,7 @@ fn serve_spawn_greeter_request(
             tracing_log(&format!(
                 "greeter spec from env failed: {e}; refusing SpawnGreeter"
             ));
-            return;
+            return None;
         }
     };
 
@@ -766,13 +868,13 @@ fn serve_spawn_greeter_request(
             ) {
                 tracing_log(&format!("send GreeterSpawned failed: {e:?}"));
             }
-            // Broker's local pidfd copy: the SCM_RIGHTS send dup'd the
-            // fd into the compositor's table; ours is no longer needed.
-            // WorkerHandle drops normally here, closing the pidfd.
-            drop(handle);
+            // The SCM_RIGHTS send gave the compositor its own pidfd;
+            // the broker keeps this one to reap the greeter.
+            Some(handle)
         }
         Err(e) => {
             tracing_log(&format!("spawn_greeter failed: {e}"));
+            None
         }
     }
 }
@@ -1038,18 +1140,7 @@ fn run_broker_loop(listener_fd: RawFd, relay_peer_uid: u32, idle_exit: Duration)
         )
         .map_err(|e| io::Error::other(format!("insert signal source: {e}")))?;
 
-    let mut bl = BrokerLoop {
-        slot: AuthSlot::with_defaults(relay_peer_uid),
-        listener_fd,
-        active: None,
-        pending: VecDeque::new(),
-        next_pending_id: 0,
-        idle_since: Some(Instant::now()),
-        loop_handle,
-        loop_signal,
-        running: true,
-        refusal_log: RefusalLog::default(),
-    };
+    let mut bl = BrokerLoop::new(listener_fd, relay_peer_uid, loop_handle, loop_signal);
 
     while bl.running {
         event_loop
@@ -1688,6 +1779,48 @@ mod tests {
     /// broker does not idle-exit under it. The compositor connects as
     /// soon as the greeter does and sends `BeginAuth` only once the
     /// user submits, which can be any time later.
+    /// A greeter the broker forked is its child: the broker reaps it
+    /// when it exits (no zombie for the rest of the session), and a
+    /// live greeter never holds the broker up past its idle window.
+    #[test]
+    fn spawned_greeter_is_reaped_on_exit_and_never_holds_the_broker_up() {
+        use nix::errno::Errno;
+        use nix::sys::wait::{WaitPidFlag, waitpid};
+        use nix::unistd::Pid;
+
+        let mut event_loop: EventLoop<'static, BrokerLoop> =
+            EventLoop::try_new().expect("event loop");
+        let mut bl = BrokerLoop::new(-1, GREETER, event_loop.handle(), event_loop.get_signal());
+        // Stands in for the greeter: runs until its channel closes.
+        let (handle, chan) = spawn_worker(|c| {
+            let _ = c.recv::<WorkerOutcome>();
+        })
+        .expect("spawn stand-in greeter");
+        let pid = Pid::from_raw(i32::try_from(handle.pid).expect("pid fits i32"));
+        bl.track_greeter(handle).expect("track greeter");
+        assert!(
+            !bl.has_connection(),
+            "a running greeter must not count as in flight"
+        );
+
+        drop(chan);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !bl.greeters.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "broker never reaped the exited greeter"
+            );
+            event_loop
+                .dispatch(Some(Duration::from_millis(100)), &mut bl)
+                .expect("dispatch");
+        }
+        assert_eq!(
+            waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+            Err(Errno::ECHILD),
+            "the greeter must already be reaped"
+        );
+    }
+
     #[test]
     fn broker_serves_others_and_stays_up_while_a_connection_awaits_its_first_frame() {
         use nix::sys::socket::{Backlog, UnixAddr, bind, connect, listen, socket};

@@ -245,6 +245,19 @@ def run(machine, visual, *, cell_name, lukshape, no_flash_mode):
     )
     print("PASS: niri mapped fullscreen; foreground=session")
 
+    # The swap SIGKILLed the greeter. Its whole process tree is gone,
+    # and the broker, its parent, reaped it.
+    machine.wait_until_succeeds(
+        "test -z \"$(ps -u halmasuit-greeter -o stat=,args= | grep -v '^Z')\"",
+        timeout=30,
+    )
+    machine.wait_until_succeeds(
+        "pid=$(systemctl show -p MainPID --value halmasuit-session.service); "
+        "test \"$pid\" -gt 0 && ! ps -o stat= --ppid \"$pid\" | grep -q '^Z'",
+        timeout=30,
+    )
+    print("PASS: greeter process tree gone after the swap; broker reaped it")
+
     # halmasuit PID continuous across the swap (login-flash invariant).
     started_now = [
         e for e in visual.introspect_events(machine) if e["event"] == "started"
