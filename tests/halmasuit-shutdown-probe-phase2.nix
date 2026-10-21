@@ -184,6 +184,10 @@ pkgs.testers.runNixOSTest {
     print(f"PASS: {pre_fd_open} pre-shutdown heartbeats with drm_fd_open=<N>")
 
     machine.shutdown()
+    # shutdown() returns once QEMU exits; the driver's serial
+    # reader may still be draining QEMU's last output, which holds
+    # the shutdown markers. Read the console only after it ends.
+    machine.serial_thread.join()
     console = machine.get_console_log()
 
     # Locate the post-pivot `shutdown[1]:` marker (same logic as Phase 1).

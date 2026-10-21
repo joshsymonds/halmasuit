@@ -138,11 +138,13 @@ def run(
 
     # ── Trigger full system shutdown ────────────────────────────────
     # `machine.shutdown()` issues `systemctl poweroff` over the
-    # backdoor and waits for the QEMU process to exit. After it
-    # returns, the serial console captures everything systemd-shutdown
-    # logged — including the post-pivot binary's output and any
-    # kmsg lines halmasuit wrote via its journal+kmsg-routed stdout.
+    # backdoor and returns once the QEMU process exits. The driver's
+    # serial reader may still be draining QEMU's last output, which
+    # holds everything systemd-shutdown logged — including the
+    # post-pivot binary's output and any kmsg lines halmasuit wrote via
+    # its journal+kmsg-routed stdout. Read the console once it ends.
     machine.shutdown()
+    machine.serial_thread.join()
     console = machine.get_console_log()
 
     # ── Locate the post-pivot marker ────────────────────────────────

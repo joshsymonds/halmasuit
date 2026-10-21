@@ -121,6 +121,10 @@ pkgs.testers.runNixOSTest {
     print(f"PASS: probe PID = {probe_pid}, emitting heartbeats pre-shutdown")
 
     machine.shutdown()
+    # shutdown() returns once QEMU exits; the driver's serial
+    # reader may still be draining QEMU's last output, which holds
+    # the shutdown markers. Read the console only after it ends.
+    machine.serial_thread.join()
     console = machine.get_console_log()
 
     # Locate the first `shutdown[1]:` line. That's emitted by

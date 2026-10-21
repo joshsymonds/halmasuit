@@ -130,10 +130,11 @@ pkgs.testers.runNixOSTest {
     # and waits for the qemu process to exit.
     machine.shutdown()
 
-    # qemu is gone; the serial console buffer is finalized. Reads from
-    # machine.get_console_log() now return everything qemu wrote to
-    # stdio (the kernel console, including /dev/kmsg writes from the
-    # probe) from boot to halt.
+    # qemu is gone, but the driver's serial reader may still be draining
+    # its last output. Once the reader ends, machine.get_console_log()
+    # holds everything qemu wrote to stdio (the kernel console,
+    # including /dev/kmsg writes from the probe) from boot to halt.
+    machine.serial_thread.join()
     console = machine.get_console_log()
 
     # Locate systemd-shutdown's "Sending SIGKILL to remaining processes"
