@@ -62,8 +62,8 @@
 //! stays slot-owned and synchronous.
 //!
 //! Greeters the broker forks for `SpawnGreeter` are not slot workers:
-//! the broker keeps each one's pidfd as a loop source and reaps that
-//! greeter when it exits. A greeter is never in flight, so the broker
+//! the broker keeps each one's pidfd as a loop source and, when that
+//! greeter exits, SIGKILLs its process group and reaps it. A greeter is never in flight, so the broker
 //! idle-exits while one runs; the unit's `KillMode=process` leaves the
 //! greeter running, and it reparents to PID 1.
 //!
@@ -567,13 +567,31 @@ impl BrokerLoop {
         Ok(())
     }
 
-    /// A tracked greeter exited: reap it. The pid is a unique key
-    /// because an unreaped child's pid cannot be reused.
+    /// A tracked greeter exited: SIGKILL its process group, then reap
+    /// it. The greeter `setsid`s, so its pid is its process group id,
+    /// and the group holds only processes of the greeter's session.
+    /// Until the reap the greeter is a zombie whose pid cannot be
+    /// reused, so the pid is also a unique key here and the group
+    /// signal reaches only what the greeter left behind.
     fn reap_greeter(&mut self, pid: u32) {
         let Some(pos) = self.greeters.iter().position(|g| g.handle.pid == pid) else {
             return;
         };
         let g = self.greeters.swap_remove(pos);
+        match i32::try_from(pid) {
+            Ok(raw) => {
+                if let Err(e) = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(raw),
+                    nix::sys::signal::Signal::SIGKILL,
+                ) && e != nix::errno::Errno::ESRCH
+                {
+                    tracing_log(&format!(
+                        "killing greeter {pid}'s process group failed: {e}"
+                    ));
+                }
+            }
+            Err(_) => tracing_log(&format!("greeter pid {pid} out of range")),
+        }
         match g.handle.wait() {
             Ok(status) => tracing_log(&format!("greeter {pid} exited: {status:?}")),
             Err(e) => tracing_log(&format!("reaping greeter {pid} failed: {e}")),
@@ -1779,6 +1797,53 @@ mod tests {
     /// broker does not idle-exit under it. The compositor connects as
     /// soon as the greeter does and sends `BeginAuth` only once the
     /// user submits, which can be any time later.
+    /// When a greeter exits, whatever it left running in its process
+    /// group dies with it.
+    #[test]
+    fn exited_greeter_takes_its_process_group_with_it() {
+        let mut event_loop: EventLoop<'static, BrokerLoop> =
+            EventLoop::try_new().expect("event loop");
+        let mut bl = BrokerLoop::new(-1, GREETER, event_loop.handle(), event_loop.get_signal());
+        // Stands in for the greeter: leads its own session like the
+        // real one, leaves a child running, and exits when its channel
+        // closes.
+        let (handle, chan) = spawn_worker(|c| {
+            if nix::unistd::setsid().is_err() {
+                return;
+            }
+            let Ok(child) = std::process::Command::new("sleep").arg("600").spawn() else {
+                return;
+            };
+            let _ = c.send(&child.id());
+            let _ = c.recv::<WorkerOutcome>();
+        })
+        .expect("spawn stand-in greeter");
+        let left_behind: u32 = chan.recv().expect("left-behind child pid");
+        bl.track_greeter(handle).expect("track greeter");
+
+        drop(chan);
+        let stat = format!("/proc/{left_behind}/stat");
+        let gone = || {
+            std::fs::read_to_string(&stat).map_or(true, |s| {
+                s.rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with('Z') || rest.starts_with('X'))
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !(bl.greeters.is_empty() && gone()) {
+            if Instant::now() >= deadline {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(i32::try_from(left_behind).expect("pid fits i32")),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                panic!("the greeter's left-behind child outlived it");
+            }
+            event_loop
+                .dispatch(Some(Duration::from_millis(100)), &mut bl)
+                .expect("dispatch");
+        }
+    }
+
     /// A greeter the broker forked is its child: the broker reaps it
     /// when it exits (no zombie for the rest of the session), and a
     /// live greeter never holds the broker up past its idle window.

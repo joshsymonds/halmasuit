@@ -247,10 +247,18 @@ def run(machine, visual, *, cell_name, lukshape, no_flash_mode):
 
     # The swap SIGKILLed the greeter. Its whole process tree is gone,
     # and the broker, its parent, reaped it.
-    machine.wait_until_succeeds(
-        "test -z \"$(ps -u halmasuit-greeter -o stat=,args= | grep -v '^Z')\"",
-        timeout=30,
-    )
+    def greeter_leftovers():
+        return machine.succeed(
+            "ps -u halmasuit-greeter -o pid=,ppid=,stat=,etime=,cgroup=,args= "
+            "| grep -v '^ *[0-9]* *[0-9]* *Z' || true"
+        ).strip()
+
+    deadline = time.monotonic() + 30
+    while greeter_leftovers():
+        assert time.monotonic() < deadline, (
+            f"greeter processes outlived the swap:\n{greeter_leftovers()}"
+        )
+        time.sleep(1)
     machine.wait_until_succeeds(
         "pid=$(systemctl show -p MainPID --value halmasuit-session.service); "
         "test \"$pid\" -gt 0 && ! ps -o stat= --ppid \"$pid\" | grep -q '^Z'",
