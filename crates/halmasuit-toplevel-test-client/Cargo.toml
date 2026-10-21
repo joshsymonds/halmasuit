@@ -8,9 +8,7 @@ license.workspace        = true
 repository.workspace     = true
 authors.workspace        = true
 
-# Throwaway test client: built via nixpkgs's pinned rustc, so a
-# looser MSRV than the workspace pin is fine.
-rust-version       = "1.87"
+rust-version.workspace = true
 
 [lints]
 workspace = true

@@ -896,7 +896,7 @@ mod tests {
         })
         .unwrap();
         let o3 = conn.feed_greeter(&pmr).unwrap();
-        assert!(o3.reply.is_empty());
+        assert_eq!(o3.reply, [] as [u8; 0]);
         assert_eq!(
             o3.demand,
             Demand::Pam {
@@ -957,7 +957,7 @@ mod tests {
         let out = conn
             .feed_greeter(&[full[full.len() - 1]])
             .expect("final byte");
-        assert!(out.reply.is_empty());
+        assert_eq!(out.reply, [] as [u8; 0]);
         assert_eq!(out.demand, Demand::Pam { response: None });
     }
 

@@ -168,10 +168,10 @@ impl Introspect {
 
 /// Spawn the D-Bus server thread. Owns `org.halmasuit` on the **system
 /// bus** (halmasuit runs as a system service) and serves the
-/// `Introspect` object at `/org/halmasuit/Debug/Introspect`. The
-/// blocking zbus connection runs its own executor; this thread parks
-/// to keep the connection (and thus the served object) alive for the
-/// process lifetime.
+/// `Introspect` object at `/org/halmasuit/Debug/Introspect`. zbus's
+/// runtime serves the connection on its own helper thread; a holder
+/// thread parks to keep the connection (and thus the served object)
+/// alive for the process lifetime.
 ///
 /// Best-effort: a bus that is unreachable or a name that is policy-
 /// denied logs a warning and the thread exits — frame_audit's
@@ -189,12 +189,13 @@ pub fn serve(bufs: SnapshotHandles) {
     park_with_connection(conn);
 }
 
-fn build_connection(bufs: SnapshotHandles) -> Option<zbus::blocking::Connection> {
-    match zbus::blocking::connection::Builder::system()
-        .and_then(|b| b.name("org.halmasuit"))
-        .and_then(|b| b.serve_at("/org/halmasuit/Debug/Introspect", Introspect { bufs }))
-        .and_then(zbus::blocking::connection::Builder::build)
-    {
+fn build_connection(bufs: SnapshotHandles) -> Option<zbus::Connection> {
+    match zbus::block_on(
+        zbus::connection::Builder::system()
+            .name("org.halmasuit")
+            .serve_at("/org/halmasuit/Debug/Introspect", Introspect { bufs })
+            .build(),
+    ) {
         Ok(conn) => {
             tracing::info!("frame_audit D-Bus Snapshot() ready on org.halmasuit.Debug.Introspect");
             Some(conn)
@@ -206,10 +207,10 @@ fn build_connection(bufs: SnapshotHandles) -> Option<zbus::blocking::Connection>
     }
 }
 
-fn park_with_connection(conn: zbus::blocking::Connection) {
+fn park_with_connection(conn: zbus::Connection) {
     // Hand the established connection to a holder thread that parks to
     // keep it (and the served object) alive for the process lifetime.
-    // zbus dispatches method calls on its own internal executor.
+    // zbus's runtime dispatches method calls on its helper thread.
     std::thread::Builder::new()
         .name("halmasuit-dbus".to_owned())
         .spawn(move || {
@@ -247,9 +248,11 @@ mod tests {
         let frame = solid(7, 5, [0x16, 0xC4, 0x4E, 0xFF]);
         write_png(&frame, &path).expect("write_png");
 
-        let decoder = png::Decoder::new(std::fs::File::open(&path).expect("open"));
+        let decoder = png::Decoder::new(std::io::BufReader::new(
+            std::fs::File::open(&path).expect("open"),
+        ));
         let mut reader = decoder.read_info().expect("png info");
-        let mut out = vec![0; reader.output_buffer_size()];
+        let mut out = vec![0; reader.output_buffer_size().expect("png buffer size")];
         let info = reader.next_frame(&mut out).expect("png frame");
         assert_eq!(info.width, 7);
         assert_eq!(info.height, 5);
@@ -257,8 +260,10 @@ mod tests {
         // Every pixel is the green we wrote.
         assert!(
             out[..info.buffer_size()]
-                .chunks_exact(4)
-                .all(|p| p == [0x16, 0xC4, 0x4E, 0xFF])
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [0x16, 0xC4, 0x4E, 0xFF])
         );
     }
 

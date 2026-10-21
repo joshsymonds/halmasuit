@@ -8,7 +8,7 @@ edition.workspace      = true
 # nixpkgs's pinned rustc (currently 1.94.x on unstable) and we don't want
 # the probe to gate on workspace-wide MSRV bumps. Highest feature actually
 # used is std::os::unix::ffi (stable since 1.0).
-rust-version           = "1.87"
+rust-version = "1.87"
 license.workspace      = true
 repository.workspace   = true
 authors.workspace      = true
@@ -20,7 +20,7 @@ workspace = true
 # signalfd, sigprocmask, poll. `libc` would be needed for direct
 # syscall wrappers; we use nix's safe layer instead, so libc itself
 # isn't a direct dep.
-nix = { version = "0.30", features = ["signal", "poll"] }
+nix = { version = "0.31", features = ["signal", "poll"] }
 # Phase 2: DRM ioctls. Same crate + version as drm-master-probe.
 # Phase 0/1 don't link this; cargo's resolver only pulls it in
 # because Phase 2 is in the same binary, but the lean phase0/phase1

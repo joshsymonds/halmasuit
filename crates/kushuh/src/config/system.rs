@@ -107,7 +107,7 @@ mod tests {
     fn empty_system_is_valid() {
         let system = System::new("blank", vec![]).expect("an empty system is valid");
         assert_eq!(system.name(), "blank");
-        assert!(system.roles().is_empty());
+        assert_eq!(system.roles(), []);
     }
 
     #[test]

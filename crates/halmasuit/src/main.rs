@@ -125,7 +125,7 @@ struct HalmasuitState {
     /// routed here and forwarded to the keyboard-focused client.
     seat: Seat<Self>,
     // OutputManagerState exists to keep the xdg_output_manager global
-    // alive; nothing reads the field directly (delegate_output! handles
+    // alive; nothing reads the field directly (delegate_dispatch2! handles
     // dispatch via the type), hence the leading underscore.
     _output_manager_state: OutputManagerState,
     /// The smithay `Output`s representing halmasuit's displays — one
@@ -148,7 +148,7 @@ struct HalmasuitState {
     /// `zwp_linux_dmabuf_v1` state. The global is created at startup
     /// from the renderer's supported dmabuf formats; the
     /// `dmabuf_state` field stores the smithay-side bookkeeping and
-    /// is referenced via `delegate_dmabuf!`. On the SKIP (no-DRM)
+    /// is referenced via `DmabufHandler`. On the SKIP (no-DRM)
     /// path there is no renderer, so no global is advertised —
     /// clients fall back to wl_shm cleanly. R10 (convergence).
     dmabuf_state: smithay::wayland::dmabuf::DmabufState,
@@ -570,7 +570,7 @@ impl HalmasuitState {
                     return;
                 };
                 let serial = SERIAL_COUNTER.next_serial();
-                let time = event.time_msec();
+                let time = event.time();
                 let code = event.key_code();
                 let key_state = event.state();
                 // Epic #71 system chords: intercept BEFORE forwarding
@@ -865,7 +865,7 @@ impl HalmasuitState {
             &MotionEvent {
                 location,
                 serial,
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         );
         pointer.frame(self);
@@ -891,7 +891,7 @@ impl HalmasuitState {
             &MotionEvent {
                 location,
                 serial: SERIAL_COUNTER.next_serial(),
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         );
         pointer.frame(self);
@@ -914,7 +914,7 @@ impl HalmasuitState {
                 button,
                 state,
                 serial,
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         );
         pointer.frame(self);
@@ -930,7 +930,7 @@ impl HalmasuitState {
         let v = evt
             .amount(Axis::Vertical)
             .unwrap_or_else(|| evt.amount_v120(Axis::Vertical).unwrap_or(0.0) * 15.0 / 120.0);
-        let mut frame = AxisFrame::new(evt.time_msec()).source(evt.source());
+        let mut frame = AxisFrame::new(evt.time()).source(evt.source());
         if h != 0.0 {
             frame = frame
                 .relative_direction(Axis::Horizontal, evt.relative_direction(Axis::Horizontal))
@@ -1000,7 +1000,7 @@ impl HalmasuitState {
                 slot: evt.slot(),
                 location,
                 serial: SERIAL_COUNTER.next_serial(),
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         );
     }
@@ -1017,7 +1017,7 @@ impl HalmasuitState {
             &smithay::input::touch::UpEvent {
                 slot: evt.slot(),
                 serial: SERIAL_COUNTER.next_serial(),
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         );
     }
@@ -1038,7 +1038,7 @@ impl HalmasuitState {
             &smithay::input::touch::MotionEvent {
                 slot: evt.slot(),
                 location,
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         );
     }
@@ -1682,7 +1682,6 @@ impl WlrLayerShellHandler for HalmasuitState {
         self.refresh_window_snapshot();
     }
 }
-smithay::delegate_layer_shell!(HalmasuitState);
 
 impl XdgShellHandler for HalmasuitState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -1940,18 +1939,15 @@ impl smithay::wayland::dmabuf::DmabufHandler for HalmasuitState {
         }
     }
 }
-smithay::delegate_dmabuf!(HalmasuitState);
-smithay::delegate_presentation!(HalmasuitState);
-smithay::delegate_viewporter!(HalmasuitState);
-smithay::delegate_fractional_scale!(HalmasuitState);
-smithay::delegate_single_pixel_buffer!(HalmasuitState);
-smithay::delegate_pointer_gestures!(HalmasuitState);
-smithay::delegate_tablet_manager!(HalmasuitState);
 
 // Phase B handlers: smithay traits with sensible default impls.
 // Nothing protocol-visible to customize for v1.
 impl smithay::wayland::fractional_scale::FractionalScaleHandler for HalmasuitState {}
-impl smithay::wayland::tablet_manager::TabletSeatHandler for HalmasuitState {}
+impl smithay::input::tablet::TabletSeatHandler for HalmasuitState {
+    type ToolFocus = WlSurface;
+}
+impl smithay::wayland::pointer_constraints::PointerConstraintsHandler for HalmasuitState {}
+impl smithay::wayland::text_input::TextInputActivation for HalmasuitState {}
 
 // Phase B: xdg-decoration handler. halmasuit always answers
 // `ServerSide` — its single fullscreen toplevel needs no decoration,
@@ -1976,7 +1972,6 @@ impl smithay::wayland::shell::xdg::decoration::XdgDecorationHandler for Halmasui
         toplevel.send_pending_configure();
     }
 }
-smithay::delegate_xdg_decoration!(HalmasuitState);
 
 impl smithay::wayland::xdg_activation::XdgActivationHandler for HalmasuitState {
     fn activation_state(&mut self) -> &mut smithay::wayland::xdg_activation::XdgActivationState {
@@ -1994,7 +1989,6 @@ impl smithay::wayland::xdg_activation::XdgActivationHandler for HalmasuitState {
         tracing::debug!("xdg_activation: request_activation (ignored in v1)");
     }
 }
-smithay::delegate_xdg_activation!(HalmasuitState);
 
 // Phase B: zwp_idle_inhibit — no idle behavior in v1; inhibit/
 // uninhibit are no-ops.
@@ -2002,7 +1996,6 @@ impl smithay::wayland::idle_inhibit::IdleInhibitHandler for HalmasuitState {
     fn inhibit(&mut self, _surface: WlSurface) {}
     fn uninhibit(&mut self, _surface: WlSurface) {}
 }
-smithay::delegate_idle_inhibit!(HalmasuitState);
 
 // Phase B: zwp_keyboard_shortcuts_inhibit — no global shortcuts in
 // v1; smithay tracks inhibitor objects, default trait methods are
@@ -2016,7 +2009,6 @@ impl smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitHandl
         &mut self.keyboard_shortcuts_inhibit_state
     }
 }
-smithay::delegate_keyboard_shortcuts_inhibit!(HalmasuitState);
 
 // Phase B: xdg_foreign_v2 — cross-client toplevel handle export/import.
 // halmasuit hosts one fullscreen toplevel per phase so cross-client
@@ -2026,19 +2018,16 @@ impl smithay::wayland::xdg_foreign::XdgForeignHandler for HalmasuitState {
         &mut self.xdg_foreign_state
     }
 }
-smithay::delegate_xdg_foreign!(HalmasuitState);
 
 // Phase B: xdg_wm_dialog_v1 — GTK 4 / Qt 6 mark toplevels as
 // modal/non-modal dialogs via this. halmasuit takes no action on the
 // hint; smithay's default no-op `dialog_hint_changed` is fine.
 impl smithay::wayland::shell::xdg::dialog::XdgDialogHandler for HalmasuitState {}
-smithay::delegate_xdg_dialog!(HalmasuitState);
 
 // Phase B: xdg_toplevel_icon_manager_v1 — toolkits set toplevel icons
 // via this protocol. halmasuit shows no titlebars/task list in v1;
 // smithay caches the request, default no-op `set_icon` is fine.
 impl smithay::wayland::xdg_toplevel_icon::XdgToplevelIconHandler for HalmasuitState {}
-smithay::delegate_xdg_toplevel_icon!(HalmasuitState);
 
 // Phase B: wl_data_device_manager — wayland.xml core selection/DnD.
 // Selection (clipboard) routing between clients is internal to
@@ -2061,7 +2050,6 @@ impl smithay::input::dnd::DndGrabHandler for HalmasuitState {}
 impl smithay::wayland::selection::SelectionHandler for HalmasuitState {
     type SelectionUserData = ();
 }
-smithay::delegate_data_device!(HalmasuitState);
 
 // Phase B: zwp_primary_selection_device_manager_v1 — X11-style
 // middle-click primary buffer. Shares the SelectionHandler with
@@ -2076,14 +2064,12 @@ impl smithay::wayland::selection::primary_selection::PrimarySelectionHandler for
         &mut self.primary_selection_state
     }
 }
-smithay::delegate_primary_selection!(HalmasuitState);
 
 // Phase B: zwp_text_input_manager_v3 — Qt-mandatory IME protocol.
 // No explicit handler trait; the delegate macro provides all dispatch.
 // halmasuit hosts no input-method-v2 server, so text-input clients
 // bind successfully and track focus via TextInputHandle in seat
 // user_data, but never receive preedit/commit events.
-smithay::delegate_text_input_manager!(HalmasuitState);
 
 // Phase B: wp_cursor_shape_manager_v1 — named-cursor protocol.
 // Smithay's delegate routes set_shape requests through
@@ -2091,7 +2077,6 @@ smithay::delegate_text_input_manager!(HalmasuitState);
 // existing R8b-state cursor_image impl stores the latest status,
 // so no additional handler is needed; visible cursor compositing
 // from that state is the orthogonal R8b-render follow-up.
-smithay::delegate_cursor_shape!(HalmasuitState);
 
 impl BufferHandler for HalmasuitState {
     fn buffer_destroyed(
@@ -3802,10 +3787,10 @@ fn write_kmsg(line: &str) {
 /// the receiving callback triggers `graceful_shutdown`.
 ///
 /// Why a thread + channel and not async-zbus inline: halmasuit's
-/// calloop is sync, smithay's reexports of calloop don't enable the
-/// `executor` feature, and zbus's `blocking::Connection` is a clean
-/// fit. The thread owns a Connection + signal-stream iterator; calloop
-/// receives only `bool` payloads. The thread exits naturally when the
+/// calloop is sync and smithay's reexports of calloop don't enable the
+/// `executor` feature, so the thread drives zbus with `zbus::block_on`
+/// for its whole life. The thread owns a Connection + signal stream;
+/// calloop receives only `bool` payloads. The thread exits naturally when the
 /// channel's receiver drops (which happens on compositor shutdown — at
 /// which point the system bus is also tearing down, so the iterator's
 /// next read would error anyway).
@@ -3944,52 +3929,59 @@ fn spawn_prepare_for_shutdown_watcher(loop_handle: &LoopHandle<'static, Halmasui
 /// the systemd-shutdown SIGTERM" ordering that the `graceful_shutdown`
 /// re-entry-bail already relies on.
 fn acquire_shutdown_delay_inhibitor() -> Option<std::os::fd::OwnedFd> {
-    let conn = match zbus::blocking::Connection::system() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "shutdown inhibitor: system bus unavailable; relying on PrepareForShutdown ordering"
-            );
-            return None;
-        }
-    };
-    let proxy = match zbus::blocking::Proxy::new(
-        &conn,
-        "org.freedesktop.login1",
-        "/org/freedesktop/login1",
-        "org.freedesktop.login1.Manager",
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "shutdown inhibitor: Proxy::new failed; relying on PrepareForShutdown ordering"
-            );
-            return None;
-        }
-    };
-    // Inhibit(what, who, why, mode) -> h (fd). mode="delay".
-    let fd: zbus::zvariant::OwnedFd = match proxy.call(
-        "Inhibit",
-        &(
-            "shutdown",
-            "halmasuit",
-            "paint wallpaper until halt for flash-free shutdown",
-            "delay",
-        ),
-    ) {
-        Ok(fd) => fd,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "shutdown inhibitor: Inhibit refused; relying on PrepareForShutdown ordering"
-            );
-            return None;
-        }
-    };
-    tracing::info!("shutdown delay inhibitor acquired");
-    Some(std::os::fd::OwnedFd::from(fd))
+    zbus::block_on(async {
+        let conn = match zbus::Connection::system().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "shutdown inhibitor: system bus unavailable; relying on PrepareForShutdown ordering"
+                );
+                return None;
+            }
+        };
+        let proxy = match zbus::Proxy::new(
+            &conn,
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "shutdown inhibitor: Proxy::new failed; relying on PrepareForShutdown ordering"
+                );
+                return None;
+            }
+        };
+        // Inhibit(what, who, why, mode) -> h (fd). mode="delay".
+        let fd: zbus::OwnedFd = match proxy
+            .call(
+                "Inhibit",
+                &(
+                    "shutdown",
+                    "halmasuit",
+                    "paint wallpaper until halt for flash-free shutdown",
+                    "delay",
+                ),
+            )
+            .await
+        {
+            Ok(fd) => fd,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "shutdown inhibitor: Inhibit refused; relying on PrepareForShutdown ordering"
+                );
+                return None;
+            }
+        };
+        tracing::info!("shutdown delay inhibitor acquired");
+        Some(std::os::fd::OwnedFd::from(fd))
+    })
 }
 
 /// Wire the reactive-wallpaper event consumer: a calloop channel fed by
@@ -4041,14 +4033,21 @@ fn spawn_wallpaper_event_consumer(loop_handle: &LoopHandle<'static, HalmasuitSta
     });
 }
 
-/// Blocking inner loop for the login1 watcher thread. Connects to the
+/// Inner loop for the login1 watcher thread: drives zbus with
+/// `zbus::block_on` for the thread's whole life. Connects to the
 /// system bus, builds a signal stream on
 /// `org.freedesktop.login1.Manager.PrepareForShutdown`, and forwards
 /// each `(arming: bool,)` payload through `tx`. Exits if the connection
 /// dies, the bus name vanishes, or `tx` is dropped — all of which are
 /// terminal for the watcher's purpose.
 fn run_prepare_for_shutdown_loop(tx: &calloop::channel::Sender<bool>) {
-    let conn = match zbus::blocking::Connection::system() {
+    zbus::block_on(prepare_for_shutdown_loop(tx));
+}
+
+async fn prepare_for_shutdown_loop(tx: &calloop::channel::Sender<bool>) {
+    use zbus::export::futures_core::Stream as _;
+
+    let conn = match zbus::Connection::system().await {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "login1-watcher: zbus system() failed; no shutdown cue");
@@ -4056,15 +4055,14 @@ fn run_prepare_for_shutdown_loop(tx: &calloop::channel::Sender<bool>) {
         }
     };
 
-    // Subscribe to Manager.PrepareForShutdown.  zbus's blocking
-    // MatchRule/signal-iterator path is the canonical "watch for a
-    // specific signal forever" shape.  See zbus 5.x docs.
-    let proxy = match zbus::blocking::Proxy::new(
+    let proxy = match zbus::Proxy::new(
         &conn,
         "org.freedesktop.login1",
         "/org/freedesktop/login1",
         "org.freedesktop.login1.Manager",
-    ) {
+    )
+    .await
+    {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "login1-watcher: Proxy::new failed");
@@ -4072,7 +4070,7 @@ fn run_prepare_for_shutdown_loop(tx: &calloop::channel::Sender<bool>) {
         }
     };
 
-    let iter = match proxy.receive_signal("PrepareForShutdown") {
+    let mut stream = match proxy.receive_signal("PrepareForShutdown").await {
         Ok(it) => it,
         Err(e) => {
             tracing::warn!(error = %e, "login1-watcher: receive_signal failed");
@@ -4082,7 +4080,9 @@ fn run_prepare_for_shutdown_loop(tx: &calloop::channel::Sender<bool>) {
 
     tracing::info!("login1-watcher: subscribed to PrepareForShutdown");
 
-    for msg in iter {
+    while let Some(msg) =
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut stream).poll_next(cx)).await
+    {
         let arming: bool = match msg.body().deserialize() {
             Ok(v) => v,
             Err(e) => {
@@ -4357,11 +4357,9 @@ fn dispatch_display(
     Ok(PostAction::Continue)
 }
 
-smithay::delegate_compositor!(HalmasuitState);
-smithay::delegate_xdg_shell!(HalmasuitState);
-smithay::delegate_seat!(HalmasuitState);
-smithay::delegate_output!(HalmasuitState);
-smithay::delegate_shm!(HalmasuitState);
+// Every smithay protocol handler above dispatches through smithay's
+// `Dispatch2`/`GlobalDispatch2` user data; one macro wires them all.
+smithay::delegate_dispatch2!(HalmasuitState);
 
 /// Run one main-loop iteration behind a fault boundary (Epic #1 R5).
 ///
@@ -5271,7 +5269,7 @@ fn main() -> io::Result<()> {
     // before `SurviveFinalKillSignal=yes` could possibly become
     // relevant. It's the canonical "shutdown is imminent" cue for
     // long-lived system processes that need to clean up gracefully.
-    // halmasuit subscribes to it (via a dedicated zbus-blocking
+    // halmasuit subscribes to it (via a dedicated zbus watcher
     // thread that posts into a calloop channel back to the main
     // loop) and treats it as the trigger for `graceful_shutdown` —
     // greeter killed, wallpaper-only recomposite, `DrmDevice::pause`,

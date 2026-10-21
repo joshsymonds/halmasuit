@@ -137,7 +137,7 @@ impl State {
             .pool
             .create_buffer(w, h, stride, Format::Argb8888)
             .expect("create_buffer");
-        for px in canvas.chunks_exact_mut(4) {
+        for px in canvas.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&self.color);
         }
         let surface = self.window.wl_surface();

@@ -158,8 +158,11 @@ without explicit user direction.
   over `_`, extracted helpers over `too_many_lines` allows. If
   reaching for an `#![allow]`, ask the user first — they're a
   judgment call that survives the immediate task.
-- **Edition 2024, Rust 1.95 pin** (see `rust-toolchain.toml`). Don't
-  bump the channel without coordinating; CI caches key on it.
+- **Edition 2024; workspace MSRV 1.95** (`rust-version` in
+  Cargo.toml). The toolchain is `rust-toolchain.toml`'s `stable`,
+  resolved by the flake's `rust-overlay` lock and provided by the
+  devShell from the Nix store (no rustup). Bump it with
+  `nix flake update rust-overlay`; CI caches key on it.
 - **Cargo workspace, monorepo, atomic commits.** A change touching the
   greetd protocol + the CLI + the IPC types lands in one commit.
 - **Test user is `tests/lib/test-user.nix`.** New VM tests import it;
@@ -199,7 +202,7 @@ These are the easy traps to fall into when adding real deps:
   against the build host's libpam headers (libpam ABI drift fails CI
   before the broker hits it). Do not add a second production PAM
   crate; do not introduce a `build.rs` in halmasuit-session.
-- **D-Bus** — `zbus` 5.x. Do not pull in glib.
+- **D-Bus** — `zbus` 6.x. Do not pull in glib.
 - **wayland-server** + **calloop** are smithay's, follow smithay's
   pin.
 

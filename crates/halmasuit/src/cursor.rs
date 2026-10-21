@@ -205,7 +205,9 @@ mod tests {
         );
         let opaque_count = frame
             .pixels_rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[3] == 0xff)
             .count();
         assert!(

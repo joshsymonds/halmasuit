@@ -1028,7 +1028,7 @@ mod tests {
         let (rc, resp) = run(&[(99, "weird")], &mut r);
         assert_eq!(rc, pam_sys::PAM_CONV_ERR);
         assert!(resp.is_null(), "no array published on the error path");
-        assert!(r.seen.is_empty());
+        assert_eq!(r.seen, [] as [halmasuit_session_ipc::BrokerToCompositor; 0]);
     }
 
     #[test]

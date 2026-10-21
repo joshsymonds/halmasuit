@@ -39,15 +39,14 @@ jobs:
           name: joshsymonds
         continue-on-error: true
 
-      # Cache Rust toolchain + cargo registry + build artifacts. Currently
-      # mostly empty (v1 workspace has zero deps), but cheap to wire in now
-      # so future v2 builds don't start from scratch on every CI run.
+      # Cache the cargo registry (the devShell's CARGO_HOME is
+      # ./.cargo-home) and build artifacts. The toolchain itself comes
+      # from the Nix store via the devShell.
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830    # v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.rustup
+            .cargo-home/registry
+            .cargo-home/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |

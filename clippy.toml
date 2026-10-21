@@ -2,6 +2,5 @@
 # under [workspace.lints.clippy]. This file is for per-lint tuning thresholds
 # (e.g. cognitive-complexity-threshold) that don't fit the level-only model.
 #
-# Empty for now. Tune as real code lands.
-
-msrv = "1.95"
+# MSRV is not set here: clippy reads each crate's `rust-version` from
+# Cargo.toml (the workspace's 1.95, or a probe's looser pin).

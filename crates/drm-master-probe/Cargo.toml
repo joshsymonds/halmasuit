@@ -10,7 +10,7 @@ edition.workspace = true
 # relaxation, not a workspace-wide concession. Production crates
 # (halmasuit-*) keep the 1.95 minimum. Highest feature used: `is_multiple_of`
 # stabilized in 1.87.
-rust-version       = "1.87"
+rust-version = "1.87"
 license.workspace  = true
 repository.workspace = true
 authors.workspace  = true
@@ -47,7 +47,7 @@ smithay = { workspace = true, optional = true, features = [
 # Phase 1: setresuid for the privilege-drop step post-switch_root. The
 # `user` feature gates nix::unistd::{Uid, setresuid}.
 # Phase 3: execve (process feature) for the exec-across-switch_root test.
-nix    = { version = "0.30", features = ["user", "process"] }
+nix    = { version = "0.31", features = ["user", "process"] }
 # Phase 1 diagnostic instrumentation: dup2 for stderr-redirect to a file
 # in /run (so writes don't depend on journald's stderr pipe surviving
 # switch_root), and signal() for installing async-signal-safe handlers

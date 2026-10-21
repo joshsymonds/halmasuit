@@ -230,7 +230,7 @@ impl State {
             .pool
             .create_buffer(self.width as i32, height, stride, Format::Argb8888)
             .expect("create_buffer");
-        for pixel in canvas.chunks_exact_mut(4) {
+        for pixel in canvas.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&self.color);
         }
         layer

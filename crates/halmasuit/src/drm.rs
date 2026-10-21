@@ -1634,7 +1634,7 @@ impl DrmBackend {
         let hu = usize::try_from(h).expect("h >= 1");
 
         let mut px = vec![0_u8; wu * hu * 4];
-        for chunk in px.chunks_exact_mut(4) {
+        for chunk in px.as_chunks_mut::<4>().0 {
             chunk.copy_from_slice(&OVERLAY_BG);
         }
         crate::console_font::blit_str(&mut px, wu, hu, 8, 8, &self.overlay_text, OVERLAY_FG);

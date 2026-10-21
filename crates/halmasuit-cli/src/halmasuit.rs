@@ -77,21 +77,30 @@ fn print_help() {
 }
 
 fn cmd_status() -> Result<()> {
-    let conn = zbus::blocking::Connection::system().context("connect to system bus")?;
-    let proxy = compositor1_proxy(&conn)?;
+    let (phase, uptime, frame_counter, broker_status) = zbus::block_on(async {
+        let conn = zbus::Connection::system()
+            .await
+            .context("connect to system bus")?;
+        let proxy = compositor1_proxy(&conn).await?;
 
-    let phase: String = proxy
-        .call("GetPhase", &())
-        .context("Compositor1.GetPhase")?;
-    let uptime: u64 = proxy
-        .call("GetUptime", &())
-        .context("Compositor1.GetUptime")?;
-    let frame_counter: u64 = proxy
-        .call("GetFrameCounter", &())
-        .context("Compositor1.GetFrameCounter")?;
-    let broker_status: String = proxy
-        .call("GetBrokerStatus", &())
-        .context("Compositor1.GetBrokerStatus")?;
+        let phase: String = proxy
+            .call("GetPhase", &())
+            .await
+            .context("Compositor1.GetPhase")?;
+        let uptime: u64 = proxy
+            .call("GetUptime", &())
+            .await
+            .context("Compositor1.GetUptime")?;
+        let frame_counter: u64 = proxy
+            .call("GetFrameCounter", &())
+            .await
+            .context("Compositor1.GetFrameCounter")?;
+        let broker_status: String = proxy
+            .call("GetBrokerStatus", &())
+            .await
+            .context("Compositor1.GetBrokerStatus")?;
+        anyhow::Ok((phase, uptime, frame_counter, broker_status))
+    })?;
 
     println!("phase={phase}");
     println!("uptime_secs={uptime}");
@@ -101,12 +110,16 @@ fn cmd_status() -> Result<()> {
 }
 
 fn cmd_windows() -> Result<()> {
-    let conn = zbus::blocking::Connection::system().context("connect to system bus")?;
-    let proxy = compositor1_proxy(&conn)?;
-
-    let windows: Vec<(u32, String, String)> = proxy
-        .call("ListWindows", &())
-        .context("Compositor1.ListWindows")?;
+    let windows: Vec<(u32, String, String)> = zbus::block_on(async {
+        let conn = zbus::Connection::system()
+            .await
+            .context("connect to system bus")?;
+        compositor1_proxy(&conn)
+            .await?
+            .call("ListWindows", &())
+            .await
+            .context("Compositor1.ListWindows")
+    })?;
 
     if windows.is_empty() {
         println!("(no windows)");
@@ -156,8 +169,9 @@ const COMPOSITOR1_BUS: &str = "org.halmasuit.Compositor1";
 const COMPOSITOR1_PATH: &str = "/org/halmasuit/Compositor1";
 const COMPOSITOR1_IFACE: &str = "org.halmasuit.Compositor1";
 
-fn compositor1_proxy(conn: &zbus::blocking::Connection) -> Result<zbus::blocking::Proxy<'static>> {
-    zbus::blocking::Proxy::new(conn, COMPOSITOR1_BUS, COMPOSITOR1_PATH, COMPOSITOR1_IFACE)
+async fn compositor1_proxy(conn: &zbus::Connection) -> Result<zbus::Proxy<'static>> {
+    zbus::Proxy::new(conn, COMPOSITOR1_BUS, COMPOSITOR1_PATH, COMPOSITOR1_IFACE)
+        .await
         .context("build Compositor1 proxy")
 }
 

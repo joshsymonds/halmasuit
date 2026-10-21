@@ -243,7 +243,7 @@ mod tests {
     fn outstanding_requests_returns_empty_when_dir_missing() {
         let path = std::path::Path::new("/this/dir/does/not/exist/ever");
         let found = outstanding_requests(path).expect("missing dir must be Ok(empty)");
-        assert!(found.is_empty());
+        assert_eq!(found, [] as [std::path::PathBuf; 0]);
     }
 
     #[test]

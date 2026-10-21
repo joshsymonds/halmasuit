@@ -145,8 +145,8 @@ mod tests {
     fn expected_solid_frame_is_tightly_packed_rgba_with_opaque_alpha() {
         let f = expected_solid_frame(4, 3, CLEAR_RGB);
         assert_eq!(f.len(), 4 * 3 * 4);
-        for px in f.chunks_exact(4) {
-            assert_eq!(px, [CLEAR_RGB[0], CLEAR_RGB[1], CLEAR_RGB[2], 0xFF]);
+        for px in f.as_chunks::<4>().0 {
+            assert_eq!(*px, [CLEAR_RGB[0], CLEAR_RGB[1], CLEAR_RGB[2], 0xFF]);
         }
     }
 

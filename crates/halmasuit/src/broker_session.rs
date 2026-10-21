@@ -845,7 +845,7 @@ mod tests {
         let (mut ep, broker) = episode();
         let o = ep.on_greeter_bytes(&create("alice"));
         // Suspended for the PAM round: nothing for the greeter yet.
-        assert!(o.greeter_reply.is_empty());
+        assert_eq!(o.greeter_reply, [] as [u8; 0]);
         assert!(!o.terminate);
         assert_eq!(o.spawned, None);
         // BeginAuth carries the client hint verbatim (R8 hint only).
@@ -891,7 +891,7 @@ mod tests {
         })
         .unwrap();
         let o = ep.on_greeter_bytes(&pmr);
-        assert!(o.greeter_reply.is_empty());
+        assert_eq!(o.greeter_reply, [] as [u8; 0]);
         match broker_recv(&broker) {
             CompositorToBroker::ConvResponse { response } => {
                 assert_eq!(response.expose(), "hunter2");
@@ -1123,6 +1123,6 @@ mod tests {
             },
         );
         let o = ep.on_broker_readable();
-        assert!(!o.greeter_reply.is_empty());
+        assert_ne!(o.greeter_reply, [] as [u8; 0]);
     }
 }

@@ -276,12 +276,16 @@ pub fn serve(state: CompositorObservability) {
     park_with_connection(conn);
 }
 
-fn build_connection(state: CompositorObservability) -> Option<zbus::blocking::Connection> {
-    match zbus::blocking::connection::Builder::system()
-        .and_then(|b| b.name("org.halmasuit.Compositor1"))
-        .and_then(|b| b.serve_at("/org/halmasuit/Compositor1", Compositor1::new(state)))
-        .and_then(zbus::blocking::connection::Builder::build)
-    {
+fn build_connection(state: CompositorObservability) -> Option<zbus::Connection> {
+    // Built inside `zbus::block_on` on the caller's thread; once the
+    // call returns, zbus's runtime keeps serving the connection on its
+    // own helper thread.
+    match zbus::block_on(
+        zbus::connection::Builder::system()
+            .name("org.halmasuit.Compositor1")
+            .serve_at("/org/halmasuit/Compositor1", Compositor1::new(state))
+            .build(),
+    ) {
         Ok(conn) => {
             tracing::info!(
                 "Compositor1 D-Bus ready on org.halmasuit.Compositor1 \
@@ -299,11 +303,11 @@ fn build_connection(state: CompositorObservability) -> Option<zbus::blocking::Co
     }
 }
 
-fn park_with_connection(conn: zbus::blocking::Connection) {
-    // Same pattern as the existing dbus.rs serve() — the blocking
-    // zbus connection runs its own executor; this thread parks to
-    // keep the connection (and thus the served object) alive for
-    // the process lifetime.
+fn park_with_connection(conn: zbus::Connection) {
+    // Same pattern as dbus.rs serve() — zbus's runtime serves the
+    // connection on its own helper thread; this thread parks to keep
+    // the connection (and thus the served object) alive for the
+    // process lifetime.
     std::thread::Builder::new()
         .name("halmasuit-compositor1-dbus".to_owned())
         .spawn(move || {
@@ -399,7 +403,7 @@ mod tests {
         let state = CompositorObservability::new();
         let comp = Compositor1::new(state.clone());
         // Empty store → empty list.
-        assert!(comp.list_windows().is_empty());
+        assert_eq!(comp.list_windows(), [] as [(u32, String, String); 0]);
         // A snapshot written through the shared Arc (as the calloop
         // thread does via refresh_window_snapshot) is visible to the
         // DBus reader.

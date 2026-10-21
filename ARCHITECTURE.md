@@ -894,7 +894,7 @@ Outbound service (halmasuit-as-server):
   `wheel`/interactive auth). Not yet implemented; lands with the
   lock-screen + inner-WM-restart milestones.
 
-D-Bus libraries: `zbus` (5.x), async, native Rust, no glib dependency.
+D-Bus libraries: `zbus` (6.x), async, native Rust, no glib dependency.
 
 ---
 
@@ -1108,17 +1108,18 @@ that must have fuzz tests and property tests.
 
 ## Rust toolchain and ecosystem
 
-As of project start (2026-05):
+Current pins (the toolchain resolves through the flake's `rust-overlay`
+lock; crate versions are `Cargo.lock`'s):
 
 | Item | Version | Notes |
 |---|---|---|
-| Rust stable | 1.95.0 (2026-04-16); 1.96 due 2026-05-28 | Pin via `rust-toolchain.toml` |
-| Rust edition | **2024** | Bleeding-edge; editions are 3-year cadence (2015/2018/2021/2024, next ~2028). No 2027 edition exists. |
-| `wayland-server` | 0.31.13 | Stable |
-| `calloop` | 0.14.4 | Smithay's event loop |
+| Rust stable | 1.99.1 | `rust-toolchain.toml` channel `stable`; workspace MSRV (`rust-version`) 1.95 |
+| Rust edition | **2024** | Editions are a 3-year cadence (2015/2018/2021/2024, next ~2028). |
+| `wayland-server` | 0.31.14 | Stable |
+| `calloop` | 0.14.5 | Smithay's event loop |
 | `tracing` | 0.1.44 | |
-| `zbus` | 5.15.0 | |
-| `drm` | 0.15.0 | |
+| `zbus` | 6.0.0 | |
+| `drm` | 0.14.1 | smithay's; the research probes use 0.15.0 |
 | `input` (libinput) | 0.10.0 | |
 | `wlcs` | 1.8.1 | Canonical-maintained, active |
 
@@ -1129,10 +1130,10 @@ since: DnD refactor, surface state overhaul, `delegate_dispatch2!` macro
 collapse, framebuffer-effect render elements). This is the standard
 smithay-downstream pattern.
 
-**PAM bindings ecosystem is stale.** `pam-client` last touched 2022;
-`pam-sys` 2023. Options for v2: (a) use them as-is — the C API is
-stable; (b) fork one with updates; (c) write thin FFI via `bindgen`.
-Decision deferred to v2.
+**PAM bindings:** `halmasuit-session` links libpam through hand-rolled
+FFI (`crates/halmasuit-session/src/pam_sys.rs`, sudo-rs's pattern); the
+third-party `pam-sys` crate survives only as a dev-dependency ABI-parity
+check. CLAUDE.md "Ecosystem caveats" has the detail.
 
 ---
 

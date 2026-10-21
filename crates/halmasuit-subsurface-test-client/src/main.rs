@@ -209,7 +209,7 @@ impl State {
             .pool
             .create_buffer(w, h, stride, Format::Argb8888)
             .expect("create parent buffer");
-        for px in canvas.chunks_exact_mut(4) {
+        for px in canvas.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&color);
         }
         let surface = self.window.wl_surface();
@@ -224,7 +224,7 @@ impl State {
             .pool
             .create_buffer(CHILD_W, CHILD_H, stride, Format::Argb8888)
             .expect("create child buffer");
-        for px in canvas.chunks_exact_mut(4) {
+        for px in canvas.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&color);
         }
         self.child_surface.damage_buffer(0, 0, CHILD_W, CHILD_H);

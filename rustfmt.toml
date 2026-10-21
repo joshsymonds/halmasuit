@@ -5,6 +5,6 @@ use_try_shorthand        = true
 newline_style            = "Unix"
 # Note: imports_granularity, group_imports, and unstable_features were
 # previously set here but require nightly rustfmt. Dropping them keeps
-# `cargo fmt` on stable, which avoids the rustup-fetch tax on every fresh
-# CI runner. Re-add when these stabilize, or revisit if grouped imports
+# `cargo fmt` on the pinned stable toolchain. Re-add when these
+# stabilize, or revisit if grouped imports
 # become important for readability.

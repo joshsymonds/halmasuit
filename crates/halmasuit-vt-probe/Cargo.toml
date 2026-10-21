@@ -7,7 +7,7 @@ edition.workspace      = true
 # Same MSRV relaxation rationale as the other probes: probes build under
 # nixpkgs's pinned rustc and we don't want the probe to gate on
 # workspace-wide MSRV bumps.
-rust-version           = "1.87"
+rust-version = "1.87"
 license.workspace      = true
 repository.workspace   = true
 authors.workspace      = true
@@ -17,7 +17,7 @@ workspace = true
 
 [dependencies]
 # signalfd, sigprocmask, poll, setsid, setresuid, setresgid, getpwnam.
-nix = { version = "0.30", features = ["signal", "poll", "user", "fs"] }
+nix = { version = "0.31", features = ["signal", "poll", "user", "fs"] }
 # Capability-bounding-set drop + verification. Matches the dependency
 # halmasuit's main daemon uses for the in-process privilege drop.
 caps = "0.5"

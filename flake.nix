@@ -27,8 +27,8 @@
     };
 
     # rust-toolchain.toml is the single source of truth for halmasuit's
-    # toolchain. rust-overlay reads it so Nix builds compile with the same
-    # rustc that rustup uses locally. Without this, nixpkgs's rustc lags
+    # toolchain. rust-overlay reads it so Nix builds and the devShell
+    # compile with the same rustc. Without this, nixpkgs's rustc lags
     # the workspace's pinned channel (today: nixpkgs ships 1.94.1, we want
     # 1.95 for edition 2024 + recent stable features).
     rust-overlay = {
@@ -59,7 +59,7 @@
       };
 
       # Toolchain derived from rust-toolchain.toml. Single source of truth
-      # shared with rustup.
+      # shared by the devShell and every package build.
       rustToolchainFor = pkgs:
         pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
@@ -82,12 +82,12 @@
           default = pkgs.mkShell {
             name = "halmasuit-dev";
             packages = with pkgs; [
-              # Rust toolchain — rustup respects rust-toolchain.toml at the repo root.
-              rustup
+              # Rust toolchain from rust-toolchain.toml via rust-overlay —
+              # the same derivation the packages below build with.
+              (rustToolchainFor pkgs)
 
               # Cargo workspace tooling.
               cargo-nextest
-              cargo-llvm-cov
               cargo-deny
               cargo-machete
               cargo-mutants
@@ -163,7 +163,6 @@
 
             shellHook = ''
               export CARGO_HOME="$PWD/.cargo-home"
-              export RUSTUP_HOME="$PWD/.rustup-home"
               export PATH="$CARGO_HOME/bin:$PATH"
               # libclang + bindgen wiring for the pam-sys parity test
               # (dev-deps-only). bindgen invokes clang directly,
@@ -172,7 +171,7 @@
               # <security/pam_appl.h> and its transitive <unistd.h>.
               export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
               export BINDGEN_EXTRA_CLANG_ARGS="-I${pkgs.pam}/include -I${pkgs.glibc.dev}/include"
-              mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
+              mkdir -p "$CARGO_HOME"
             '';
           };
         });

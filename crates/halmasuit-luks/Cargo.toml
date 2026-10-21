@@ -8,10 +8,7 @@ license.workspace    = true
 repository.workspace = true
 authors.workspace    = true
 
-# Throwaway-style boot-phase tool: built via nixpkgs's pinned rustc, so
-# a looser MSRV than the workspace pin is fine (matches the test-client
-# pattern).
-rust-version = "1.87"
+rust-version.workspace = true
 
 [lints]
 workspace = true

@@ -507,7 +507,7 @@ impl State {
         } else {
             PROMPT_BGRA
         };
-        for px in canvas.chunks_exact_mut(4) {
+        for px in canvas.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&color);
         }
         let surface = self.window.wl_surface();
