@@ -262,6 +262,10 @@ pkgs.testers.runNixOSTest {
         timeout=120,
     )
 
+    # Keystrokes reach the foreground VT's tty too; no console getty
+    # may have taken them as a login.
+    machine.fail("journalctl -b -o cat --no-pager | grep -F 'pam_unix(login:session)'")
+
     # halmasuit PID continuous across the auth arc.
     pid_now = machine.succeed(
         "systemctl show -p MainPID --value halmasuit.service"

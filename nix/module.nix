@@ -1245,6 +1245,14 @@ in
    # greetd.sock files are bound with — without it, halmasuit can't
    # accept() on the sockets it bound while still root.
    (lib.mkIf (cfg.enable || cfg.fromInitrd.enable) {
+     # The kernel delivers keystrokes to the foreground VT's tty as well
+     # as to halmasuit's libinput. That VT is the home VT, or tty1 when
+     # none is configured; a getty there would read everything typed at
+     # the greeter and in the session, credentials included, and log
+     # the user into a hidden console shell. Keep logind's autovt getty
+     # off it, as NixOS's greetd module does for greetd's VT.
+     systemd.services."autovt@tty${toString (if cfg.homeVt == null then 1 else cfg.homeVt)}".enable = false;
+
      users.users.${cfg.compositorUser} = {
        isSystemUser = lib.mkDefault true;
        uid          = lib.mkDefault cfg.compositorUid;

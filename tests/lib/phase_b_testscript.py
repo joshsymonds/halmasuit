@@ -216,6 +216,13 @@ def run(machine, visual, *, cell_name, lukshape, no_flash_mode):
     )
     print("PASS: session_opened (real pam_unix through broker)")
 
+    # Keystrokes reach the foreground VT's tty too; no console getty
+    # may have taken them as a login.
+    machine.fail(
+        "journalctl -b -o cat --no-pager | grep -F 'pam_unix(login:session)'"
+    )
+    print("PASS: no console login took the typed credentials")
+
     # Real niri came up as the broker-launched session.
     machine.wait_until_succeeds("pgrep -x niri", timeout=60)
     # Wait for the swap-gate's session foreground event, not the
