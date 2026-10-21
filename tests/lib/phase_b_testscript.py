@@ -258,6 +258,13 @@ def run(machine, visual, *, cell_name, lukshape, no_flash_mode):
     )
     print("PASS: greeter process tree gone after the swap; broker reaped it")
 
+    # The observability surface came up on the rootfs bus after the
+    # pivot.
+    machine.wait_until_succeeds(
+        "busctl --system status org.halmasuit.Compositor1", timeout=30
+    )
+    print("PASS: org.halmasuit.Compositor1 served after the pivot")
+
     # halmasuit PID continuous across the swap (login-flash invariant).
     started_now = [
         e for e in visual.introspect_events(machine) if e["event"] == "started"

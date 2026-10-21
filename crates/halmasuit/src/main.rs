@@ -2850,15 +2850,14 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
         step_errors.extend(setup_post_pivot_input(state));
     }
 
-    // frame_audit only: retry the D-Bus `Snapshot()` server connect
-    // post-chroot. The pre-pivot connect (in `main`) targets the
-    // initramfs system bus, which has no halmasuit ownership policy
-    // — it bounces with `AccessDenied`. The post-chroot bus is
-    // rootfs's dbus-broker, whose policy DOES grant `org.halmasuit`
-    // to halmasuit; a fresh connect here succeeds. In rootfs-only
-    // `enable` deployments this branch never runs (`post_pivot_setup`
-    // is invoked only from the fromInitrd pivot-poll timer); the
-    // single main()-time connect is sufficient there.
+    // Start the D-Bus servers post-chroot: the observability
+    // `Compositor1` surface, and (frame_audit only) `Snapshot()`.
+    // `main` skips both in the initramfs, whose system bus has no
+    // halmasuit ownership policy. The post-chroot bus is rootfs's
+    // dbus-broker, whose policy grants both names to halmasuit. In
+    // rootfs-only `enable` deployments this never runs
+    // (`post_pivot_setup` is invoked only from the fromInitrd
+    // pivot-poll timer); `main` starts them there.
     //
     // Sync `serve` is the only correct shape here, even though we're
     // inside the calloop dispatcher and zbus' SASL handshake can burn
@@ -2872,6 +2871,7 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
     // org.halmasuit. The one-time post-pivot jitter is harmless: no
     // frames are racing against it yet (the greeter is still loading
     // QML when this fires).
+    dbus_compositor1::serve(state.dbus_state.clone());
     #[cfg(feature = "frame_audit")]
     if let Some(backend) = state.drm_backend.as_ref() {
         dbus::serve(backend.snapshot_handle());
@@ -5571,7 +5571,12 @@ fn main() -> io::Result<()> {
     // authenticates as the pre-drop euid (root) and the connection
     // persists across the subsequent setresuid. Best-effort —
     // `serve` logs and the thread exits if the bus is unreachable.
-    dbus_compositor1::serve(state.dbus_state.clone());
+    // In the initramfs both servers wait for the pivot
+    // (`post_pivot_setup`): that bus has no halmasuit policy.
+    let rootfs_bus = !context::is_initramfs();
+    if rootfs_bus {
+        dbus_compositor1::serve(state.dbus_state.clone());
+    }
 
     // frame_audit only: start the D-Bus `Snapshot()` server, handing
     // it a clone of the render loop's snapshot slot. Started before
@@ -5582,7 +5587,7 @@ fn main() -> io::Result<()> {
     // thread exits if the bus is unreachable. Absent entirely from
     // the production binary.
     #[cfg(feature = "frame_audit")]
-    if let Some(backend) = state.drm_backend.as_ref() {
+    if rootfs_bus && let Some(backend) = state.drm_backend.as_ref() {
         dbus::serve(backend.snapshot_handle());
     }
 
