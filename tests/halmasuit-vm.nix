@@ -394,6 +394,36 @@ pkgs.testers.runNixOSTest {
             f"halmasuit CapAmb must be empty, got {caps.get('CapAmb')!r}"
         )
 
+        # Every thread, not just the main one. Capabilities and the
+        # bounding set are per-thread (capabilities(7)); only setresuid
+        # reaches every thread. EGL driver threads and zbus's runtime
+        # thread start before the drop, so this is where a regression
+        # that lets a thread keep a full bounding set would show.
+        task_raw = machine.succeed(
+            f"grep -H -E '^(Uid|Cap(Bnd|Eff|Inh|Prm|Amb)):' /proc/{pid}/task/*/status"
+        )
+        tasks = {}
+        for line in task_raw.strip().splitlines():
+            path, field, value = line.split(":", 2)
+            tasks.setdefault(path, {})[field] = value.strip()
+        # The parked D-Bus holder threads alone guarantee more than one
+        # task; fewer means this check would be vacuous.
+        assert len(tasks) >= 2, (
+            f"expected halmasuit to have worker threads, got {sorted(tasks)}"
+        )
+        for path, t in tasks.items():
+            assert t.get("Uid", "").split() == ["998"] * 4, (
+                f"{path}: every uid component must be 998, got {t.get('Uid')!r}"
+            )
+            for field in ("CapBnd", "CapInh", "CapAmb"):
+                assert t.get(field) == "0000000000000000", (
+                    f"{path}: {field} must be empty on every thread, got {t.get(field)!r}"
+                )
+            for field in ("CapPrm", "CapEff"):
+                assert int(t.get(field, "ffffffffffffffff"), 16) & ~0x20 == 0, (
+                    f"{path}: {field} must hold nothing beyond CAP_KILL, got {t.get(field)!r}"
+                )
+
     # ──────────────────────────────────────────────────────────────────
     # Suite 2.7: Greeter child process exists and runs as greeter uid
     # ──────────────────────────────────────────────────────────────────

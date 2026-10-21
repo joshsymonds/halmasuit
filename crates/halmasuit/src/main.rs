@@ -44,6 +44,7 @@ mod frame_audit;
 #[cfg(feature = "frame_audit")]
 mod offscreen;
 mod swap_gate;
+mod task_caps;
 mod vt_switch;
 mod wallpaper;
 
@@ -4142,41 +4143,57 @@ fn reap_zombie_children(state: &mut HalmasuitState) {
     }
 }
 
+/// Empty the calling thread's capability bounding set. Requires
+/// `CAP_SETPCAP` in the effective set, so it runs while still root.
+/// `main` calls it before the first thread exists, so every thread
+/// inherits the empty set (the set is per-thread; see `task_caps`).
+fn clear_bounding_set() -> io::Result<()> {
+    use caps::CapSet;
+    for cap in caps::all() {
+        caps::drop(None, CapSet::Bounding, cap)
+            .map_err(|e| io::Error::other(format!("bounding drop {cap}: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Drop privileges to the configured compositor uid. The compositor
 /// execs NO setuid helper and holds NO PAM handle — it relays auth to
 /// the privileged `halmasuit-session` broker (Epic R2/R3/R15). So it
 /// retains the absolute minimum: only `CAP_KILL`, to signal its
 /// greeter child (which runs under a different uid) on session start.
-/// The bounding set is emptied COMPLETELY — neither the compositor
-/// nor anything it execs can ever gain a capability. Supplementary
-/// groups pinned at unit-startup via systemd `SupplementaryGroups=`
-/// are intentionally NOT cleared.
+/// The bounding set is already empty on every thread (`main` cleared
+/// it before the first thread existed), so neither the compositor nor
+/// anything it execs can ever gain a capability. Supplementary groups
+/// pinned at unit-startup via systemd `SupplementaryGroups=` are
+/// intentionally NOT cleared.
+///
+/// Capabilities and securebits are per-thread; only `setresuid` and
+/// `setresgid` reach every thread (glibc's setxid broadcast). Every
+/// other step below acts on the calling (main) thread alone, which is
+/// the only thread that keeps `CAP_KILL`: the others lose all
+/// capabilities at the uid change because they never set KeepCaps.
 ///
 /// Order is load-bearing:
-///   1. Empty the bounding set entirely. `PR_CAPBSET_DROP` requires
-///      `CAP_SETPCAP` in the *effective* set, which is full here
-///      (still root, no `setresuid` yet); doing it AFTER `setresuid`
-///      would `EPERM` (the kernel clears `effective` on the
-///      root → non-root transition). The bounding set constrains only
-///      caps *gained later* (execve grants / capset→inheritable); it
-///      does not retroactively shrink halmasuit's own permitted set,
-///      so emptying it does not affect step 5's `CAP_KILL`.
-///   2. `prctl(PR_SET_KEEPCAPS, 1)` — without this, `setresuid`
+///   1. `prctl(PR_SET_KEEPCAPS, 1)` — without this, `setresuid`
 ///      below would clear the permitted capability set entirely.
 ///      KeepCaps preserves permitted; effective is still cleared
-///      and must be rebuilt via `capset` (step 5).
-///   3. `setresgid(egid, egid, egid)` — pin all three gid components.
-///   4. `setresuid(uid, uid, uid)` — drop uid. All three components
+///      and must be rebuilt via `capset` (step 4).
+///   2. `setresgid(egid, egid, egid)` — pin all three gid components.
+///   3. `setresuid(uid, uid, uid)` — drop uid. All three components
 ///      set to the same value so the process cannot resurrect root.
 ///      Permitted caps survive due to KeepCaps; effective caps are
 ///      kernel-cleared.
-///   5. Single `capset(2)` writing both permitted and effective to
+///   4. Single `capset(2)` writing both permitted and effective to
 ///      `{CAP_KILL}` in one syscall. The `caps` crate's high-level
 ///      `set()` does `capget+capset` per CapSet, so calling it
 ///      twice would be 4 syscalls; the kernel's `cap_user_data_t`
 ///      carries effective + permitted + inheritable in one payload
 ///      that `capset(2)` updates atomically. We bypass `caps::set`
 ///      for that.
+///   5. Audit every thread (`task_caps::audit_all_tasks`): all uid
+///      components are `uid`, bounding/inheritable/ambient are empty,
+///      permitted/effective hold nothing beyond `CAP_KILL`. Any
+///      violation fails the drop.
 ///
 /// `SECBIT_NOROOT` / `SECBIT_NO_SETUID_FIXUP` are not set here. With
 /// the setuid helper deleted there is no setuid-root execve to reason
@@ -4185,24 +4202,7 @@ fn reap_zombie_children(state: &mut HalmasuitState) {
 /// scope (tracked as a follow-up, same as the systemd NNP posture —
 /// see nix/module.nix).
 fn drop_privileges(uid: u32) -> io::Result<()> {
-    use caps::CapSet;
     use nix::unistd::{Gid, Uid, getegid, setresgid, setresuid};
-
-    // Step 1: empty the bounding set ENTIRELY while we're still root
-    // with CAP_SETPCAP in effective. Nothing is kept: the compositor
-    // execs no setuid helper (Epic R15), so no future execve should
-    // ever be permitted to gain a capability. The bounding set is
-    // preserved across setresuid/fork/execve and constrains only caps
-    // gained later — it never retroactively shrinks halmasuit's own
-    // permitted/effective sets, so the runtime `CAP_KILL` raised by
-    // step 5's `capset` is unaffected. Doing this here (still root,
-    // CAP_SETPCAP in effective) avoids the capset choreography
-    // otherwise needed to re-raise CAP_SETPCAP after setresuid clears
-    // effective.
-    for cap in caps::all() {
-        caps::drop(None, CapSet::Bounding, cap)
-            .map_err(|e| io::Error::other(format!("bounding drop {cap}: {e}")))?;
-    }
 
     caps::securebits::set_keepcaps(true)
         .map_err(|e| io::Error::other(format!("set_keepcaps(true): {e}")))?;
@@ -4252,6 +4252,9 @@ fn drop_privileges(uid: u32) -> io::Result<()> {
 
     capset_permitted_effective_cap_kill()
         .map_err(|e| io::Error::other(format!("capset permitted=effective={{CAP_KILL}}: {e}")))?;
+
+    task_caps::audit_all_tasks(uid)
+        .map_err(|e| io::Error::other(format!("post-drop thread audit: {e}")))?;
 
     Ok(())
 }
@@ -4656,6 +4659,20 @@ fn main() -> io::Result<()> {
     // bring-up before the event loop's first ping can take >10s). The
     // loop-driven timer below takes over once we're running.
     notify_systemd_watchdog();
+
+    // Empty the capability bounding set while the process is still
+    // single-threaded. The bounding set is per-thread and every thread
+    // created later inherits its creator's (Mesa/NVIDIA EGL driver
+    // threads during DRM init, zbus's runtime thread, the login1
+    // watcher), while `drop_privileges` can only empty the calling
+    // thread's. Clearing it here, before any of those exist, is what
+    // makes "nothing the compositor execs can ever gain a capability"
+    // hold for every thread; `drop_privileges` audits the result. Only
+    // when a drop will follow: a dev launch without
+    // HALMASUIT_COMPOSITOR_UID never drops and is refused if root.
+    if compositor_uid_from_env()?.is_some() {
+        clear_bounding_set()?;
+    }
 
     // Phase B (boot-from-initrd) runtime detection. `/etc/initrd-release`
     // is the systemd-canonical signal that we're in the initramfs

@@ -82,14 +82,17 @@ out of scope for v2 (edge-case UX — happy-path mandate).
 ```
 multi-user.target → halmasuit.service starts as root
         │
+        ├─ empty the capability bounding set (still single-threaded,
+        │  so every later thread inherits CapBnd=0)
         ├─ open /dev/dri/card0, DRM_IOCTL_SET_MASTER  → Phase::DrmMasterAcquired
         ├─ smithay state, bind /run/halmasuit/wayland-0 → Phase::WaylandReady
         ├─ bind /run/halmasuit/greetd.sock (0660, SO_PEERCRED gated) → Phase::GreetdReady
         ├─ fork+exec the configured greeter as the greeter system user
         │  via Command::pre_exec → setresgid + setresuid (still root)
         ├─ setresgid + setresuid into the compositor system user,
-        │  capset permitted=effective={CAP_KILL}, bounding set EMPTY
-        │  → Phase::Deprivileged   (no setuid helper is ever exec'd)
+        │  capset permitted=effective={CAP_KILL}, then audit every
+        │  thread's uid + caps → Phase::Deprivileged
+        │  (no setuid helper is ever exec'd)
         ↓
 main loop (calloop) — unprivileged compositor
         │

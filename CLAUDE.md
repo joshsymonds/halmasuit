@@ -53,9 +53,13 @@ without explicit user direction.
   `MAX_SESSION_BUILDS_PER_CONNECTION`. Privilege-drop+exec exists ONLY
   in the broker's non-setuid session-leader child (fork-then-drop from
   already-root).
-- **The compositor retains zero escalation capability.** After its
-  in-process privilege drop the bounding set is emptied entirely; it
-  keeps only `CAP_KILL` (to signal its greeter child). Do NOT re-add
+- **The compositor retains zero escalation capability.** Its
+  bounding set is emptied at the top of `main`, before any thread
+  exists (the set is per-thread and inherited), so every thread —
+  including Mesa/NVIDIA EGL and zbus runtime threads — has `CapBnd=0`;
+  `drop_privileges` audits every `/proc/self/task/*/status` and fails
+  on any violation. After the drop it keeps only `CAP_KILL` (to signal
+  its greeter child), on the main thread alone. Do NOT re-add
   `{CAP_SETUID,CAP_SETGID}` (or anything) to the compositor bounding
   set — it execs no setuid helper, so any retained cap is a
   least-authority regression.
