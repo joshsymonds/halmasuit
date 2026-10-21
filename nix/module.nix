@@ -134,6 +134,15 @@ let
   # have materialized." The risk the upstream warning points at —
   # "settle returns but a slow-arriving device pops up later" —
   # is handled by the Rust resolver's 10s deadline-bounded retry.
+  #
+  # systemd creates `dev-X.device` units only for udev devices tagged
+  # `systemd`, and its stock rules do not tag DRM cards: without
+  # `drmCardSystemdTag` the unit never appears and the start job waits
+  # for its timeout (minutes) before halmasuit starts.
+  drmCardSystemdTag = ''
+    SUBSYSTEM=="drm", KERNEL=="card[0-9]*", TAG+="systemd"
+  '';
+
   drmDeviceUnitDeps =
     [ "systemd-udev-settle.service" ]
     ++ lib.optionals (drmCardMatch != null) [
@@ -1252,6 +1261,11 @@ in
      # the user into a hidden console shell. Keep logind's autovt getty
      # off it, as NixOS's greetd module does for greetd's VT.
      systemd.services."autovt@tty${toString (if cfg.homeVt == null then 1 else cfg.homeVt)}".enable = false;
+
+     # Path mode orders halmasuit after `dev-dri-cardN.device`.
+     services.udev.extraRules = lib.mkIf (drmCardMatch != null) drmCardSystemdTag;
+     boot.initrd.services.udev.rules =
+       lib.mkIf (cfg.fromInitrd.enable && drmCardMatch != null) drmCardSystemdTag;
 
      users.users.${cfg.compositorUser} = {
        isSystemUser = lib.mkDefault true;
