@@ -95,6 +95,27 @@
         };
       };
 
+      # What the Rust package builds read: the workspace plus the one
+      # test fixture a unit test compiles in (shader.rs include_str!).
+      # Test scripts, goldens, fixtures, docs, and the NixOS module stay
+      # out, so editing them doesn't rebuild every package and with it
+      # re-run every VM gate.
+      rustSrc = nixpkgs.lib.fileset.toSource {
+        root = ./.;
+        fileset = nixpkgs.lib.fileset.unions [
+          ./Cargo.toml
+          ./Cargo.lock
+          ./.cargo
+          ./crates
+          ./xtask
+          ./vendor
+          ./rust-toolchain.toml
+          ./clippy.toml
+          ./rustfmt.toml
+          ./tests/fixtures/wallpaper-shader.glsl
+        ];
+      };
+
       # Toolchain derived from rust-toolchain.toml. Single source of truth
       # shared by the devShell and every package build.
       rustToolchainFor = pkgs:
@@ -228,7 +249,7 @@
           halmasuit = rustPlatform.buildRustPackage {
             pname   = "halmasuit";
             version = "0.1.0";
-            src     = ./.;
+            src     = rustSrc;
             # smithay is pinned to a git rev. allowBuiltinFetchGit lets
             # nixpkgs's rustPlatform clone the rev at build time via
             # builtins.fetchGit rather than requiring a pre-computed
@@ -323,7 +344,7 @@
           halmasuit-vm-client = rustPlatform.buildRustPackage {
             pname   = "halmasuit-vm-client";
             version = "0.1.0";
-            src     = ./.;
+            src     = rustSrc;
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
@@ -352,7 +373,7 @@
           halmasuit-luks = rustPlatform.buildRustPackage {
             pname   = "halmasuit-luks";
             version = "0.1.0";
-            src     = ./.;
+            src     = rustSrc;
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
@@ -379,7 +400,7 @@
           halmasuit-session = rustPlatform.buildRustPackage {
             pname   = "halmasuit-session";
             version = "0.1.0";
-            src     = ./.;
+            src     = rustSrc;
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
@@ -420,7 +441,7 @@
           halmasuit-decoder = rustPlatform.buildRustPackage {
             pname   = "halmasuit-decoder";
             version = "0.1.0";
-            src     = ./.;
+            src     = rustSrc;
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
@@ -449,7 +470,7 @@
           halmasuit-session-pam-testdriver = rustPlatform.buildRustPackage {
             pname   = "halmasuit-session-pam-testdriver";
             version = "0.1.0";
-            src     = ./.;
+            src     = rustSrc;
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
@@ -476,7 +497,7 @@
           drm-master-probe = rustPlatform.buildRustPackage {
             pname   = "drm-master-probe";
             version = "0.1.0";
-            src     = ./.;
+            src     = rustSrc;
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
@@ -497,7 +518,7 @@
           halmasuit-shutdown-probe = rustPlatform.buildRustPackage {
             pname   = "halmasuit-shutdown-probe";
             version = "0.1.0";
-            src     = ./.;
+            src     = rustSrc;
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
@@ -519,7 +540,7 @@
           drm-master-probe-phase4 = rustPlatform.buildRustPackage {
             pname   = "drm-master-probe-phase4";
             version = "0.1.0";
-            src     = ./.;
+            src     = rustSrc;
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
@@ -551,7 +572,7 @@
           halmasuit-layer-shell-test-client = rustPlatform.buildRustPackage {
             pname   = "halmasuit-layer-shell-test-client";
             version = "0.1.0";
-            src     = ./.;
+            src     = rustSrc;
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
@@ -573,7 +594,7 @@
           halmasuit-toplevel-test-client = rustPlatform.buildRustPackage {
             pname   = "halmasuit-toplevel-test-client";
             version = "0.1.0";
-            src     = ./.;
+            src     = rustSrc;
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
@@ -597,7 +618,7 @@
           halmasuit-subsurface-test-client = rustPlatform.buildRustPackage {
             pname   = "halmasuit-subsurface-test-client";
             version = "0.1.0";
-            src     = ./.;
+            src     = rustSrc;
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
@@ -622,7 +643,7 @@
           halmasuit-deferred-configure-test-client = rustPlatform.buildRustPackage {
             pname   = "halmasuit-deferred-configure-test-client";
             version = "0.1.0";
-            src     = ./.;
+            src     = rustSrc;
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
@@ -646,7 +667,7 @@
           halmasuit-popup-test-client = rustPlatform.buildRustPackage {
             pname   = "halmasuit-popup-test-client";
             version = "0.1.0";
-            src     = ./.;
+            src     = rustSrc;
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
