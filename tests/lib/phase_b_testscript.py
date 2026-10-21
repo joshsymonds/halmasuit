@@ -203,6 +203,7 @@ def run(machine, visual, *, cell_name, lukshape, no_flash_mode):
     # DMS QML uses ONE TextField that toggles between username and
     # password mode on Enter. The username→password transition is
     # client-side state inside Quickshell — no journal-visible marker.
+    visual.wait_greeter_settled(machine)
     machine.send_chars("alice")
     machine.send_key("ret")
     import time

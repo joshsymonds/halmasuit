@@ -293,6 +293,7 @@ pkgs.testers.runNixOSTest {
     # password mode), then the password "testpassword", then Enter.
     # pam_u2f sees the cue prompt round-trip with no key registered →
     # falls through; pam_unix verifies the password.
+    visual.wait_greeter_settled(machine)
     machine.send_chars("alice")
     machine.send_key("ret")
     time.sleep(1)

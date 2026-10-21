@@ -244,6 +244,7 @@ pkgs.testers.runNixOSTest {
     # The condition is elapsed guest time itself, so this is a
     # guest-side sleep rather than a state wait.
     machine.succeed("sleep 35")
+    visual.wait_greeter_settled(machine)
     machine.send_chars("alice")
     machine.send_key("ret")
     time.sleep(1)

@@ -342,6 +342,47 @@ def introspect_events(machine) -> list:
     return events
 
 
+def wait_greeter_settled(machine, quiet: float = 2.0, timeout: float = 90.0) -> None:
+    """Block until the greeter has painted and its frames have gone quiet.
+
+    The greeter's surface maps and gets keyboard focus before its UI
+    finishes its first burst of renders, and keys sent during that
+    burst can be lost. Wait for halmasuit to composite the greeter's
+    first frame, then for `quiet` seconds with no new frame.
+    """
+    import time
+
+    def greeter_frames():
+        events = introspect_events(machine)
+        start = next(
+            (
+                i for i, e in enumerate(events)
+                if e.get("event") == "client_first_frame"
+                and e.get("role") == "overlay"
+            ),
+            None,
+        )
+        if start is None:
+            return 0
+        return sum(1 for e in events[start:] if e.get("event") == "frame_rendered")
+
+    deadline = time.monotonic() + timeout
+    seen = greeter_frames()
+    while seen == 0:
+        assert time.monotonic() < deadline, "the greeter never painted a frame"
+        time.sleep(0.5)
+        seen = greeter_frames()
+    changed = time.monotonic()
+    while time.monotonic() - changed < quiet:
+        assert time.monotonic() < deadline, (
+            f"the greeter's frames never went quiet for {quiet}s"
+        )
+        time.sleep(0.5)
+        now_seen = greeter_frames()
+        if now_seen != seen:
+            seen, changed = now_seen, time.monotonic()
+
+
 def assert_no_flash_stream(machine, events=None) -> None:
     """The no-flash invariant (Epic #1 req 11 / R3), asserted over
     100% of the `frame_rendered` stream as EXACT integer/boolean facts
