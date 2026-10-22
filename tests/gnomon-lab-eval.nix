@@ -86,6 +86,272 @@ let
   # The CRC sampler, built from the same derivation the module stages.
   labCrc = pkgs.callPackage ../nix/lab/lab-crc.nix { };
 
+  # Cadence harness: includes lab-crc.c unchanged and runs its real sampler
+  # loop against scripted DRM and a simulated clock. The clock moves only when
+  # the loop sleeps, to the sleep's deadline, so pacing is exact and no
+  # scenario reads the host clock. Each scenario states the rounds that
+  # re-read head activity and the rounds that sample each head.
+  cadenceSource = pkgs.writeText "lab-crc-cadence.c" ''
+    #include <stdarg.h>
+    #define main lab_crc_main
+    #include "${../nix/lab/lab-crc.c}"
+    #undef main
+
+    /*
+     * A round is one pass of the sampler loop, ended by its pacing sleep.
+     * Round k starts at (k - 1) * PACING_NS, so the run covers two
+     * ACTIVITY_PERIOD_NS periods and the re-reads due at 1 s and 2 s fall
+     * inside it.
+     */
+    #define CADENCE_ROUNDS 1100
+    #define CADENCE_HEADS 2
+
+    struct scenario {
+    	const char *name;
+    	/* Round from which each head reads active; 0 means never. */
+    	uint32_t active_from[CADENCE_HEADS];
+    	/* Activity is re-read in rounds 1 through dense_refresh. */
+    	uint32_t dense_refresh;
+    	/* Later rounds that re-read activity; unused entries are 0. */
+    	uint32_t refresh_at[4];
+    };
+
+    static const struct scenario scenarios[] = {
+    	/* No head is ever active: every round re-reads activity. */
+    	{ "idle", { 0, 0 }, CADENCE_ROUNDS, { 0 } },
+    	/*
+    	 * Head 40 reads active in round 4, so round 4 re-reads and samples it.
+    	 * The next re-reads come ACTIVITY_PERIOD_NS after round 4's: round 504
+    	 * (1006 ms), then round 1004 (2006 ms).
+    	 */
+    	{ "wake", { 4, 0 }, 4, { 504, 1004 } },
+    	/*
+    	 * Head 40 is active from round 1: re-reads at round 1, then only at
+    	 * round 501 (1000 ms) and round 1001 (2000 ms).
+    	 */
+    	{ "active", { 1, 0 }, 1, { 501, 1001 } },
+    	/* Head 41 is active from round 1 and head 40 never is: one head suffices. */
+    	{ "any", { 0, 1 }, 1, { 501, 1001 } },
+    };
+
+    static uint32_t crtc_ids[CADENCE_HEADS] = { 40, 41 };
+    static const struct scenario *active_scenario;
+    static struct timespec sim_now = { 100, 0 };
+    static uint32_t rounds_done;
+    static bool refreshed[CADENCE_ROUNDS + 1];
+    static bool sampled[CADENCE_HEADS][CADENCE_ROUNDS + 1];
+
+    static uint32_t current_round(void)
+    {
+    	return rounds_done + 1;
+    }
+
+    static size_t head_index(uint32_t crtc_id)
+    {
+    	for (size_t i = 0; i < CADENCE_HEADS; i++) {
+    		if (crtc_ids[i] == crtc_id)
+    			return i;
+    	}
+    	fprintf(stderr, "cadence: unknown crtc %" PRIu32 "\n", crtc_id);
+    	exit(2);
+    }
+
+    static bool head_active(size_t index)
+    {
+    	uint32_t from = active_scenario->active_from[index];
+
+    	return from != 0 && current_round() >= from;
+    }
+
+    static bool refresh_expected(uint32_t round)
+    {
+    	if (round <= active_scenario->dense_refresh)
+    		return true;
+    	for (size_t i = 0; i < sizeof active_scenario->refresh_at / sizeof active_scenario->refresh_at[0]; i++) {
+    		if (active_scenario->refresh_at[i] == round)
+    			return true;
+    	}
+    	return false;
+    }
+
+    static bool check_refresh(void)
+    {
+    	for (uint32_t r = 1; r <= CADENCE_ROUNDS; r++) {
+    		bool want = refresh_expected(r);
+
+    		if (refreshed[r] != want) {
+    			fprintf(stderr, "FAIL %s: round %" PRIu32 " re-read activity=%d, expected %d\n",
+    				active_scenario->name, r, refreshed[r], want);
+    			return false;
+    		}
+    	}
+    	return true;
+    }
+
+    static bool check_sampling(size_t head)
+    {
+    	uint32_t from = active_scenario->active_from[head];
+
+    	for (uint32_t r = 1; r <= CADENCE_ROUNDS; r++) {
+    		bool want = from != 0 && r >= from;
+
+    		if (sampled[head][r] != want) {
+    			fprintf(stderr, "FAIL %s: head %" PRIu32 " sampled=%d in round %" PRIu32 ", expected %d\n",
+    				active_scenario->name, crtc_ids[head], sampled[head][r], r, want);
+    			return false;
+    		}
+    	}
+    	return true;
+    }
+
+    static _Noreturn void finish(void)
+    {
+    	bool ok = check_refresh();
+
+    	for (size_t i = 0; i < CADENCE_HEADS; i++) {
+    		if (!check_sampling(i))
+    			ok = false;
+    	}
+    	if (ok)
+    		printf("PASS %s\n", active_scenario->name);
+    	exit(ok ? EXIT_SUCCESS : EXIT_FAILURE);
+    }
+
+    /* Referenced by lab_crc_main, which the harness never runs. */
+    int drmIsMaster(int fd)
+    {
+    	(void)fd;
+    	return 0;
+    }
+
+    int drmDropMaster(int fd)
+    {
+    	(void)fd;
+    	return 0;
+    }
+
+    drmModeResPtr drmModeGetResources(int fd)
+    {
+    	drmModeResPtr res;
+
+    	(void)fd;
+    	res = calloc(1, sizeof *res);
+    	if (res == NULL)
+    		return NULL;
+    	res->count_crtcs = CADENCE_HEADS;
+    	res->crtcs = crtc_ids;
+    	return res;
+    }
+
+    void drmModeFreeResources(drmModeResPtr ptr)
+    {
+    	free(ptr);
+    }
+
+    drmModeCrtcPtr drmModeGetCrtc(int fd, uint32_t crtcId)
+    {
+    	drmModeCrtcPtr crtc;
+
+    	(void)fd;
+    	crtc = calloc(1, sizeof *crtc);
+    	if (crtc == NULL)
+    		return NULL;
+    	crtc->mode_valid = head_active(head_index(crtcId));
+    	refreshed[current_round()] = true;
+    	return crtc;
+    }
+
+    void drmModeFreeCrtc(drmModeCrtcPtr ptr)
+    {
+    	free(ptr);
+    }
+
+    int ioctl(int fd, unsigned long int request, ...)
+    {
+    	struct drm_nvidia_get_crtc_crc32_v2_params *p;
+    	va_list ap;
+
+    	(void)fd;
+    	if (request != DRM_IOCTL_NVIDIA_GET_CRTC_CRC32_V2) {
+    		errno = ENOTTY;
+    		return -1;
+    	}
+    	va_start(ap, request);
+    	p = va_arg(ap, struct drm_nvidia_get_crtc_crc32_v2_params *);
+    	va_end(ap);
+    	sampled[head_index(p->crtc_id)][current_round()] = true;
+    	p->comp.supported = 1;
+    	p->rg.supported = 1;
+    	p->out.supported = 1;
+    	return 0;
+    }
+
+    int clock_gettime(clockid_t clock_id, struct timespec *ts)
+    {
+    	(void)clock_id;
+    	*ts = sim_now;
+    	return 0;
+    }
+
+    int clock_nanosleep(clockid_t clock_id, int flags,
+    		    const struct timespec *request, struct timespec *remain)
+    {
+    	(void)clock_id;
+    	(void)remain;
+    	if (flags != TIMER_ABSTIME) {
+    		fprintf(stderr, "cadence: relative sleep is not modelled\n");
+    		exit(2);
+    	}
+    	sim_now = *request;
+    	rounds_done++;
+    	if (rounds_done == CADENCE_ROUNDS)
+    		finish();
+    	return 0;
+    }
+
+    int main(int argc, char **argv)
+    {
+    	if (argc != 2) {
+    		fprintf(stderr, "usage: lab-crc-cadence SCENARIO\n");
+    		return 2;
+    	}
+    	for (size_t i = 0; i < sizeof scenarios / sizeof scenarios[0]; i++) {
+    		if (strcmp(scenarios[i].name, argv[1]) == 0)
+    			active_scenario = &scenarios[i];
+    	}
+    	if (active_scenario == NULL) {
+    		fprintf(stderr, "lab-crc-cadence: unknown scenario %s\n", argv[1]);
+    		return 2;
+    	}
+    	sample_forever(-1, "card1");
+    }
+  '';
+
+  cadenceScenarios = [ "idle" "wake" "active" "any" ];
+
+  labCrcCadence = pkgs.stdenv.mkDerivation {
+    pname = "lab-crc-cadence";
+    version = "0";
+
+    dontUnpack = true;
+    dontConfigure = true;
+
+    nativeBuildInputs = [ pkgs.pkg-config ];
+    buildInputs = [ pkgs.libdrm ];
+
+    buildPhase = ''
+      runHook preBuild
+      $CC -Wall -Wextra -Werror -O2 ${cadenceSource} $(pkg-config --cflags libdrm) -o lab-crc-cadence
+      runHook postBuild
+    '';
+
+    installPhase = ''
+      runHook preInstall
+      install -Dm755 lab-crc-cadence $out/bin/lab-crc-cadence
+      runHook postInstall
+    '';
+  };
+
   # The keyboard probe script, staged by the module as the lab-probe unit's payload.
   labProbe = ../nix/lab/lab_probe.py;
 
@@ -509,5 +775,6 @@ pkgs.runCommand "gnomon-lab-eval" { } ''
   ${report}
   ${lib.optionalString (failures != [ ]) "exit 1"}
   test -x ${labCrc}/bin/lab-crc
-  echo "gnomon-lab-eval: ${toString (builtins.length allChecks)} checks passed" > $out
+  ${lib.concatMapStrings (s: "${labCrcCadence}/bin/lab-crc-cadence ${s}\n") cadenceScenarios}
+  echo "gnomon-lab-eval: ${toString (builtins.length allChecks)} checks passed, ${toString (builtins.length cadenceScenarios)} lab-crc cadence scenarios passed" > $out
 ''
