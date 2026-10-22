@@ -3,7 +3,33 @@
 # in both boot stages, a stage-1 deadline, a rootfs deadline, reboot on
 # kernel panic, and Wake-on-LAN. Everything is gated on halmasuit.lab.enable.
 # The module declares no specialisation and adds no generation or boot entry.
-{ config, lib, ... }:
+#
+# Lab instrumentation settings: netconsole from the initramfs, U2F off for
+# listed PAM services, and the lab-crc scanout sampler, which runs in stage 1
+# and after switch-root. The probe option loads uinput and defines
+# lab-probe.service, an on-demand root oneshot that nothing starts on its own.
+# Every option defaults off or empty.
+#
+# Journal contract (frozen; consumed by tests/hw/timeline.py). Each entry is
+# one journal line, identified by SYSLOG_IDENTIFIER. `t` is CLOCK_MONOTONIC in
+# microseconds. Hex values are 8 lowercase digits.
+#
+#   lab-crc (SYSLOG_IDENTIFIER=lab-crc; stage-1 unit lab-crc-initrd.service,
+#   rootfs unit lab-crc.service):
+#     start t=<us>                  once, at process start
+#     sample card=<cardN> crtc=<id> t=<us> comp=<hex> rg=<hex> out=<hex> comp_sup=<0|1> rg_sup=<0|1> out_sup=<0|1>
+#                                   for a head's first sample, and whenever any
+#                                   value or flag differs from that head's
+#                                   previous sample
+#     error card=<cardN> crtc=<id> t=<us> errno=<n>
+#                                   once each time a head's CRC read starts failing
+#
+#   lab-probe (SYSLOG_IDENTIFIER=lab-probe; unit lab-probe.service):
+#     device node=<path>
+#     ready holder=<comm> pid=<pid>
+#     typed keys=<n>
+#     error reason=<text>
+{ config, lib, pkgs, ... }:
 
 let
   cfg = config.halmasuit.lab;
@@ -15,6 +41,12 @@ let
     WatchdogDevice = "/dev/watchdog0";
     RuntimeWatchdogSec = "60s";
   };
+
+  netconsoleDevice = "sys-subsystem-net-devices-${cfg.netconsole.interface}.device";
+
+  labCrc = pkgs.callPackage ./lab-crc.nix { };
+
+  labProbe = ./lab_probe.py;
 in
 {
   options.halmasuit.lab = {
@@ -53,6 +85,47 @@ in
       type = lib.types.str;
       default = "enp7s0";
       description = "Network interface that answers Wake-on-LAN magic packets.";
+    };
+
+    crcSampler.enable = lib.mkEnableOption "the lab-crc scanout CRC sampler";
+
+    probe.enable = lib.mkEnableOption "the lab-probe uinput keyboard and probe unit";
+
+    netconsole = {
+      enable = lib.mkEnableOption "netconsole from the initramfs, sending kernel messages over UDP";
+
+      targetIp = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "IPv4 address of the host that receives netconsole messages.";
+      };
+
+      sourceIp = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "IPv4 address the lab host sends netconsole messages from.";
+      };
+
+      interface = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Network interface netconsole sends through.";
+      };
+
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 6666;
+        description = "UDP port on targetIp that receives netconsole messages.";
+      };
+    };
+
+    u2fOffServices = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = ''
+        PAM services whose U2F authentication the lab image turns off, so a
+        host's U2F setting cannot prompt for a token on these services.
+      '';
     };
   };
 
@@ -130,5 +203,74 @@ in
 
     # Wake-on-LAN magic packets on the lab interface.
     networking.interfaces.${cfg.wolInterface}.wakeOnLan.enable = true;
+
+    # Netconsole from stage 1. The module loads once the interface device
+    # exists and stays loaded across switch-root. It sends UDP only, and
+    # the firewall is not touched.
+    assertions = [
+      {
+        assertion = !cfg.netconsole.enable
+          || (cfg.netconsole.targetIp != "" && cfg.netconsole.sourceIp != "" && cfg.netconsole.interface != "");
+        message = "halmasuit.lab.netconsole needs targetIp, sourceIp and interface when enabled.";
+      }
+    ];
+    boot.initrd.availableKernelModules = lib.optional cfg.netconsole.enable "netconsole";
+    boot.initrd.systemd.storePaths =
+      lib.optional cfg.netconsole.enable pkgs.kmod
+      ++ lib.optional cfg.crcSampler.enable labCrc;
+    boot.initrd.systemd.services.lab-netconsole = lib.mkIf cfg.netconsole.enable {
+      wantedBy = [ "initrd.target" ];
+      bindsTo = [ netconsoleDevice ];
+      after = [ netconsoleDevice ];
+      unitConfig.DefaultDependencies = false;
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${pkgs.kmod}/bin/modprobe netconsole netconsole=+@${cfg.netconsole.sourceIp}/${cfg.netconsole.interface},${toString cfg.netconsole.port}@${cfg.netconsole.targetIp}/";
+      };
+    };
+
+    # CRC sampler. The stage-1 unit starts as early as stage 1 allows and is
+    # stopped by the switch-root isolate. The rootfs unit is started before the
+    # display manager; the sampler opens the card and drops DRM master within
+    # microseconds of starting, long before the greeter compositor opens it.
+    # Both restart the sampler when it exits nonzero.
+    boot.initrd.systemd.services.lab-crc-initrd = lib.mkIf cfg.crcSampler.enable {
+      wantedBy = [ "sysinit.target" ];
+      unitConfig.DefaultDependencies = false;
+      serviceConfig = {
+        ExecStart = "${labCrc}/bin/lab-crc";
+        SyslogIdentifier = "lab-crc";
+        Restart = "on-failure";
+      };
+    };
+    systemd.services.lab-crc = lib.mkIf cfg.crcSampler.enable {
+      wantedBy = [ "sysinit.target" ];
+      before = [ cfg.displayManagerUnit ];
+      unitConfig.DefaultDependencies = false;
+      serviceConfig = {
+        ExecStart = "${labCrc}/bin/lab-crc";
+        SyslogIdentifier = "lab-crc";
+        Restart = "on-failure";
+      };
+    };
+
+    # Keyboard probe. uinput loads at boot so the probe can create its virtual
+    # keyboard on demand. lab-probe.service has no wantedBy, requiredBy,
+    # upheldBy, timer, path, or socket, so only an explicit start runs it. The
+    # runner starts it after the greeter is up.
+    boot.kernelModules = lib.optional cfg.probe.enable "uinput";
+    systemd.services.lab-probe = lib.mkIf cfg.probe.enable {
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${pkgs.python3}/bin/python3 ${labProbe}";
+        SyslogIdentifier = "lab-probe";
+      };
+    };
+
+    # Lab image: U2F off for the listed services, overriding the host's setting.
+    security.pam.services = lib.genAttrs cfg.u2fOffServices (_: {
+      u2f.enable = lib.mkForce false;
+    });
   };
 }

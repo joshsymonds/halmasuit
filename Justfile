@@ -62,10 +62,15 @@ vis-selftest:
 lab-run +experiments:
     python3 -B tests/hw/lab.py {{experiments}}
 
-# Selftest for the lab runner: drives it against a simulated gnomon (no
-# ssh, nix, or network) with an injected clock. Part of `check`.
+# Builds timeline.json on the power-on clock for one lab run directory and
+# checks it against a profile (default baseline-greetd; pass --expect PROFILE).
+lab-timeline-check run *args:
+    python3 -B tests/hw/timeline.py {{run}} {{args}}
+
+# Selftests for the lab tooling: every tests/hw/test_*.py, run against
+# simulated gnomons, fixtures, and temp trees (no ssh or nix). Part of `check`.
 lab-selftest:
-    python3 -B tests/hw/test_lab.py
+    python3 -B -m unittest discover -s tests/hw -t tests/hw -p 'test_*.py'
 
 # Lint everything (format + clippy + dep policy + spelling + dead deps).
 lint:

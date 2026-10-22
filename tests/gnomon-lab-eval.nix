@@ -5,7 +5,7 @@
 # present and wired to its option. Each experiment is composed with the module
 # on the same host and must carry its own fault. Builds no system closure: the
 # derivation only writes a marker file when every check passes.
-{ system, nixpkgs, labModule, labExperiments }:
+{ system, nixpkgs, labModule, labExperiments, labPatches }:
 
 let
   pkgs = nixpkgs.legacyPackages.${system};
@@ -19,6 +19,16 @@ let
     stage1Deadline = 241;
     rootfsDeadline = 421;
     wolInterface = "enp9s0";
+    crcSampler.enable = true;
+    probe.enable = true;
+    netconsole = {
+      enable = true;
+      targetIp = "10.20.30.40";
+      sourceIp = "10.20.30.50";
+      interface = "enp10s0";
+      port = 6700;
+    };
+    u2fOffServices = [ "login" "sudo" ];
   };
 
   # Synthetic gnomon-like host: systemd stage 1, LUKS root `cryptroot`
@@ -64,6 +74,73 @@ let
   rootRebootCmd = "${cfg.systemd.package}/bin/systemctl --force reboot";
 
   armed = v: v != null && v != "0";
+
+  # initrd storePaths entries are packages or { source, target, ... } sets.
+  inStorePaths = c: pkg:
+    builtins.any (p: "${if p ? source then p.source else p}" == "${pkg}")
+      (get c [ "boot" "initrd" "systemd" "storePaths" ] [ ]);
+
+  # The CRC sampler, built from the same derivation the module stages.
+  labCrc = pkgs.callPackage ../nix/lab/lab-crc.nix { };
+
+  # The keyboard probe script, staged by the module as the lab-probe unit's payload.
+  labProbe = ../nix/lab/lab_probe.py;
+
+  # ── Lab instrumentation fixtures ─────────────────────────────────────
+  nc = labOptions.netconsole;
+  netconsoleDevice = "sys-subsystem-net-devices-${nc.interface}.device";
+  netconsoleUnit = get cfg [ "boot" "initrd" "systemd" "services" "lab-netconsole" ] { };
+
+  # The same host with one netconsole field emptied; its assertions must fail.
+  netconsoleWithEmpty = field:
+    (evalWith (labOptions // { netconsole = nc // { ${field} = ""; }; })).config;
+
+  # Every new setting non-default, with the lab disabled: nothing may appear.
+  disabledNew = (evalWith (labOptions // { enable = false; })).config;
+  # The same host with netconsole off: the firewall must match it exactly.
+  netconsoleOff = (evalWith (labOptions // { netconsole = nc // { enable = false; }; })).config;
+  # The same host with the CRC sampler off: neither unit may appear.
+  crcOff = (evalWith (labOptions // { crcSampler = { enable = false; }; })).config;
+  # The same host with the probe off: neither the unit nor uinput may appear.
+  probeOff = (evalWith (labOptions // { probe = { enable = false; }; })).config;
+  # No lab settings at all: the new options must default off or empty.
+  defaults = (evalWith { }).config.halmasuit.lab;
+
+  # The host enables U2F globally and explicitly turns on one listed service,
+  # so the lab override must beat both. Disabled, neither is forced off.
+  u2fHost = lab: (lib.nixosSystem {
+    inherit system;
+    modules = [
+      labModule
+      (gnomonLike lab)
+      {
+        security.pam.u2f.enable = true;
+        security.pam.services.sudo.u2f.enable = true;
+      }
+    ];
+  }).config;
+  u2fOn = u2fHost labOptions;
+  u2fOff = u2fHost (labOptions // { enable = false; });
+
+  failingAssertions = c: builtins.filter (a: !a.assertion) c.assertions;
+
+  # Journal contract text frozen in nix/lab/module.nix for tests/hw/timeline.py.
+  moduleSource = builtins.readFile labModule;
+  journalContract = [
+    "SYSLOG_IDENTIFIER=lab-crc"
+    "lab-crc-initrd.service"
+    "lab-crc.service"
+    "start t=<us>"
+    "sample card=<cardN> crtc=<id> t=<us> comp=<hex> rg=<hex> out=<hex> comp_sup=<0|1> rg_sup=<0|1> out_sup=<0|1>"
+    "error card=<cardN> crtc=<id> t=<us> errno=<n>"
+    "SYSLOG_IDENTIFIER=lab-probe"
+    "lab-probe.service"
+    "device node=<path>"
+    "ready holder=<comm> pid=<pid>"
+    "typed keys=<n>"
+    "error reason=<text>"
+    "8 lowercase digits"
+  ];
 
   checks = [
     # ── Hardware watchdog, stage 1 ───────────────────────────────────
@@ -151,7 +228,71 @@ let
       msg = "enable = false still sets panic=10"; }
     { ok = (get disabled [ "systemd" "network" "links" "40-enp7s0" ] null) == null;
       msg = "enable = false still defines a WakeOnLan link"; }
+
+    # ── Lab instrumentation options: declared, defaulted, carried ────
+    { ok = (get cfg [ "halmasuit" "lab" "crcSampler" "enable" ] false) == true;
+      msg = "halmasuit.lab.crcSampler.enable does not carry its value"; }
+    { ok = (get cfg [ "halmasuit" "lab" "probe" "enable" ] false) == true;
+      msg = "halmasuit.lab.probe.enable does not carry its value"; }
+    { ok = !defaults.crcSampler.enable && !defaults.probe.enable && !defaults.netconsole.enable
+        && defaults.netconsole.targetIp == "" && defaults.netconsole.sourceIp == ""
+        && defaults.netconsole.interface == "" && defaults.netconsole.port == 6666
+        && defaults.u2fOffServices == [ ];
+      msg = "a new lab option does not default off or empty (netconsole.port defaults to 6666)"; }
+
+    # ── Netconsole from stage 1: outbound UDP only ───────────────────
+    { ok = builtins.elem "netconsole" (get cfg [ "boot" "initrd" "availableKernelModules" ] [ ]);
+      msg = "netconsole is not in boot.initrd.availableKernelModules"; }
+    { ok = inStorePaths cfg pkgs.kmod;
+      msg = "kmod (modprobe) is not in boot.initrd.systemd.storePaths"; }
+    { ok = (netconsoleUnit.serviceConfig.ExecStart or null)
+        == "${pkgs.kmod}/bin/modprobe netconsole netconsole=+@${nc.sourceIp}/${nc.interface},${toString nc.port}@${nc.targetIp}/";
+      msg = "lab-netconsole ExecStart is not modprobe netconsole with source, interface, port and target"; }
+    { ok = (netconsoleUnit.serviceConfig.Type or null) == "oneshot"
+        && (netconsoleUnit.serviceConfig.RemainAfterExit or false) == true;
+      msg = "lab-netconsole is not a oneshot with RemainAfterExit=yes"; }
+    { ok = builtins.elem netconsoleDevice (netconsoleUnit.bindsTo or [ ])
+        && builtins.elem netconsoleDevice (netconsoleUnit.after or [ ]);
+      msg = "lab-netconsole is not BindsTo= and After= ${netconsoleDevice}"; }
+    { ok = builtins.elem "initrd.target" (netconsoleUnit.wantedBy or [ ])
+        && (netconsoleUnit.unitConfig.DefaultDependencies or true) == false;
+      msg = "lab-netconsole is not wanted by initrd.target with DefaultDependencies=no"; }
+    { ok = failingAssertions cfg == [ ];
+      msg = "the valid lab config fails an assertion"; }
+    { ok = lib.all (f: failingAssertions (netconsoleWithEmpty f) != [ ]) [ "targetIp" "sourceIp" "interface" ];
+      msg = "netconsole.enable with an empty targetIp, sourceIp or interface passes its assertion"; }
+    { ok = cfg.networking.firewall.allowedUDPPorts == netconsoleOff.networking.firewall.allowedUDPPorts
+        && cfg.networking.firewall.allowedTCPPorts == netconsoleOff.networking.firewall.allowedTCPPorts
+        && cfg.networking.firewall.allowedUDPPortRanges == netconsoleOff.networking.firewall.allowedUDPPortRanges
+        && cfg.networking.firewall.allowedTCPPortRanges == netconsoleOff.networking.firewall.allowedTCPPortRanges
+        && !(builtins.elem nc.port cfg.networking.firewall.allowedUDPPorts);
+      msg = "netconsole changes the firewall (it must open no port)"; }
+    { ok = (get disabledNew [ "boot" "initrd" "systemd" "services" "lab-netconsole" ] null) == null
+        && !(builtins.elem "netconsole" (get disabledNew [ "boot" "initrd" "availableKernelModules" ] [ ]));
+      msg = "enable = false still defines lab-netconsole or loads the netconsole module"; }
+
+    # ── u2fOffServices: forced off, and only when the lab is enabled ─
+    { ok = (get u2fOn [ "security" "pam" "u2f" "enable" ] false) == true;
+      msg = "the U2F host fixture does not enable U2F (the override check would be vacuous)"; }
+    { ok = lib.all (name: (get u2fOn [ "security" "pam" "services" name "u2f" "enable" ] null) == false)
+        labOptions.u2fOffServices;
+      msg = "u2fAuth is not false for every u2fOffServices entry on a U2F-enabled host"; }
+    { ok = lib.all (name: (get u2fOff [ "security" "pam" "services" name "u2f" "enable" ] null) != false)
+        labOptions.u2fOffServices;
+      msg = "enable = false still forces u2fAuth off for u2fOffServices"; }
+
+    # ── Patch export ─────────────────────────────────────────────────
+    { ok = toString labPatches.nvidiaCrcVblankWait == toString ./lib/crc-vblank-wait.patch;
+      msg = "lib.labPatches.nvidiaCrcVblankWait is not tests/lib/crc-vblank-wait.patch"; }
   ];
+
+  # Journal contract documented in the module header for the lab-crc and
+  # lab-probe producers. A source-text check: the contract is a comment, so
+  # it has no evaluated form to assert on.
+  journalChecks = map (s: {
+    ok = lib.hasInfix s moduleSource;
+    msg = "nix/lab/module.nix does not document journal contract text: ${s}";
+  }) journalContract;
 
   # ── Lab experiments, composed with the module on the same host ───────
   # Each experiment is evaluated the way nix-config composes it: the module,
@@ -293,7 +434,62 @@ let
       rescueChecks name c ++ faultCheck name c)
     faultChecks);
 
-  allChecks = checks ++ experimentChecks;
+  # ── CRC sampler units: stage 1 and rootfs ────────────────────────────
+  crcInitrd = get cfg [ "boot" "initrd" "systemd" "services" "lab-crc-initrd" ] { };
+  crcRoot = get cfg [ "systemd" "services" "lab-crc" ] { };
+  crcUnitChecks = label: unit: [
+    { ok = (unit.serviceConfig.ExecStart or null) == "${labCrc}/bin/lab-crc";
+      msg = "${label} does not run the lab-crc sampler binary"; }
+    { ok = (unit.serviceConfig.SyslogIdentifier or null) == "lab-crc";
+      msg = "${label} lacks SyslogIdentifier=lab-crc"; }
+    { ok = (unit.serviceConfig.Restart or null) == "on-failure";
+      msg = "${label} does not restart the sampler on failure"; }
+    { ok = (unit.unitConfig.DefaultDependencies or true) == false;
+      msg = "${label} lacks DefaultDependencies=no"; }
+    { ok = builtins.elem "sysinit.target" (unit.wantedBy or [ ]);
+      msg = "${label} is not wanted by sysinit.target"; }
+  ];
+  crcChecks = crcUnitChecks "lab-crc-initrd.service" crcInitrd
+    ++ crcUnitChecks "lab-crc.service" crcRoot ++ [
+    { ok = inStorePaths cfg labCrc;
+      msg = "the lab-crc sampler is not in boot.initrd.systemd.storePaths (stage 1 would miss it)"; }
+    { ok = builtins.elem labOptions.displayManagerUnit (crcRoot.before or [ ]);
+      msg = "lab-crc.service is not Before=${labOptions.displayManagerUnit} (the display manager's DRM master must follow the drop)"; }
+    { ok = (get crcOff [ "boot" "initrd" "systemd" "services" "lab-crc-initrd" ] null) == null
+        && (get crcOff [ "systemd" "services" "lab-crc" ] null) == null
+        && !(inStorePaths crcOff labCrc);
+      msg = "crcSampler.enable = false still defines a lab-crc unit or stages the sampler"; }
+    { ok = (get disabledNew [ "boot" "initrd" "systemd" "services" "lab-crc-initrd" ] null) == null
+        && (get disabledNew [ "systemd" "services" "lab-crc" ] null) == null
+        && !(inStorePaths disabledNew labCrc);
+      msg = "enable = false (with crcSampler.enable = true) still defines a lab-crc unit or stages the sampler"; }
+  ];
+
+  # ── lab-probe: on-demand root oneshot, never started on its own ──────
+  probeUnit = get cfg [ "systemd" "services" "lab-probe" ] { };
+  probeChecks = [
+    { ok = (probeUnit.serviceConfig.Type or null) == "oneshot";
+      msg = "lab-probe.service is missing or not a oneshot"; }
+    { ok = (probeUnit.serviceConfig.ExecStart or null) == "${pkgs.python3}/bin/python3 ${labProbe}";
+      msg = "lab-probe.service does not run lab_probe.py with python3"; }
+    { ok = (probeUnit.serviceConfig.SyslogIdentifier or null) == "lab-probe";
+      msg = "lab-probe.service lacks SyslogIdentifier=lab-probe"; }
+    { ok = lib.all (key: (probeUnit.${key} or [ ]) == [ ]) [ "wantedBy" "requiredBy" "upheldBy" ];
+      msg = "lab-probe.service has a wantedBy, requiredBy or upheldBy entry (it must never start on its own)"; }
+    { ok = lib.all (kind: !(builtins.hasAttr "lab-probe" (get cfg [ "systemd" kind ] { })))
+        [ "timers" "paths" "sockets" ];
+      msg = "a timer, path or socket unit named lab-probe can activate the probe"; }
+    { ok = builtins.elem "uinput" (get cfg [ "boot" "kernelModules" ] [ ]);
+      msg = "uinput is not in boot.kernelModules"; }
+    { ok = (get probeOff [ "systemd" "services" "lab-probe" ] null) == null
+        && !(builtins.elem "uinput" (get probeOff [ "boot" "kernelModules" ] [ ]));
+      msg = "probe.enable = false still defines lab-probe or loads uinput"; }
+    { ok = (get disabledNew [ "systemd" "services" "lab-probe" ] null) == null
+        && !(builtins.elem "uinput" (get disabledNew [ "boot" "kernelModules" ] [ ]));
+      msg = "enable = false (with probe.enable = true) still defines lab-probe or loads uinput"; }
+  ];
+
+  allChecks = checks ++ journalChecks ++ experimentChecks ++ crcChecks ++ probeChecks;
   failures = builtins.filter (c: !c.ok) allChecks;
   report = lib.concatMapStrings
     (c: "echo ${lib.escapeShellArg "FAIL: ${c.msg}"} >&2\n")
@@ -302,5 +498,6 @@ in
 pkgs.runCommand "gnomon-lab-eval" { } ''
   ${report}
   ${lib.optionalString (failures != [ ]) "exit 1"}
+  test -x ${labCrc}/bin/lab-crc
   echo "gnomon-lab-eval: ${toString (builtins.length allChecks)} checks passed" > $out
 ''
