@@ -36,7 +36,9 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
-use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmSurface};
+use smithay::backend::drm::{
+    CreateDrmNodeError, DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, DrmSurface, NodeType,
+};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::element::memory::{
@@ -598,6 +600,11 @@ pub struct DrmBackend {
     /// across every output's compositor. Used by `render_frame` to
     /// clear + composite each output's scene every vblank.
     pub renderer: GlesRenderer,
+    /// `dev_t` of the render node that `zwp_linux_dmabuf_v1` default
+    /// feedback names as its main device. `None` when the opened DRM
+    /// device has no render node; the dmabuf global then stays at
+    /// version 3 without feedback.
+    pub dmabuf_main_device: Option<libc::dev_t>,
     /// The wallpaper engine — owns the active backend (image / shader
     /// / video) and builds the bottom-most render element every frame
     /// (epic G1/R3/R6). When no backend is configured the engine
@@ -871,6 +878,49 @@ where
     build_drm_pipeline(device_fd, loop_handle, drm_event_handler, wallpaper_config)
 }
 
+/// The `zwp_linux_dmabuf_v1` default-feedback main device: the `dev_t`
+/// of the render node for the opened DRM device. An opened render node
+/// is its own render node. `None` means there is no render node to name,
+/// so the global stays at version 3 without feedback.
+fn dmabuf_feedback_main_device<E>(
+    opened_dev: libc::dev_t,
+    opened_ty: NodeType,
+    render: Result<Option<libc::dev_t>, E>,
+) -> Option<libc::dev_t> {
+    if opened_ty == NodeType::Render {
+        return Some(opened_dev);
+    }
+    render.ok().flatten()
+}
+
+/// Looks up the dmabuf feedback main device for the DRM device behind
+/// `device_fd`. Lookup failures are logged here and resolve to `None`.
+fn resolve_dmabuf_main_device(device_fd: &DrmDeviceFd) -> Option<libc::dev_t> {
+    let opened = match device_fd
+        .dev_id()
+        .map_err(|e| CreateDrmNodeError::Io(io::Error::from(e)))
+        .and_then(DrmNode::from_dev_id)
+    {
+        Ok(node) => node,
+        Err(e) => {
+            tracing::warn!(error = %e, "opened DRM device is not a DRM node; no dmabuf feedback");
+            return None;
+        }
+    };
+    let render = opened.node_with_type(NodeType::Render).transpose();
+    if let Err(e) = &render {
+        tracing::warn!(error = %e, "render node lookup failed; no dmabuf feedback");
+    }
+    let render = render.map(|node| node.map(|n| n.dev_id()));
+    let main_device = dmabuf_feedback_main_device(opened.dev_id(), opened.ty(), render);
+    if main_device.is_none() {
+        tracing::info!(
+            "no render node for the opened DRM device; zwp_linux_dmabuf_v1 stays at version 3"
+        );
+    }
+    main_device
+}
+
 // reason: a single linear DRM→GBM→EGL→GLES→DrmCompositor→calloop
 // init sequence used by `setup_drm_direct`. The ordering is
 // load-bearing (master before GBM, EGL before GLES, surface before
@@ -894,6 +944,8 @@ where
     S: 'static,
     F: FnMut(DrmEvent, &mut Option<smithay::backend::drm::DrmEventMetadata>, &mut S) + 'static,
 {
+    // Resolved before `device_fd` moves into the GBM device below.
+    let dmabuf_main_device = resolve_dmabuf_main_device(&device_fd);
     // DrmDevice + its event notifier. `drm` must be `mut` so we can
     // call `create_surface` on it below.
     let (mut drm, notifier) = DrmDevice::new(device_fd.clone(), true)
@@ -1186,6 +1238,7 @@ where
         DrmBackend {
             outputs: output_surfaces,
             renderer,
+            dmabuf_main_device,
             wallpaper,
             cursor: CursorRenderState {
                 theming: crate::cursor::CursorTheming::load(),
@@ -2036,6 +2089,50 @@ fn render_one_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `dev_t` for a DRM node with the given minor on major 226 (the DRM
+    /// char major on Linux). Minors 0-63 are primary, 64-127 control,
+    /// 128-191 render. The decision takes plain values, so no node is
+    /// looked up in sysfs.
+    fn drm_dev(minor: u32) -> libc::dev_t {
+        libc::makedev(226, minor)
+    }
+
+    #[test]
+    fn dmabuf_main_device_is_the_render_node_of_a_primary_device() {
+        let card = drm_dev(0);
+        let render = drm_dev(128);
+        assert_eq!(
+            dmabuf_feedback_main_device(card, NodeType::Primary, Ok::<_, io::Error>(Some(render))),
+            Some(render)
+        );
+    }
+
+    #[test]
+    fn dmabuf_main_device_is_the_opened_node_when_it_is_already_render() {
+        let render = drm_dev(128);
+        assert_eq!(
+            dmabuf_feedback_main_device(render, NodeType::Render, Ok::<_, io::Error>(None)),
+            Some(render)
+        );
+    }
+
+    #[test]
+    fn dmabuf_main_device_falls_back_without_a_render_node() {
+        assert_eq!(
+            dmabuf_feedback_main_device(drm_dev(0), NodeType::Primary, Ok::<_, io::Error>(None)),
+            None
+        );
+    }
+
+    #[test]
+    fn dmabuf_main_device_falls_back_on_a_lookup_error() {
+        let err = io::Error::other("sysfs unreadable");
+        assert_eq!(
+            dmabuf_feedback_main_device(drm_dev(0), NodeType::Primary, Err::<Option<_>, _>(err)),
+            None
+        );
+    }
 
     #[test]
     fn centered_origin_centers_a_smaller_window() {
