@@ -8,7 +8,7 @@ default:
 # ── Top-level gates ─────────────────────────────────────────────────────────
 
 # Full local CI gate. Run before every push.
-check: lint r14-gate vis-selftest nvidia-egl-env-gate test
+check: lint r14-gate vis-selftest lab-selftest nvidia-egl-env-gate test
 
 # Pure Nix-eval structural gate: asserts the halmasuit module's
 # nvidia branch produces the expected unit shape — env vars, the
@@ -46,6 +46,17 @@ r14-gate:
 # silently weaken.
 vis-selftest:
     python3 tests/lib/visual.py
+
+# Vermissian-side lab runner for gnomon. Runs the named experiments in
+# order and stops at the first failure. Refuses while a graphical session
+# is logged in on gnomon; never reboots without this command.
+lab-run +experiments:
+    python3 -B tests/hw/lab.py {{experiments}}
+
+# Selftest for the lab runner: drives it against a simulated gnomon (no
+# ssh, nix, or network) with an injected clock. Part of `check`.
+lab-selftest:
+    python3 -B tests/hw/test_lab.py
 
 # Lint everything (format + clippy + dep policy + spelling + dead deps).
 lint:
