@@ -18,23 +18,39 @@ When an experiment checks its lab boot, the runner copies gnomon's firmware and
 loader evidence (FPDT, BGRT, boot_params, and the systemd-boot efivars) into the
 run's firmware/ directory while the lab entry is up; a file gnomon lacks is noted in
 run.log and skipped.
-The baseline experiment also probes the greeter on the checked lab boot, once the display
+The baseline experiment probes the greetd PAM service on the checked lab boot, once the display
 manager is active. The probe refuses, and never starts lab-probe.service, when the resolved
-greetd PAM stack holds a lockout module (pam_faillock, pam_tally, pam_tally2), when an auth
-line lets pam_unix accept a blank password (nullok), or when the stack cannot be resolved.
-Otherwise the runner starts lab-probe.service, whose unit types a wrong password into
-greetd, and waits up to 30 seconds after each start for the lab boot's authpriv journal to hold a
-pam_unix(greetd:auth) authentication failure for --probe-user. A start that is not matched is
+stack of the probed service holds a lockout module (pam_faillock, pam_tally, pam_tally2), when an
+auth line lets pam_unix accept a blank password (nullok), or when the stack cannot be resolved.
+Otherwise the runner starts lab-probe.service, whose unit types a wrong password into the
+greeter, and waits up to 30 seconds after each start for the lab boot's authpriv journal to hold a
+pam_unix(<service>:auth) authentication failure for --probe-user. A start that is not matched is
 followed by another start, at most 5 starts in all, and no start begins 180 seconds after the
 first. probe.json records each start's return code and match, and the probe passes when a start
 is matched. A refused or failed probe fails the run after gnomon has returned to its default
 entry.
-The halmasuit and halmasuit-production experiments hold the checked lab boot before the return
-reboot instead of probing it. The runner polls the lab boot's journal every 5 seconds for
-halmasuit.service's greeter event (foreground_changed to greeter), then for the lab boot's newest
-entry to be at least 30 seconds past that event on the journal's monotonic clock. One 300 second
-deadline covers both waits. When it passes first, the runner notes why in run.log, returns gnomon
-to its default entry, collects the journal as usual, and fails the run after the return.
+The halmasuit experiment holds the checked lab boot first, then probes the halmasuit PAM service
+before the return reboot with the same refusals and starts, without waiting on the display
+manager: the passed hold shows the greeter is up. The hold polls the lab boot's journal every 5
+seconds for halmasuit.service's greeter event (foreground_changed to greeter), then for the lab
+boot's newest entry to be at least 30 seconds past that event on the journal's monotonic clock.
+One 300 second deadline covers both waits. When it passes first, the runner notes why in
+run.log, starts no probe, records the refusal in probe.json, returns gnomon to its default
+entry, collects the journal as usual, and fails the run after the return. A halmasuit probe that
+matches a line waits 10 seconds on the runner's clock, then reads halmasuit.service's journal
+once more. It passes only when the first greeter_spawned event's pid still exists (`test -d
+/proc/PID`) and no greeter_died_pre_auth or greeter_terminated event follows that spawn;
+probe.json records the pid, its liveness and that death event. halmasuit-production holds the
+lab boot and never probes it.
+With `--attended` (accepted only when the experiments are exactly halmasuit), the halmasuit
+experiment runs no probe. After the hold it says the greeter is up and waits up to 1800 seconds
+for halmasuit.service's lab boot journal to hold both session_opened and
+session_client_first_frame, in either order. A journal query that fails counts as not yet. Once
+both events are there, the runner says how to return gnomon: `touch` on the `return` file in the
+run directory. It then waits for that file with no deadline. The return reboot after a login skips
+the graphical-session refusal, because the person's own session is on the lab boot. A hold that
+expires, a login wait that reaches its deadline, or a return file that appears before a login
+returns gnomon as the other experiments do, and the run fails after the return.
 Once gnomon has returned, the runner saves the lab boot's journal as journal.json in the
 run directory (`journalctl -b ID -o json --all`). A checked lab boot is known from the boot the
 runner saw; otherwise the lab boot is the boot list-boots lists right after the boot the
@@ -51,8 +67,9 @@ to the run's netconsole.log, prefixed with the time vermissian received it.
 
 A run refuses before it installs anything, and again before each reboot it
 issues, while a graphical user session (Class=user, Type wayland, x11, or mir)
-is logged in. Any failure after the install removes the lab entry and clears
-the one-shot before the runner exits.
+is logged in; the attended return reboot after a login is the one exception. Any
+failure after the install removes the lab entry and clears the one-shot before the
+runner exits.
 """
 
 from __future__ import annotations
@@ -60,6 +77,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import re
 import shlex
 import socket
@@ -123,18 +141,24 @@ NETCONSOLE_LOG = "netconsole.log"
 UDP_MAX_DATAGRAM = 65535
 LISTEN_POLL_SECONDS = 0.2
 PAM_DIR = "/etc/pam.d/"
-PAM_SERVICE = "greetd"
+GREETD_SERVICE = "greetd"
 PROBE_UNIT = "lab-probe.service"
-PROBE_MARKER = f"pam_unix({PAM_SERVICE}:auth): authentication failure"
 PROBE_MAX_STARTS = 5
 PROBE_WAIT_SECONDS = 30
 PROBE_DEADLINE_SECONDS = 180
 AUTHPRIV_FACILITY = 10
 DEFAULT_PROBE_USER = "joshsymonds"
+HALMASUIT_SERVICE = "halmasuit"
 HALMASUIT_UNIT = "halmasuit.service"
+GREETER_SETTLE_SECONDS = 10
+GREETER_DEATH_EVENTS = frozenset({"greeter_died_pre_auth", "greeter_terminated"})
 HOLD_DEADLINE_SECONDS = 300
 HOLD_AFTER_GREETER_SECONDS = 30
 MICROSECONDS_PER_SECOND = 1_000_000
+RETURN_FILE = "return"
+ATTENDED_LOGIN_DEADLINE_SECONDS = 1800
+LOGIN_EVENTS = frozenset({"session_opened", "session_client_first_frame"})
+ATTENDED_REFUSAL = "--attended needs exactly the halmasuit experiment"
 
 
 class LabError(Exception):
@@ -288,18 +312,18 @@ class Plan:
 
     lab_boot_checked: bool  # the lab entry must be seen booting before the return reboot
     poweroff: bool  # gnomon powers off and returns on wake-on-LAN
-    probe: bool  # the greeter's PAM stack is probed with a wrong password on the checked lab boot
+    probe_service: str | None  # the PAM service probed with a wrong password on the checked lab boot
     hold: bool  # the checked lab boot is held until the greeter event is 30 s old, before the return reboot
 
 
 EXPERIMENTS: dict[str, Plan] = {
-    "baseline": Plan(lab_boot_checked=True, poweroff=False, probe=True, hold=False),
-    "fault-initrd": Plan(lab_boot_checked=False, poweroff=False, probe=False, hold=False),
-    "fault-hang": Plan(lab_boot_checked=False, poweroff=False, probe=False, hold=False),
-    "fault-panic": Plan(lab_boot_checked=False, poweroff=False, probe=False, hold=False),
-    "fault-poweroff": Plan(lab_boot_checked=False, poweroff=True, probe=False, hold=False),
-    "halmasuit": Plan(lab_boot_checked=True, poweroff=False, probe=False, hold=True),
-    "halmasuit-production": Plan(lab_boot_checked=True, poweroff=False, probe=False, hold=True),
+    "baseline": Plan(lab_boot_checked=True, poweroff=False, probe_service=GREETD_SERVICE, hold=False),
+    "fault-initrd": Plan(lab_boot_checked=False, poweroff=False, probe_service=None, hold=False),
+    "fault-hang": Plan(lab_boot_checked=False, poweroff=False, probe_service=None, hold=False),
+    "fault-panic": Plan(lab_boot_checked=False, poweroff=False, probe_service=None, hold=False),
+    "fault-poweroff": Plan(lab_boot_checked=False, poweroff=True, probe_service=None, hold=False),
+    "halmasuit": Plan(lab_boot_checked=True, poweroff=False, probe_service=HALMASUIT_SERVICE, hold=True),
+    "halmasuit-production": Plan(lab_boot_checked=True, poweroff=False, probe_service=None, hold=True),
 }
 
 
@@ -402,23 +426,30 @@ def _journal_records(text: str) -> list[dict]:
     return records
 
 
-def _is_greeter_event(record: dict) -> bool:
-    """Whether a journal entry is halmasuit's greeter Event.
+def _halmasuit_event(record: dict) -> dict | None:
+    """The Event a journal entry carries, or None for an entry that is not a halmasuit Event.
 
     halmasuit's tracing-JSON line carries the Event as a JSON string in fields.json. Any other
-    entry, from another unit or a plain or non-JSON halmasuit line, is not the greeter event.
+    entry, from another unit or a plain or non-JSON halmasuit line, carries none.
     """
     if record.get("_SYSTEMD_UNIT") != HALMASUIT_UNIT or not isinstance(record.get("MESSAGE"), str):
-        return False
+        return None
     try:
         event = json.loads(json.loads(record["MESSAGE"])["fields"]["json"])
     except (json.JSONDecodeError, KeyError, TypeError):
-        return False
-    return (
-        isinstance(event, dict)
-        and event.get("event") == "foreground_changed"
-        and event.get("to") == "greeter"
-    )
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def _is_greeter_event(record: dict) -> bool:
+    """Whether a journal entry is halmasuit's greeter Event: foreground_changed to greeter."""
+    event = _halmasuit_event(record)
+    return event is not None and event.get("event") == "foreground_changed" and event.get("to") == "greeter"
+
+
+def _probe_marker(service: str) -> str:
+    """The authpriv text pam_unix writes for a wrong password typed at the service's greeter."""
+    return f"pam_unix({service}:auth): authentication failure"
 
 
 def _monotonic_us(record: dict) -> int:
@@ -491,7 +522,7 @@ class Lab:
         self.probe_user = probe_user
         self.emit = emit
 
-    def run_experiment(self, name: str) -> None:
+    def run_experiment(self, name: str, attended: bool = False) -> None:
         plan = EXPERIMENTS[name]
         run = RunLog(self.state_root, self.clock.stamp(), name, self.emit)
         netconsole = NetconsoleLog(run.directory / NETCONSOLE_LOG)
@@ -531,20 +562,31 @@ class Lab:
             booted_from = boot_before
             lab_boot: str | None = None
             probe: dict | None = None
+            probe_problem: str | None = None
             hold_reason: str | None = None
+            attended_reason: str | None = None
+            signalled_after_login = False
             if plan.lab_boot_checked:
                 lab_boot = self._await_boot("lab entry to boot", boot_before, LAB_ENTRY)
                 booted_from = lab_boot
                 run.say(f"lab entry booted as {lab_boot}")
                 self._collect_firmware(run)
-                if plan.probe:
-                    probe = self._probe(run)
-                    run.save("probe.json", probe)
                 if plan.hold:
                     hold_reason = self._hold()
                     if hold_reason is not None:
                         run.say(f"hold expired: {hold_reason}; returning gnomon to {pre.default}")
-                self._refuse_if_graphical("refusing before return reboot")
+                    elif attended:
+                        signal = (run.directory / RETURN_FILE).resolve()
+                        attended_reason = self._attended_wait(run, signal)
+                        if attended_reason is not None:
+                            reason = f"no attended login: {attended_reason}"
+                            run.say(f"{reason}; returning gnomon to {pre.default}")
+                        signalled_after_login = attended_reason is None
+                if plan.probe_service is not None and not attended:
+                    probe, probe_problem = self._probe(run, plan.probe_service, plan.hold, hold_reason)
+                    run.save("probe.json", probe)
+                if not signalled_after_login:
+                    self._refuse_if_graphical("refusing before return reboot")
                 self._reboot()
             if plan.poweroff:
                 self._await_power_off()
@@ -560,10 +602,12 @@ class Lab:
             self._remove_entry()
             _, post = self._record()
             _compare(pre, post)
-            if probe is not None:
-                self._check_probe(probe)
             if hold_reason is not None:
                 raise LabError("lab boot hold expired before the return reboot")
+            if attended_reason is not None:
+                raise LabError(f"attended login did not happen: {attended_reason}")
+            if probe is not None:
+                self._check_probe(probe, probe_problem)
             run.say("PASS")
         except BaseException as err:
             run.say(f"FAIL: {err}")
@@ -766,10 +810,16 @@ class Lab:
 
         self._poll(f"{self.display_manager} to become active", active, DISPLAY_DEADLINE_SECONDS)
 
-    def _probe(self, run: RunLog) -> dict:
-        """Type a wrong password into greetd on the lab boot and record what the journal shows."""
+    def _probe(
+        self, run: RunLog, service: str, held: bool, hold_reason: str | None
+    ) -> tuple[dict, str | None]:
+        """Type a wrong password into the service's greeter on the lab boot and record what the journal shows.
+
+        A held boot checks the greeter after a matched line. The second value is why that check could
+        not complete, or None; the caller fails the run with it after the return reboot.
+        """
         probe: dict = {
-            "service": PAM_SERVICE,
+            "service": service,
             "pam_files": None,
             "pam_modules": None,
             "lockout": None,
@@ -781,52 +831,100 @@ class Lab:
             "matched": None,
             "passed": False,
         }
+        if held:
+            probe.update({"greeter_pid": None, "greeter_alive": None, "greeter_death": None})
+        if hold_reason is not None:
+            probe["refused"] = f"lab boot hold expired: {hold_reason}"
+            return probe, None
+        if not held:
+            try:
+                self._await_display_manager()
+            except LabError as err:
+                probe["refused"] = f"greeter not active: {err}"
+                return probe, None
         try:
-            self._await_display_manager()
-        except LabError as err:
-            probe["refused"] = f"greeter not active: {err}"
-            return probe
-        try:
-            stack = pam_stack.resolve(PAM_SERVICE, self._read_pam_file)
+            stack = pam_stack.resolve(service, self._read_pam_file)
         except pam_stack.PamStackError as err:
-            probe["refused"] = f"cannot resolve the {PAM_SERVICE} PAM stack: {err}"
-            return probe
+            probe["refused"] = f"cannot resolve the {service} PAM stack: {err}"
+            return probe, None
         probe["pam_files"] = list(stack.files)
         probe["pam_modules"] = list(stack.modules)
         probe["lockout"] = list(stack.lockout)
         probe["nullok_auth"] = list(stack.nullok_auth)
         if stack.lockout:
-            probe["refused"] = f"{PAM_SERVICE} PAM stack holds lockout module(s): {', '.join(stack.lockout)}"
-            return probe
+            probe["refused"] = f"{service} PAM stack holds lockout module(s): {', '.join(stack.lockout)}"
+            return probe, None
         if stack.nullok_auth:
             probe["refused"] = (
-                f"{PAM_SERVICE} PAM stack lets pam_unix accept a blank password (nullok on auth): "
+                f"{service} PAM stack lets pam_unix accept a blank password (nullok on auth): "
                 f"{'; '.join(stack.nullok_auth)}"
             )
-            return probe
+            return probe, None
         probe["started"] = True
         first_start = self.clock.monotonic()
         for number in range(PROBE_MAX_STARTS):
             if number and self.clock.monotonic() - first_start >= PROBE_DEADLINE_SECONDS:
                 break
-            attempt = self._probe_start(run)
+            attempt = self._probe_start(run, service)
             probe["attempts"].append(attempt)
             if attempt["matched"] is not None:
                 break
         last = probe["attempts"][-1]
         probe["unit_returncode"] = last["unit_returncode"]
         probe["matched"] = last["matched"]
-        probe["passed"] = probe["matched"] is not None
-        return probe
+        problem = None
+        if held and probe["matched"] is not None:
+            problem = self._check_greeter(probe)
+        if held:
+            probe["passed"] = (
+                probe["matched"] is not None
+                and probe["greeter_alive"] is True
+                and probe["greeter_death"] is None
+            )
+        else:
+            probe["passed"] = probe["matched"] is not None
+        return probe, problem
 
-    def _probe_start(self, run: RunLog) -> dict:
+    def _check_greeter(self, probe: dict) -> str | None:
+        """Record the greeter's pid, liveness and death on a held boot's probe.
+
+        Waits GREETER_SETTLE_SECONDS on the clock after the matched line, then reads halmasuit's
+        lab boot journal once. Returns why the greeter could not be checked, or None.
+        """
+        self.clock.sleep(GREETER_SETTLE_SECONDS)
+        try:
+            events = [event for event in map(_halmasuit_event, self._halmasuit_records()) if event is not None]
+        except LabError as err:
+            return str(err)
+        spawn_index = next(
+            (index for index, event in enumerate(events) if event.get("event") == "greeter_spawned"), None
+        )
+        if spawn_index is None:
+            return None
+        spawn = events[spawn_index]
+        pid = spawn.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            return f"greeter_spawned event has no integer pid: {json.dumps(spawn)}"
+        probe["greeter_pid"] = pid
+        probe["greeter_death"] = next(
+            (event for event in events[spawn_index + 1 :] if event.get("event") in GREETER_DEATH_EVENTS), None
+        )
+        result = self.layer.remote(["test", "-d", f"/proc/{pid}"])
+        if result.returncode not in (0, 1):
+            detail = result.stderr.strip() or "no output"
+            return f"liveness check of greeter pid {pid} failed (rc {result.returncode}): {detail}"
+        probe["greeter_alive"] = result.returncode == 0
+        return None
+
+    def _probe_start(self, run: RunLog, service: str) -> dict:
         """Start lab-probe.service once, then wait up to PROBE_WAIT_SECONDS for the probe user's marker line."""
         start = self.layer.remote(["sudo", "-n", "systemctl", "start", PROBE_UNIT])
         attempt: dict = {"unit_returncode": start.returncode, "matched": None}
+        marker = _probe_marker(service)
         try:
             attempt["matched"] = self._poll(
-                f"{PROBE_MARKER} for {self.probe_user} in the lab boot journal",
-                self._probe_line,
+                f"{marker} for {self.probe_user} in the lab boot journal",
+                lambda: self._probe_line(marker),
                 PROBE_WAIT_SECONDS,
             )
         except LabError as err:
@@ -843,8 +941,8 @@ class Lab:
         detail = result.stderr.strip() or "no output"
         raise pam_stack.PamStackError(f"cannot read {PAM_DIR}{name} (rc {result.returncode}): {detail}")
 
-    def _probe_line(self) -> str | None:
-        """The lab boot's authpriv line for the probe user's greetd failure, or None while it is absent."""
+    def _probe_line(self, marker: str) -> str | None:
+        """The lab boot's authpriv line for the probe user's failure at the marker's service, or None while it is absent."""
         journal = _ok(
             self.layer.remote(
                 [
@@ -863,17 +961,30 @@ class Lab:
         )
         token = f"user={self.probe_user}"
         for line in journal.splitlines():
-            if PROBE_MARKER in line and token in line.split():
+            if marker in line and token in line.split():
                 return line
         return None
 
-    def _check_probe(self, probe: dict) -> None:
+    def _check_probe(self, probe: dict, problem: str | None) -> None:
         if probe["refused"] is not None:
             raise LabError(f"probe refused: {probe['refused']}")
-        if not probe["passed"]:
+        if probe["passed"]:
+            return
+        marker = _probe_marker(probe["service"])
+        if probe["matched"] is None:
             raise LabError(
-                f"probe did not pass: no '{PROBE_MARKER}' line for {self.probe_user} in the lab boot journal"
+                f"probe did not pass: no '{marker}' line for {self.probe_user} in the lab boot journal"
             )
+        if problem is not None:
+            raise LabError(f"probe did not pass: {problem}")
+        if probe["greeter_pid"] is None:
+            raise LabError("probe did not pass: no greeter_spawned event in the lab boot journal")
+        if probe["greeter_death"] is not None:
+            raise LabError(
+                f"probe did not pass: greeter pid {probe['greeter_pid']} has a death event after its spawn: "
+                f"{json.dumps(probe['greeter_death'])}"
+            )
+        raise LabError(f"probe did not pass: greeter pid {probe['greeter_pid']} is not running")
 
     def _hold(self) -> str | None:
         """Hold the lab boot until its greeter event is 30 s old in its journal.
@@ -931,8 +1042,69 @@ class Lab:
             reason += f"; last read problem: {problem}"
         return reason
 
-    def _greeter_event_us(self) -> int | None:
-        """Journal monotonic time of the lab boot's first halmasuit greeter event, or None while there is none."""
+    def _attended_wait(self, run: RunLog, signal: Path) -> str | None:
+        """Hold the lab boot for a login at the greeter, then for the operator's return file.
+
+        Returns None once the login is seen and the return file exists, or why the login wait
+        ended without a login. After the login it says how to return gnomon, then waits for the
+        file with no deadline.
+        """
+        run.say(
+            "greeter is up on gnomon: the person may log in; "
+            f"waiting up to {ATTENDED_LOGIN_DEADLINE_SECONDS} seconds for the login"
+        )
+        reason = self._await_login(signal)
+        if reason is not None:
+            return reason
+        touch = shlex.join(["touch", str(signal)])
+        run.say(f"session is up on gnomon; when you are done, return gnomon with: {touch}")
+        self._poll("the return file", lambda: True if self._signalled(signal) else None, math.inf)
+        return None
+
+    def _await_login(self, signal: Path) -> str | None:
+        """Wait for both login events in the lab boot journal, or for the return file first.
+
+        Returns None once both events are there, in either order. Otherwise returns why the wait
+        ended: the return file existed before a login, or ATTENDED_LOGIN_DEADLINE_SECONDS passed.
+        Each journal query that fails counts as not yet, and the last such failure is part of a
+        deadline reason.
+        """
+        problem = ""
+
+        def logged_in() -> bool | None:
+            nonlocal problem
+            try:
+                if LOGIN_EVENTS <= self._halmasuit_event_names():
+                    return True
+            except LabError as err:
+                problem = str(err)
+            return False if self._signalled(signal) else None
+
+        try:
+            logged = self._poll("a login at the greeter", logged_in, ATTENDED_LOGIN_DEADLINE_SECONDS)
+        except LabError:
+            reason = (
+                f"no login within {ATTENDED_LOGIN_DEADLINE_SECONDS} seconds: halmasuit.service's lab "
+                "boot journal did not hold both session_opened and session_client_first_frame"
+            )
+            return f"{reason}; last read problem: {problem}" if problem else reason
+        return None if logged else "the return file appeared before a login"
+
+    def _signalled(self, signal: Path) -> bool:
+        """Whether the operator's return file exists; a check that fails counts as not yet."""
+        return self.layer.local(["test", "-e", str(signal)]).returncode == 0
+
+    def _halmasuit_event_names(self) -> set[str]:
+        """The event name of every halmasuit Event in the lab boot journal."""
+        names: set[str] = set()
+        for record in self._halmasuit_records():
+            event = _halmasuit_event(record)
+            if event is not None and isinstance(event.get("event"), str):
+                names.add(event["event"])
+        return names
+
+    def _halmasuit_records(self) -> list[dict]:
+        """Every entry of halmasuit.service's lab boot journal, oldest first."""
         result = self.layer.remote(
             [
                 "sudo",
@@ -947,7 +1119,11 @@ class Lab:
                 "--no-pager",
             ]
         )
-        for record in _journal_records(_ok(result, f"read {HALMASUIT_UNIT}'s lab boot journal")):
+        return _journal_records(_ok(result, f"read {HALMASUIT_UNIT}'s lab boot journal"))
+
+    def _greeter_event_us(self) -> int | None:
+        """Journal monotonic time of the lab boot's first halmasuit greeter event, or None while there is none."""
+        for record in self._halmasuit_records():
             if _is_greeter_event(record):
                 return _monotonic_us(record)
         return None
@@ -1048,6 +1224,11 @@ def main(
     )
     parser.add_argument("experiments", nargs="+", metavar="EXPERIMENT", choices=sorted(EXPERIMENTS))
     parser.add_argument(
+        "--attended",
+        action="store_true",
+        help="hold the halmasuit boot for a person to log in at the greeter, then wait for the return file",
+    )
+    parser.add_argument(
         "--nix-config",
         type=Path,
         default=Path.home() / "nix-config",
@@ -1078,9 +1259,11 @@ def main(
     parser.add_argument(
         "--probe-user",
         default=DEFAULT_PROBE_USER,
-        help="user whose pam_unix greetd failure must appear in the lab boot journal for the probe to pass",
+        help="user whose pam_unix authentication failure must appear in the lab boot journal for the probe to pass",
     )
     options = parser.parse_args(argv)
+    if options.attended and options.experiments != ["halmasuit"]:
+        parser.error(ATTENDED_REFUSAL)
     runner = Lab(
         layer or SystemLayer(),
         clock or SystemClock(),
@@ -1095,7 +1278,7 @@ def main(
     )
     for name in options.experiments:
         try:
-            runner.run_experiment(name)
+            runner.run_experiment(name, attended=options.attended)
         except LabError as err:
             print(f"lab-run: {name} failed: {err}; queue stopped", file=sys.stderr)
             return 1

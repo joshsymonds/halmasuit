@@ -68,6 +68,15 @@ a nonzero checksum and at least two distinct values there; an overlay
 `client_first_frame` and a greeter `foreground_changed`. It checks nothing else:
 no firmware mode, BGRT logo, frame stats, `assert_animating`, flash stream,
 greeter-window checksum, or checksum after the first frame.
+
+Profile `attended-login` checks a run in which a person logs in at the greeter
+through halmasuit. It reads only halmasuit events. The checks, one message each
+when they fail: a `session_opened` exists; a `session_client_first_frame` exists;
+exactly one `started` exists; when it does and a `session_opened` exists, that
+`started` has a monotonic time no later than the first `session_opened` that has
+one; and `assert_no_flash_stream` passes over every halmasuit payload in timeline
+order. A halmasuit restart across the swap is caught by the `started` count and
+order checks.
 """
 
 from __future__ import annotations
@@ -578,7 +587,34 @@ def production(timeline: Timeline) -> list[str]:
     return failures
 
 
+def attended_login(timeline: Timeline) -> list[str]:
+    halmasuit = [event for event in timeline["events"] if event["kind"] == "halmasuit"]
+    payloads = [event["payload"] for event in halmasuit]
+    opened = [event for event in halmasuit if payload_matches(event["payload"], "session_opened")]
+    started = [event for event in halmasuit if payload_matches(event["payload"], "started")]
+    failures: list[str] = []
+
+    if not opened:
+        failures.append("no session_opened")
+    if not any(payload_matches(payload, "session_client_first_frame") for payload in payloads):
+        failures.append("no session_client_first_frame")
+    if len(started) != 1:
+        failures.append(f"{len(started)} halmasuit started events; expected exactly one")
+    opened_mono = next((event["mono_us"] for event in opened if event["mono_us"] is not None), None)
+    if len(started) == 1 and opened_mono is not None:
+        started_mono = started[0]["mono_us"]
+        if started_mono is not None and started_mono > opened_mono:
+            failures.append("halmasuit started after session_opened")
+
+    try:
+        visual.assert_no_flash_stream(None, events=payloads)
+    except AssertionError as exc:
+        failures.append(str(exc))
+    return failures
+
+
 PROFILES: dict[str, Profile] = {
+    "attended-login": attended_login,
     "baseline-greetd": baseline_greetd,
     "bios-shader-greeter": bios_shader_greeter,
     "production": production,
