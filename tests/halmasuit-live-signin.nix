@@ -321,9 +321,12 @@ pkgs.testers.runNixOSTest {
         f"{halmasuit_pid} -> {pid_now}"
     )
 
-    machine.succeed(
+    # The broker logs this through journald, which can trail the
+    # compositor's session_opened event under host load.
+    machine.wait_until_succeeds(
         "journalctl -u halmasuit-session.service | "
-        "grep -qF 'pam_unix(halmasuit:session): session opened for user alice'"
+        "grep -qF 'pam_unix(halmasuit:session): session opened for user alice'",
+        timeout=30,
     )
 
     print(

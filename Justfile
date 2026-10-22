@@ -148,9 +148,6 @@ test-vm jobs="":
         visual-logout-respawn
         visual-shutdown-tear-down
         visual-shutdown-pivot-survival
-        # R13 forcing function: real DMS DankGreeter (Quickshell+Qt6) as
-        # halmasuit's greeter over the wallpaper, no-flash invariant intact.
-        visual-dankgreeter
         # R12 (GTK4 half): minimal GTK4 wayland client end-to-end.
         visual-gtk4-smoke
         # R13(b): G3 keystroke auth arc end-to-end through real DMS
@@ -169,12 +166,18 @@ test-vm jobs="":
         # budget-exhaustion + login-flash continuity under video wallpaper.
         visual-wallpaper-video
     )
-    # Throughput gates measure a render rate inside the VM, so they run
-    # alone after the parallel batch: sharing the host with other
-    # llvmpipe VMs cuts the measured rate (42 fps among 8 VMs vs 75 alone
+    # Timing-bound gates run alone after the parallel batch: sharing the
+    # host with other llvmpipe VMs slows the guest. Throughput gates
+    # measure a render rate inside the VM (42 fps among 8 VMs vs 75 alone
     # for visual-wallpaper-render-rate, whose bar is 50).
+    # visual-dankgreeter (R13 forcing function: real DMS DankGreeter as
+    # halmasuit's greeter over the wallpaper) must capture the greeter
+    # before its clock's first minute repaint, about 60 s after the
+    # wall-clock pin; under parallel load halmasuit's llvmpipe setup alone
+    # took 19 s and the capture missed that window.
     solo=(
         visual-wallpaper-render-rate
+        visual-dankgreeter
     )
     rc=0
     echo "── test-vm: ${#gates[@]} gates, up to $jobs VMs at once ──"
