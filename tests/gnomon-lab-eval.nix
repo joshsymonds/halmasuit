@@ -83,6 +83,9 @@ let
   # The CRC sampler, built from the same derivation the module stages.
   labCrc = pkgs.callPackage ../nix/lab/lab-crc.nix { };
 
+  # The keyboard probe script, staged by the module as the lab-probe unit's payload.
+  labProbe = ../nix/lab/lab_probe.py;
+
   # ── Lab instrumentation fixtures ─────────────────────────────────────
   nc = labOptions.netconsole;
   netconsoleDevice = "sys-subsystem-net-devices-${nc.interface}.device";
@@ -98,6 +101,8 @@ let
   netconsoleOff = (evalWith (labOptions // { netconsole = nc // { enable = false; }; })).config;
   # The same host with the CRC sampler off: neither unit may appear.
   crcOff = (evalWith (labOptions // { crcSampler = { enable = false; }; })).config;
+  # The same host with the probe off: neither the unit nor uinput may appear.
+  probeOff = (evalWith (labOptions // { probe = { enable = false; }; })).config;
   # No lab settings at all: the new options must default off or empty.
   defaults = (evalWith { }).config.halmasuit.lab;
 
@@ -460,7 +465,31 @@ let
       msg = "enable = false (with crcSampler.enable = true) still defines a lab-crc unit or stages the sampler"; }
   ];
 
-  allChecks = checks ++ journalChecks ++ experimentChecks ++ crcChecks;
+  # ── lab-probe: on-demand root oneshot, never started on its own ──────
+  probeUnit = get cfg [ "systemd" "services" "lab-probe" ] { };
+  probeChecks = [
+    { ok = (probeUnit.serviceConfig.Type or null) == "oneshot";
+      msg = "lab-probe.service is missing or not a oneshot"; }
+    { ok = (probeUnit.serviceConfig.ExecStart or null) == "${pkgs.python3}/bin/python3 ${labProbe}";
+      msg = "lab-probe.service does not run lab_probe.py with python3"; }
+    { ok = (probeUnit.serviceConfig.SyslogIdentifier or null) == "lab-probe";
+      msg = "lab-probe.service lacks SyslogIdentifier=lab-probe"; }
+    { ok = lib.all (key: (probeUnit.${key} or [ ]) == [ ]) [ "wantedBy" "requiredBy" "upheldBy" ];
+      msg = "lab-probe.service has a wantedBy, requiredBy or upheldBy entry (it must never start on its own)"; }
+    { ok = lib.all (kind: !(builtins.hasAttr "lab-probe" (get cfg [ "systemd" kind ] { })))
+        [ "timers" "paths" "sockets" ];
+      msg = "a timer, path or socket unit named lab-probe can activate the probe"; }
+    { ok = builtins.elem "uinput" (get cfg [ "boot" "kernelModules" ] [ ]);
+      msg = "uinput is not in boot.kernelModules"; }
+    { ok = (get probeOff [ "systemd" "services" "lab-probe" ] null) == null
+        && !(builtins.elem "uinput" (get probeOff [ "boot" "kernelModules" ] [ ]));
+      msg = "probe.enable = false still defines lab-probe or loads uinput"; }
+    { ok = (get disabledNew [ "systemd" "services" "lab-probe" ] null) == null
+        && !(builtins.elem "uinput" (get disabledNew [ "boot" "kernelModules" ] [ ]));
+      msg = "enable = false (with probe.enable = true) still defines lab-probe or loads uinput"; }
+  ];
+
+  allChecks = checks ++ journalChecks ++ experimentChecks ++ crcChecks ++ probeChecks;
   failures = builtins.filter (c: !c.ok) allChecks;
   report = lib.concatMapStrings
     (c: "echo ${lib.escapeShellArg "FAIL: ${c.msg}"} >&2\n")

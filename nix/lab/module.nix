@@ -6,8 +6,9 @@
 #
 # Lab instrumentation settings: netconsole from the initramfs, U2F off for
 # listed PAM services, and the lab-crc scanout sampler, which runs in stage 1
-# and after switch-root. The probe option is declared here, and its unit is
-# not defined yet. Every option defaults off or empty.
+# and after switch-root. The probe option loads uinput and defines
+# lab-probe.service, an on-demand root oneshot that nothing starts on its own.
+# Every option defaults off or empty.
 #
 # Journal contract (frozen; consumed by tests/hw/timeline.py). Each entry is
 # one journal line, identified by SYSLOG_IDENTIFIER. `t` is CLOCK_MONOTONIC in
@@ -44,6 +45,8 @@ let
   netconsoleDevice = "sys-subsystem-net-devices-${cfg.netconsole.interface}.device";
 
   labCrc = pkgs.callPackage ./lab-crc.nix { };
+
+  labProbe = ./lab_probe.py;
 in
 {
   options.halmasuit.lab = {
@@ -249,6 +252,19 @@ in
         ExecStart = "${labCrc}/bin/lab-crc";
         SyslogIdentifier = "lab-crc";
         Restart = "on-failure";
+      };
+    };
+
+    # Keyboard probe. uinput loads at boot so the probe can create its virtual
+    # keyboard on demand. lab-probe.service has no wantedBy, requiredBy,
+    # upheldBy, timer, path, or socket, so only an explicit start runs it. The
+    # runner starts it after the greeter is up.
+    boot.kernelModules = lib.optional cfg.probe.enable "uinput";
+    systemd.services.lab-probe = lib.mkIf cfg.probe.enable {
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${pkgs.python3}/bin/python3 ${labProbe}";
+        SyslogIdentifier = "lab-probe";
       };
     };
 
