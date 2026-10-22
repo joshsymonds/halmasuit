@@ -333,18 +333,34 @@ pkgs.testers.runNixOSTest {
             f"halmasuit must run as uid 998 (services.halmasuit.compositorUid) "
             f"on all four uid components after the drop; got {status_uid!r}"
         )
-        # gid pinning: setresgid(egid, egid, egid) means saved-set-gid
-        # equals current egid — the Gid: line should show four equal
-        # values. We don't pin the absolute value here because that's
-        # controlled by greeterGroup (already exercised in suite 2's
-        # `stat -c '%G'`); we only assert all four match.
+        # gid pinning: setresgid(egid, egid, input) — real, effective
+        # and fs gid are the unit's egid; the saved set-gid is the
+        # `input` group's gid (HALMASUIT_INPUT_GID), reachable only
+        # through a per-open setfsgid and never inherited by exec'd
+        # children. We don't pin the egid's absolute value here because
+        # that's controlled by greeterGroup (already exercised in suite
+        # 2's `stat -c '%G'`). No supplementary group is held.
+        input_gid = machine.succeed("getent group input | cut -d: -f3").strip()
+        assert input_gid.isdigit(), f"input group gid must be digit, got {input_gid!r}"
         status_gid = machine.succeed(
             f"awk '/^Gid:/ {{print $2,$3,$4,$5}}' /proc/{pid}/status"
         ).strip()
         gids = status_gid.split()
-        assert len(gids) == 4 and len(set(gids)) == 1, (
-            f"halmasuit's four gid components must all match after setresgid, "
-            f"got {status_gid!r}"
+        assert len(gids) == 4 and gids[0] == gids[1] == gids[3], (
+            f"halmasuit's real, effective and fs gid must match after "
+            f"setresgid, got {status_gid!r}"
+        )
+        assert gids[2] == input_gid, (
+            f"halmasuit's saved gid must be the input group's gid "
+            f"{input_gid} after setresgid, got {status_gid!r}; a saved gid "
+            f"of 0 means the drop kept PID1's root group"
+        )
+        status_groups = machine.succeed(
+            f"awk '/^Groups:/' /proc/{pid}/status"
+        ).split()[1:]
+        assert not status_groups, (
+            f"halmasuit must hold no supplementary groups after the drop, "
+            f"got {status_groups!r}"
         )
 
         # Capability sets — the load-bearing architectural state of

@@ -49,6 +49,7 @@ mod vt_switch;
 mod wallpaper;
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -3035,7 +3036,18 @@ fn setup_post_pivot_input(state: &mut HalmasuitState) -> Vec<String> {
 /// `drop_privileges` the compositor runs as the compositor user, but the
 /// fds remain valid — Linux checks file permissions at `open(2)`, not
 /// at subsequent `read(2)` / `write(2)`.
-struct DirectInputInterface;
+///
+/// `input_gid` is the `input` group from `HALMASUIT_INPUT_GID`. After
+/// `drop_privileges` the compositor's gids are compositor/compositor/
+/// input/compositor (real/effective/saved/fs), so `input` is not in the
+/// filesystem gid and an `open(2)` of an `input`-group event node would
+/// be refused. Each open therefore runs with the thread's fsgid set to
+/// `input_gid` and restores the previous fsgid afterwards, on success
+/// and failure alike. `setfsgid` is per-thread and is legal here because
+/// `input_gid` is the saved set-gid. Unset means no bracket.
+struct DirectInputInterface {
+    input_gid: Option<u32>,
+}
 impl smithay::reexports::input::LibinputInterface for DirectInputInterface {
     fn open_restricted(
         &mut self,
@@ -3044,17 +3056,37 @@ impl smithay::reexports::input::LibinputInterface for DirectInputInterface {
     ) -> Result<std::os::fd::OwnedFd, i32> {
         use std::os::unix::fs::OpenOptionsExt as _;
         let accmode = flags & libc::O_ACCMODE;
-        std::fs::OpenOptions::new()
-            .custom_flags(flags)
-            .read(accmode == libc::O_RDONLY || accmode == libc::O_RDWR)
-            .write(accmode == libc::O_WRONLY || accmode == libc::O_RDWR)
-            .open(path)
+        let open = || {
+            std::fs::OpenOptions::new()
+                .custom_flags(flags)
+                .read(accmode == libc::O_RDONLY || accmode == libc::O_RDWR)
+                .write(accmode == libc::O_WRONLY || accmode == libc::O_RDWR)
+                .open(path)
+        };
+        self.input_gid
+            .map_or_else(open, |gid| {
+                with_fsgid(nix::unistd::Gid::from_raw(gid), nix::unistd::setfsgid, open)
+            })
             .map(std::os::fd::OwnedFd::from)
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
     }
     fn close_restricted(&mut self, fd: std::os::fd::OwnedFd) {
         drop(fd);
     }
+}
+
+/// Run `f` with the calling thread's fsgid set to `gid` through
+/// `setfsgid`, then restore the fsgid `setfsgid` reported as previous,
+/// whatever `f` returned.
+fn with_fsgid<T>(
+    gid: nix::unistd::Gid,
+    setfsgid: impl Fn(nix::unistd::Gid) -> nix::unistd::Gid,
+    f: impl FnOnce() -> T,
+) -> T {
+    let previous = setfsgid(gid);
+    let result = f();
+    setfsgid(previous);
+    result
 }
 
 /// Build a libinput backend that opens `/dev/input/event*` devices
@@ -3078,7 +3110,9 @@ impl smithay::reexports::input::LibinputInterface for DirectInputInterface {
 fn setup_libinput_direct(
     loop_handle: &LoopHandle<'static, HalmasuitState>,
 ) -> io::Result<RegistrationToken> {
-    let mut libinput = smithay::reexports::input::Libinput::new_from_path(DirectInputInterface);
+    let mut libinput = smithay::reexports::input::Libinput::new_from_path(DirectInputInterface {
+        input_gid: input_gid_from(std::env::var_os("HALMASUIT_INPUT_GID").as_deref())?,
+    });
     let entries = match std::fs::read_dir("/dev/input") {
         Ok(it) => it,
         Err(e) => {
@@ -4177,6 +4211,33 @@ fn clear_bounding_set() -> io::Result<()> {
     Ok(())
 }
 
+/// Parse `HALMASUIT_INPUT_GID`, the `input` group. The compositor keeps
+/// it as its saved set-gid after the drop (see `drop_privileges`) and
+/// uses it as the fsgid for each input node open (see
+/// `DirectInputInterface`). Unset means no input gid. `0` (root group)
+/// and non-numeric values are refused.
+///
+/// # Errors
+/// The value is not UTF-8, not a `u32`, or is `0`.
+fn input_gid_from(raw: Option<&OsStr>) -> io::Result<Option<u32>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let s = raw
+        .to_str()
+        .ok_or_else(|| io::Error::other("HALMASUIT_INPUT_GID is not valid UTF-8"))?;
+    match s.parse::<u32>() {
+        Ok(0) => Err(io::Error::other(
+            "HALMASUIT_INPUT_GID=0 refused: \
+             the compositor must not keep the root group",
+        )),
+        Ok(g) => Ok(Some(g)),
+        Err(e) => Err(io::Error::other(format!(
+            "HALMASUIT_INPUT_GID={s:?} is not a u32: {e}"
+        ))),
+    }
+}
+
 /// Drop privileges to the configured compositor uid. The compositor
 /// execs NO setuid helper and holds NO PAM handle — it relays auth to
 /// the privileged `halmasuit-session` broker (Epic R2/R3/R15). So it
@@ -4184,35 +4245,47 @@ fn clear_bounding_set() -> io::Result<()> {
 /// greeter child (which runs under a different uid) on session start.
 /// The bounding set is already empty on every thread (`main` cleared
 /// it before the first thread existed), so neither the compositor nor
-/// anything it execs can ever gain a capability. Supplementary groups
-/// pinned at unit-startup via systemd `SupplementaryGroups=` are
-/// intentionally NOT cleared.
+/// anything it execs can ever gain a capability. The supplementary
+/// group list is cleared, replacing whatever the unit inherited. The
+/// `input` gid (`HALMASUIT_INPUT_GID`, when set) is the saved set-gid,
+/// not a supplementary group: `execve` sets the saved gid to the
+/// effective gid, so exec'd children (the sandboxed video decoder among
+/// them) hold no `input` gid, while the compositor's own threads reach
+/// it through `setfsgid` (see `DirectInputInterface`).
 ///
-/// Capabilities and securebits are per-thread; only `setresuid` and
-/// `setresgid` reach every thread (glibc's setxid broadcast). Every
-/// other step below acts on the calling (main) thread alone, which is
-/// the only thread that keeps `CAP_KILL`: the others lose all
-/// capabilities at the uid change because they never set KeepCaps.
+/// Capabilities and securebits are per-thread; only `setgroups`,
+/// `setresgid` and `setresuid` reach every thread (glibc's setxid
+/// broadcast). Every other step below acts on the calling (main)
+/// thread alone, which is the only thread that keeps `CAP_KILL`: the
+/// others lose all capabilities at the uid change because they never
+/// set KeepCaps.
 ///
 /// Order is load-bearing:
 ///   1. `prctl(PR_SET_KEEPCAPS, 1)` — without this, `setresuid`
 ///      below would clear the permitted capability set entirely.
 ///      KeepCaps preserves permitted; effective is still cleared
-///      and must be rebuilt via `capset` (step 4).
-///   2. `setresgid(egid, egid, egid)` — pin all three gid components.
-///   3. `setresuid(uid, uid, uid)` — drop uid. All three components
+///      and must be rebuilt via `capset` (step 5).
+///   2. `setgroups([])` — clear the supplementary groups while still
+///      root, so the call has the `CAP_SETGID` it needs: before
+///      `setresuid`, which clears the effective set.
+///   3. `setresgid(egid, egid, saved)` — real and effective are the
+///      compositor gid; saved is `input_gid`, or the compositor gid
+///      when `HALMASUIT_INPUT_GID` is unset.
+///   4. `setresuid(uid, uid, uid)` — drop uid. All three components
 ///      set to the same value so the process cannot resurrect root.
 ///      Permitted caps survive due to KeepCaps; effective caps are
 ///      kernel-cleared.
-///   4. Single `capset(2)` writing both permitted and effective to
+///   5. Single `capset(2)` writing both permitted and effective to
 ///      `{CAP_KILL}` in one syscall. The `caps` crate's high-level
 ///      `set()` does `capget+capset` per CapSet, so calling it
 ///      twice would be 4 syscalls; the kernel's `cap_user_data_t`
 ///      carries effective + permitted + inheritable in one payload
 ///      that `capset(2)` updates atomically. We bypass `caps::set`
 ///      for that.
-///   5. Audit every thread (`task_caps::audit_all_tasks`): all uid
-///      components are `uid`, bounding/inheritable/ambient are empty,
+///   6. Audit every thread (`task_caps::audit_all_tasks`): all uid
+///      components are `uid`, the gid line is exactly
+///      `[egid, egid, saved, egid]`, the supplementary group list is
+///      empty, bounding/inheritable/ambient are empty, and
 ///      permitted/effective hold nothing beyond `CAP_KILL`. Any
 ///      violation fails the drop.
 ///
@@ -4223,7 +4296,7 @@ fn clear_bounding_set() -> io::Result<()> {
 /// scope (tracked as a follow-up, same as the systemd NNP posture —
 /// see nix/module.nix).
 fn drop_privileges(uid: u32) -> io::Result<()> {
-    use nix::unistd::{Gid, Uid, getegid, setresgid, setresuid};
+    use nix::unistd::{Gid, Uid, getegid, setgroups, setresgid, setresuid};
 
     caps::securebits::set_keepcaps(true)
         .map_err(|e| io::Error::other(format!("set_keepcaps(true): {e}")))?;
@@ -4265,8 +4338,16 @@ fn drop_privileges(uid: u32) -> io::Result<()> {
         },
         Err(_) => getegid(),
     };
-    setresgid(target_gid, target_gid, target_gid)
-        .map_err(|e| io::Error::other(format!("setresgid({target_gid}): {e}")))?;
+    let saved_gid = input_gid_from(std::env::var_os("HALMASUIT_INPUT_GID").as_deref())?
+        .map_or(target_gid, Gid::from_raw);
+
+    setgroups(&[]).map_err(|e| io::Error::other(format!("setgroups([]): {e}")))?;
+
+    setresgid(target_gid, target_gid, saved_gid).map_err(|e| {
+        io::Error::other(format!(
+            "setresgid({target_gid}, {target_gid}, {saved_gid}): {e}"
+        ))
+    })?;
 
     let u = Uid::from_raw(uid);
     setresuid(u, u, u).map_err(|e| io::Error::other(format!("setresuid({u}): {e}")))?;
@@ -4274,7 +4355,13 @@ fn drop_privileges(uid: u32) -> io::Result<()> {
     capset_permitted_effective_cap_kill()
         .map_err(|e| io::Error::other(format!("capset permitted=effective={{CAP_KILL}}: {e}")))?;
 
-    task_caps::audit_all_tasks(uid)
+    let expected_gids = [
+        target_gid.as_raw(),
+        target_gid.as_raw(),
+        saved_gid.as_raw(),
+        target_gid.as_raw(),
+    ];
+    task_caps::audit_all_tasks(uid, expected_gids)
         .map_err(|e| io::Error::other(format!("post-drop thread audit: {e}")))?;
 
     Ok(())
@@ -6093,6 +6180,7 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smithay::reexports::input::LibinputInterface as _;
 
     // R4 port: the SIGCHLD reaper must distinguish which child died.
     // Greeter exit pre-auth (session_uid still None) is the wedge
@@ -6241,5 +6329,105 @@ mod tests {
     fn wayland_peer_root_rejected() {
         assert!(!wayland_peer_authorized(0, 1000, Some(1001)));
         assert!(!wayland_peer_authorized(0, 1000, None));
+    }
+
+    #[test]
+    fn input_gid_unset_yields_no_input_gid() {
+        assert!(matches!(input_gid_from(None), Ok(None)));
+    }
+
+    #[test]
+    fn input_gid_valid_value_yields_that_gid() {
+        assert!(matches!(
+            input_gid_from(Some(OsStr::new("990"))),
+            Ok(Some(990))
+        ));
+    }
+
+    #[test]
+    fn input_gid_zero_is_refused() {
+        assert!(input_gid_from(Some(OsStr::new("0"))).is_err());
+    }
+
+    #[test]
+    fn input_gid_non_numeric_is_refused() {
+        assert!(input_gid_from(Some(OsStr::new("input"))).is_err());
+        assert!(input_gid_from(Some(OsStr::new(""))).is_err());
+    }
+
+    #[test]
+    fn input_gid_non_utf8_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(input_gid_from(Some(OsStr::from_bytes(b"\xff990"))).is_err());
+    }
+
+    /// A fake `setfsgid` over one recorded fsgid: sets it, returns the
+    /// previous value, and logs every call.
+    fn fake_setfsgid(
+        fsgid: &std::cell::RefCell<u32>,
+        calls: &std::cell::RefCell<Vec<u32>>,
+    ) -> impl Fn(nix::unistd::Gid) -> nix::unistd::Gid {
+        move |gid| {
+            calls.borrow_mut().push(gid.as_raw());
+            nix::unistd::Gid::from_raw(fsgid.replace(gid.as_raw()))
+        }
+    }
+
+    #[test]
+    fn with_fsgid_holds_gid_during_call_and_restores_after_success() {
+        let fsgid = std::cell::RefCell::new(999);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let out = with_fsgid(
+            nix::unistd::Gid::from_raw(174),
+            fake_setfsgid(&fsgid, &calls),
+            || *fsgid.borrow(),
+        );
+        assert_eq!(out, 174);
+        assert_eq!(*fsgid.borrow(), 999);
+        assert_eq!(*calls.borrow(), vec![174, 999]);
+    }
+
+    #[test]
+    fn with_fsgid_restores_after_failure() {
+        let fsgid = std::cell::RefCell::new(999);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let out: Result<(), i32> = with_fsgid(
+            nix::unistd::Gid::from_raw(174),
+            fake_setfsgid(&fsgid, &calls),
+            || Err(libc::EACCES),
+        );
+        assert_eq!(out, Err(libc::EACCES));
+        assert_eq!(*fsgid.borrow(), 999);
+        assert_eq!(*calls.borrow(), vec![174, 999]);
+    }
+
+    #[test]
+    fn open_restricted_with_input_gid_opens_and_passes_errno() {
+        let fsgid = nix::unistd::getegid().as_raw();
+        let mut iface = DirectInputInterface {
+            input_gid: Some(fsgid),
+        };
+        assert!(
+            iface
+                .open_restricted(Path::new("/dev/null"), libc::O_RDONLY)
+                .is_ok()
+        );
+        let err = iface
+            .open_restricted(
+                Path::new("/nonexistent/halmasuit-input-node"),
+                libc::O_RDONLY,
+            )
+            .unwrap_err();
+        assert_eq!(err, libc::ENOENT);
+    }
+
+    #[test]
+    fn open_restricted_without_input_gid_opens() {
+        let mut iface = DirectInputInterface { input_gid: None };
+        assert!(
+            iface
+                .open_restricted(Path::new("/dev/null"), libc::O_RDONLY)
+                .is_ok()
+        );
     }
 }

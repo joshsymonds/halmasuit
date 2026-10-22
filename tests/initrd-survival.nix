@@ -292,18 +292,37 @@ pkgs.testers.runNixOSTest {
     # the post-drop compositor at `998:0` (root group). The module's
     # `Group = cfg.greeterGroup` pins the egid so the drop lands on
     # the greeter group's gid (default 999, matching greeterUid).
+    # The saved set-gid is the `input` group's gid (HALMASUIT_INPUT_GID):
+    # the compositor reaches it only through a per-open setfsgid, and
+    # exec'd children never inherit it. No supplementary group is held.
+    input_gid = machine.succeed("getent group input | cut -d: -f3").strip()
+    assert input_gid.isdigit(), f"input group gid must be digit, got {input_gid!r}"
     status_gid = machine.succeed(f"grep '^Gid:' /proc/{started_pid}/status").strip()
     gid_fields = status_gid.split()
-    assert all(f == "999" for f in gid_fields[1:5]), (
+    real_gid, eff_gid, saved_gid, fs_gid = gid_fields[1:5]
+    assert (real_gid, eff_gid, fs_gid) == ("999", "999", "999"), (
         f"halmasuit PID {started_pid} has Gid fields {gid_fields[1:5]}; "
-        "expected all 999 (the greeter group's gid). Most likely the "
-        "fromInitrd unit lost its `Group = cfg.greeterGroup` and is "
-        "inheriting PID1's gid 0 — the gid half of the privilege drop "
-        "regressed."
+        "expected real/effective/fs 999 (the greeter group's gid). Most "
+        "likely the fromInitrd unit lost its `Group = cfg.greeterGroup` "
+        "and is inheriting PID1's gid 0 — the gid half of the privilege "
+        "drop regressed."
+    )
+    assert saved_gid == input_gid, (
+        f"halmasuit PID {started_pid} has Gid fields {gid_fields[1:5]}; "
+        f"expected saved gid {input_gid} (the input group's gid, "
+        "HALMASUIT_INPUT_GID). A saved gid of 0 means the gid half of the "
+        "privilege drop regressed to PID1's root group."
+    )
+    status_groups = machine.succeed(
+        f"grep '^Groups:' /proc/{started_pid}/status"
+    ).split()[1:]
+    assert not status_groups, (
+        f"halmasuit PID {started_pid} holds supplementary groups "
+        f"{status_groups}; drop_privileges must clear them all."
     )
     print(
         f"PASS: phase=deprivileged emitted; PID {started_pid} runs as "
-        f"compositor uid 998, gid 999"
+        f"compositor uid 998, gid 999, saved gid {input_gid}, no groups"
     )
 
     # ASSERTION 9: post-pivot greeter spawn succeeded. Proves

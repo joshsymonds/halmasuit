@@ -1070,9 +1070,13 @@ in
         RuntimeDirectory     = "halmasuit";
         RuntimeDirectoryMode = "0755";
         # No `SupplementaryGroups`: the compositor runs NO PAM and has
-        # no business reading /etc/shadow. PAM (and its `shadow`-group
-        # getspnam fast-path) lives in the privileged halmasuit-session
-        # broker unit only (Epic #1 R2/R14; least authority).
+        # no business reading /etc/shadow. `drop_privileges` clears
+        # the supplementary groups in-process, so none are inherited
+        # from the unit; the `input` gid travels as the saved set-gid
+        # (see `HALMASUIT_INPUT_GID` below). PAM (and its
+        # `shadow`-group getspnam fast-path) lives in the privileged
+        # halmasuit-session broker unit only (Epic #1 R2/R14; least
+        # authority).
         #
         # Hardening posture. The primary defense is the privilege
         # split: the compositor deprivileges to compositorUid, holds no
@@ -1119,6 +1123,12 @@ in
         # Privilege-drop target. halmasuit reads this after binding
         # sockets and `setresuid`s to it in-process.
         HALMASUIT_COMPOSITOR_UID = toString cfg.compositorUid;
+        # The `input` group. drop_privileges keeps it as the saved
+        # set-gid (not a supplementary group, so exec'd children do not
+        # inherit it), and the libinput opener sets it as the fsgid for
+        # each /dev/input/event* open (keyd's virtual keyboard among
+        # them).
+        HALMASUIT_INPUT_GID = toString config.users.groups.input.gid;
         # No HALMASUIT_SPAWN_BIN: the compositor execs no helper. Its
         # broker socket defaults to /run/halmasuit-session.sock — the
         # ListenSequentialPacket the broker unit binds below — so no
@@ -1955,6 +1965,9 @@ in
          # gid by default — an operator overriding `greeterGroup` to
          # a pre-existing group breaks that coincidence).
          HALMASUIT_COMPOSITOR_GID = toString config.users.groups.${cfg.greeterGroup}.gid;
+         # The `input` group: the saved set-gid after drop_privileges,
+         # and the fsgid for each input event node open.
+         HALMASUIT_INPUT_GID      = toString config.users.groups.input.gid;
          HALMASUIT_PAM_SERVICE    = cfg.pamService;
 
          # GL runtime. /run/opengl-driver symlink is created by the
