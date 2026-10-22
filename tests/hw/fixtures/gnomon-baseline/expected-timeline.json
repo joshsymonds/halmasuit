@@ -1,0 +1,1406 @@
+{
+  "run": "gnomon-baseline",
+  "boot_id": "b007b007b007b007b007b007b007b007",
+  "clock": {
+    "zero": "cpu-reset",
+    "kernel_zero_us": 19664764,
+    "kernel_zero_source": "fpdt.exitbootservice_end"
+  },
+  "firmware": {
+    "info": "American Megatrends 5.35",
+    "loader_init_us": 17635009,
+    "loader_exec_us": 18954313,
+    "fpdt": {
+      "firmware_start_us": 0,
+      "bootloader_load_us": 17626577,
+      "bootloader_launch_us": 17637959,
+      "exitbootservice_start_us": 19663783,
+      "exitbootservice_end_us": 19664764
+    }
+  },
+  "firmware_mode": {
+    "width": 1024,
+    "height": 768,
+    "depth": 32,
+    "linelength": 4096,
+    "efi": true
+  },
+  "logo": {
+    "status": 1,
+    "type": 0,
+    "version": 1,
+    "xoffset": 107,
+    "yoffset": 326,
+    "width": 809,
+    "height": 116
+  },
+  "events": [
+    {
+      "t_us": 0,
+      "mono_us": null,
+      "kind": "firmware",
+      "source": "fpdt",
+      "detail": "firmware_start_us"
+    },
+    {
+      "t_us": 17626577,
+      "mono_us": null,
+      "kind": "firmware",
+      "source": "fpdt",
+      "detail": "bootloader_load_us"
+    },
+    {
+      "t_us": 17635009,
+      "mono_us": null,
+      "kind": "loader",
+      "source": "efivar",
+      "detail": "LoaderTimeInitUSec"
+    },
+    {
+      "t_us": 17637959,
+      "mono_us": null,
+      "kind": "firmware",
+      "source": "fpdt",
+      "detail": "bootloader_launch_us"
+    },
+    {
+      "t_us": 18954313,
+      "mono_us": null,
+      "kind": "loader",
+      "source": "efivar",
+      "detail": "LoaderTimeExecUSec"
+    },
+    {
+      "t_us": 19663783,
+      "mono_us": null,
+      "kind": "firmware",
+      "source": "fpdt",
+      "detail": "exitbootservice_start_us"
+    },
+    {
+      "t_us": 19664764,
+      "mono_us": null,
+      "kind": "firmware",
+      "source": "fpdt",
+      "detail": "exitbootservice_end_us"
+    },
+    {
+      "t_us": 19664764,
+      "mono_us": 0,
+      "kind": "kernel-display",
+      "source": "kernel",
+      "detail": "Command line: init=/nix/store/ylqxq24xg7hfi6m6g7f7sd4jf0gljj7y-nixos-system-gnomon-26.11.20261020.02c087f/init amd_pstate=active slab_nomerge init_on_alloc=1 init_on_free=1 page_alloc.shuffle=1 randomize_kstack_offset=on vsyscall=none printk.always_kmsg_dump=1 panic=10 amd_pstate=active mitigations=auto acpi_enforce_resources=lax fbcon=nodefer video=2560x1440 root=fstab loglevel=4 lsm=landlock,yama,bpf"
+    },
+    {
+      "t_us": 19710176,
+      "mono_us": 45412,
+      "kind": "kernel-display",
+      "source": "kernel",
+      "detail": "Kernel command line: init=/nix/store/ylqxq24xg7hfi6m6g7f7sd4jf0gljj7y-nixos-system-gnomon-26.11.20261020.02c087f/init amd_pstate=active slab_nomerge init_on_alloc=1 init_on_free=1 page_alloc.shuffle=1 randomize_kstack_offset=on vsyscall=none printk.always_kmsg_dump=1 panic=10 amd_pstate=active mitigations=auto acpi_enforce_resources=lax fbcon=nodefer video=2560x1440 root=fstab loglevel=4 lsm=landlock,yama,bpf"
+    },
+    {
+      "t_us": 26235762,
+      "mono_us": 6570998,
+      "kind": "kernel-display",
+      "source": "kernel",
+      "detail": "simple-framebuffer simple-framebuffer.0: [drm] Registered 1 planes with drm panic"
+    },
+    {
+      "t_us": 26235772,
+      "mono_us": 6571008,
+      "kind": "kernel-display",
+      "source": "kernel",
+      "detail": "[drm] Initialized simpledrm 1.0.0 for simple-framebuffer.0 on minor 0"
+    },
+    {
+      "t_us": 26235808,
+      "mono_us": 6571044,
+      "kind": "kernel-display",
+      "source": "kernel",
+      "detail": "simple-framebuffer simple-framebuffer.0: [drm] User-defined mode not supported: \"2560x1440\": 60 311862 2560 2744 3024 3488 1440 1441 1444 1490 0x20 0x6"
+    },
+    {
+      "t_us": 26236819,
+      "mono_us": 6572055,
+      "kind": "kernel-display",
+      "source": "kernel",
+      "detail": "Console: switching to colour frame buffer device 128x48"
+    },
+    {
+      "t_us": 26237165,
+      "mono_us": 6572401,
+      "kind": "kernel-display",
+      "source": "kernel",
+      "detail": "simple-framebuffer simple-framebuffer.0: [drm] fb0: simpledrmdrmfb frame buffer device"
+    },
+    {
+      "t_us": 26727310,
+      "mono_us": 7062546,
+      "kind": "sampler-start",
+      "source": "lab-crc-initrd.service",
+      "detail": "start t=7062546"
+    },
+    {
+      "t_us": 28186655,
+      "mono_us": 8521891,
+      "kind": "driver-display",
+      "source": "kernel",
+      "detail": "NVRM: loading NVIDIA UNIX Open Kernel Module for x86_64  615.78.08  Release Build  (nixbld@)  "
+    },
+    {
+      "t_us": 28238618,
+      "mono_us": 8573854,
+      "kind": "driver-display",
+      "source": "kernel",
+      "detail": "nvidia-modeset: Loading NVIDIA UNIX Open Kernel Mode Setting Driver for x86_64  615.78.08  Release Build  (nixbld@)  "
+    },
+    {
+      "t_us": 28273027,
+      "mono_us": 8608263,
+      "kind": "driver-display",
+      "source": "kernel",
+      "detail": "[drm] [nvidia-drm] [GPU ID 0x00000100] Loading driver"
+    },
+    {
+      "t_us": 28777210,
+      "mono_us": 9112446,
+      "kind": "driver-display",
+      "source": "kernel",
+      "detail": "[drm] Initialized nvidia-drm 0.0.0 for 0000:01:00.0 on minor 1"
+    },
+    {
+      "t_us": 28794170,
+      "mono_us": 9129406,
+      "kind": "kernel-display",
+      "source": "kernel",
+      "detail": "Console: switching to colour dummy device 80x25"
+    },
+    {
+      "t_us": 28848926,
+      "mono_us": 9184162,
+      "kind": "driver-display",
+      "source": "kernel",
+      "detail": "fbcon: nvidia-drmdrmfb (fb0) is primary device"
+    },
+    {
+      "t_us": 29235938,
+      "mono_us": 9571174,
+      "kind": "kernel-display",
+      "source": "kernel",
+      "detail": "Console: switching to colour frame buffer device 160x45"
+    },
+    {
+      "t_us": 29238281,
+      "mono_us": 9573517,
+      "kind": "driver-display",
+      "source": "kernel",
+      "detail": "nvidia 0000:01:00.0: [drm] fb0: nvidia-drmdrmfb frame buffer device"
+    },
+    {
+      "t_us": 30264604,
+      "mono_us": 10599840,
+      "kind": "sampler-start",
+      "source": "lab-crc.service",
+      "detail": "start t=10599840"
+    },
+    {
+      "t_us": 30364548,
+      "mono_us": 10699784,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=10699784 comp=de17ad4f rg=731e7ad0 out=b4b5f825 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 30364792,
+      "mono_us": 10700028,
+      "kind": "driver-display",
+      "source": "kernel",
+      "detail": "nvidia-modeset: WARNING: Too many CRC32 generated entries (1 expected; 5 found)"
+    },
+    {
+      "t_us": 30464679,
+      "mono_us": 10799915,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=10799915 comp=1efc8562 rg=5d09a23a out=b2e7ad2b comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 30564703,
+      "mono_us": 10899939,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=10899939 comp=354bb473 rg=6093fe28 out=b3b2c782 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 30664773,
+      "mono_us": 11000009,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=11000009 comp=cb73ad7d rg=fcd12e2f out=22947c14 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 30764855,
+      "mono_us": 11100091,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=11100091 comp=9a7514f5 rg=1490da1c out=51627ba2 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 30864955,
+      "mono_us": 11200191,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=11200191 comp=666b9630 rg=6cb4a238 out=72cd3989 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 30965053,
+      "mono_us": 11300289,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=11300289 comp=c25efc06 rg=4296e697 out=eb7445b5 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 31065064,
+      "mono_us": 11400300,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=11400300 comp=5ffb8595 rg=133d6e61 out=6fad5127 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 31165183,
+      "mono_us": 11500419,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=11500419 comp=5ffb8595 rg=133d6e61 out=6fad5127 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 31265270,
+      "mono_us": 11600506,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=11600506 comp=a3e50750 rg=6b191645 out=4c02130c comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 31365361,
+      "mono_us": 11700597,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=11700597 comp=d9026951 rg=d7485640 out=e09f5073 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 31465429,
+      "mono_us": 11800665,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=11800665 comp=c7494e2f rg=e26ee7f5 out=415d19ce comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 31565506,
+      "mono_us": 11900742,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=11900742 comp=c7494e2f rg=e26ee7f5 out=415d19ce comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 31665579,
+      "mono_us": 12000815,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=12000815 comp=3b57ccea rg=9a4a9fd1 out=62f25be5 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 31765669,
+      "mono_us": 12100905,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=12100905 comp=f368f31a rg=de4496ce out=0d9e6719 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 31865710,
+      "mono_us": 12200946,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=12200946 comp=0f7671df rg=a660eeea out=2e312532 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 31965830,
+      "mono_us": 12301066,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=12301066 comp=0f7671df rg=a660eeea out=2e312532 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 32065871,
+      "mono_us": 12401107,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=12401107 comp=f368f31a rg=de4496ce out=0d9e6719 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 32165992,
+      "mono_us": 12501228,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=12501228 comp=f368f31a rg=de4496ce out=0d9e6719 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 32266063,
+      "mono_us": 12601299,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=12601299 comp=0f7671df rg=a660eeea out=2e312532 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 32366195,
+      "mono_us": 12701431,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=12701431 comp=82d79368 rg=cabb18a9 out=ecb5e854 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 32466305,
+      "mono_us": 12801541,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=12801541 comp=ec735841 rg=8b3985af out=51f7c10f comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 32566324,
+      "mono_us": 12901560,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=12901560 comp=c0046153 rg=5d30f29c out=9fb95373 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 32666422,
+      "mono_us": 13001658,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=13001658 comp=329d6a27 rg=64aa2d9a out=75dfbc76 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 32792114,
+      "mono_us": 13127350,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=13127350 comp=96ed0b68 rg=a6cea219 out=ce923522 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 32883513,
+      "mono_us": 13218749,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=13218749 comp=8b197266 rg=25a17224 out=ad5c6a91 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 33003672,
+      "mono_us": 13338908,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=13338908 comp=8b197266 rg=25a17224 out=ad5c6a91 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 33100151,
+      "mono_us": 13435387,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=13435387 comp=7707f0a3 rg=5d850a00 out=8ef328ba comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 33200177,
+      "mono_us": 13535413,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=13535413 comp=7707f0a3 rg=5d850a00 out=8ef328ba comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 33300240,
+      "mono_us": 13635476,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=13635476 comp=8b197266 rg=25a17224 out=ad5c6a91 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 33412400,
+      "mono_us": 13747636,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=13747636 comp=8b197266 rg=25a17224 out=ad5c6a91 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 33501560,
+      "mono_us": 13836796,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=13836796 comp=7707f0a3 rg=5d850a00 out=8ef328ba comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 33600540,
+      "mono_us": 13935776,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=13935776 comp=07624f42 rg=1233ba65 out=de484005 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 33730658,
+      "mono_us": 14065894,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=14065894 comp=7b222c28 rg=294385fa out=6dd4a0e1 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 33817363,
+      "mono_us": 14152599,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=14152599 comp=127a6ca2 rg=e27f03d2 out=9578ed7a comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 33917809,
+      "mono_us": 14253045,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=14253045 comp=ee64ee67 rg=9a5b7bf6 out=b6d7af51 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 33964431,
+      "mono_us": 14299667,
+      "kind": "unit",
+      "source": "systemd",
+      "detail": "greetd.service started"
+    },
+    {
+      "t_us": 34017549,
+      "mono_us": 14352785,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=14352785 comp=8f7da99b rg=e627309d out=f47993db comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 34017549,
+      "mono_us": 14352785,
+      "kind": "greeter",
+      "source": "card1/crtc205",
+      "detail": "first sample"
+    },
+    {
+      "t_us": 34117658,
+      "mono_us": 14452894,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=14452894 comp=3726d66c rg=9a468c2a out=21bb813e comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 34117658,
+      "mono_us": 14452894,
+      "kind": "greeter",
+      "source": "card1/crtc494",
+      "detail": "first sample"
+    },
+    {
+      "t_us": 34218282,
+      "mono_us": 14553518,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=14553518 comp=72a478ba rg=027ab00d out=6dd700b7 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 34335580,
+      "mono_us": 14670816,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=14670816 comp=90b9f4fa rg=d69fe27c out=f6708525 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 34434561,
+      "mono_us": 14769797,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=14769797 comp=8f8d492e rg=c8d7c8d7 out=2ee8373f comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 34534579,
+      "mono_us": 14869815,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=14869815 comp=8f8d492e rg=c8d7c8d7 out=2ee8373f comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 43492033,
+      "mono_us": 23827269,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=23827269 comp=54354ead rg=2104d729 out=31ce0e35 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 44219530,
+      "mono_us": 24554766,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=24554766 comp=8f8d492e rg=c3960ed7 out=412213f2 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 44590938,
+      "mono_us": 24926174,
+      "kind": "probe",
+      "source": "lab-probe",
+      "detail": "device node=/dev/input/event20"
+    },
+    {
+      "t_us": 44595405,
+      "mono_us": 24930641,
+      "kind": "probe",
+      "source": "lab-probe",
+      "detail": "ready holder=keyd pid=1140"
+    },
+    {
+      "t_us": 44816249,
+      "mono_us": 25151485,
+      "kind": "probe",
+      "source": "lab-probe",
+      "detail": "typed keys=11"
+    },
+    {
+      "t_us": 59138118,
+      "mono_us": 39473354,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=39473354 comp=5a2bb22e rg=45a29173 out=b57c3fb3 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 59802689,
+      "mono_us": 40137925,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=40137925 comp=33174a0b rg=829b120c out=12e2814a comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 60219295,
+      "mono_us": 40554531,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=40554531 comp=93557461 rg=ea0ea47b out=3624ec1b comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 60302647,
+      "mono_us": 40637883,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=40637883 comp=1246bd9f rg=3df69448 out=74f86282 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 60385962,
+      "mono_us": 40721198,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=40721198 comp=a2bb0b4f rg=47c2a18b out=9ca522c9 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 60552621,
+      "mono_us": 40887857,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=40887857 comp=83222bc8 rg=08882969 out=5dced276 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 60802635,
+      "mono_us": 41137871,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=41137871 comp=9961c15f rg=f0cb125c out=e16798a8 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 60885952,
+      "mono_us": 41221188,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=41221188 comp=08055708 rg=c5b5af7d out=c851285c comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 64385943,
+      "mono_us": 44721179,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=44721179 comp=08055708 rg=943fe51c out=0beddeeb comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 64552591,
+      "mono_us": 44887827,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=44887827 comp=08055708 rg=c5b5af7d out=c851285c comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 70801897,
+      "mono_us": 51137133,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=51137133 comp=eb244f67 rg=318aaacc out=761c4a80 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 70885223,
+      "mono_us": 51220459,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=51220459 comp=7a40d930 rg=04f417ed out=5f2afa74 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 107275154,
+      "mono_us": 87610390,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "error card=card1 crtc=494 t=87610390 errno=19"
+    },
+    {
+      "t_us": 107275163,
+      "mono_us": 87610399,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "lab-crc: nvidia card fd lost: No such device"
+    },
+    {
+      "t_us": 107468132,
+      "mono_us": 87803368,
+      "kind": "sampler-start",
+      "source": "lab-crc.service",
+      "detail": "start t=87803368"
+    },
+    {
+      "t_us": 108554418,
+      "mono_us": 88889654,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=88889654 comp=03b96ffa rg=12b4affd out=4a720173 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 108654401,
+      "mono_us": 88989637,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=88989637 comp=03b96ffa rg=12b4affd out=4a720173 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 110156011,
+      "mono_us": 90491247,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=90491247 comp=4d8f8566 rg=8f939434 out=d4c3051d comp_sup=1 rg_sup=1 out_sup=1"
+    }
+  ],
+  "heads": {
+    "card1/crtc205": {
+      "samples": [
+        {
+          "t_us": 30364548,
+          "mono_us": 10699784,
+          "unit": "lab-crc.service",
+          "comp": "de17ad4f",
+          "rg": "731e7ad0",
+          "out": "b4b5f825",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 30564703,
+          "mono_us": 10899939,
+          "unit": "lab-crc.service",
+          "comp": "354bb473",
+          "rg": "6093fe28",
+          "out": "b3b2c782",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 30764855,
+          "mono_us": 11100091,
+          "unit": "lab-crc.service",
+          "comp": "9a7514f5",
+          "rg": "1490da1c",
+          "out": "51627ba2",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 30965053,
+          "mono_us": 11300289,
+          "unit": "lab-crc.service",
+          "comp": "c25efc06",
+          "rg": "4296e697",
+          "out": "eb7445b5",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 31165183,
+          "mono_us": 11500419,
+          "unit": "lab-crc.service",
+          "comp": "5ffb8595",
+          "rg": "133d6e61",
+          "out": "6fad5127",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 31365361,
+          "mono_us": 11700597,
+          "unit": "lab-crc.service",
+          "comp": "d9026951",
+          "rg": "d7485640",
+          "out": "e09f5073",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 31565506,
+          "mono_us": 11900742,
+          "unit": "lab-crc.service",
+          "comp": "c7494e2f",
+          "rg": "e26ee7f5",
+          "out": "415d19ce",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 31765669,
+          "mono_us": 12100905,
+          "unit": "lab-crc.service",
+          "comp": "f368f31a",
+          "rg": "de4496ce",
+          "out": "0d9e6719",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 31965830,
+          "mono_us": 12301066,
+          "unit": "lab-crc.service",
+          "comp": "0f7671df",
+          "rg": "a660eeea",
+          "out": "2e312532",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 32165992,
+          "mono_us": 12501228,
+          "unit": "lab-crc.service",
+          "comp": "f368f31a",
+          "rg": "de4496ce",
+          "out": "0d9e6719",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 32366195,
+          "mono_us": 12701431,
+          "unit": "lab-crc.service",
+          "comp": "82d79368",
+          "rg": "cabb18a9",
+          "out": "ecb5e854",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 32566324,
+          "mono_us": 12901560,
+          "unit": "lab-crc.service",
+          "comp": "c0046153",
+          "rg": "5d30f29c",
+          "out": "9fb95373",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 32792114,
+          "mono_us": 13127350,
+          "unit": "lab-crc.service",
+          "comp": "96ed0b68",
+          "rg": "a6cea219",
+          "out": "ce923522",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 33003672,
+          "mono_us": 13338908,
+          "unit": "lab-crc.service",
+          "comp": "8b197266",
+          "rg": "25a17224",
+          "out": "ad5c6a91",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 33200177,
+          "mono_us": 13535413,
+          "unit": "lab-crc.service",
+          "comp": "7707f0a3",
+          "rg": "5d850a00",
+          "out": "8ef328ba",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 33412400,
+          "mono_us": 13747636,
+          "unit": "lab-crc.service",
+          "comp": "8b197266",
+          "rg": "25a17224",
+          "out": "ad5c6a91",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 33600540,
+          "mono_us": 13935776,
+          "unit": "lab-crc.service",
+          "comp": "07624f42",
+          "rg": "1233ba65",
+          "out": "de484005",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 33817363,
+          "mono_us": 14152599,
+          "unit": "lab-crc.service",
+          "comp": "127a6ca2",
+          "rg": "e27f03d2",
+          "out": "9578ed7a",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 34017549,
+          "mono_us": 14352785,
+          "unit": "lab-crc.service",
+          "comp": "8f7da99b",
+          "rg": "e627309d",
+          "out": "f47993db",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 34218282,
+          "mono_us": 14553518,
+          "unit": "lab-crc.service",
+          "comp": "72a478ba",
+          "rg": "027ab00d",
+          "out": "6dd700b7",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 34434561,
+          "mono_us": 14769797,
+          "unit": "lab-crc.service",
+          "comp": "8f8d492e",
+          "rg": "c8d7c8d7",
+          "out": "2ee8373f",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 43492033,
+          "mono_us": 23827269,
+          "unit": "lab-crc.service",
+          "comp": "54354ead",
+          "rg": "2104d729",
+          "out": "31ce0e35",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 59138118,
+          "mono_us": 39473354,
+          "unit": "lab-crc.service",
+          "comp": "5a2bb22e",
+          "rg": "45a29173",
+          "out": "b57c3fb3",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 59802689,
+          "mono_us": 40137925,
+          "unit": "lab-crc.service",
+          "comp": "33174a0b",
+          "rg": "829b120c",
+          "out": "12e2814a",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 60302647,
+          "mono_us": 40637883,
+          "unit": "lab-crc.service",
+          "comp": "1246bd9f",
+          "rg": "3df69448",
+          "out": "74f86282",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 60802635,
+          "mono_us": 41137871,
+          "unit": "lab-crc.service",
+          "comp": "9961c15f",
+          "rg": "f0cb125c",
+          "out": "e16798a8",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 70801897,
+          "mono_us": 51137133,
+          "unit": "lab-crc.service",
+          "comp": "eb244f67",
+          "rg": "318aaacc",
+          "out": "761c4a80",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 108554418,
+          "mono_us": 88889654,
+          "unit": "lab-crc.service",
+          "comp": "03b96ffa",
+          "rg": "12b4affd",
+          "out": "4a720173",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 110156011,
+          "mono_us": 90491247,
+          "unit": "lab-crc.service",
+          "comp": "4d8f8566",
+          "rg": "8f939434",
+          "out": "d4c3051d",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        }
+      ],
+      "errors": []
+    },
+    "card1/crtc494": {
+      "samples": [
+        {
+          "t_us": 30464679,
+          "mono_us": 10799915,
+          "unit": "lab-crc.service",
+          "comp": "1efc8562",
+          "rg": "5d09a23a",
+          "out": "b2e7ad2b",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 30664773,
+          "mono_us": 11000009,
+          "unit": "lab-crc.service",
+          "comp": "cb73ad7d",
+          "rg": "fcd12e2f",
+          "out": "22947c14",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 30864955,
+          "mono_us": 11200191,
+          "unit": "lab-crc.service",
+          "comp": "666b9630",
+          "rg": "6cb4a238",
+          "out": "72cd3989",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 31065064,
+          "mono_us": 11400300,
+          "unit": "lab-crc.service",
+          "comp": "5ffb8595",
+          "rg": "133d6e61",
+          "out": "6fad5127",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 31265270,
+          "mono_us": 11600506,
+          "unit": "lab-crc.service",
+          "comp": "a3e50750",
+          "rg": "6b191645",
+          "out": "4c02130c",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 31465429,
+          "mono_us": 11800665,
+          "unit": "lab-crc.service",
+          "comp": "c7494e2f",
+          "rg": "e26ee7f5",
+          "out": "415d19ce",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 31665579,
+          "mono_us": 12000815,
+          "unit": "lab-crc.service",
+          "comp": "3b57ccea",
+          "rg": "9a4a9fd1",
+          "out": "62f25be5",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 31865710,
+          "mono_us": 12200946,
+          "unit": "lab-crc.service",
+          "comp": "0f7671df",
+          "rg": "a660eeea",
+          "out": "2e312532",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 32065871,
+          "mono_us": 12401107,
+          "unit": "lab-crc.service",
+          "comp": "f368f31a",
+          "rg": "de4496ce",
+          "out": "0d9e6719",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 32266063,
+          "mono_us": 12601299,
+          "unit": "lab-crc.service",
+          "comp": "0f7671df",
+          "rg": "a660eeea",
+          "out": "2e312532",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 32466305,
+          "mono_us": 12801541,
+          "unit": "lab-crc.service",
+          "comp": "ec735841",
+          "rg": "8b3985af",
+          "out": "51f7c10f",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 32666422,
+          "mono_us": 13001658,
+          "unit": "lab-crc.service",
+          "comp": "329d6a27",
+          "rg": "64aa2d9a",
+          "out": "75dfbc76",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 32883513,
+          "mono_us": 13218749,
+          "unit": "lab-crc.service",
+          "comp": "8b197266",
+          "rg": "25a17224",
+          "out": "ad5c6a91",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 33100151,
+          "mono_us": 13435387,
+          "unit": "lab-crc.service",
+          "comp": "7707f0a3",
+          "rg": "5d850a00",
+          "out": "8ef328ba",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 33300240,
+          "mono_us": 13635476,
+          "unit": "lab-crc.service",
+          "comp": "8b197266",
+          "rg": "25a17224",
+          "out": "ad5c6a91",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 33501560,
+          "mono_us": 13836796,
+          "unit": "lab-crc.service",
+          "comp": "7707f0a3",
+          "rg": "5d850a00",
+          "out": "8ef328ba",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 33730658,
+          "mono_us": 14065894,
+          "unit": "lab-crc.service",
+          "comp": "7b222c28",
+          "rg": "294385fa",
+          "out": "6dd4a0e1",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 33917809,
+          "mono_us": 14253045,
+          "unit": "lab-crc.service",
+          "comp": "ee64ee67",
+          "rg": "9a5b7bf6",
+          "out": "b6d7af51",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 34117658,
+          "mono_us": 14452894,
+          "unit": "lab-crc.service",
+          "comp": "3726d66c",
+          "rg": "9a468c2a",
+          "out": "21bb813e",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 34335580,
+          "mono_us": 14670816,
+          "unit": "lab-crc.service",
+          "comp": "90b9f4fa",
+          "rg": "d69fe27c",
+          "out": "f6708525",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 34534579,
+          "mono_us": 14869815,
+          "unit": "lab-crc.service",
+          "comp": "8f8d492e",
+          "rg": "c8d7c8d7",
+          "out": "2ee8373f",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 44219530,
+          "mono_us": 24554766,
+          "unit": "lab-crc.service",
+          "comp": "8f8d492e",
+          "rg": "c3960ed7",
+          "out": "412213f2",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 60219295,
+          "mono_us": 40554531,
+          "unit": "lab-crc.service",
+          "comp": "93557461",
+          "rg": "ea0ea47b",
+          "out": "3624ec1b",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 60385962,
+          "mono_us": 40721198,
+          "unit": "lab-crc.service",
+          "comp": "a2bb0b4f",
+          "rg": "47c2a18b",
+          "out": "9ca522c9",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 60552621,
+          "mono_us": 40887857,
+          "unit": "lab-crc.service",
+          "comp": "83222bc8",
+          "rg": "08882969",
+          "out": "5dced276",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 60885952,
+          "mono_us": 41221188,
+          "unit": "lab-crc.service",
+          "comp": "08055708",
+          "rg": "c5b5af7d",
+          "out": "c851285c",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 64385943,
+          "mono_us": 44721179,
+          "unit": "lab-crc.service",
+          "comp": "08055708",
+          "rg": "943fe51c",
+          "out": "0beddeeb",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 64552591,
+          "mono_us": 44887827,
+          "unit": "lab-crc.service",
+          "comp": "08055708",
+          "rg": "c5b5af7d",
+          "out": "c851285c",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 70885223,
+          "mono_us": 51220459,
+          "unit": "lab-crc.service",
+          "comp": "7a40d930",
+          "rg": "04f417ed",
+          "out": "5f2afa74",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 108654401,
+          "mono_us": 88989637,
+          "unit": "lab-crc.service",
+          "comp": "03b96ffa",
+          "rg": "12b4affd",
+          "out": "4a720173",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        }
+      ],
+      "errors": [
+        {
+          "t_us": 107275154,
+          "mono_us": 87610390,
+          "unit": "lab-crc.service",
+          "errno": 19
+        }
+      ]
+    }
+  },
+  "sampler_starts": [
+    {
+      "t_us": 26727310,
+      "mono_us": 7062546,
+      "unit": "lab-crc-initrd.service"
+    },
+    {
+      "t_us": 30264604,
+      "mono_us": 10599840,
+      "unit": "lab-crc.service"
+    },
+    {
+      "t_us": 107468132,
+      "mono_us": 87803368,
+      "unit": "lab-crc.service"
+    }
+  ],
+  "greetd_started": {
+    "t_us": 33964431,
+    "mono_us": 14299667
+  },
+  "greeter_first_appearance": {
+    "card1/crtc205": {
+      "t_us": 34017549,
+      "mono_us": 14352785
+    },
+    "card1/crtc494": {
+      "t_us": 34117658,
+      "mono_us": 14452894
+    }
+  },
+  "probe": [
+    {
+      "t_us": 44590938,
+      "mono_us": 24926174,
+      "line": "device node=/dev/input/event20"
+    },
+    {
+      "t_us": 44595405,
+      "mono_us": 24930641,
+      "line": "ready holder=keyd pid=1140"
+    },
+    {
+      "t_us": 44816249,
+      "mono_us": 25151485,
+      "line": "typed keys=11"
+    }
+  ]
+}
