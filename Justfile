@@ -8,7 +8,7 @@ default:
 # ── Top-level gates ─────────────────────────────────────────────────────────
 
 # Full local CI gate. Run before every push.
-check: lint r14-gate vis-selftest lab-selftest nvidia-egl-env-gate test
+check: lint r14-gate vis-selftest lab-selftest nvidia-egl-env-gate gnomon-lab-eval test
 
 # Pure Nix-eval structural gate: asserts the halmasuit module's
 # nvidia branch produces the expected unit shape — env vars, the
@@ -18,6 +18,15 @@ check: lint r14-gate vis-selftest lab-selftest nvidia-egl-env-gate test
 # full list of structural invariants under check.
 nvidia-egl-env-gate:
     nix build .#checks.x86_64-linux.halmasuit-nvidia-egl-env -L --print-build-logs --no-link
+
+# Pure Nix-eval structural gate for the gnomon lab module
+# (nix/lab/module.nix, nixosModules.gnomon-lab): evaluates the module
+# against a gnomon-like system with non-default option values and
+# asserts every rescue setting (both boot-stage deadlines, the watchdog,
+# panic reboot, Wake-on-LAN) is present and wired to its option. Builds
+# no system closure; fast, no VM. See tests/gnomon-lab-eval.nix.
+gnomon-lab-eval:
+    nix build .#checks.x86_64-linux.gnomon-lab-eval -L --print-build-logs --no-link
 
 # R14 epic close-gate (Amendment A9 fold-in, review G3/F3): the
 # unprivileged compositor must never transitively link libpam. Exactly
