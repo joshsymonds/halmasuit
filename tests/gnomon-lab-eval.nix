@@ -5,7 +5,7 @@
 # present and wired to its option. Each experiment is composed with the module
 # on the same host and must carry its own fault. Builds no system closure: the
 # derivation only writes a marker file when every check passes.
-{ system, nixpkgs, labModule, labExperiments }:
+{ system, nixpkgs, labModule, labExperiments, labPatches }:
 
 let
   pkgs = nixpkgs.legacyPackages.${system};
@@ -19,6 +19,16 @@ let
     stage1Deadline = 241;
     rootfsDeadline = 421;
     wolInterface = "enp9s0";
+    crcSampler.enable = true;
+    probe.enable = true;
+    netconsole = {
+      enable = true;
+      targetIp = "10.20.30.40";
+      sourceIp = "10.20.30.50";
+      interface = "enp10s0";
+      port = 6700;
+    };
+    u2fOffServices = [ "login" "sudo" ];
   };
 
   # Synthetic gnomon-like host: systemd stage 1, LUKS root `cryptroot`
@@ -64,6 +74,58 @@ let
   rootRebootCmd = "${cfg.systemd.package}/bin/systemctl --force reboot";
 
   armed = v: v != null && v != "0";
+
+  # ── Lab instrumentation fixtures ─────────────────────────────────────
+  nc = labOptions.netconsole;
+  netconsoleDevice = "sys-subsystem-net-devices-${nc.interface}.device";
+  netconsoleUnit = get cfg [ "boot" "initrd" "systemd" "services" "lab-netconsole" ] { };
+
+  # The same host with one netconsole field emptied; its assertions must fail.
+  netconsoleWithEmpty = field:
+    (evalWith (labOptions // { netconsole = nc // { ${field} = ""; }; })).config;
+
+  # Every new setting non-default, with the lab disabled: nothing may appear.
+  disabledNew = (evalWith (labOptions // { enable = false; })).config;
+  # The same host with netconsole off: the firewall must match it exactly.
+  netconsoleOff = (evalWith (labOptions // { netconsole = nc // { enable = false; }; })).config;
+  # No lab settings at all: the new options must default off or empty.
+  defaults = (evalWith { }).config.halmasuit.lab;
+
+  # The host enables U2F globally and explicitly turns on one listed service,
+  # so the lab override must beat both. Disabled, neither is forced off.
+  u2fHost = lab: (lib.nixosSystem {
+    inherit system;
+    modules = [
+      labModule
+      (gnomonLike lab)
+      {
+        security.pam.u2f.enable = true;
+        security.pam.services.sudo.u2f.enable = true;
+      }
+    ];
+  }).config;
+  u2fOn = u2fHost labOptions;
+  u2fOff = u2fHost (labOptions // { enable = false; });
+
+  failingAssertions = c: builtins.filter (a: !a.assertion) c.assertions;
+
+  # Journal contract text frozen in nix/lab/module.nix for tests/hw/timeline.py.
+  moduleSource = builtins.readFile labModule;
+  journalContract = [
+    "SYSLOG_IDENTIFIER=lab-crc"
+    "lab-crc-initrd.service"
+    "lab-crc.service"
+    "start t=<us>"
+    "sample card=<cardN> crtc=<id> t=<us> comp=<hex> rg=<hex> out=<hex> comp_sup=<0|1> rg_sup=<0|1> out_sup=<0|1>"
+    "error card=<cardN> crtc=<id> t=<us> errno=<n>"
+    "SYSLOG_IDENTIFIER=lab-probe"
+    "lab-probe.service"
+    "device node=<path>"
+    "ready holder=<comm> pid=<pid>"
+    "typed keys=<n>"
+    "error reason=<text>"
+    "8 lowercase digits"
+  ];
 
   checks = [
     # ── Hardware watchdog, stage 1 ───────────────────────────────────
@@ -151,7 +213,73 @@ let
       msg = "enable = false still sets panic=10"; }
     { ok = (get disabled [ "systemd" "network" "links" "40-enp7s0" ] null) == null;
       msg = "enable = false still defines a WakeOnLan link"; }
+
+    # ── Lab instrumentation options: declared, defaulted, carried ────
+    { ok = (get cfg [ "halmasuit" "lab" "crcSampler" "enable" ] false) == true;
+      msg = "halmasuit.lab.crcSampler.enable does not carry its value"; }
+    { ok = (get cfg [ "halmasuit" "lab" "probe" "enable" ] false) == true;
+      msg = "halmasuit.lab.probe.enable does not carry its value"; }
+    { ok = !defaults.crcSampler.enable && !defaults.probe.enable && !defaults.netconsole.enable
+        && defaults.netconsole.targetIp == "" && defaults.netconsole.sourceIp == ""
+        && defaults.netconsole.interface == "" && defaults.netconsole.port == 6666
+        && defaults.u2fOffServices == [ ];
+      msg = "a new lab option does not default off or empty (netconsole.port defaults to 6666)"; }
+
+    # ── Netconsole from stage 1: outbound UDP only ───────────────────
+    { ok = builtins.elem "netconsole" (get cfg [ "boot" "initrd" "availableKernelModules" ] [ ]);
+      msg = "netconsole is not in boot.initrd.availableKernelModules"; }
+    # initrd storePaths entries are packages or { source, target, ... } sets.
+    { ok = builtins.any (p: "${if p ? source then p.source else p}" == "${pkgs.kmod}")
+        (get cfg [ "boot" "initrd" "systemd" "storePaths" ] [ ]);
+      msg = "kmod (modprobe) is not in boot.initrd.systemd.storePaths"; }
+    { ok = (netconsoleUnit.serviceConfig.ExecStart or null)
+        == "${pkgs.kmod}/bin/modprobe netconsole netconsole=+@${nc.sourceIp}/${nc.interface},${toString nc.port}@${nc.targetIp}/";
+      msg = "lab-netconsole ExecStart is not modprobe netconsole with source, interface, port and target"; }
+    { ok = (netconsoleUnit.serviceConfig.Type or null) == "oneshot"
+        && (netconsoleUnit.serviceConfig.RemainAfterExit or false) == true;
+      msg = "lab-netconsole is not a oneshot with RemainAfterExit=yes"; }
+    { ok = builtins.elem netconsoleDevice (netconsoleUnit.bindsTo or [ ])
+        && builtins.elem netconsoleDevice (netconsoleUnit.after or [ ]);
+      msg = "lab-netconsole is not BindsTo= and After= ${netconsoleDevice}"; }
+    { ok = builtins.elem "initrd.target" (netconsoleUnit.wantedBy or [ ])
+        && (netconsoleUnit.unitConfig.DefaultDependencies or true) == false;
+      msg = "lab-netconsole is not wanted by initrd.target with DefaultDependencies=no"; }
+    { ok = failingAssertions cfg == [ ];
+      msg = "the valid lab config fails an assertion"; }
+    { ok = lib.all (f: failingAssertions (netconsoleWithEmpty f) != [ ]) [ "targetIp" "sourceIp" "interface" ];
+      msg = "netconsole.enable with an empty targetIp, sourceIp or interface passes its assertion"; }
+    { ok = cfg.networking.firewall.allowedUDPPorts == netconsoleOff.networking.firewall.allowedUDPPorts
+        && cfg.networking.firewall.allowedTCPPorts == netconsoleOff.networking.firewall.allowedTCPPorts
+        && cfg.networking.firewall.allowedUDPPortRanges == netconsoleOff.networking.firewall.allowedUDPPortRanges
+        && cfg.networking.firewall.allowedTCPPortRanges == netconsoleOff.networking.firewall.allowedTCPPortRanges
+        && !(builtins.elem nc.port cfg.networking.firewall.allowedUDPPorts);
+      msg = "netconsole changes the firewall (it must open no port)"; }
+    { ok = (get disabledNew [ "boot" "initrd" "systemd" "services" "lab-netconsole" ] null) == null
+        && !(builtins.elem "netconsole" (get disabledNew [ "boot" "initrd" "availableKernelModules" ] [ ]));
+      msg = "enable = false still defines lab-netconsole or loads the netconsole module"; }
+
+    # ── u2fOffServices: forced off, and only when the lab is enabled ─
+    { ok = (get u2fOn [ "security" "pam" "u2f" "enable" ] false) == true;
+      msg = "the U2F host fixture does not enable U2F (the override check would be vacuous)"; }
+    { ok = lib.all (name: (get u2fOn [ "security" "pam" "services" name "u2f" "enable" ] null) == false)
+        labOptions.u2fOffServices;
+      msg = "u2fAuth is not false for every u2fOffServices entry on a U2F-enabled host"; }
+    { ok = lib.all (name: (get u2fOff [ "security" "pam" "services" name "u2f" "enable" ] null) != false)
+        labOptions.u2fOffServices;
+      msg = "enable = false still forces u2fAuth off for u2fOffServices"; }
+
+    # ── Patch export ─────────────────────────────────────────────────
+    { ok = toString labPatches.nvidiaCrcVblankWait == toString ./lib/crc-vblank-wait.patch;
+      msg = "lib.labPatches.nvidiaCrcVblankWait is not tests/lib/crc-vblank-wait.patch"; }
   ];
+
+  # Journal contract documented in the module header for the lab-crc and
+  # lab-probe producers. A source-text check: the contract is a comment, so
+  # it has no evaluated form to assert on.
+  journalChecks = map (s: {
+    ok = lib.hasInfix s moduleSource;
+    msg = "nix/lab/module.nix does not document journal contract text: ${s}";
+  }) journalContract;
 
   # ── Lab experiments, composed with the module on the same host ───────
   # Each experiment is evaluated the way nix-config composes it: the module,
@@ -293,7 +421,7 @@ let
       rescueChecks name c ++ faultCheck name c)
     faultChecks);
 
-  allChecks = checks ++ experimentChecks;
+  allChecks = checks ++ journalChecks ++ experimentChecks;
   failures = builtins.filter (c: !c.ok) allChecks;
   report = lib.concatMapStrings
     (c: "echo ${lib.escapeShellArg "FAIL: ${c.msg}"} >&2\n")

@@ -743,6 +743,13 @@
         fault-poweroff = ./nix/lab/experiments/fault-poweroff.nix;
       };
 
+      # NVIDIA driver patches for a lab host to apply to its own driver package
+      # (the gnomon-lab module cannot override hardware.nvidia.package).
+      # Checked by checks.gnomon-lab-eval.
+      lib.labPatches = {
+        nvidiaCrcVblankWait = ./tests/lib/crc-vblank-wait.patch;
+      };
+
       # Overlay exposing halmasuit-related packages under their bare names so
       # the NixOS module's `default = pkgs.halmasuit` / `default =
       # pkgs.halmasuit-session` resolutions work. Consumers apply this once
@@ -871,6 +878,7 @@
           inherit nixpkgs;
           labModule = self.nixosModules.gnomon-lab;
           labExperiments = self.lib.labExperiments;
+          labPatches = self.lib.labPatches;
         };
         # NVIDIA-EGL env shape regression gate. Cannot replicate the
         # actual NVIDIA failure in CI (no single-GPU passthrough on
