@@ -14,7 +14,6 @@ let
   watchdogManager = {
     WatchdogDevice = "/dev/watchdog0";
     RuntimeWatchdogSec = "60s";
-    RebootWatchdogSec = "10min";
   };
 in
 {
