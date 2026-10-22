@@ -33,7 +33,11 @@ time on the kernel clock. Every such line is kept, repeats included. Any other
 line from that unit is ignored, and lines from other units produce no
 `halmasuit` event.
 greetd's start is the first entry whose MESSAGE_ID is the unit-started ID and
-whose `UNIT` is `greetd.service`; it is a `unit` event.
+whose `UNIT` is `greetd.service`; it is a `unit` event. That start is read from
+MESSAGE_ID and UNIT and does not depend on MESSAGE. A journal entry whose MESSAGE
+is null, missing, or neither a string nor a list of byte values 0-255 yields no
+event derived from its message, of any kind. A list of byte values is decoded as
+UTF-8 with replacement and then treated as a string.
 
 Greeter first appearance. Per head, the first sample whose monotonic time is
 strictly after greetd's start.
@@ -114,7 +118,7 @@ TIMELINE_NAME = "timeline.json"
 
 @dataclass(frozen=True)
 class JournalEntry:
-    message: str
+    message: str | None
     identifier: str
     transport: str
     unit: str
@@ -130,10 +134,12 @@ class KernelZero:
     source: str | None
 
 
-def decode_message(raw: str | list[int]) -> str:
-    if isinstance(raw, list):
+def decode_message(raw: object) -> str | None:
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list) and all(type(byte) is int and 0 <= byte <= 255 for byte in raw):
         return bytes(raw).decode("utf-8", errors="replace")
-    return raw
+    return None
 
 
 def monotonic_us(fields: dict[str, str]) -> int | None:
@@ -151,7 +157,7 @@ def read_journal(path: Path) -> list[JournalEntry]:
         fields = json.loads(line)
         entries.append(
             JournalEntry(
-                message=decode_message(fields.get("MESSAGE", "")),
+                message=decode_message(fields.get("MESSAGE")),
                 identifier=fields.get("SYSLOG_IDENTIFIER", ""),
                 transport=fields.get("_TRANSPORT", ""),
                 unit=fields.get("_SYSTEMD_UNIT", ""),
@@ -303,6 +309,8 @@ def build_timeline(run: Path) -> Timeline:
             greetd = entry
             t = platform_us(zero, mono)
             events.append(make_event(t, mono, "unit", entry.identifier, "greetd.service started"))
+        if entry.message is None:
+            continue
         if entry.unit == HALMASUIT_UNIT:
             payload = halmasuit_payload(entry.message)
             if payload is not None:

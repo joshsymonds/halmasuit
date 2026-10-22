@@ -19,6 +19,7 @@ import timeline
 
 BOOT_ID = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
 GREETD_MESSAGE_ID = "39f53479d3a045ac8e11786248231fbf"
+GREETD_UNIT = "greetd.service"
 LOADER_GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
 FPDT = "firmware/acpi/fpdt/boot"
 EFIVARS = "firmware/efi/efivars"
@@ -698,6 +699,95 @@ class HalmasuitEventTest(unittest.TestCase):
         doc = build(with_journal(complete_files(), journal_of(complete_files()) + lines))
         self.assertEqual([event["mono_us"] for event in halmasuit_events(doc)], [1_700_400])
         self.assertEqual(one_event(doc, "client_first_frame")["payload"], CLIENT_PAYLOAD)
+
+
+class NullMessageTest(unittest.TestCase):
+    def test_entries_without_a_message_yield_no_event(self):
+        null_lines = {
+            "null halmasuit": journal_line(
+                None, identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_000
+            ),
+            "number halmasuit": journal_line(
+                42, identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_010
+            ),
+            "list with a non-byte halmasuit": journal_line(
+                [300], identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_020
+            ),
+            "list with a string halmasuit": journal_line(
+                ["x", 1], identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_030
+            ),
+            "missing halmasuit": json.dumps(
+                {
+                    "_BOOT_ID": BOOT_ID,
+                    "_TRANSPORT": "stdout",
+                    "SYSLOG_IDENTIFIER": "halmasuit",
+                    "_SYSTEMD_UNIT": HALMASUIT_UNIT,
+                    "__MONOTONIC_TIMESTAMP": "1700040",
+                }
+            ),
+            "null kernel": journal_line(None, identifier="kernel", transport="kernel", source=1_700_050),
+            "null lab-crc sample": journal_line(None, identifier="lab-crc", unit=ROOTFS_UNIT, mono=1_700_060),
+            "null lab-crc failure": journal_line(None, identifier="lab-crc", unit=ROOTFS_UNIT, mono=1_700_070),
+            "null lab-probe": journal_line(None, identifier="lab-probe", mono=1_700_080),
+            "missing lab-probe": json.dumps(
+                {"_BOOT_ID": BOOT_ID, "SYSLOG_IDENTIFIER": "lab-probe", "__MONOTONIC_TIMESTAMP": "1700090"}
+            ),
+        }
+        expected = build()
+        for label, line in null_lines.items():
+            with self.subTest(label):
+                doc = build(with_journal(complete_files(), journal_of(complete_files()) + [line]))
+                self.assertEqual(doc, expected)
+
+    def test_greetd_start_reads_message_id_and_unit_not_message(self):
+        files = replacing_lines(
+            complete_files(),
+            "Started Greeter.",
+            journal_line(
+                None,
+                identifier="systemd",
+                started_unit=GREETD_UNIT,
+                message_id=GREETD_MESSAGE_ID,
+                mono=GREETD_MONO_US,
+            ),
+        )
+        doc = build(files)
+        self.assertEqual(one_event(doc, "greetd.service started")["t_us"], KERNEL_ZERO_FPDT_US + GREETD_MONO_US)
+        self.assertEqual(
+            doc["greetd_started"], {"t_us": KERNEL_ZERO_FPDT_US + GREETD_MONO_US, "mono_us": GREETD_MONO_US}
+        )
+        self.assertEqual(
+            doc["greeter_first_appearance"],
+            {
+                "card1/crtc7": {"t_us": KERNEL_ZERO_FPDT_US + 2_050_000, "mono_us": 2_050_000},
+                "card0/crtc42": {"t_us": KERNEL_ZERO_FPDT_US + 2_100_000, "mono_us": 2_100_000},
+            },
+        )
+
+    def test_invalid_utf8_byte_list_keeps_its_halmasuit_event(self):
+        body = tracing_line(json.dumps({**PHASE_PAYLOAD, "note": "MARK"}))
+        raw = list(body.encode().replace(b"MARK", b"\xff"))
+        line = journal_line(raw, identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_300_000)
+        doc = build(with_journal(complete_files(), journal_of(complete_files()) + [line]))
+        self.assertEqual(one_event(doc, "phase_entered")["payload"], {**PHASE_PAYLOAD, "note": "�"})
+
+    def test_null_message_entries_leave_both_profiles_passing(self):
+        nulls = [
+            journal_line(None, identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_545_000),
+            journal_line([300], identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_545_500),
+            journal_line(None, identifier="kernel", transport="kernel", source=1_546_000),
+            journal_line(None, identifier="lab-crc", unit=ROOTFS_UNIT, mono=1_547_000),
+            journal_line(None, identifier="lab-probe", mono=1_548_000),
+        ]
+        files = bios_files(extra=nulls)
+        self.assertEqual(bios_failures(files), [])
+        self.assertEqual(production_failures(files), [])
+        for profile in ("bios-shader-greeter", "production"):
+            with self.subTest(profile), tempfile.TemporaryDirectory() as tmp:
+                run = write_run(Path(tmp), files)
+                code, out, err = run_cli([str(run), "--expect", profile])
+                self.assertEqual(code, 0, out + err)
+                self.assertIn(f"PASS {profile}", out)
 
 
 class FirmwareTest(unittest.TestCase):
