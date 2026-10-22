@@ -9,6 +9,11 @@ control, `include` and `substack` naming a service to resolve recursively, and
 `@include <service>` including a whole file. Any file that is missing, any
 malformed line, and any include cycle raises PamStackError, so an unresolved
 stack never reads as lockout-free.
+
+Besides the module list, the resolved stack reports `nullok_auth`: every `auth`
+line whose module is `pam_unix` and whose arguments (up to any `#` comment)
+include `nullok`, as `"<service file>: <logical line>"`, listed once in first-seen
+order. Such a line accepts a blank password, so the caller refuses on it.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ class PamStackError(Exception):
 class PamStack:
     files: tuple[str, ...]
     modules: tuple[str, ...]
+    nullok_auth: tuple[str, ...]
 
     @property
     def lockout(self) -> tuple[str, ...]:
@@ -40,8 +46,9 @@ class PamStack:
 def resolve(service: str, read: Callable[[str], str | None]) -> PamStack:
     files: list[str] = []
     modules: list[str] = []
-    _walk(service, read, (), files, modules)
-    return PamStack(files=tuple(files), modules=tuple(modules))
+    nullok: list[str] = []
+    _walk(service, read, (), files, modules, nullok)
+    return PamStack(files=tuple(files), modules=tuple(modules), nullok_auth=tuple(nullok))
 
 
 def _walk(
@@ -50,6 +57,7 @@ def _walk(
     ancestors: tuple[str, ...],
     files: list[str],
     modules: list[str],
+    nullok: list[str],
 ) -> None:
     if not SERVICE_NAME.fullmatch(service):
         raise PamStackError(f"invalid PAM service name {service!r}")
@@ -68,15 +76,20 @@ def _walk(
         if fields[0] == "@include":
             if len(fields) != 2:
                 raise PamStackError(f"{service!r}: malformed line {line!r}")
-            _walk(fields[1], read, chain, files, modules)
+            _walk(fields[1], read, chain, files, modules, nullok)
             continue
         kind, control, args = _split_entry(service, line)
         if kind.removeprefix("-") not in PAM_TYPES or not args:
             raise PamStackError(f"{service!r}: malformed line {line!r}")
         if control in INCLUDE_CONTROLS:
-            _walk(args[0], read, chain, files, modules)
+            _walk(args[0], read, chain, files, modules, nullok)
         else:
-            modules.append(_module_name(args[0]))
+            module = _module_name(args[0])
+            modules.append(module)
+            if kind.removeprefix("-") == "auth" and module == "pam_unix" and _has_nullok(args[1:]):
+                entry = f"{service}: {line.strip()}"
+                if entry not in nullok:
+                    nullok.append(entry)
 
 
 def _logical_lines(text: str) -> list[str]:
@@ -114,3 +127,11 @@ def _split_entry(service: str, line: str) -> tuple[str, str, list[str]]:
 def _module_name(module_path: str) -> str:
     base = module_path.rsplit("/", 1)[-1]
     return base.removesuffix(".so")
+
+
+def _has_nullok(arguments: list[str]) -> bool:
+    comment = next(
+        (i for i, token in enumerate(arguments) if token.startswith("#")),
+        len(arguments),
+    )
+    return "nullok" in arguments[:comment]
