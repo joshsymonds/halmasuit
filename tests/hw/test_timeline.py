@@ -27,6 +27,8 @@ BOOT_PARAMS = "firmware/boot_params/data"
 JOURNAL = "journal.json"
 INITRD_UNIT = "lab-crc-initrd.service"
 ROOTFS_UNIT = "lab-crc.service"
+FATAL_ERRNO = "lab-crc: nvidia card fd lost: No such device"
+FATAL_BARE = "lab-crc: nvidia card fd lost"
 TIMELINE_KEYS = {
     "run",
     "boot_id",
@@ -202,6 +204,16 @@ def replacing_lines(files, marker, replacement):
     return with_journal(files, [replacement if marker in line else line for line in journal_of(files)])
 
 
+def inserting_after(files, marker, *lines):
+    existing = journal_of(files)
+    index = next(i for i, line in enumerate(existing) if marker in line)
+    return with_journal(files, existing[: index + 1] + list(lines) + existing[index + 1 :])
+
+
+def sampler_fatal(message, mono):
+    return journal_line(message, identifier="lab-crc", transport="stdout", unit=ROOTFS_UNIT, mono=mono)
+
+
 def write_run(root, files):
     run = root / "run"
     for rel, data in files.items():
@@ -372,6 +384,18 @@ class HeadTest(unittest.TestCase):
             ],
         )
 
+    def test_sampler_fatal_output_attributed_to_no_head(self):
+        doc = build(
+            inserting_after(
+                complete_files(),
+                "t=1200000",
+                sampler_fatal(FATAL_ERRNO, 1_250_000),
+                sampler_fatal(FATAL_BARE, 1_260_000),
+            )
+        )
+        self.assertEqual(doc["heads"], build()["heads"])
+        self.assertEqual(doc["greeter_first_appearance"], build()["greeter_first_appearance"])
+
     def test_greeter_first_appearance_is_first_sample_strictly_after_greetd(self):
         doc = build()
         self.assertEqual(
@@ -416,6 +440,23 @@ class EventTest(unittest.TestCase):
         details = [event["detail"] for event in doc["events"]]
         self.assertFalse(any("usb" in detail for detail in details))
         self.assertNotIn("efifb: copied into the journal", details)
+
+    def test_sampler_fatal_output_is_a_crc_event(self):
+        doc = build(
+            inserting_after(
+                complete_files(),
+                "t=1200000",
+                sampler_fatal(FATAL_ERRNO, 1_250_000),
+                sampler_fatal(FATAL_BARE, 1_260_000),
+            )
+        )
+        for message, mono in ((FATAL_ERRNO, 1_250_000), (FATAL_BARE, 1_260_000)):
+            with self.subTest(message):
+                event = one_event(doc, message)
+                self.assertEqual(event["kind"], "crc")
+                self.assertEqual(event["source"], ROOTFS_UNIT)
+                self.assertEqual(event["mono_us"], mono)
+                self.assertEqual(event["t_us"], KERNEL_ZERO_FPDT_US + mono)
 
     def test_probe_lines_recorded(self):
         doc = build()
@@ -556,6 +597,42 @@ class CliTest(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("BGRT logo missing", out)
             self.assertTrue((run / "timeline.json").is_file())
+
+    def test_sampler_restart_after_fatal_output_still_builds(self):
+        restart = journal_line("start t=1300000", identifier="lab-crc", unit=ROOTFS_UNIT, mono=5)
+        files = inserting_after(complete_files(), "t=1200000", sampler_fatal(FATAL_ERRNO, 1_250_000), restart)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = write_run(Path(tmp), files)
+            code, out, _ = run_cli([str(run)])
+            self.assertEqual(code, 0, out)
+            self.assertIn("PASS", out)
+            written = json.loads((run / "timeline.json").read_text())
+        self.assertEqual(
+            [start["unit"] for start in written["sampler_starts"]],
+            [INITRD_UNIT, ROOTFS_UNIT],
+        )
+
+    def test_malformed_contract_line_exits_two(self):
+        cases = {
+            "sample token without =": journal_line(
+                "sample card=card0 crtc=42 t=1200000 comp=00000001 rg=00000002 out=00000003 "
+                "comp_sup=1 rg_sup=1 out_sup",
+                identifier="lab-crc",
+                unit=INITRD_UNIT,
+            ),
+            "sample without t": journal_line(
+                "sample card=card0 crtc=42 comp=00000001 rg=00000002 out=00000003 "
+                "comp_sup=1 rg_sup=1 out_sup=0",
+                identifier="lab-crc",
+                unit=INITRD_UNIT,
+            ),
+        }
+        for label, line in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                run = write_run(Path(tmp), replacing_lines(complete_files(), "t=1200000", line))
+                code, _, err = run_cli([str(run)])
+                self.assertEqual(code, 2)
+                self.assertIn("malformed run", err)
 
     def test_unknown_profile_exits_two(self):
         with tempfile.TemporaryDirectory() as tmp:

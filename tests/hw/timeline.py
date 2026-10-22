@@ -13,14 +13,19 @@ present and nonzero, and otherwise at `LoaderTimeExecUSec`. A journal line's
 time is that kernel zero plus the line's monotonic time, and it is null when
 neither anchor exists. A journal line takes `_SOURCE_MONOTONIC_TIMESTAMP` when
 present (kernel lines carry the kmsg time there) and `__MONOTONIC_TIMESTAMP`
-otherwise. A lab-crc line takes its monotonic time from its own `t=` field,
-which wins over the journal timestamps.
+otherwise. A lab-crc `start`, `sample`, or `error` line takes its monotonic time
+from its own `t=` field, which wins over the journal timestamps; any other
+lab-crc line takes the journal timestamps.
 
 Events. Firmware and loader times are events on the platform clock with a null
 `mono_us`. A kernel-transport line matching the display pattern is a
 `driver-display` event when it also matches the driver pattern and a
 `kernel-display` event otherwise. A lab-crc `start` is a `sampler-start` event;
-a `sample` or `error` is a `crc` event. A lab-probe line is a `probe` event.
+a `sample` or `error` is a `crc` event. Any other lab-crc line is the sampler's
+own failure output (`lab-crc: <what>`, optionally `: <strerror>`), kept as a
+`crc` event whose source is its unit and which is attributed to no head. A
+`start`, `sample`, or `error` line whose fields do not parse is a malformed run.
+A lab-probe line is a `probe` event.
 greetd's start is the first entry whose MESSAGE_ID is the unit-started ID and
 whose `UNIT` is `greetd.service`; it is a `unit` event.
 
@@ -60,6 +65,7 @@ EFI_FRAMEBUFFER_TYPE = 0x70
 GREETD_STARTED_MESSAGE_ID = "39f53479d3a045ac8e11786248231fbf"
 GREETD_UNIT = "greetd.service"
 INITRD_SAMPLER_UNIT = "lab-crc-initrd.service"
+CRC_VERBS = ("start", "sample", "error")
 DISPLAY_PATTERN = re.compile(
     r"efifb|simpledrm|simple-framebuffer|fbcon|Console: switching|\[drm\]|nvidia-drm|nvidia-modeset|NVRM"
 )
@@ -194,6 +200,11 @@ def read_logo(bgrt_dir: Path) -> dict[str, int] | None:
     return {**logo, "width": width, "height": abs(height)}
 
 
+def crc_verb(message: str) -> str:
+    words = message.split(maxsplit=1)
+    return words[0] if words else ""
+
+
 def crc_fields(message: str) -> tuple[str, dict[str, str]]:
     verb, *tokens = message.split()
     return verb, dict(token.split("=", 1) for token in tokens)
@@ -241,7 +252,7 @@ def build_timeline(run: Path) -> Timeline:
         if entry.transport == "kernel" and DISPLAY_PATTERN.search(entry.message):
             kind = "driver-display" if DRIVER_PATTERN.search(entry.message) else "kernel-display"
             events.append(make_event(platform_us(zero, mono), mono, kind, "kernel", entry.message))
-        elif entry.identifier == "lab-crc":
+        elif entry.identifier == "lab-crc" and crc_verb(entry.message) in CRC_VERBS:
             verb, fields = crc_fields(entry.message)
             if verb == "start":
                 mono = int(fields["t"])
@@ -273,6 +284,8 @@ def build_timeline(run: Path) -> Timeline:
                         {"t_us": t, "mono_us": mono, "unit": entry.unit, "errno": int(fields["errno"])}
                     )
                 events.append(make_event(t, mono, "crc", entry.unit, entry.message))
+        elif entry.identifier == "lab-crc":
+            events.append(make_event(platform_us(zero, mono), mono, "crc", entry.unit, entry.message))
         elif entry.identifier == "lab-probe":
             t = platform_us(zero, mono)
             probe.append({"t_us": t, "mono_us": mono, "line": entry.message})
