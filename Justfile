@@ -111,6 +111,7 @@ test-vm jobs="":
         halmasuit-multi-drm-auto
         halmasuit-multi-output
         initrd-survival
+        halmasuit-initrd-input
         halmasuit-tty-graphics
         halmasuit-shutdown-probe-phase0
         halmasuit-shutdown-probe-phase1
