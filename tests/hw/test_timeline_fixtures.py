@@ -4,9 +4,9 @@
 A fixture run is a directory under tests/hw/fixtures/ that holds
 `expected-timeline.json`; its `profile` file names the profile that must pass.
 Runs are read in place: build_timeline never writes into the fixture. The
-synthetic-baseline, gnomon-baseline, and synthetic-bios-shader-greeter runs
-also assert their story facts by hand, so a golden file regenerated from a
-broken timeline still fails.
+synthetic-baseline, gnomon-baseline, synthetic-bios-shader-greeter, and
+synthetic-production runs also assert their story facts by hand, so a golden
+file regenerated from a broken timeline still fails.
 """
 
 import errno
@@ -26,6 +26,7 @@ JOURNAL_NAME = "journal.json"
 BASELINE_RUN = FIXTURE_ROOT / "synthetic-baseline"
 GNOMON_RUN = FIXTURE_ROOT / "gnomon-baseline"
 BIOS_RUN = FIXTURE_ROOT / "synthetic-bios-shader-greeter"
+PRODUCTION_RUN = FIXTURE_ROOT / "synthetic-production"
 # exitbootservice_end_ns is 2_583_541_217, which floors to 2_583_541 us.
 KERNEL_ZERO_US = 2_583_541
 # Recorded gnomon boot: exitbootservice_end_ns floors to 19_664_764 us.
@@ -71,6 +72,7 @@ FRAME_SAMPLE_TOLERANCE_US = 250_000
 SAMPLE_TICKS = (2_300_000, 2_800_000) + tuple(3_300_000 + 500_000 * k for k in range(61))
 # lab-crc reads each head's time right after that head's ioctl, so head 494 is sampled after head 205.
 PANEL_SAMPLE_DELAY_US = {HEAD_CRTC205: 1_200, HEAD_CRTC494: 2_400}
+ZERO_COMP = "00000000"
 NVIDIA_LINES = (
     "NVRM: loading NVIDIA UNIX Open Kernel Module for x86_64  615.78.08  Release Build  (nixbld@)  ",
     "nvidia-modeset: Loading NVIDIA UNIX Open Kernel Mode Setting Driver for x86_64  615.78.08"
@@ -151,6 +153,9 @@ class FixtureReplayTest(unittest.TestCase):
 
     def test_bios_fixture_is_committed(self):
         self.assertIn(BIOS_RUN, fixture_runs())
+
+    def test_production_fixture_is_committed(self):
+        self.assertIn(PRODUCTION_RUN, fixture_runs())
 
     def test_every_fixture_matches_expected_timeline(self):
         for run in fixture_runs():
@@ -439,6 +444,208 @@ class BiosShaderGreeterShapeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.rows = journal_rows(BIOS_RUN)
+
+    def test_every_value_is_a_string(self):
+        for row in self.rows:
+            for key, value in row.items():
+                with self.subTest(key=key):
+                    self.assertIsInstance(value, str)
+
+    def test_every_line_carries_the_common_fields(self):
+        for row in self.rows:
+            with self.subTest(message=row["MESSAGE"]):
+                self.assertLessEqual(COMMON_FIELDS, set(row))
+
+    def test_kernel_lines_carry_source_time_and_no_user_or_group(self):
+        kernel = [row for row in self.rows if row["_TRANSPORT"] == "kernel"]
+        self.assertTrue(kernel)
+        for row in kernel:
+            with self.subTest(message=row["MESSAGE"]):
+                self.assertIn("_SOURCE_MONOTONIC_TIMESTAMP", row)
+                self.assertNotIn("_UID", row)
+                self.assertNotIn("_GID", row)
+
+    def test_systemd_lines_carry_their_job_fields(self):
+        systemd = [row for row in self.rows if row.get("_PID") == "1"]
+        self.assertTrue(systemd)
+        for row in systemd:
+            with self.subTest(message=row["MESSAGE"]):
+                self.assertLessEqual(SYSTEMD_FIELDS, set(row))
+
+    def test_unit_stdout_lines_carry_their_unit(self):
+        unit = [row for row in self.rows if row["_TRANSPORT"] == "stdout"]
+        self.assertTrue(unit)
+        for row in unit:
+            with self.subTest(message=row["MESSAGE"]):
+                self.assertLessEqual(UNIT_STDOUT_FIELDS, set(row))
+
+    def test_halmasuit_lines_are_compositor_stdout_with_tracing_json(self):
+        halmasuit = [row for row in self.rows if row.get("_SYSTEMD_UNIT") == HALMASUIT_UNIT]
+        self.assertTrue(halmasuit)
+        for row in halmasuit:
+            with self.subTest(message=row["MESSAGE"]):
+                self.assertEqual(row["_TRANSPORT"], "stdout")
+                self.assertEqual(row["SYSLOG_IDENTIFIER"], "halmasuit")
+                self.assertEqual(row["_COMM"], "halmasuit")
+                self.assertEqual(row["_UID"], HALMASUIT_STREAM_ID)
+                self.assertEqual(row["_GID"], HALMASUIT_STREAM_ID)
+                outer = json.loads(row["MESSAGE"])
+                self.assertEqual(set(outer), {"timestamp", "level", "fields", "target"})
+                self.assertEqual(outer["level"], "INFO")
+                self.assertEqual(outer["target"], "halmasuit::event")
+                self.assertEqual(set(outer["fields"]), {"json"})
+                self.assertIn("event", json.loads(outer["fields"]["json"]))
+                self.assertEqual(outer["timestamp"], rfc3339(row["__REALTIME_TIMESTAMP"]))
+
+    def test_halmasuit_lines_come_from_one_process(self):
+        pids = {row["_PID"] for row in self.rows if row.get("_SYSTEMD_UNIT") == HALMASUIT_UNIT}
+        self.assertEqual(pids, {HALMASUIT_PID})
+
+    def test_sample_lines_match_the_lab_crc_shape(self):
+        samples = [row for row in self.rows if row.get("_SYSTEMD_UNIT") in (INITRD_UNIT, ROOTFS_UNIT)]
+        messages = [row["MESSAGE"] for row in samples if row["MESSAGE"].startswith("sample ")]
+        self.assertTrue(messages)
+        for message in messages:
+            with self.subTest(message=message):
+                self.assertRegex(message, SAMPLE_LINE)
+
+
+class ProductionStoryTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.timeline = replay(PRODUCTION_RUN)
+        cls.events = cls.timeline["events"]
+        cls.halmasuit = [event for event in cls.events if event["kind"] == "halmasuit"]
+        cls.display = [event for event in cls.events if event["kind"] in ("kernel-display", "driver-display")]
+
+    def test_anchor_is_fpdt_exit_boot_services_end(self):
+        self.assertEqual(self.timeline["clock"]["kernel_zero_source"], "fpdt.exitbootservice_end")
+        self.assertEqual(self.timeline["clock"]["kernel_zero_us"], KERNEL_ZERO_US)
+
+    def test_every_halmasuit_line_reaches_the_timeline(self):
+        lines = [row for row in journal_rows(PRODUCTION_RUN) if row.get("_SYSTEMD_UNIT") == HALMASUIT_UNIT]
+        self.assertEqual(len(self.halmasuit), len(lines))
+        self.assertEqual(len(self.halmasuit), len(EXPECTED_HALMASUIT_STORY))
+
+    def test_halmasuit_story_events_are_in_order(self):
+        story = [(event["mono_us"], event["payload"]) for event in self.halmasuit]
+        self.assertEqual(story, EXPECTED_HALMASUIT_STORY)
+
+    def test_no_frame_rendered_events_are_emitted(self):
+        self.assertFalse(any(event["payload"]["event"] == "frame_rendered" for event in self.halmasuit))
+        self.assertFalse(any("frame_rendered" in row["MESSAGE"] for row in journal_rows(PRODUCTION_RUN)))
+
+    def test_halmasuit_starts_in_initrd_and_survives_into_rootfs(self):
+        self.assertEqual(
+            [(start["unit"], start["mono_us"]) for start in self.timeline["sampler_starts"]],
+            [(INITRD_UNIT, INITRD_SAMPLER_START_MONO), (ROOTFS_UNIT, ROOTFS_SAMPLER_START_MONO)],
+        )
+        started = self.halmasuit[0]
+        self.assertEqual(started["payload"]["event"], "started")
+        ready = next(
+            event
+            for event in self.halmasuit
+            if event["payload"] == {"event": "phase_entered", "phase": "rootfs_ready"}
+        )
+        self.assertLess(started["mono_us"], ROOTFS_SAMPLER_START_MONO)
+        self.assertLess(ROOTFS_SAMPLER_START_MONO, ready["mono_us"])
+
+    def test_nvidia_driver_loads_before_drm_master(self):
+        drivers = [event for event in self.display if event["kind"] == "driver-display"]
+        self.assertEqual([event["detail"] for event in drivers], list(NVIDIA_LINES))
+        for event in drivers:
+            with self.subTest(detail=event["detail"]):
+                self.assertLess(event["mono_us"], DRM_MASTER_MONO)
+
+    def test_no_console_takeover_before_drm_master(self):
+        details = [event["detail"] for event in self.display]
+        self.assertFalse(any("Console: switching" in detail for detail in details))
+        self.assertFalse(any("is primary device" in detail and "fbcon" in detail for detail in details))
+        self.assertFalse(any("frame buffer device" in detail for detail in details))
+
+    def test_wallpaper_is_the_only_first_frame_before_scanout(self):
+        wallpaper = [
+            event["mono_us"]
+            for event in self.halmasuit
+            if event["payload"] == {"event": "client_first_frame", "role": "wallpaper"}
+        ]
+        self.assertEqual(wallpaper, [WALLPAPER_MONO])
+        self.assertLess(WALLPAPER_MONO, SCANOUT_MONO)
+
+    def test_greeter_takes_foreground_before_the_overlay_first_frame(self):
+        overlay_payload = {"event": "client_first_frame", "role": "overlay"}
+        overlay = [event for event in self.halmasuit if event["payload"] == overlay_payload]
+        self.assertEqual([event["mono_us"] for event in overlay], [OVERLAY_MONO])
+        greeter_payload = {"event": "foreground_changed", "to": "greeter"}
+        greeter = [event for event in self.halmasuit if event["payload"] == greeter_payload]
+        self.assertEqual(
+            greeter,
+            [
+                {
+                    "t_us": KERNEL_ZERO_US + GREETER_MONO,
+                    "mono_us": GREETER_MONO,
+                    "kind": "halmasuit",
+                    "source": HALMASUIT_UNIT,
+                    "detail": "foreground_changed",
+                    "payload": greeter_payload,
+                }
+            ],
+        )
+        self.assertLess(GREETER_MONO, OVERLAY_MONO)
+
+    def test_panel_heads_are_exactly_the_two_panel_heads(self):
+        self.assertEqual(sorted(self.timeline["heads"]), sorted(PANEL_HEADS))
+
+    def test_no_sample_precedes_drm_master(self):
+        for key in PANEL_HEADS:
+            with self.subTest(head=key):
+                samples = self.timeline["heads"][key]["samples"]
+                self.assertTrue(samples)
+                self.assertGreater(min(sample["mono_us"] for sample in samples), DRM_MASTER_MONO)
+
+    def test_each_panel_head_samples_every_tick_through_the_hold(self):
+        for key in PANEL_HEADS:
+            with self.subTest(head=key):
+                samples = self.timeline["heads"][key]["samples"]
+                expected = [tick + PANEL_SAMPLE_DELAY_US[key] for tick in SAMPLE_TICKS]
+                self.assertEqual([sample["mono_us"] for sample in samples], expected)
+                self.assertGreaterEqual(SAMPLE_TICKS[-1], HOLD_END_MONO)
+
+    def test_panel_heads_never_share_a_sample_time(self):
+        first, second = (
+            {sample["mono_us"] for sample in self.timeline["heads"][key]["samples"]} for key in PANEL_HEADS
+        )
+        self.assertTrue(first.isdisjoint(second))
+
+    def test_panel_heads_hold_nonzero_changing_checksums_after_drm_master(self):
+        for key in PANEL_HEADS:
+            with self.subTest(head=key):
+                samples = self.timeline["heads"][key]["samples"]
+                comps = [sample["comp"] for sample in samples]
+                self.assertNotIn(ZERO_COMP, comps)
+                self.assertGreaterEqual(len(set(comps)), 2)
+
+    def test_each_printed_sample_differs_from_the_one_before_on_its_head(self):
+        for key in PANEL_HEADS:
+            with self.subTest(head=key):
+                samples = self.timeline["heads"][key]["samples"]
+                for before, after in zip(samples, samples[1:]):
+                    self.assertNotEqual(
+                        (before["comp"], before["rg"], before["out"]),
+                        (after["comp"], after["rg"], after["out"]),
+                    )
+
+    def test_production_profile_passes(self):
+        self.assertEqual(timeline.production(self.timeline), [])
+
+    def test_bios_profile_fails_because_no_frame_is_rendered(self):
+        self.assertIn("no non-degenerate frame_rendered", timeline.bios_shader_greeter(self.timeline))
+
+
+class ProductionShapeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.rows = journal_rows(PRODUCTION_RUN)
 
     def test_every_value_is_a_string(self):
         for row in self.rows:
