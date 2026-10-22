@@ -729,6 +729,20 @@
       # gnomon host config, VM tests) import these.
       nixosModules.halmasuit = ./nix/module.nix;
 
+      # Gnomon lab rescue settings (watchdog, deadlines, panic reboot, WoL).
+      # Gated on halmasuit.lab.enable; checked by checks.gnomon-lab-eval.
+      nixosModules.gnomon-lab = ./nix/lab/module.nix;
+
+      # Lab experiments: each composes nixosModules.gnomon-lab on top of a
+      # host and sets halmasuit.lab.enable. Checked by checks.gnomon-lab-eval.
+      lib.labExperiments = {
+        baseline = ./nix/lab/experiments/baseline.nix;
+        fault-initrd = ./nix/lab/experiments/fault-initrd.nix;
+        fault-hang = ./nix/lab/experiments/fault-hang.nix;
+        fault-panic = ./nix/lab/experiments/fault-panic.nix;
+        fault-poweroff = ./nix/lab/experiments/fault-poweroff.nix;
+      };
+
       # Overlay exposing halmasuit-related packages under their bare names so
       # the NixOS module's `default = pkgs.halmasuit` / `default =
       # pkgs.halmasuit-session` resolutions work. Consumers apply this once
@@ -849,6 +863,14 @@
           halmasuit            = self.packages.x86_64-linux.halmasuit;
           halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-vm-client  = self.packages.x86_64-linux.halmasuit-vm-client;
+        };
+        # Gnomon lab module structural gate: pure eval of the exported
+        # module against a synthetic gnomon-like system; builds no closure.
+        gnomon-lab-eval = import ./tests/gnomon-lab-eval.nix {
+          system    = "x86_64-linux";
+          inherit nixpkgs;
+          labModule = self.nixosModules.gnomon-lab;
+          labExperiments = self.lib.labExperiments;
         };
         # NVIDIA-EGL env shape regression gate. Cannot replicate the
         # actual NVIDIA failure in CI (no single-GPU passthrough on
