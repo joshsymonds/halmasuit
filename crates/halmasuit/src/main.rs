@@ -41,6 +41,7 @@ mod diagnostic;
 mod drm;
 #[cfg(feature = "frame_audit")]
 mod frame_audit;
+mod input_hotplug;
 #[cfg(feature = "frame_audit")]
 mod offscreen;
 mod swap_gate;
@@ -48,11 +49,14 @@ mod task_caps;
 mod vt_switch;
 mod wallpaper;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -319,7 +323,7 @@ struct HalmasuitState {
     /// `Session`. Gates keyboard focus (greeter layer vs session
     /// toplevel) so focus follows the lifecycle, not connection order.
     foreground: halmasuit_introspect::Foreground,
-    /// Registration token for the libinput calloop source. halmasuit
+    /// The direct-open libinput context. halmasuit
     /// opens `/dev/input/event*` directly (no libseat brokerage; R2.3)
     /// while still root via `setup_libinput_direct`; libinput holds
     /// the OwnedFds across the subsequent privilege drop. Set in BOTH
@@ -327,10 +331,9 @@ struct HalmasuitState {
     /// initramfs path enumerates too (the interactive LUKS prompt is a
     /// `wl_keyboard` client and needs seat input pre-pivot). `None` only
     /// on the SKIP (no-DRM/dev) path or if initramfs enumeration found no
-    /// devices. The token is removed by `graceful_shutdown` so the
-    /// calloop loop stops dispatching against the input subsystem during
-    /// shutdown.
-    libinput_token: Option<RegistrationToken>,
+    /// devices. `graceful_shutdown` removes its sources so the calloop
+    /// loop stops dispatching against the input subsystem during shutdown.
+    libinput: Option<DirectInput>,
 
     // ── greetd I/O ──────────────────────────────────────────────────────
     /// LoopHandle for inserting per-connection sources from inside
@@ -2848,9 +2851,19 @@ fn run_post_pivot_setup(state: &mut HalmasuitState) -> io::Result<()> {
     // missing or libinput rejects every device, log + continue without
     // input. The visible surface still composites; only interactive
     // greeters lose input. The `is_none()` guard skips this when the
-    // initramfs phase already registered a token.
-    if state.libinput_token.is_none() {
+    // initramfs phase already registered a context.
+    if state.libinput.is_none() {
         step_errors.extend(setup_post_pivot_input(state));
+    }
+    // The hotplug watch starts here in fromInitrd, after the context exists
+    // and before the privilege drop below: devices created after
+    // switch-root (keyd's virtual keyboard, late USB devices) are the ones
+    // stage 1 never saw. Guarded by `hotplug.is_none()` so it starts once.
+    if let Some(direct) = state.libinput.as_mut().filter(|d| d.hotplug.is_none())
+        && let Err(e) = start_input_hotplug(&state.loop_handle, direct)
+    {
+        tracing::error!(error = %e, "post-pivot: input hotplug watch failed to start");
+        step_errors.push(format!("post-pivot start_input_hotplug: {e}"));
     }
 
     // Start the D-Bus servers post-chroot: the observability
@@ -3004,7 +3017,7 @@ fn apply_chroot_to_root_fd(root_fd: &std::os::fd::OwnedFd) -> io::Result<()> {
 /// post-pivot call is the fallback for when no input devices were present
 /// pre-pivot: it re-enumerates via the same direct-open path the rootfs
 /// deployment uses (see `setup_libinput_direct`), guarded by
-/// `libinput_token.is_none()` so it never double-registers. No libseat,
+/// `libinput.is_none()` so it never double-registers. No libseat,
 /// no seatd, no brokerage: the compositor is still root at this point
 /// (privilege drop happens later in `run_post_pivot_setup`'s sequence).
 ///
@@ -3015,8 +3028,8 @@ fn apply_chroot_to_root_fd(root_fd: &std::os::fd::OwnedFd) -> io::Result<()> {
 fn setup_post_pivot_input(state: &mut HalmasuitState) -> Vec<String> {
     let mut errs: Vec<String> = Vec::new();
     match setup_libinput_direct(&state.loop_handle) {
-        Ok(token) => {
-            state.libinput_token = Some(token);
+        Ok(direct) => {
+            state.libinput = Some(direct);
             tracing::info!("post-pivot: libinput backend attached (direct, no libseat)");
         }
         Err(e) => {
@@ -3045,8 +3058,13 @@ fn setup_post_pivot_input(state: &mut HalmasuitState) -> Vec<String> {
 /// `input_gid` and restores the previous fsgid afterwards, on success
 /// and failure alike. `setfsgid` is per-thread and is legal here because
 /// `input_gid` is the saved set-gid. Unset means no bracket.
+///
+/// `held` counts the fds libinput holds per device number: an open
+/// counts the device, a close releases it. The hotplug watch reads it to
+/// skip devices that are already held.
 struct DirectInputInterface {
     input_gid: Option<u32>,
+    held: Rc<RefCell<input_hotplug::HeldDevices>>,
 }
 impl smithay::reexports::input::LibinputInterface for DirectInputInterface {
     fn open_restricted(
@@ -3063,15 +3081,28 @@ impl smithay::reexports::input::LibinputInterface for DirectInputInterface {
                 .write(accmode == libc::O_WRONLY || accmode == libc::O_RDWR)
                 .open(path)
         };
-        self.input_gid
+        let file = self
+            .input_gid
             .map_or_else(open, |gid| {
                 with_fsgid(nix::unistd::Gid::from_raw(gid), nix::unistd::setfsgid, open)
             })
-            .map(std::os::fd::OwnedFd::from)
-            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+        let rdev = file
+            .metadata()
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?
+            .rdev();
+        self.held.borrow_mut().open(rdev);
+        Ok(std::os::fd::OwnedFd::from(file))
     }
     fn close_restricted(&mut self, fd: std::os::fd::OwnedFd) {
-        drop(fd);
+        let file = std::fs::File::from(fd);
+        match file.metadata() {
+            Ok(metadata) => self.held.borrow_mut().close(metadata.rdev()),
+            Err(e) => tracing::error!(
+                error = %e,
+                "close_restricted: fstat failed; the device number stays counted as held"
+            ),
+        }
     }
 }
 
@@ -3089,32 +3120,69 @@ fn with_fsgid<T>(
     result
 }
 
-/// Build a libinput backend that opens `/dev/input/event*` devices
-/// directly (no libseat / seatd brokerage), attach it to the calloop,
-/// and dispatch events to `HalmasuitState::dispatch_libinput`.
+/// The direct-open libinput context and the handles `graceful_shutdown`
+/// removes. Built by `setup_libinput_direct`.
+struct DirectInput {
+    /// Calloop source that dispatches the context's events.
+    token: RegistrationToken,
+    /// Clone of the context the dispatch source drives. The hotplug watch
+    /// adds devices through it.
+    context: smithay::reexports::input::Libinput,
+    /// Open-fd counts per device number, maintained by `DirectInputInterface`.
+    held: Rc<RefCell<input_hotplug::HeldDevices>>,
+    /// Calloop source of the hotplug watch. `None` until
+    /// `start_input_hotplug` runs.
+    hotplug: Option<RegistrationToken>,
+}
+
+/// Build the direct-open libinput context and attach its calloop source,
+/// which dispatches events to `HalmasuitState::dispatch_libinput`.
 ///
-/// halmasuit is a system compositor and enumerates input devices once
-/// at startup — no udev-monitor-driven hotplug. Newly-plugged USB
-/// devices won't be picked up without a compositor restart (intentional;
-/// matches the "system compositor enumerated at boot" framing). The
-/// trade for that loss is removing seatd from the runtime closure
-/// entirely, which collapses the rootfs→shutdownRamfs pivot survival
-/// surface (R2.3): no standing root daemon to keep alive across the
-/// pivot, no smithay `LibSeatSessionNotifier` panic vector when seatd
-/// dies mid-shutdown.
+/// Each `/dev/input/eventN` open happens via `DirectInputInterface` while
+/// halmasuit is still root. libinput retains the OwnedFds; subsequent
+/// reads work after `drop_privileges` because the kernel checks file
+/// permissions at `open()`, not on later I/O.
 ///
-/// Each `/dev/input/eventN` open happens via `DirectInputInterface`
-/// while halmasuit is still root. libinput retains the OwnedFds;
-/// subsequent reads work after `drop_privileges` because the kernel
-/// checks file permissions at `open()`, not on later I/O.
+/// The nodes present at this call are added without the udev gate (the
+/// units start after udev has settled). Nodes that appear later are
+/// added by the watch that `start_input_hotplug` starts.
 fn setup_libinput_direct(
     loop_handle: &LoopHandle<'static, HalmasuitState>,
-) -> io::Result<RegistrationToken> {
+) -> io::Result<DirectInput> {
+    let held = Rc::new(RefCell::new(input_hotplug::HeldDevices::default()));
     let mut libinput = smithay::reexports::input::Libinput::new_from_path(DirectInputInterface {
         input_gid: input_gid_from(std::env::var_os("HALMASUIT_INPUT_GID").as_deref())?,
+        held: Rc::clone(&held),
     });
-    let entries = match std::fs::read_dir("/dev/input") {
-        Ok(it) => it,
+    match std::fs::read_dir("/dev/input") {
+        Ok(entries) => {
+            let mut device_count = 0u32;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !name.starts_with("event") {
+                    continue;
+                }
+                let Some(path_str) = path.to_str() else {
+                    continue;
+                };
+                // `path_add_device` calls back into `DirectInputInterface::
+                // open_restricted`. `None` means libinput rejected the device
+                // (e.g., kernel reported no input-class capability). Log +
+                // skip; not fatal.
+                if libinput.path_add_device(path_str).is_none() {
+                    tracing::debug!(path = %path.display(), "libinput.path_add_device refused");
+                    continue;
+                }
+                device_count += 1;
+            }
+            tracing::info!(
+                device_count,
+                "libinput direct: enumerated /dev/input/event* devices"
+            );
+        }
         Err(e) => {
             // Test / SKIP-DRM environments may have no /dev/input. Log
             // and proceed with a libinput context that has no devices;
@@ -3124,46 +3192,31 @@ fn setup_libinput_direct(
                 error = %e,
                 "/dev/input: read_dir failed; no input devices will be enumerated"
             );
-            return loop_handle
-                .insert_source(
-                    LibinputInputBackend::new(libinput),
-                    |event, (), state: &mut HalmasuitState| state.dispatch_libinput(event),
-                )
-                .map_err(|e| io::Error::other(format!("insert libinput backend: {e}")));
         }
-    };
-    let mut device_count = 0u32;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("event") {
-            continue;
-        }
-        let Some(path_str) = path.to_str() else {
-            continue;
-        };
-        // `path_add_device` calls back into `DirectInputInterface::
-        // open_restricted`. `None` means libinput rejected the device
-        // (e.g., kernel reported no input-class capability). Log +
-        // skip; not fatal.
-        if libinput.path_add_device(path_str).is_none() {
-            tracing::debug!(path = %path.display(), "libinput.path_add_device refused");
-            continue;
-        }
-        device_count += 1;
     }
-    tracing::info!(
-        device_count,
-        "libinput direct: enumerated /dev/input/event* devices"
-    );
-    loop_handle
+    let token = loop_handle
         .insert_source(
-            LibinputInputBackend::new(libinput),
+            LibinputInputBackend::new(libinput.clone()),
             |event, (), state: &mut HalmasuitState| state.dispatch_libinput(event),
         )
-        .map_err(|e| io::Error::other(format!("insert libinput backend: {e}")))
+        .map_err(|e| io::Error::other(format!("insert libinput backend: {e}")))?;
+    Ok(DirectInput {
+        token,
+        context: libinput,
+        held,
+        hotplug: None,
+    })
+}
+
+/// Start the hotplug watch for `direct`. Rootfs starts it at startup;
+/// fromInitrd starts it after switch-root, in `run_post_pivot_setup`.
+fn start_input_hotplug(
+    loop_handle: &LoopHandle<'static, HalmasuitState>,
+    direct: &mut DirectInput,
+) -> io::Result<()> {
+    let token = input_hotplug::start(loop_handle, direct.context.clone(), Rc::clone(&direct.held))?;
+    direct.hotplug = Some(token);
+    Ok(())
 }
 
 /// Apply the Phase B initramfs group-ownership convention to a freshly
@@ -3729,15 +3782,18 @@ fn graceful_shutdown(state: &mut HalmasuitState, reason: ShutdownReason) {
         tracing::warn!(error = %e, "graceful_shutdown: render_layer_elements failed");
     }
 
-    // R2.2 / R2.3: remove the libinput source from the calloop loop.
+    // R2.2 / R2.3: remove the libinput sources from the calloop loop.
     // halmasuit doesn't need libinput post-shutdown (no input routing
     // to a dying session). With R2.3's direct-open libinput
     // (`setup_libinput_direct`), the device fds are owned by the
-    // libinput context — removing the calloop source stops dispatch;
-    // dropping the source's owner drops the libinput context, which
-    // closes the fds.
-    if let Some(tok) = state.libinput_token.take() {
-        state.loop_handle.remove(tok);
+    // libinput context — removing the calloop sources stops dispatch
+    // and the hotplug watch; dropping the last context handle closes
+    // the fds.
+    if let Some(direct) = state.libinput.take() {
+        if let Some(tok) = direct.hotplug {
+            state.loop_handle.remove(tok);
+        }
+        state.loop_handle.remove(direct.token);
     }
 
     emit(&Event::Shutdown { reason });
@@ -4904,7 +4960,7 @@ fn main() -> io::Result<()> {
     //    once `/dev/input/event*` is available on the rootfs.
     // 2. `None`: the dev/test SKIP path — synthesized 1920x1080
     //    placeholder so wl_clients can still discover an output global.
-    let (drm_backend, drm_token, outputs, libinput_token) = if let Some(path) = &drm_device_path {
+    let (drm_backend, drm_token, outputs, libinput) = if let Some(path) = &drm_device_path {
         let (backend, token, real_outputs) =
             drm::setup_drm_direct(path, &loop_handle, handle_drm_event, wallpaper_config)?;
         // One wl_output global per connector (extended multi-output).
@@ -4918,16 +4974,18 @@ fn main() -> io::Result<()> {
         // (`halmasuit-luks`, a `wl_keyboard` client) needs the seat to
         // receive keys pre-pivot — without this the prompt renders but
         // cannot be typed into. `setup_post_pivot_input`'s
-        // `libinput_token.is_none()` guard then skips the duplicate
+        // `libinput.is_none()` guard then skips the duplicate
         // post-pivot call. The enumerated device count is logged by
         // `setup_libinput_direct`, so a keyboard-less initramfs is visible
-        // in the journal rather than a silent no-op.
-        let libinput_tok = if in_initramfs {
+        // in the journal rather than a silent no-op. In the initramfs the
+        // hotplug watch is not started here; it starts after switch-root,
+        // in `run_post_pivot_setup`.
+        let libinput = if in_initramfs {
             // Graceful: a libinput-context failure must not fail the boot
             // (the non-interactive `--passphrase-from` auto-unlock path
             // needs no input). Zero devices is already logged + non-fatal.
             match setup_libinput_direct(&loop_handle) {
-                Ok(token) => Some(token),
+                Ok(direct) => Some(direct),
                 Err(e) => {
                     tracing::error!(
                         error = %e,
@@ -4937,9 +4995,18 @@ fn main() -> io::Result<()> {
                 }
             }
         } else {
-            Some(setup_libinput_direct(&loop_handle)?)
+            let mut direct = setup_libinput_direct(&loop_handle)?;
+            // Degraded-state recoverable: the nodes present at startup are
+            // already attached, so a failed watch costs only hotplug.
+            if let Err(e) = start_input_hotplug(&loop_handle, &mut direct) {
+                tracing::error!(
+                    error = %e,
+                    "rootfs: input hotplug watch failed to start; devices plugged after startup will not be added"
+                );
+            }
+            Some(direct)
         };
-        (Some(backend), Some(token), real_outputs, libinput_tok)
+        (Some(backend), Some(token), real_outputs, libinput)
     } else {
         // SKIP path: synthesized placeholder. Geometry is invented;
         // the advertisement exists so clients can discover an output
@@ -5573,7 +5640,7 @@ fn main() -> io::Result<()> {
         foreground_toplevel: None,
         popups: PopupManager::default(),
         foreground: halmasuit_introspect::Foreground::Greeter,
-        libinput_token,
+        libinput,
         loop_handle: loop_handle.clone(),
         connections: HashMap::new(),
         next_conn_id: 0,
@@ -6406,6 +6473,7 @@ mod tests {
         let fsgid = nix::unistd::getegid().as_raw();
         let mut iface = DirectInputInterface {
             input_gid: Some(fsgid),
+            held: Rc::new(RefCell::new(input_hotplug::HeldDevices::default())),
         };
         assert!(
             iface
@@ -6423,7 +6491,10 @@ mod tests {
 
     #[test]
     fn open_restricted_without_input_gid_opens() {
-        let mut iface = DirectInputInterface { input_gid: None };
+        let mut iface = DirectInputInterface {
+            input_gid: None,
+            held: Rc::new(RefCell::new(input_hotplug::HeldDevices::default())),
+        };
         assert!(
             iface
                 .open_restricted(Path::new("/dev/null"), libc::O_RDONLY)
