@@ -15,9 +15,13 @@ in place. The roots keep the images in gnomon's store until someone removes them
 They are not system generations and create no boot entries.
 The lab entry is removed on the way out.
 
-Every remote, local, clock, and magic-packet effect goes through the `Layer`
+Every remote, local, clock, UDP, and magic-packet effect goes through the `Layer`
 and `Clock` objects handed to `Lab`, so test_lab.py runs the whole sequence
 against a simulated gnomon.
+
+From before the first build until PASS, FAIL, or the abort has finished, the
+runner listens for gnomon's netconsole stream on UDP. Every received line goes
+to the run's netconsole.log, prefixed with the time vermissian received it.
 
 A run refuses before it installs anything, and again before each reboot it
 issues, while a graphical user session (Class=user, Type wayland, x11, or mir)
@@ -34,6 +38,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -62,6 +67,10 @@ SHUTDOWN_DEADLINE_SECONDS = 600
 DISPLAY_DEADLINE_SECONDS = 300
 REMOTE_TIMEOUT_SECONDS = 120
 MAGIC_PORT = 9
+NETCONSOLE_PORT = 6666
+NETCONSOLE_LOG = "netconsole.log"
+UDP_MAX_DATAGRAM = 65535
+LISTEN_POLL_SECONDS = 0.2
 
 
 class LabError(Exception):
@@ -74,6 +83,13 @@ class Result(NamedTuple):
     stderr: str
 
 
+DatagramSink = Callable[[datetime, bytes], None]
+
+
+class NetconsoleListener(Protocol):
+    def stop(self) -> None: ...
+
+
 class Layer(Protocol):
     """Every effect the runner has on the outside world."""
 
@@ -82,6 +98,8 @@ class Layer(Protocol):
     def remote(self, argv: Sequence[str]) -> Result: ...
 
     def wake(self, mac: str) -> None: ...
+
+    def netconsole(self, port: int, on_datagram: DatagramSink) -> NetconsoleListener: ...
 
 
 class Clock(Protocol):
@@ -93,7 +111,7 @@ class Clock(Protocol):
 
 
 class SystemLayer:
-    """The real effects: local processes, ssh to the gnomon alias, a UDP broadcast."""
+    """The real effects: local processes, ssh to the gnomon alias, UDP broadcast and listen."""
 
     def local(self, argv: Sequence[str]) -> Result:
         return _capture(list(argv), timeout=None)
@@ -110,6 +128,75 @@ class SystemLayer:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             sock.sendto(magic_packet(mac), ("255.255.255.255", MAGIC_PORT))
+
+    def netconsole(self, port: int, on_datagram: DatagramSink) -> NetconsoleListener:
+        return UdpListener(_bind_udp(port), on_datagram)
+
+
+def _bind_udp(port: int) -> socket.socket:
+    """A UDP socket on every IPv4 address at `port`, polled so a stop() never blocks long."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind(("", port))
+    except OSError as err:
+        sock.close()
+        raise LabError(f"cannot listen for netconsole on UDP port {port}: {err}") from err
+    sock.settimeout(LISTEN_POLL_SECONDS)
+    return sock
+
+
+class UdpListener:
+    """Receives datagrams on a background thread until stop().
+
+    A failure on the thread (a closed socket or a callback error) is raised by stop(),
+    so a broken listener fails the run instead of silently dropping kernel log lines.
+    """
+
+    def __init__(self, sock: socket.socket, on_datagram: DatagramSink) -> None:
+        self._sock = sock
+        self._on_datagram = on_datagram
+        self._stopping = threading.Event()
+        self._failure: Exception | None = None
+        self._thread = threading.Thread(target=self._receive, name="netconsole", daemon=True)
+        self._thread.start()
+
+    def _receive(self) -> None:
+        try:
+            while not self._stopping.is_set():
+                try:
+                    datagram, _ = self._sock.recvfrom(UDP_MAX_DATAGRAM)
+                except TimeoutError:
+                    continue
+                self._on_datagram(datetime.now(timezone.utc), datagram)
+        except Exception as err:
+            self._failure = err
+
+    def stop(self) -> None:
+        self._stopping.set()
+        self._thread.join()
+        self._sock.close()
+        if self._failure is not None:
+            raise LabError(f"netconsole listener failed: {self._failure}") from self._failure
+
+
+class NetconsoleLog:
+    """A run's netconsole.log: every received line, prefixed with its receive time."""
+
+    def __init__(self, path: Path) -> None:
+        self._file = path.open("a", encoding="utf-8")
+
+    def record(self, received: datetime, datagram: bytes) -> None:
+        stamp = received.isoformat(timespec="microseconds")
+        lines = datagram.split(b"\n")
+        if lines[-1] == b"":
+            lines.pop()
+        for line in lines:
+            text = line.decode("utf-8", errors="replace")
+            self._file.write(f"{stamp} {text}\n")
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
 
 
 class SystemClock:
@@ -253,6 +340,7 @@ class Lab:
         state_root: Path,
         wol_iface: str,
         display_manager: str,
+        netconsole_port: int,
         emit: Callable[[str], None],
     ) -> None:
         self.layer = layer
@@ -262,13 +350,17 @@ class Lab:
         self.state_root = state_root
         self.wol_iface = wol_iface
         self.display_manager = display_manager
+        self.netconsole_port = netconsole_port
         self.emit = emit
 
     def run_experiment(self, name: str) -> None:
         plan = EXPERIMENTS[name]
         run = RunLog(self.state_root, self.clock.stamp(), name, self.emit)
+        netconsole = NetconsoleLog(run.directory / NETCONSOLE_LOG)
+        listener: NetconsoleListener | None = None
         installed = False
         try:
+            listener = self.layer.netconsole(self.netconsole_port, netconsole.record)
             head = self._head_rev()
             run.say(f"experiment {name} from halmasuit {head}")
             toplevel = self._build(name, "toplevel", head)
@@ -323,6 +415,10 @@ class Lab:
             if installed:
                 self._abort(run)
             raise
+        finally:
+            if listener is not None:
+                listener.stop()
+            netconsole.close()
 
     def _head_rev(self) -> str:
         return _ok(
@@ -562,6 +658,12 @@ def main(
     parser.add_argument(
         "--display-manager", default="display-manager.service", help="unit that must be active after return"
     )
+    parser.add_argument(
+        "--netconsole-port",
+        type=int,
+        default=NETCONSOLE_PORT,
+        help="UDP port that receives gnomon's netconsole stream",
+    )
     options = parser.parse_args(argv)
     runner = Lab(
         layer or SystemLayer(),
@@ -571,6 +673,7 @@ def main(
         state_root=options.state_root,
         wol_iface=options.wol_iface,
         display_manager=options.display_manager,
+        netconsole_port=options.netconsole_port,
         emit=print,
     )
     for name in options.experiments:

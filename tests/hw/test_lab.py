@@ -21,9 +21,12 @@ import io
 import itertools
 import json
 import re
+import socket
 import tempfile
+import threading
 import unittest
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import lab
@@ -78,6 +81,10 @@ GC_TARGETS = {"toplevel": TOPLEVEL_OUT, "uki": UKI_DIR}
 
 class UnscriptedCommand(AssertionError):
     """A command reached the simulator that no scripted shape accepts."""
+
+
+RECEIVED = datetime(2026, 10, 21, 12, 0, 0, 123456, tzinfo=timezone.utc)
+RECEIVED_STAMP = "2026-10-21T12:00:00.123456+00:00"
 
 
 def _ok(stdout: str = "") -> lab.Result:
@@ -143,6 +150,22 @@ class FakeClock:
         return "20260101T000000Z"
 
 
+class FakeNetconsole:
+    """The listener the fake layer hands out. Datagrams reach it only while it is open."""
+
+    def __init__(self, trace: list[str], on_datagram: Callable[[datetime, bytes], None]) -> None:
+        self.trace = trace
+        self.on_datagram = on_datagram
+        self.open = True
+
+    def deliver(self, datagram: bytes) -> None:
+        self.on_datagram(RECEIVED, datagram)
+
+    def stop(self) -> None:
+        self.open = False
+        self.trace.append("listen:stop")
+
+
 class FakeGnomon:
     """Simulated gnomon behind the Layer seam.
 
@@ -168,6 +191,8 @@ class FakeGnomon:
         uki_files: Sequence[str] = (UKI_IMAGE_NAME,),
         gc_roots: Mapping[str, str] | None = None,
         fail_gc_root: str | None = None,
+        bind_fails: bool = False,
+        deliveries: Mapping[str, Sequence[bytes]] | None = None,
     ) -> None:
         self.lab_mode = lab_mode
         self.sessions = list(sessions)
@@ -199,6 +224,31 @@ class FakeGnomon:
         self.gc_dir = gc_roots is not None
         self.gc_roots: dict[str, str] = dict(gc_roots or {})
         self.fail_gc_root = fail_gc_root
+        # trace interleaves gnomon events, emitted lines, and listener start/stop in order.
+        self.trace: list[str] = []
+        self.bind_fails = bind_fails
+        # deliveries maps an event to the datagrams the netconsole stream sends right after it.
+        self.deliveries = dict(deliveries or {})
+        self.netconsole_ports: list[int] = []
+        self.listener: FakeNetconsole | None = None
+
+    def say(self, message: str) -> None:
+        self.trace.append(f"say:{message}")
+
+    def netconsole(self, port: int, on_datagram: Callable[[datetime, bytes], None]) -> FakeNetconsole:
+        if self.bind_fails:
+            raise lab.LabError(f"cannot listen for netconsole on UDP port {port}: Address already in use")
+        self.netconsole_ports.append(port)
+        self.trace.append("listen:start")
+        self.listener = FakeNetconsole(self.trace, on_datagram)
+        return self.listener
+
+    def _event(self, event: str) -> None:
+        self.events.append(event)
+        self.trace.append(event)
+        if self.listener is not None and self.listener.open:
+            for datagram in self.deliveries.get(event, ()):
+                self.listener.deliver(datagram)
 
     def _boot(self) -> None:
         self.boots += 1
@@ -248,7 +298,7 @@ class FakeGnomon:
                 or command[9:] != ("--override-input", "halmasuit", f"git+file://{REPO}?rev={REV}")
             ):
                 raise UnscriptedCommand(command)
-            self.events.append(f"build:{match['exp']}:{match['kind']}")
+            self._event(f"build:{match['exp']}:{match['kind']}")
             return _ok(f"/nix/store/aaaa-{match['exp']}-{match['kind']}\n")
         raise UnscriptedCommand(command)
 
@@ -275,7 +325,7 @@ class FakeGnomon:
             return lab.Result(1, "", "no such session")
         if argv == ("sudo", "-n", "rm", "-f", ESP):
             self.esp.discard(LAB)
-            self.events.append("rm-entry")
+            self._event("rm-entry")
             return _ok()
         if argv == ("sudo", "-n", "install", "-d", "-m", "0755", GC_ROOT_DIR):
             self.gc_dir = True
@@ -291,7 +341,7 @@ class FakeGnomon:
             and UKI_IMAGE.fullmatch(argv[6])
         ):
             self.staged = True
-            self.events.append("stage")
+            self._event("stage")
             return _ok()
         if argv == ("df", "-B1", "--output=avail", "/boot"):
             return _ok(f"     Avail\n{self.esp_free}\n")
@@ -307,18 +357,18 @@ class FakeGnomon:
             if not self.staged:
                 return lab.Result(1, "", "cp: cannot stat staged image")
             self.esp.add(LAB)
-            self.events.append("install")
+            self._event("install")
             return _ok()
         if argv == ("sudo", "-n", "bootctl", "set-oneshot", LAB):
             self.oneshot = LAB
-            self.events.append(f"oneshot:{LAB}")
+            self._event(f"oneshot:{LAB}")
             return _ok()
         if argv == ("sudo", "-n", "bootctl", "set-oneshot", ""):
             self.oneshot = None
-            self.events.append("oneshot-clear")
+            self._event("oneshot-clear")
             return _ok()
         if argv == ("sudo", "-n", "systemctl", "reboot"):
-            self.events.append("reboot")
+            self._event("reboot")
             self.up = False
             self.pending = True
             return _ok()
@@ -342,12 +392,12 @@ class FakeGnomon:
         if kind == self.fail_gc_root:
             return lab.Result(1, "", f"ln: failed to create symbolic link '{link}': Read-only file system")
         self.gc_roots[kind] = target
-        self.events.append(f"root:{kind}")
+        self._event(f"root:{kind}")
         return _ok()
 
     def wake(self, mac: str) -> None:
         self.woken.append(mac)
-        self.events.append("wake")
+        self._event("wake")
         if self.powered_off and mac == MAC:
             self.powered_off = False
             self.pending = True
@@ -382,7 +432,7 @@ class LabRunnerTest(unittest.TestCase):
         self.state_root = self.tmp
 
     def run_queue(
-        self, names: Sequence[str], gnomon: FakeGnomon
+        self, names: Sequence[str], gnomon: FakeGnomon, extra: Sequence[str] = ()
     ) -> tuple[int, str, str]:
         self.state_root = self.tmp / f"runs-{next(self.runs)}"
         argv = [
@@ -392,6 +442,7 @@ class LabRunnerTest(unittest.TestCase):
             REPO,
             "--state-root",
             str(self.state_root),
+            *extra,
             *names,
         ]
         out, err = io.StringIO(), io.StringIO()
@@ -399,10 +450,34 @@ class LabRunnerTest(unittest.TestCase):
             code = lab.main(argv, layer=gnomon, clock=FakeClock())
         return code, out.getvalue(), err.getvalue()
 
+    def run_traced(self, name: str, gnomon: FakeGnomon) -> None:
+        """Run one experiment through Lab directly so emitted lines land in gnomon.trace."""
+        self.state_root = self.tmp / f"runs-{next(self.runs)}"
+        runner = lab.Lab(
+            gnomon,
+            FakeClock(),
+            repo_root=Path(REPO),
+            nix_config=Path(NIX_CONFIG),
+            state_root=self.state_root,
+            wol_iface="enp7s0",
+            display_manager="display-manager.service",
+            netconsole_port=6666,
+            emit=gnomon.say,
+        )
+        runner.run_experiment(name)
+
     def single_run_dir(self, name: str) -> Path:
         found = sorted(self.state_root.glob(f"*-{name}"))
         self.assertEqual(len(found), 1, found)
         return found[0]
+
+    def netconsole_lines(self, name: str) -> list[str]:
+        return (self.single_run_dir(name) / "netconsole.log").read_text(encoding="utf-8").splitlines()
+
+    def position(self, trace: Sequence[str], prefix: str) -> int:
+        matches = [index for index, entry in enumerate(trace) if entry.startswith(prefix)]
+        self.assertEqual(len(matches), 1, (prefix, trace))
+        return matches[0]
 
     def test_images_are_built_in_gnomon_store_from_the_pinned_head(self) -> None:
         gnomon = FakeGnomon()
@@ -723,6 +798,160 @@ class LabRunnerTest(unittest.TestCase):
             self.run_queue(["baseline", "bogus"], gnomon)
         self.assertEqual(caught.exception.code, 2)
         self.assertEqual(gnomon.calls, [])
+
+    def test_netconsole_port_defaults_to_6666_and_follows_the_option(self) -> None:
+        gnomon = FakeGnomon()
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(gnomon.netconsole_ports, [6666])
+        gnomon = FakeGnomon()
+        code, _, err = self.run_queue(["baseline"], gnomon, extra=["--netconsole-port", "7777"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(gnomon.netconsole_ports, [7777])
+
+    def test_bind_failure_refuses_before_any_remote_effect(self) -> None:
+        gnomon = FakeGnomon(bind_fails=True)
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 1)
+        self.assertIn("netconsole", err)
+        self.assertEqual(gnomon.calls, [])
+        self.assertEqual(gnomon.events, [])
+
+    def test_listener_starts_before_the_first_build_and_stops_after_pass(self) -> None:
+        gnomon = FakeGnomon()
+        self.run_traced("baseline", gnomon)
+        trace = gnomon.trace
+        self.assertEqual(trace[0], "listen:start")
+        self.assertLess(self.position(trace, "listen:start"), self.position(trace, "build:baseline:toplevel"))
+        self.assertLess(self.position(trace, "say:PASS"), self.position(trace, "listen:stop"))
+        self.assertEqual(trace[-1], "listen:stop")
+        self.assertFalse(gnomon.listener.open)
+
+    def test_listener_receives_lines_from_build_lab_boot_and_return(self) -> None:
+        gnomon = FakeGnomon(
+            deliveries={
+                "build:baseline:toplevel": [b"build\n"],
+                "reboot": [b"reboot\n"],
+                "rm-entry": [b"return\n"],
+            }
+        )
+        self.run_traced("baseline", gnomon)
+        # rm-entry fires once before install and once after the return, so the
+        # second "return" line exists only if the listener was still open at return.
+        self.assertEqual(
+            self.netconsole_lines("baseline"),
+            [
+                f"{RECEIVED_STAMP} build",
+                f"{RECEIVED_STAMP} return",
+                f"{RECEIVED_STAMP} reboot",
+                f"{RECEIVED_STAMP} reboot",
+                f"{RECEIVED_STAMP} return",
+            ],
+        )
+
+    def test_listener_stays_open_through_the_abort_steps(self) -> None:
+        gnomon = FakeGnomon(
+            lab_mode="returns",
+            display_manager="inactive",
+            deliveries={"oneshot-clear": [b"abort\n"]},
+        )
+        with self.assertRaises(lab.LabError):
+            self.run_traced("fault-panic", gnomon)
+        trace = gnomon.trace
+        self.assertLess(self.position(trace, "say:FAIL"), self.position(trace, "listen:stop"))
+        self.assertLess(
+            self.position(trace, "say:aborting"), self.position(trace, "oneshot-clear")
+        )
+        self.assertEqual(trace[-1], "listen:stop")
+        self.assertEqual(self.netconsole_lines("fault-panic"), [f"{RECEIVED_STAMP} abort"])
+
+    def test_listener_is_stopped_when_a_run_fails_before_install(self) -> None:
+        gnomon = FakeGnomon(fail_gc_root="uki")
+        with self.assertRaises(lab.LabError):
+            self.run_traced("fault-panic", gnomon)
+        self.assertLess(self.position(gnomon.trace, "say:FAIL"), self.position(gnomon.trace, "listen:stop"))
+        self.assertEqual(gnomon.trace[-1], "listen:stop")
+        self.assertFalse(gnomon.listener.open)
+
+
+class NetconsoleLogTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "netconsole.log"
+
+    def write(self, *datagrams: bytes) -> list[str]:
+        log = lab.NetconsoleLog(self.path)
+        try:
+            for datagram in datagrams:
+                log.record(RECEIVED, datagram)
+        finally:
+            log.close()
+        return self.path.read_text(encoding="utf-8").splitlines()
+
+    def test_each_line_is_prefixed_with_the_receive_time(self) -> None:
+        lines = self.write(b"6,1234,5678901,-;nvidia-drm 0000:01:00.0: probe\n")
+        self.assertEqual(lines, [f"{RECEIVED_STAMP} 6,1234,5678901,-;nvidia-drm 0000:01:00.0: probe"])
+
+    def test_datagram_lines_split_into_one_line_each(self) -> None:
+        lines = self.write(b"6,1,1,-;first\n6,2,2,-;second\n")
+        self.assertEqual(lines, [f"{RECEIVED_STAMP} 6,1,1,-;first", f"{RECEIVED_STAMP} 6,2,2,-;second"])
+
+    def test_last_line_without_newline_is_kept(self) -> None:
+        self.assertEqual(self.write(b"a\nb"), [f"{RECEIVED_STAMP} a", f"{RECEIVED_STAMP} b"])
+
+    def test_empty_datagram_writes_nothing(self) -> None:
+        self.assertEqual(self.write(b""), [])
+
+    def test_undecodable_bytes_are_replaced(self) -> None:
+        self.assertEqual(self.write(b"x\xffy\n"), [f"{RECEIVED_STAMP} x�y"])
+
+    def test_each_datagram_is_flushed_before_the_next_arrives(self) -> None:
+        log = lab.NetconsoleLog(self.path)
+        self.addCleanup(log.close)
+        log.record(RECEIVED, b"kept\n")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), f"{RECEIVED_STAMP} kept\n")
+
+
+class NetconsoleListenerTest(unittest.TestCase):
+    def free_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind(("", 0))
+            return sock.getsockname()[1]
+
+    def test_loopback_datagram_reaches_the_callback_until_stopped(self) -> None:
+        port = self.free_port()
+        received: list[tuple[datetime, bytes]] = []
+        arrived = threading.Event()
+
+        def on_datagram(at: datetime, payload: bytes) -> None:
+            received.append((at, payload))
+            arrived.set()
+
+        before = datetime.now(timezone.utc)
+        listener = lab.SystemLayer().netconsole(port, on_datagram)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+                sender.sendto(b"6,1,1,-;hello\n", ("127.0.0.1", port))
+            self.assertTrue(arrived.wait(timeout=10))
+        finally:
+            listener.stop()
+        after = datetime.now(timezone.utc)
+        at, payload = received[0]
+        self.assertEqual(payload, b"6,1,1,-;hello\n")
+        self.assertEqual(at.utcoffset(), timedelta(0))
+        self.assertLessEqual(before, at)
+        self.assertLessEqual(at, after)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as rebind:
+            rebind.bind(("", port))
+
+    def test_port_already_in_use_is_a_lab_error(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as held:
+            held.bind(("", 0))
+            port = held.getsockname()[1]
+            with self.assertRaises(lab.LabError) as caught:
+                lab.SystemLayer().netconsole(port, lambda at, payload: None)
+        self.assertIn(f"UDP port {port}", str(caught.exception))
 
 
 class MagicPacketTest(unittest.TestCase):
