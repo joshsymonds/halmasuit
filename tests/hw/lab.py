@@ -7,6 +7,12 @@ on gnomon, sign it with the sbctl db key into a staging path, check the ESP has
 room, record the boot entries, default entry, and system generations, install
 the UKI as a one-shot ESP entry, reboot, and verify gnomon returns to the
 pre-run default with the pre-run record intact.
+Before anything is staged, the run points two GC roots on gnomon at the built
+images: /nix/var/nix/gcroots/halmasuit-lab/toplevel at the lab toplevel and
+/nix/var/nix/gcroots/halmasuit-lab/uki at the lab UKI. Each run replaces existing
+links, and the runner never removes them, so a failed or aborted run leaves them
+in place. The roots keep the images in gnomon's store until someone removes them.
+They are not system generations and create no boot entries.
 The lab entry is removed on the way out.
 
 Every remote, local, clock, and magic-packet effect goes through the `Layer`
@@ -42,6 +48,9 @@ LAB_ENTRY = "halmasuit-lab.efi"
 ESP_ENTRY = f"/boot/EFI/Linux/{LAB_ENTRY}"
 STAGED_DIR = "/var/lib/halmasuit-lab"
 STAGED = f"{STAGED_DIR}/{LAB_ENTRY}"
+GC_ROOT_DIR = "/nix/var/nix/gcroots/halmasuit-lab"
+GC_TOPLEVEL = f"{GC_ROOT_DIR}/toplevel"
+GC_UKI = f"{GC_ROOT_DIR}/uki"
 BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
 SELECTED_VAR = "/sys/firmware/efi/efivars/LoaderEntrySelected-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
 ESP_MARGIN_BYTES = 200 * 1024 * 1024
@@ -262,8 +271,9 @@ class Lab:
         try:
             head = self._head_rev()
             run.say(f"experiment {name} from halmasuit {head}")
-            self._build(name, "toplevel", head)
+            toplevel = self._build(name, "toplevel", head)
             uki = self._build(name, "uki", head)
+            self._point_gc_roots(toplevel, uki)
             image = self._uki_image(uki)
             self._stage(image)
             self._remove_entry()
@@ -344,6 +354,17 @@ class Lab:
         if not out.startswith("/nix/store/"):
             raise LabError(f"nix build {name} {kind} printed no store path: {out!r}")
         return out
+
+    def _point_gc_roots(self, toplevel: str, uki: str) -> None:
+        _ok(
+            self.layer.remote(["sudo", "-n", "install", "-d", "-m", "0755", GC_ROOT_DIR]),
+            "create GC root directory",
+        )
+        _ok(
+            self.layer.remote(["sudo", "-n", "ln", "-sfnT", toplevel, GC_TOPLEVEL]),
+            "point toplevel GC root",
+        )
+        _ok(self.layer.remote(["sudo", "-n", "ln", "-sfnT", uki, GC_UKI]), "point uki GC root")
 
     def _uki_image(self, uki: str) -> str:
         """The one .efi image inside the UKI store directory."""
