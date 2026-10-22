@@ -112,6 +112,38 @@ class Ipv6Test(unittest.TestCase):
     def test_clock_time_is_not_an_address(self):
         self.assertEqual(hits(b"12:34:56"), [])
 
+    def test_candidate_glued_to_a_word_is_not_an_address(self):
+        for text in ("halmasuit::event", "v2606:4700::1111", "fe80::1g", "fe80::1:g"):
+            with self.subTest(text=text):
+                self.assertEqual(hits(text.encode()), [])
+
+    def test_tracing_target_in_journal_row_is_not_flagged(self):
+        row = (
+            b'{"timestamp":"2026-10-22T12:00:00Z","level":"INFO",'
+            b'"fields":{"json":"{}"},"target":"halmasuit::event"}'
+        )
+        self.assertEqual(hits(row), [])
+
+    def test_address_beside_non_ascii_bytes_is_still_flagged(self):
+        for data in (
+            b"fe80::1\xff",
+            b"\xff\xff\xffinet6 fe80::1\xff\xff\xff",
+            "\u2018fe80::1\u2019".encode(),
+            "fe80::1\u4e00".encode("utf-16-le"),
+        ):
+            with self.subTest(data=data):
+                self.assertIn(("ipv6", "fe80::1"), hits(data))
+
+    def test_standalone_addresses_in_context_are_still_flagged(self):
+        for text, addr in (
+            ("fe80::1", "fe80::1"),
+            ("inet6 fe80::1/64", "fe80::1"),
+            ("[2600:1700::5]:443", "2600:1700::5"),
+            ("src=2600:1700::5", "2600:1700::5"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(hits(text.encode()), [("ipv6", addr)])
+
 
 class UsernameTest(unittest.TestCase):
     def test_username_in_any_case_is_flagged(self):

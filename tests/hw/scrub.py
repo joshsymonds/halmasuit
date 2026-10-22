@@ -36,7 +36,12 @@ DASHED_UUID = re.compile(
 )
 MAC = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5}(?![0-9a-fA-F])")
 IPV4_CANDIDATE = re.compile(r"(?<!\d)(?<!\d\.)\d{1,3}(?:\.\d{1,3}){3}(?!\.?\d)")
-IPV6_CANDIDATE = re.compile(r"[0-9a-fA-F:]+")
+# A candidate is a maximal run of hex digits and colons. A run glued to an ASCII
+# word character on either side is part of a word (`halmasuit::event`), not an
+# address; non-ASCII neighbours, such as 0xFF fill in a binary recording, do not
+# glue. The atomic group keeps the run whole, so no shorter run ending before a
+# colon is tried.
+IPV6_CANDIDATE = re.compile(r"(?<![\w:])(?>[0-9a-fA-F:]+)(?!\w)", re.ASCII)
 DOC_IPV4 = tuple(
     ipaddress.ip_network(net)
     for net in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")
