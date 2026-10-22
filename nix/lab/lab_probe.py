@@ -3,12 +3,14 @@
 
 Creates a uinput virtual keyboard, waits for udev to publish its event node
 and for a process other than udev, running as the consumer user, to hold that
-node open, presses BackSpace 32 times to clear the focused field, types
-PASSWORD and Enter, holds the device briefly, then destroys it. PASSWORD is a
-fixed, obviously wrong constant: it is never read from anywhere and reaches
-the system only as key events.
+node open, presses BackSpace 32 times to clear the focused field, types the
+username and Enter when one is given, types PASSWORD and Enter, holds the
+device briefly, then destroys it. A username with a character that has no key
+code is refused before /dev/uinput is opened. PASSWORD is a fixed, obviously
+wrong constant: it is never read from anywhere and reaches the system only as
+key events.
 
-Usage: lab_probe.py --consumer-user USER
+Usage: lab_probe.py --consumer-user USER [--username USER]
 
 On success prints `device node=`, `ready holder=`, and `typed keys=`, one
 line each. On failure prints one `error reason=` line and exits with status 1.
@@ -99,6 +101,13 @@ def ui_get_sysname(length: int) -> int:
 
 def key_sequence(text: str) -> list[int]:
     return [KEY_CODES[char] for char in text] + [ENTER]
+
+
+def typed_codes(username: str) -> list[int]:
+    codes = [KEY_BACKSPACE] * CLEAR_PRESSES
+    if username:
+        codes += key_sequence(username)
+    return codes + key_sequence(PASSWORD)
 
 
 def pack_event(event_type: int, code: int, value: int) -> bytes:
@@ -198,8 +207,7 @@ def wait_for_holder(host: Host, node: str, consumer_uid: int) -> Holder:
     return holder
 
 
-def probe_keyboard(host: Host, fd: int, consumer_uid: int) -> None:
-    codes = [KEY_BACKSPACE] * CLEAR_PRESSES + key_sequence(PASSWORD)
+def probe_keyboard(host: Host, fd: int, consumer_uid: int, codes: list[int]) -> None:
     host.ioctl(fd, UI_SET_EVBIT, EV_KEY)
     for code in sorted(set(codes)):
         host.ioctl(fd, UI_SET_KEYBIT, code)
@@ -227,17 +235,21 @@ def fail(reason: str) -> int:
     return 1
 
 
-def run(host: Host, consumer_user: str) -> int:
+def run(host: Host, consumer_user: str, username: str = "") -> int:
     try:
         consumer_uid = host.lookup_uid(consumer_user)
     except KeyError:
         return fail(f"unknown consumer user {consumer_user}")
     try:
+        codes = typed_codes(username)
+    except KeyError:
+        return fail("username has a character with no key code")
+    try:
         fd = os.open(host.uinput_path, os.O_WRONLY | os.O_NONBLOCK)
     except OSError as err:
         return fail(f"open {host.uinput_path}: {err}")
     try:
-        probe_keyboard(host, fd, consumer_uid)
+        probe_keyboard(host, fd, consumer_uid, codes)
     except (OSError, ProbeError) as err:
         return fail(str(err))
     finally:
@@ -245,14 +257,16 @@ def run(host: Host, consumer_user: str) -> int:
     return 0
 
 
-def parse_consumer_user(argv: list[str] | None) -> str:
+def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Type one wrong password into the greeter through a virtual keyboard.")
     parser.add_argument("--consumer-user", required=True, metavar="USER", help="account whose process must hold the keyboard")
-    return parser.parse_args(argv).consumer_user
+    parser.add_argument("--username", default="", metavar="USER", help="account name typed before the wrong password")
+    return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    return run(Host(), parse_consumer_user(argv))
+    args = parse_arguments(argv)
+    return run(Host(), args.consumer_user, args.username)
 
 
 if __name__ == "__main__":
