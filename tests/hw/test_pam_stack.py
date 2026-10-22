@@ -130,6 +130,56 @@ class ResolveTests(unittest.TestCase):
         self.assertIn("pam_tally2", stack.lockout)
 
 
+NIX_UNIX = "/nix/store/bbbb-linux-pam-1.7.2/lib/security/pam_unix.so"
+
+
+class NullokTests(unittest.TestCase):
+    def test_auth_nullok_lines_in_substacked_login_are_reported_once_each(self):
+        unix_early = f"auth optional {NIX_UNIX} likeauth nullok # unix-early (order 11700)"
+        unix = f"auth sufficient {NIX_UNIX} likeauth nullok try_first_pass # unix (order 13100)"
+        files = {
+            "greetd": "auth substack login\n",
+            "login": f"{unix_early}\n{unix}\n"
+            f"password sufficient {NIX_UNIX} nullok # unix (order 10200)\n",
+        }
+        stack = pam_stack.resolve("greetd", reader(files))
+        self.assertEqual(stack.nullok_auth, (f"login: {unix_early}", f"login: {unix}"))
+
+    def test_nullok_auth_line_walked_twice_is_reported_once(self):
+        line = f"auth required {NIX_UNIX} nullok\n"
+        files = {
+            "greetd": "auth include common\nauth substack login\n",
+            "login": "auth include common\n",
+            "common": line,
+        }
+        stack = pam_stack.resolve("greetd", reader(files))
+        self.assertEqual(stack.nullok_auth, (f"common: {line.strip()}",))
+
+    def test_dash_type_auth_nullok_line_is_reported(self):
+        line = f"-auth optional {NIX_UNIX} nullok"
+        stack = pam_stack.resolve("greetd", reader({"greetd": f"{line}\n"}))
+        self.assertEqual(stack.nullok_auth, (f"greetd: {line}",))
+
+    def test_nullok_only_on_password_account_session_lines_is_not_reported(self):
+        files = {
+            "greetd": f"password sufficient {NIX_UNIX} nullok # unix (order 10200)\n"
+            f"account required {NIX_UNIX} nullok\n"
+            f"session optional {NIX_UNIX} nullok\n",
+        }
+        stack = pam_stack.resolve("greetd", reader(files))
+        self.assertEqual(stack.nullok_auth, ())
+
+    def test_nullok_inside_comment_is_not_reported(self):
+        files = {"greetd": f"auth required {NIX_UNIX} try_first_pass # nullok\n"}
+        stack = pam_stack.resolve("greetd", reader(files))
+        self.assertEqual(stack.nullok_auth, ())
+
+    def test_nullok_on_non_pam_unix_auth_module_is_not_reported(self):
+        files = {"greetd": "auth required pam_permit.so nullok\n"}
+        stack = pam_stack.resolve("greetd", reader(files))
+        self.assertEqual(stack.nullok_auth, ())
+
+
 class RefusalTests(unittest.TestCase):
     def assertRefuses(self, service, files):
         with self.assertRaises(PamStackError):

@@ -20,8 +20,9 @@ run's firmware/ directory while the lab entry is up; a file gnomon lacks is note
 run.log and skipped.
 The baseline experiment also probes the greeter on the checked lab boot, once the display
 manager is active. The probe refuses, and never starts lab-probe.service, when the resolved
-greetd PAM stack holds a lockout module (pam_faillock, pam_tally, pam_tally2) or cannot be
-resolved. Otherwise the runner starts lab-probe.service, whose unit types a wrong password into
+greetd PAM stack holds a lockout module (pam_faillock, pam_tally, pam_tally2), when an auth
+line lets pam_unix accept a blank password (nullok), or when the stack cannot be resolved.
+Otherwise the runner starts lab-probe.service, whose unit types a wrong password into
 greetd, and waits up to 30 seconds after each start for the lab boot's authpriv journal to hold a
 pam_unix(greetd:auth) authentication failure for --probe-user. A start that is not matched is
 followed by another start, at most 5 starts in all, and no start begins 180 seconds after the
@@ -709,6 +710,7 @@ class Lab:
             "pam_files": None,
             "pam_modules": None,
             "lockout": None,
+            "nullok_auth": None,
             "refused": None,
             "started": False,
             "unit_returncode": None,
@@ -729,8 +731,15 @@ class Lab:
         probe["pam_files"] = list(stack.files)
         probe["pam_modules"] = list(stack.modules)
         probe["lockout"] = list(stack.lockout)
+        probe["nullok_auth"] = list(stack.nullok_auth)
         if stack.lockout:
             probe["refused"] = f"{PAM_SERVICE} PAM stack holds lockout module(s): {', '.join(stack.lockout)}"
+            return probe
+        if stack.nullok_auth:
+            probe["refused"] = (
+                f"{PAM_SERVICE} PAM stack lets pam_unix accept a blank password (nullok on auth): "
+                f"{'; '.join(stack.nullok_auth)}"
+            )
             return probe
         probe["started"] = True
         first_start = self.clock.monotonic()

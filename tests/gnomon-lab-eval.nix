@@ -394,6 +394,24 @@ let
   u2fOn = u2fHost labOptions;
   u2fOff = u2fHost (labOptions // { enable = false; });
 
+  # The same host with a service outside u2fOffServices that allows blank
+  # passwords: the lab must leave its nullok alone.
+  nullHost = lab: (lib.nixosSystem {
+    inherit system;
+    modules = [
+      labModule
+      (gnomonLike lab)
+      { security.pam.services.su.allowNullPassword = true; }
+    ];
+  }).config;
+  nullOn = nullHost labOptions;
+
+  # A service's PAM auth lines, and whether one carries the nullok argument.
+  authLines = c: name:
+    builtins.filter (lib.hasPrefix "auth ")
+      (lib.splitString "\n" (get c [ "security" "pam" "services" name "text" ] ""));
+  hasNullok = line: lib.elem "nullok" (lib.splitString " " line);
+
   failingAssertions = c: builtins.filter (a: !a.assertion) c.assertions;
 
   # Journal contract text frozen in nix/lab/module.nix for tests/hw/timeline.py.
@@ -560,6 +578,16 @@ let
     { ok = lib.all (name: (get u2fOff [ "security" "pam" "services" name "u2f" "enable" ] null) != false)
         labOptions.u2fOffServices;
       msg = "enable = false still forces u2fAuth off for u2fOffServices"; }
+
+    # ── u2fOffServices: no blank passwords, and only when the lab is enabled ─
+    { ok = lib.all (name: authLines cfg name != [ ]) labOptions.u2fOffServices;
+      msg = "a u2fOffServices entry has no auth lines in its PAM text (the nullok check would be vacuous)"; }
+    { ok = lib.all (name: !(lib.any hasNullok (authLines cfg name))) labOptions.u2fOffServices;
+      msg = "an auth line of a u2fOffServices entry carries nullok (blank passwords are accepted)"; }
+    { ok = lib.any hasNullok (authLines disabled "login");
+      msg = "login has no auth line with nullok with the lab disabled (the nullok check would be vacuous)"; }
+    { ok = authLines nullOn "su" != [ ] && lib.any hasNullok (authLines nullOn "su");
+      msg = "an unlisted service with allowNullPassword = true lost nullok on its auth lines"; }
 
     # ── Patch export ─────────────────────────────────────────────────
     { ok = toString labPatches.nvidiaCrcVblankWait == toString ./lib/crc-vblank-wait.patch;
