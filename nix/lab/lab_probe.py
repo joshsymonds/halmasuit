@@ -10,7 +10,14 @@ code is refused before /dev/uinput is opened. PASSWORD is a fixed, obviously
 wrong constant: it is never read from anywhere and reaches the system only as
 key events.
 
-Usage: lab_probe.py --consumer-user USER [--username USER]
+With --early-keyboard no device is created and /dev/uinput is never opened.
+The probe instead finds the input device named `lab-probe keyboard` that the
+boot-time holder created, waits for the consumer-user holder as above, and
+writes the username to the holder's request FIFO. The holder types the
+sequence and replies `ok <n>` on the reply FIFO, where n is the number of keys
+it typed.
+
+Usage: lab_probe.py --consumer-user USER [--username USER] [--early-keyboard]
 
 On success prints `device node=`, `ready holder=`, and `typed keys=`, one
 line each. On failure prints one `error reason=` line and exits with status 1.
@@ -18,6 +25,7 @@ line each. On failure prints one `error reason=` line and exits with status 1.
 
 import argparse
 import dataclasses
+import errno
 import fcntl
 import os
 import pwd
@@ -64,6 +72,8 @@ EVENT = struct.Struct("<qqHHi")
 SETUP = struct.Struct("<HHHH80sI")
 SYN_EVENT = EVENT.pack(0, 0, EV_SYN, SYN_REPORT, 0)
 EVENT_NODE = re.compile(r"event\d+")
+INPUT_DEVICE = re.compile(r"input\d+")
+HOLDER_REPLY = re.compile(r"ok (?P<count>[0-9]+)|error (?P<text>.+)")
 
 
 class ProbeError(Exception):
@@ -88,6 +98,8 @@ class Host:
     dev_root: str = "/dev/input"
     sysfs_root: str = "/sys"
     proc_root: str = "/proc"
+    holder_request: str = "/run/lab-probe-kbd/request"
+    holder_reply: str = "/run/lab-probe-kbd/reply"
     self_pid: int = dataclasses.field(default_factory=os.getpid)
     ioctl: Callable[..., object] = fcntl.ioctl
     clock: Callable[[], float] = time.monotonic
@@ -124,6 +136,24 @@ def event_node_name(sysfs_root: str, sysname: str) -> str | None:
     except FileNotFoundError:
         return None
     return next((entry for entry in entries if EVENT_NODE.fullmatch(entry)), None)
+
+
+def named_input(sysfs_root: str, name: str) -> str | None:
+    class_input = os.path.join(sysfs_root, "class/input")
+    try:
+        entries = sorted(os.listdir(class_input))
+    except FileNotFoundError:
+        return None
+    for entry in entries:
+        if not INPUT_DEVICE.fullmatch(entry):
+            continue
+        try:
+            device_name = Path(class_input, entry, "name").read_text(errors="replace").strip()
+        except OSError:
+            continue  # not an input device directory, or it vanished while listing
+        if device_name == name:
+            return entry
+    return None
 
 
 def real_uid(proc: str) -> int | None:
@@ -181,17 +211,29 @@ def type_keys(write: Callable[[bytes], object], codes: Iterable[int], sleep: Cal
         sleep(KEY_PACE_SECONDS)
 
 
+def device_node(host: Host, sysname: str) -> str | None:
+    name = event_node_name(host.sysfs_root, sysname)
+    if name is None:
+        return None
+    path = os.path.join(host.dev_root, name)
+    return path if os.path.exists(path) else None
+
+
 def wait_for_node(host: Host, sysname: str) -> str:
+    node = wait_until(lambda: device_node(host, sysname), timeout=WAIT_SECONDS, clock=host.clock, sleep=host.sleep)
+    if node is None:
+        raise ProbeError(f"no event node for {sysname} within {WAIT_SECONDS}s")
+    return node
+
+
+def wait_for_named_node(host: Host) -> str:
     def check() -> str | None:
-        name = event_node_name(host.sysfs_root, sysname)
-        if name is None:
-            return None
-        path = os.path.join(host.dev_root, name)
-        return path if os.path.exists(path) else None
+        sysname = named_input(host.sysfs_root, DEVICE_NAME)
+        return None if sysname is None else device_node(host, sysname)
 
     node = wait_until(check, timeout=WAIT_SECONDS, clock=host.clock, sleep=host.sleep)
     if node is None:
-        raise ProbeError(f"no event node for {sysname} within {WAIT_SECONDS}s")
+        raise ProbeError(f"no input device named {DEVICE_NAME} within {WAIT_SECONDS}s")
     return node
 
 
@@ -205,6 +247,71 @@ def wait_for_holder(host: Host, node: str, consumer_uid: int) -> Holder:
     if holder is None:
         raise ProbeError(f"no consumer-user process holds {node} within {WAIT_SECONDS}s")
     return holder
+
+
+def read_available(fd: int) -> bytes:
+    data = bytearray()
+    while True:
+        try:
+            chunk = os.read(fd, 4096)
+        except BlockingIOError:
+            break
+        if not chunk:
+            break
+        data += chunk
+    return bytes(data)
+
+
+def ask_holder(host: Host, username: str) -> bytes:
+    """Writes the username line to the holder's request FIFO and returns the first line of its reply."""
+    reply_fd = os.open(host.holder_reply, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        read_available(reply_fd)  # discard replies left over from an earlier request
+        try:
+            request_fd = os.open(host.holder_request, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as err:
+            if err.errno == errno.ENXIO:
+                raise ProbeError(f"no reader on {host.holder_request}") from err
+            raise
+        try:
+            os.write(request_fd, f"{username}\n".encode())
+        finally:
+            os.close(request_fd)
+
+        pending = bytearray()
+
+        def check() -> bytes | None:
+            pending.extend(read_available(reply_fd))
+            end = pending.find(b"\n")
+            return None if end < 0 else bytes(pending[:end])
+
+        line = wait_until(check, timeout=WAIT_SECONDS, clock=host.clock, sleep=host.sleep)
+        if line is None:
+            raise ProbeError(f"no holder reply within {WAIT_SECONDS}s")
+        return line
+    finally:
+        os.close(reply_fd)
+
+
+def expect_holder_reply(line: bytes, expected: int) -> None:
+    text = line.decode(errors="replace")
+    match = HOLDER_REPLY.fullmatch(text)
+    if match is None:
+        raise ProbeError(f"malformed holder reply: {text!r}")
+    if match["text"] is not None:
+        raise ProbeError(f"holder: {match['text']}")
+    typed = int(match["count"])
+    if typed != expected:
+        raise ProbeError(f"holder typed {typed} keys, expected {expected}")
+
+
+def probe_early(host: Host, consumer_uid: int, username: str, expected: int) -> None:
+    node = wait_for_named_node(host)
+    print(f"device node={node}", flush=True)
+    holder = wait_for_holder(host, node, consumer_uid)
+    print(f"ready holder={holder.comm} pid={holder.pid}", flush=True)
+    expect_holder_reply(ask_holder(host, username), expected)
+    print(f"typed keys={expected}", flush=True)
 
 
 def probe_keyboard(host: Host, fd: int, consumer_uid: int, codes: list[int]) -> None:
@@ -235,7 +342,7 @@ def fail(reason: str) -> int:
     return 1
 
 
-def run(host: Host, consumer_user: str, username: str = "") -> int:
+def run(host: Host, consumer_user: str, username: str = "", early_keyboard: bool = False) -> int:
     try:
         consumer_uid = host.lookup_uid(consumer_user)
     except KeyError:
@@ -244,6 +351,12 @@ def run(host: Host, consumer_user: str, username: str = "") -> int:
         codes = typed_codes(username)
     except KeyError:
         return fail("username has a character with no key code")
+    if early_keyboard:
+        try:
+            probe_early(host, consumer_uid, username, len(codes))
+        except (OSError, ProbeError) as err:
+            return fail(str(err))
+        return 0
     try:
         fd = os.open(host.uinput_path, os.O_WRONLY | os.O_NONBLOCK)
     except OSError as err:
@@ -261,12 +374,17 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Type one wrong password into the greeter through a virtual keyboard.")
     parser.add_argument("--consumer-user", required=True, metavar="USER", help="account whose process must hold the keyboard")
     parser.add_argument("--username", default="", metavar="USER", help="account name typed before the wrong password")
+    parser.add_argument(
+        "--early-keyboard",
+        action="store_true",
+        help="type through the boot-time holder's keyboard instead of creating a uinput device",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_arguments(argv)
-    return run(Host(), args.consumer_user, args.username)
+    return run(Host(), args.consumer_user, args.username, args.early_keyboard)
 
 
 if __name__ == "__main__":

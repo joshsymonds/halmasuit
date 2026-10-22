@@ -29,6 +29,7 @@ GREETER_PID = 812
 OTHER_USER_PID = 2201
 SYSNAME = "input7"
 DEVICE = "event5"
+DEVICE_NAME = "lab-probe keyboard"
 CONSUMER_USER = "greeter"
 CONSUMER_UID = 988
 ROOT_UID = 0
@@ -103,8 +104,45 @@ class FakeUinput:
         return 0
 
 
+class HolderClock(FakeClock):
+    """A FakeClock whose sleeps let the fake holder answer while the probe waits."""
+
+    def __init__(self):
+        super().__init__()
+        self.holder = None
+
+    def sleep(self, seconds):
+        super().sleep(seconds)
+        if self.holder is not None:
+            self.holder.step()
+
+
+class FakeKbdHolder:
+    """The boot-time holder: keeps both FIFOs open O_RDWR and answers each request it reads."""
+
+    def __init__(self, tree, reply=None):
+        self.request_fd = os.open(tree.request, os.O_RDWR | os.O_NONBLOCK)
+        self.reply_fd = os.open(tree.reply, os.O_RDWR | os.O_NONBLOCK)
+        self.reply = reply
+        self.requests = []
+
+    def step(self):
+        try:
+            line = os.read(self.request_fd, 4096)
+        except BlockingIOError:
+            return
+        if line:
+            self.requests.append(line)
+            if self.reply is not None:
+                os.write(self.reply_fd, self.reply)
+
+    def close(self):
+        os.close(self.request_fd)
+        os.close(self.reply_fd)
+
+
 class Tree:
-    """Temporary sysfs, dev, proc, and uinput paths for one probe run."""
+    """Temporary sysfs, dev, proc, run, and uinput paths for one probe run."""
 
     def __init__(self, root):
         self.root = Path(root)
@@ -116,6 +154,12 @@ class Tree:
         self.sys.mkdir()
         self.proc = self.root / "proc"
         self.proc.mkdir()
+        self.run = self.root / "run"
+        self.run.mkdir()
+        self.request = self.run / "request"
+        self.reply = self.run / "reply"
+        os.mkfifo(self.request)
+        os.mkfifo(self.reply)
 
     @property
     def node(self):
@@ -127,6 +171,16 @@ class Tree:
         if event is not None:
             (input_dir / event).mkdir()
             (self.dev / event).touch()
+
+    def add_input_device(self, sysname, name, event):
+        """An input device as the kernel publishes it: its devices/ directory with a name file and an
+        eventN child, a class/input symlink to that directory, and a class/input symlink to the event."""
+        self.add_input(sysname, event)
+        (self.sys / "devices" / "virtual" / "input" / sysname / "name").write_text(f"{name}\n")
+        class_input = self.sys / "class" / "input"
+        class_input.mkdir(parents=True, exist_ok=True)
+        os.symlink(f"../../devices/virtual/input/{sysname}", class_input / sysname)
+        os.symlink(f"../../devices/virtual/input/{sysname}/{event}", class_input / event)
 
     def add_process(self, pid, comm, uid, fd_targets):
         proc = self.proc / str(pid)
@@ -144,6 +198,8 @@ class Tree:
             dev_root=str(self.dev),
             sysfs_root=str(self.sys),
             proc_root=str(self.proc),
+            holder_request=str(self.request),
+            holder_reply=str(self.reply),
             self_pid=PROBE_PID,
             ioctl=ioctl,
             clock=clock.clock,
@@ -308,6 +364,14 @@ class ConsumerArgument(unittest.TestCase):
         args = probe.parse_arguments(["--consumer-user", CONSUMER_USER])
         self.assertEqual(args.username, "")
 
+    def test_early_keyboard_flag_is_parsed(self):
+        args = probe.parse_arguments(["--consumer-user", CONSUMER_USER, "--early-keyboard"])
+        self.assertTrue(args.early_keyboard)
+
+    def test_early_keyboard_is_off_when_absent(self):
+        args = probe.parse_arguments(["--consumer-user", CONSUMER_USER])
+        self.assertFalse(args.early_keyboard)
+
 
 class ProbeRun(unittest.TestCase):
     def setUp(self):
@@ -468,6 +532,206 @@ class ProbeRun(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0].startswith("error reason="))
         self.assertEqual(ioctl.requests, [])
+
+
+OTHER_INPUT_NAME = "AT Translated Set 2 keyboard"
+NEAR_MISS_NAME = "lab-probe keyboard spare"
+
+
+def ok_reply(count):
+    return f"ok {count}\n".encode()
+
+
+class EarlyKeyboard(unittest.TestCase):
+    """--early-keyboard: the probe finds the holder's node by name and asks the holder to type."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tree = Tree(self._tmp.name)
+        self.tree.uinput.unlink()  # early mode must never open /dev/uinput
+        self.clock = HolderClock()
+        self.ioctl = FakeUinput(SYSNAME, self.clock)
+        self.holder = None
+
+    def add_other_inputs(self):
+        self.tree.add_input_device("input3", OTHER_INPUT_NAME, "event2")
+        self.tree.add_input_device("input4", NEAR_MISS_NAME, "event6")
+
+    def add_probe_keyboard(self):
+        self.tree.add_input_device(SYSNAME, DEVICE_NAME, DEVICE)
+
+    def add_consumer_holder(self):
+        self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, [self.tree.node])
+
+    def add_ready_early_keyboard(self):
+        self.add_other_inputs()
+        self.add_probe_keyboard()
+        self.add_consumer_holder()
+
+    def open_holder(self, reply):
+        self.holder = FakeKbdHolder(self.tree, reply)
+        self.addCleanup(self.holder.close)
+        self.clock.holder = self.holder
+
+    def run_early(self, username=""):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = probe.run(
+                self.tree.host(self.ioctl, self.clock), CONSUMER_USER, username, early_keyboard=True
+            )
+        return status, out.getvalue().splitlines()
+
+    def test_named_node_is_found_among_other_inputs_without_touching_uinput(self):
+        self.add_ready_early_keyboard()
+        self.open_holder(ok_reply(TYPED_KEYS))
+        status, lines = self.run_early()
+
+        self.assertEqual(status, 0)
+        self.assertEqual(lines[0], f"device node={self.tree.node}")
+        self.assertEqual(self.ioctl.requests, [])
+        self.assertFalse(self.tree.uinput.exists())
+
+    def test_undecodable_name_before_the_probe_keyboard_is_skipped(self):
+        self.tree.add_input_device("input2", "placeholder", "event1")
+        (self.tree.sys / "devices" / "virtual" / "input" / "input2" / "name").write_bytes(b"bad\xff\xfe\n")
+        self.add_ready_early_keyboard()
+        self.open_holder(ok_reply(TYPED_KEYS))
+        status, lines = self.run_early()
+
+        self.assertEqual(status, 0)
+        self.assertEqual(lines[0], f"device node={self.tree.node}")
+
+    def test_near_miss_name_is_not_the_probe_keyboard(self):
+        self.add_other_inputs()
+        self.add_consumer_holder()
+        status, lines = self.run_early()
+
+        self.assertEqual(status, 1)
+        self.assertEqual(lines, [f"error reason=no input device named {DEVICE_NAME} within 30s"])
+        self.assertGreaterEqual(self.clock.now, 30)
+
+    def test_request_line_is_exact_without_username(self):
+        self.add_ready_early_keyboard()
+        self.open_holder(ok_reply(TYPED_KEYS))
+        self.run_early()
+
+        self.assertEqual(self.holder.requests, [b"\n"])
+
+    def test_request_line_carries_username(self):
+        self.add_ready_early_keyboard()
+        self.open_holder(ok_reply(TYPED_KEYS_WITH_USERNAME))
+        status, lines = self.run_early(SYNTHETIC_USERNAME)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(self.holder.requests, [SYNTHETIC_USERNAME.encode() + b"\n"])
+
+    def test_ok_reply_logs_device_ready_and_typed_lines_in_order(self):
+        self.add_ready_early_keyboard()
+        self.open_holder(ok_reply(TYPED_KEYS))
+        status, lines = self.run_early()
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            lines,
+            [
+                f"device node={self.tree.node}",
+                f"ready holder=halmasuit pid={GREETER_PID}",
+                f"typed keys={TYPED_KEYS}",
+            ],
+        )
+
+    def test_ok_reply_with_username_logs_the_username_count(self):
+        self.add_ready_early_keyboard()
+        self.open_holder(ok_reply(TYPED_KEYS_WITH_USERNAME))
+        status, lines = self.run_early(SYNTHETIC_USERNAME)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(lines[-1], f"typed keys={TYPED_KEYS_WITH_USERNAME}")
+
+    def test_holder_error_reply_is_one_error_line(self):
+        self.add_ready_early_keyboard()
+        self.open_holder(b"error keyboard busy\n")
+        status, lines = self.run_early()
+
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            lines,
+            [
+                f"device node={self.tree.node}",
+                f"ready holder=halmasuit pid={GREETER_PID}",
+                "error reason=holder: keyboard busy",
+            ],
+        )
+
+    def test_wrong_count_reply_is_one_error_line(self):
+        self.add_ready_early_keyboard()
+        self.open_holder(ok_reply(TYPED_KEYS - 1))
+        status, lines = self.run_early()
+
+        self.assertEqual(status, 1)
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(
+            lines[-1],
+            f"error reason=holder typed {TYPED_KEYS - 1} keys, expected {TYPED_KEYS}",
+        )
+
+    def test_malformed_reply_is_one_error_line(self):
+        self.add_ready_early_keyboard()
+        self.open_holder(b"ok forty-three\n")
+        status, lines = self.run_early()
+
+        self.assertEqual(status, 1)
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(lines[-1].startswith("error reason=malformed holder reply"))
+
+    def test_silent_holder_times_out_as_one_error_line(self):
+        self.add_ready_early_keyboard()
+        self.open_holder(None)
+        status, lines = self.run_early()
+
+        self.assertEqual(status, 1)
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(lines[-1], "error reason=no holder reply within 30s")
+        self.assertGreaterEqual(self.clock.now, 30)
+
+    def test_no_reader_on_request_is_one_error_line(self):
+        self.add_ready_early_keyboard()
+        status, lines = self.run_early()
+
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            lines,
+            [
+                f"device node={self.tree.node}",
+                f"ready holder=halmasuit pid={GREETER_PID}",
+                f"error reason=no reader on {self.tree.request}",
+            ],
+        )
+
+    def test_missing_named_node_is_one_error_line_after_timeout(self):
+        self.add_other_inputs()
+        self.add_consumer_holder()
+        status, lines = self.run_early()
+
+        self.assertEqual(status, 1)
+        self.assertEqual(lines, [f"error reason=no input device named {DEVICE_NAME} within 30s"])
+        self.assertGreaterEqual(self.clock.now, 30)
+
+    def test_no_consumer_holder_is_one_error_line_after_timeout(self):
+        self.add_other_inputs()
+        self.add_probe_keyboard()
+        status, lines = self.run_early()
+
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            lines,
+            [
+                f"device node={self.tree.node}",
+                f"error reason=no consumer-user process holds {self.tree.node} within 30s",
+            ],
+        )
+        self.assertGreaterEqual(self.clock.now, 30)
 
 
 if __name__ == "__main__":
