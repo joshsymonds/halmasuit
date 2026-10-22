@@ -1115,6 +1115,17 @@
           halmasuit-luks    = self.packages.x86_64-linux.halmasuit-luks;
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
         };
+        # Phase B input after switch-root: stage-1 libinput fds held
+        # through deprivileged, a send_key keystroke reaching the
+        # greeter, and again after keyd grabs the keyboard.
+        halmasuit-initrd-input = import ./tests/halmasuit-initrd-input.nix {
+          system                            = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-luks                    = self.packages.x86_64-linux.halmasuit-luks;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+        };
         # Epic #28 boot-suppression: the halmasuit-tty-graphics initrd
         # oneshot must put /dev/tty1 in KD_GRAPHICS BEFORE halmasuit's
         # first frame, and the kernel forensics in dmesg must stay

@@ -327,6 +327,33 @@ pkgs.testers.runNixOSTest {
             "spawned before the compositor's privilege drop "
             "(regression of task #25's lazy-spawn fix)."
         )
+    # The compositor holds the `input` group's gid as its saved
+    # set-gid; execve copies the effective gid into the saved gid,
+    # so a leak of `input` into the decoder would surface in the
+    # Gid: slots or the supplementary Groups: line. Neither may
+    # carry the input gid, and Groups: must be empty.
+    input_gid = machine.succeed("getent group input | cut -d: -f3").strip()
+    assert input_gid.isdigit(), (
+        f"input group gid must be digit, got {input_gid!r}"
+    )
+    decoder_gid_line = machine.succeed(
+        f"grep '^Gid:' /proc/{initial_decoder_pid}/status"
+    ).strip()
+    decoder_groups_line = machine.succeed(
+        f"grep '^Groups:' /proc/{initial_decoder_pid}/status"
+    ).strip()
+    print(f"DECODER {decoder_gid_line}")
+    print(f"DECODER {decoder_groups_line}")
+    decoder_gids = decoder_gid_line.split()[1:]
+    decoder_groups = decoder_groups_line.split()[1:]
+    if input_gid in decoder_gids or decoder_groups:
+        raise AssertionError(
+            "GATE 1 FAIL: decoder carries the input group's gid "
+            f"(input gid {input_gid}) or supplementary groups.\n"
+            "The compositor must not leak `input` to its children.\n"
+            f"Observed: {decoder_gid_line}\n"
+            f"Observed: {decoder_groups_line}"
+        )
     # Epic Req #3: "seccomp-bpf allowlist: read, write, mmap, ...
     # Everything else → SIGSYS." /proc/<pid>/status's Seccomp line
     # reports the filter mode: 0=disabled, 1=strict, 2=filter
