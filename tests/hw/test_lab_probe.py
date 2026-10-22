@@ -12,6 +12,7 @@ import contextlib
 import importlib
 import io
 import os
+import stat
 import struct
 import sys
 import tempfile
@@ -160,10 +161,26 @@ class Tree:
         self.reply = self.run / "reply"
         os.mkfifo(self.request)
         os.mkfifo(self.reply)
+        self.inodes = {}  # path -> (st_mode, st_rdev) of the inode the path names now
+        self.open_inodes = {}  # /proc fd path -> the inode it held when it was opened, or None
 
     @property
     def node(self):
         return str(self.dev / DEVICE)
+
+    def place(self, path, mode, rdev=0):
+        self.inodes[path] = (mode, rdev)
+
+    def alias(self, path, node):
+        self.inodes[path] = self.inodes[node]
+
+    def stat_path(self, path):
+        """Stats like the kernel: a /proc fd resolves to the inode it holds, any other path to the inode it names now."""
+        inode = self.open_inodes[path] if path in self.open_inodes else self.inodes.get(path)
+        if inode is None:
+            raise FileNotFoundError(path)
+        mode, rdev = inode
+        return os.stat_result((mode, 0, 0, 1, 0, 0, 0, 0, 0, 0), {"st_rdev": rdev})
 
     def add_input(self, sysname, event=None):
         input_dir = self.sys / "devices" / "virtual" / "input" / sysname
@@ -171,6 +188,8 @@ class Tree:
         if event is not None:
             (input_dir / event).mkdir()
             (self.dev / event).touch()
+            # evdev nodes are major 13, minor 64 + N for eventN
+            self.place(str(self.dev / event), stat.S_IFCHR | 0o600, os.makedev(13, 64 + int(event.removeprefix("event"))))
 
     def add_input_device(self, sysname, name, event):
         """An input device as the kernel publishes it: its devices/ directory with a name file and an
@@ -190,7 +209,9 @@ class Tree:
             f"Name:\t{comm}\nState:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
         )
         for number, target in enumerate(fd_targets):
-            os.symlink(target, proc / "fd" / str(number))
+            fd_path = str(proc / "fd" / str(number))
+            os.symlink(target, fd_path)
+            self.open_inodes[fd_path] = self.inodes.get(target)
 
     def host(self, ioctl, clock):
         return probe.Host(
@@ -205,6 +226,7 @@ class Tree:
             clock=clock.clock,
             sleep=clock.sleep,
             lookup_uid=fake_lookup_uid,
+            stat=self.stat_path,
         )
 
 
@@ -258,10 +280,11 @@ class HolderDetection(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.tree = Tree(self._tmp.name)
+        self.tree.add_input(SYSNAME, DEVICE)
         self.node = self.tree.node
 
     def holder(self):
-        return probe.holder_of(str(self.tree.proc), self.node, PROBE_PID, CONSUMER_UID)
+        return probe.holder_of(str(self.tree.proc), self.node, PROBE_PID, CONSUMER_UID, self.tree.stat_path)
 
     def test_finds_consumer_process_holding_node(self):
         self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, [self.node])
@@ -277,6 +300,7 @@ class HolderDetection(unittest.TestCase):
         self.assertIsNone(self.holder())
 
     def test_ignores_other_nodes(self):
+        self.tree.add_input("input9", "event9")
         self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, [str(self.tree.dev / "event9")])
         self.assertIsNone(self.holder())
 
@@ -304,6 +328,38 @@ class HolderDetection(unittest.TestCase):
     def test_process_without_status_file_is_skipped(self):
         self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, [self.node])
         (self.tree.proc / str(GREETER_PID) / "status").unlink()
+        self.assertIsNone(self.holder())
+
+    def test_fd_with_other_link_text_and_same_device_number_is_holder(self):
+        # After switch-root the stage-1 /dev is detached, so halmasuit's fds read /input/eventN.
+        self.tree.alias("/input/event8", self.node)
+        self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, ["/input/event8"])
+        self.assertEqual(self.holder(), probe.Holder(GREETER_PID, "halmasuit"))
+
+    def test_fd_with_node_link_text_and_other_device_number_is_not_holder(self):
+        self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, [self.node])
+        # the node is recreated under the same name with another device number
+        self.tree.place(self.node, stat.S_IFCHR | 0o600, os.makedev(13, 70))
+        self.assertIsNone(self.holder())
+
+    def test_regular_file_fd_with_equal_device_number_is_not_holder(self):
+        _, node_rdev = self.tree.inodes[self.node]
+        # the fd opened a regular file at the node's name, which a character device then replaced
+        self.tree.place(self.node, stat.S_IFREG | 0o600, node_rdev)
+        self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, [self.node])
+        self.tree.place(self.node, stat.S_IFCHR | 0o600, node_rdev)
+        self.assertIsNone(self.holder())
+
+    def test_node_that_is_not_a_character_device_has_no_holder(self):
+        self.tree.place(self.node, stat.S_IFREG | 0o600)
+        self.tree.place("/input/null", stat.S_IFCHR | 0o600)
+        self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, ["/input/null"])
+        self.assertIsNone(self.holder())
+
+    def test_stat_failures_mean_not_this_fd_and_no_holder_yet(self):
+        self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, ["/gone", self.node])
+        self.assertEqual(self.holder(), probe.Holder(GREETER_PID, "halmasuit"))
+        self.tree.inodes.pop(self.node)
         self.assertIsNone(self.holder())
 
 

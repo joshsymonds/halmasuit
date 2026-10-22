@@ -35,6 +35,7 @@ import sys
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
+from stat import S_ISCHR
 
 PASSWORD = "wrongprobe"
 DEVICE_NAME = "lab-probe keyboard"
@@ -105,6 +106,7 @@ class Host:
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
     lookup_uid: Callable[[str], int] = passwd_uid
+    stat: Callable[[str], os.stat_result] = os.stat
 
 
 def ui_get_sysname(length: int) -> int:
@@ -163,7 +165,21 @@ def real_uid(proc: str) -> int | None:
     return None
 
 
-def holder_of(proc_root: str, node: str, self_pid: int, consumer_uid: int) -> Holder | None:
+def holder_of(
+    proc_root: str, node: str, self_pid: int, consumer_uid: int, stat: Callable[[str], os.stat_result]
+) -> Holder | None:
+    """Finds a consumer-user process with an fd to the character device node names.
+
+    The fd's link text is never compared: after switch-root a holder's fd can read a different path
+    for the same device. A node that cannot be stat'ed, or is not a character device, has no holder.
+    """
+    try:
+        node_stat = stat(node)
+    except OSError:
+        return None
+    if not S_ISCHR(node_stat.st_mode):
+        return None
+    node_rdev = node_stat.st_rdev
     for entry in os.listdir(proc_root):
         if not entry.isdigit() or int(entry) == self_pid:
             continue
@@ -177,10 +193,10 @@ def holder_of(proc_root: str, node: str, self_pid: int, consumer_uid: int) -> Ho
             continue  # the process exited between listing and reading it
         for fd in fds:
             try:
-                target = os.readlink(os.path.join(proc, "fd", fd))
+                fd_stat = stat(os.path.join(proc, "fd", fd))
             except OSError:
-                continue
-            if target == node:
+                continue  # the fd closed between listing and stat-ing it
+            if S_ISCHR(fd_stat.st_mode) and fd_stat.st_rdev == node_rdev:
                 return Holder(int(entry), comm)
     return None
 
@@ -239,7 +255,7 @@ def wait_for_named_node(host: Host) -> str:
 
 def wait_for_holder(host: Host, node: str, consumer_uid: int) -> Holder:
     holder = wait_until(
-        lambda: holder_of(host.proc_root, node, host.self_pid, consumer_uid),
+        lambda: holder_of(host.proc_root, node, host.self_pid, consumer_uid, host.stat),
         timeout=WAIT_SECONDS,
         clock=host.clock,
         sleep=host.sleep,
