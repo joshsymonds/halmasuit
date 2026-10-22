@@ -1,9 +1,11 @@
 # Pure-eval structural gate for the gnomon lab module (nix/lab/module.nix,
-# exported as nixosModules.gnomon-lab). Evaluates the module against a
-# gnomon-like synthetic system with NON-default option values, then asserts
-# every rescue setting is present and wired to its option. Builds no system
-# closure: the derivation only writes a marker file when every check passes.
-{ system, nixpkgs, labModule }:
+# exported as nixosModules.gnomon-lab) and its experiments (exported as
+# lib.labExperiments). Evaluates the module against a gnomon-like synthetic
+# system with NON-default option values, then asserts every rescue setting is
+# present and wired to its option. Each experiment is composed with the module
+# on the same host and must carry its own fault. Builds no system closure: the
+# derivation only writes a marker file when every check passes.
+{ system, nixpkgs, labModule, labExperiments }:
 
 let
   pkgs = nixpkgs.legacyPackages.${system};
@@ -151,7 +153,148 @@ let
       msg = "enable = false still defines a WakeOnLan link"; }
   ];
 
-  failures = builtins.filter (c: !c.ok) checks;
+  # ── Lab experiments, composed with the module on the same host ───────
+  # Each experiment is evaluated the way nix-config composes it: the module,
+  # the experiment, and the gnomon-like host with the non-default lab options.
+  # The host leaves halmasuit.lab.enable unset, as gnomon's own config does, so
+  # only the experiment can turn the rescue settings on.
+  evalExperiment = module: (lib.nixosSystem {
+    inherit system;
+    modules = [ labModule module (gnomonLike (removeAttrs labOptions [ "enable" ])) ];
+  }).config;
+
+  # Names of the units each stage defines. An experiment may add its fault
+  # unit and nothing else, so baseline must match the module alone.
+  unitNames = c: {
+    system = lib.attrNames (get c [ "systemd" "services" ] { });
+    systemTimers = lib.attrNames (get c [ "systemd" "timers" ] { });
+    initrd = lib.attrNames (get c [ "boot" "initrd" "systemd" "services" ] { });
+    initrdTimers = lib.attrNames (get c [ "boot" "initrd" "systemd" "timers" ] { });
+  };
+
+  # Every rescue setting, asserted on the composed experiment. The toplevel
+  # drvPath is forced with its string context discarded: the evaluation runs,
+  # and nothing is built.
+  rescueChecks = name: c:
+    let
+      initrdManager = get c [ "boot" "initrd" "systemd" "settings" "Manager" ] { };
+      rootManager = get c [ "systemd" "settings" "Manager" ] { };
+      stage1Timer = get c [ "boot" "initrd" "systemd" "timers" "lab-stage1-deadline" ] { };
+      stage1Service = get c [ "boot" "initrd" "systemd" "services" "lab-stage1-deadline" ] { };
+      rootTimer = get c [ "systemd" "timers" "lab-rootfs-deadline" ] { };
+      rootService = get c [ "systemd" "services" "lab-rootfs-deadline" ] { };
+      rootRebootUnit = get c [ "systemd" "services" "lab-rootfs-reboot" ] { };
+      wolLink = get c [ "systemd" "network" "links" "40-${labOptions.wolInterface}" ] { };
+      stage1RebootCmd = "${c.boot.initrd.systemd.package}/bin/systemctl --force reboot";
+      rootRebootCmd = "${c.systemd.package}/bin/systemctl --force reboot";
+    in [
+      { ok = (get c [ "halmasuit" "lab" "enable" ] false) == true;
+        msg = "${name}: halmasuit.lab.enable is not true"; }
+      { ok = builtins.seq (builtins.unsafeDiscardStringContext c.system.build.toplevel.drvPath) true;
+        msg = "${name}: system.build.toplevel.drvPath does not evaluate"; }
+
+      { ok = armed (initrdManager.RuntimeWatchdogSec or null)
+          && (initrdManager.WatchdogDevice or null) == "/dev/watchdog0";
+        msg = "${name}: stage-1 watchdog is not armed on /dev/watchdog0"; }
+      { ok = armed (rootManager.RuntimeWatchdogSec or null)
+          && (rootManager.WatchdogDevice or null) == "/dev/watchdog0";
+        msg = "${name}: rootfs watchdog is not armed on /dev/watchdog0"; }
+
+      { ok = (stage1Timer.timerConfig.OnBootSec or null) == "${toString labOptions.stage1Deadline}s";
+        msg = "${name}: stage-1 deadline timer is missing or has the wrong OnBootSec"; }
+      { ok = (stage1Service.serviceConfig.ExecStart or null) == stage1RebootCmd;
+        msg = "${name}: stage-1 deadline service does not reboot with one --force"; }
+
+      { ok = (rootTimer.timerConfig.OnBootSec or null) == "${toString labOptions.rootfsDeadline}s";
+        msg = "${name}: rootfs deadline timer is missing or has the wrong OnBootSec"; }
+      { ok = lib.hasInfix "is-active --quiet ${labOptions.displayManagerUnit}" (rootService.serviceConfig.ExecStart or "");
+        msg = "${name}: rootfs deadline service does not test ${labOptions.displayManagerUnit}"; }
+      { ok = builtins.elem "lab-rootfs-reboot.service" (rootService.onFailure or [ ]);
+        msg = "${name}: rootfs deadline service does not OnFailure= the reboot unit"; }
+      { ok = (rootRebootUnit.serviceConfig.ExecStart or null) == rootRebootCmd;
+        msg = "${name}: rootfs reboot unit does not reboot with one --force"; }
+
+      { ok = builtins.elem "panic=10" (get c [ "boot" "kernelParams" ] [ ]);
+        msg = "${name}: panic=10 is not on the kernel command line"; }
+      { ok = (wolLink.linkConfig.WakeOnLan or null) == "magic";
+        msg = "${name}: Wake-on-LAN magic is not enabled on ${labOptions.wolInterface}"; }
+    ];
+
+  # Each experiment's own fault, keyed by experiment name. The fault units are
+  # asserted on the structure that makes them block or fire in the boot path.
+  faultChecks = {
+    baseline = name: c: [
+      { ok = unitNames c == unitNames cfg;
+        msg = "${name}: defines units beyond the module's"; }
+    ];
+
+    fault-initrd = name: c:
+      let stall = get c [ "boot" "initrd" "systemd" "services" "lab-fault-initrd" ] { }; in [
+        { ok = lib.hasSuffix "/bin/sleep infinity" (stall.serviceConfig.ExecStart or "");
+          msg = "${name}: initrd stall unit does not run `sleep infinity`"; }
+        { ok = (stall.serviceConfig.Type or null) == "oneshot"
+            && (stall.serviceConfig.TimeoutStartSec or null) == "infinity";
+          msg = "${name}: initrd stall unit is not a oneshot with TimeoutStartSec=infinity (a timeout lets root mount)"; }
+        { ok = builtins.elem "sysroot.mount" (stall.before or [ ]);
+          msg = "${name}: initrd stall unit is not Before=sysroot.mount"; }
+        { ok = builtins.elem "initrd.target" (stall.wantedBy or [ ]);
+          msg = "${name}: initrd stall unit is not wanted by initrd.target (outside the initial transaction)"; }
+        { ok = (stall.unitConfig.DefaultDependencies or true) == false;
+          msg = "${name}: initrd stall unit lacks DefaultDependencies=no"; }
+      ];
+
+    fault-hang = name: c:
+      let
+        hang = get c [ "systemd" "services" "lab-fault-hang" ] { };
+        dm = labOptions.displayManagerUnit;
+        services = get c [ "systemd" "services" ] { };
+        units = get c [ "systemd" "units" ] { };
+      in [
+        { ok = lib.hasSuffix "/bin/sleep infinity" (hang.serviceConfig.ExecStart or "");
+          msg = "${name}: hang unit does not run `sleep infinity`"; }
+        { ok = (hang.serviceConfig.Type or null) == "oneshot"
+            && (hang.serviceConfig.TimeoutStartSec or null) == "infinity";
+          msg = "${name}: hang unit is not a oneshot with TimeoutStartSec=infinity (a timeout lets ${dm} start)"; }
+        { ok = builtins.elem dm (hang.before or [ ]);
+          msg = "${name}: hang unit is not Before=${dm}"; }
+        { ok = builtins.elem "graphical.target" (hang.wantedBy or [ ]);
+          msg = "${name}: hang unit is not wanted by graphical.target (the target that pulls the display manager)"; }
+        { ok = !(builtins.hasAttr (lib.removeSuffix ".service" dm) services)
+            && !(builtins.hasAttr dm units);
+          msg = "${name}: defines a unit named ${dm}; greetd's alias would conflict with it"; }
+      ];
+
+    fault-panic = name: c:
+      let panic = get c [ "systemd" "services" "lab-fault-panic" ] { }; in [
+        { ok = lib.hasSuffix "/bin/sync" (panic.serviceConfig.ExecStartPre or "");
+          msg = "${name}: fault unit does not run sync before the crash"; }
+        { ok = lib.hasSuffix "/bin/echo c" (panic.serviceConfig.ExecStart or "");
+          msg = "${name}: fault unit ExecStart is not `echo c`"; }
+        { ok = (panic.serviceConfig.StandardOutput or null) == "file:/proc/sysrq-trigger";
+          msg = "${name}: fault unit does not write to /proc/sysrq-trigger"; }
+        { ok = builtins.elem "graphical.target" (panic.after or [ ])
+            && builtins.elem "graphical.target" (panic.wantedBy or [ ]);
+          msg = "${name}: fault unit does not run after graphical.target (after boot)"; }
+      ];
+
+    fault-poweroff = name: c:
+      let off = get c [ "systemd" "services" "lab-fault-poweroff" ] { }; in [
+        { ok = lib.hasSuffix "/bin/systemctl --no-block poweroff" (off.serviceConfig.ExecStart or "");
+          msg = "${name}: fault unit does not power off with systemctl --no-block"; }
+        { ok = builtins.elem "graphical.target" (off.after or [ ])
+            && builtins.elem "graphical.target" (off.wantedBy or [ ]);
+          msg = "${name}: fault unit does not run after graphical.target (after boot)"; }
+      ];
+  };
+
+  experimentChecks = lib.concatLists (lib.mapAttrsToList
+    (name: faultCheck:
+      let c = evalExperiment labExperiments.${name}; in
+      rescueChecks name c ++ faultCheck name c)
+    faultChecks);
+
+  allChecks = checks ++ experimentChecks;
+  failures = builtins.filter (c: !c.ok) allChecks;
   report = lib.concatMapStrings
     (c: "echo ${lib.escapeShellArg "FAIL: ${c.msg}"} >&2\n")
     failures;
@@ -159,5 +302,5 @@ in
 pkgs.runCommand "gnomon-lab-eval" { } ''
   ${report}
   ${lib.optionalString (failures != [ ]) "exit 1"}
-  echo "gnomon-lab-eval: ${toString (builtins.length checks)} checks passed" > $out
+  echo "gnomon-lab-eval: ${toString (builtins.length allChecks)} checks passed" > $out
 ''
