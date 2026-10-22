@@ -41,11 +41,26 @@ strictly after greetd's start.
 Profiles map a name to a function that returns failure messages for a timeline.
 `main` writes `timeline.json` into the run directory, prints each failure, and
 exits 0 only when the chosen profile passes.
+
+Profile `bios-shader-greeter` checks a run whose greeter is drawn by halmasuit
+itself after the firmware console. M is the first `drm_master_acquired` phase
+with a monotonic time. Display lines are checked against M, so the NVIDIA
+driver may load before M but may not take the console over before it. The
+checks, one message each when they fail: M exists; no console switch, no fbcon
+primary-device claim, and no NVIDIA frame-buffer-device line before M; the
+firmware mode and BGRT logo are present; at least one frame is not degenerate;
+`assert_animating` passes over every halmasuit payload; every head with a
+sample after M has a nonzero checksum there and at least two distinct values;
+an overlay `client_first_frame` and a greeter `foreground_changed` exist; no
+sample from the greeter's foreground until the next session foreground is zero;
+`assert_no_flash_stream` passes; no sample after the first `frame_rendered` is
+zero. A display line with no monotonic time counts as before M.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import re
 import struct
@@ -57,6 +72,13 @@ from typing import Any
 
 Timeline = dict[str, Any]
 Profile = Callable[[Timeline], list[str]]
+
+# tests/lib holds the phash and no-flash assertions the bios profile reuses. It
+# is not a package, so its modules are imported by path.
+TESTS_LIB = Path(__file__).resolve().parents[1] / "lib"
+sys.path.insert(0, str(TESTS_LIB))
+phash_progression = importlib.import_module("phash_progression")
+visual = importlib.import_module("visual")
 
 FPDT_NAMES = (
     "firmware_start",
@@ -391,7 +413,127 @@ def baseline_greetd(timeline: Timeline) -> list[str]:
     return failures
 
 
-PROFILES: dict[str, Profile] = {"baseline-greetd": baseline_greetd}
+ZERO_CHECKSUM = "00000000"
+DRM_MASTER_PHASE = "drm_master_acquired"
+DISPLAY_KINDS = ("kernel-display", "driver-display")
+
+
+def payload_matches(payload: dict[str, Any], name: str, **fields: Any) -> bool:
+    return payload.get("event") == name and all(payload.get(key) == value for key, value in fields.items())
+
+
+def foreground_window(timed: list[dict[str, Any]]) -> tuple[int | None, int | None]:
+    """The greeter's first foreground time and the next session foreground time.
+
+    The end is None while no session foreground follows the greeter's.
+    """
+    start = None
+    for event in timed:
+        payload = event["payload"]
+        if payload.get("event") != "foreground_changed":
+            continue
+        if start is None and payload.get("to") == "greeter":
+            start = event["mono_us"]
+        elif start is not None and payload.get("to") == "session":
+            return start, event["mono_us"]
+    return start, None
+
+
+def bios_shader_greeter(timeline: Timeline) -> list[str]:
+    failures: list[str] = []
+    events = timeline["events"]
+    halmasuit = [event for event in events if event["kind"] == "halmasuit"]
+    timed = [event for event in halmasuit if event["mono_us"] is not None]
+    payloads = [event["payload"] for event in halmasuit]
+    display = [event for event in events if event["kind"] in DISPLAY_KINDS]
+    heads = timeline["heads"]
+
+    master = next(
+        (event for event in timed if payload_matches(event["payload"], "phase_entered", phase=DRM_MASTER_PHASE)),
+        None,
+    )
+    if master is None:
+        failures.append("drm_master_acquired missing")
+    m = None if master is None else master["mono_us"]
+
+    before_master = (
+        [] if m is None else [event for event in display if event["mono_us"] is None or event["mono_us"] < m]
+    )
+    if any("Console: switching" in event["detail"] for event in before_master):
+        failures.append("fbcon console switched before drm_master_acquired")
+    if any("is primary device" in event["detail"] and "fbcon" in event["detail"] for event in before_master):
+        failures.append("fbcon claimed the primary device before drm_master_acquired")
+    if any(
+        DRIVER_PATTERN.search(event["detail"]) and "frame buffer device" in event["detail"]
+        for event in before_master
+    ):
+        failures.append("NVIDIA drm frame buffer device line before drm_master_acquired")
+
+    if timeline["firmware_mode"] is None:
+        failures.append("firmware mode missing")
+    if timeline["logo"] is None:
+        failures.append("BGRT logo missing")
+
+    if not any(payload["event"] == "frame_rendered" and payload.get("degenerate") is False for payload in payloads):
+        failures.append("no non-degenerate frame_rendered")
+    try:
+        phash_progression.assert_animating(payloads)
+    except AssertionError as exc:
+        failures.append(str(exc))
+
+    if m is not None:
+        active = {
+            key: [sample for sample in head["samples"] if sample["mono_us"] > m] for key, head in heads.items()
+        }
+        active = {key: samples for key, samples in active.items() if samples}
+        if not active:
+            failures.append("no active head after drm_master_acquired")
+        zero_only = [key for key, samples in active.items() if all(s["comp"] == ZERO_CHECKSUM for s in samples)]
+        if zero_only:
+            failures.append(f"no nonzero checksum after drm_master_acquired on: {', '.join(zero_only)}")
+        constant = [key for key, samples in active.items() if len({s["comp"] for s in samples}) < 2]
+        if constant:
+            failures.append(f"checksum takes one value after drm_master_acquired on: {', '.join(constant)}")
+
+    if not any(payload_matches(payload, "client_first_frame", role="overlay") for payload in payloads):
+        failures.append("no client_first_frame{role: overlay}")
+    if not any(payload_matches(payload, "foreground_changed", to="greeter") for payload in payloads):
+        failures.append("no foreground_changed{to: greeter}")
+    start, end = foreground_window(timed)
+    if start is not None:
+        zero_in_greeter = [
+            key
+            for key, head in heads.items()
+            if any(
+                s["comp"] == ZERO_CHECKSUM and s["mono_us"] >= start and (end is None or s["mono_us"] < end)
+                for s in head["samples"]
+            )
+        ]
+        if zero_in_greeter:
+            failures.append(f"zero checksum during greeter foreground on: {', '.join(zero_in_greeter)}")
+
+    try:
+        visual.assert_no_flash_stream(None, events=payloads)
+    except AssertionError as exc:
+        failures.append(str(exc))
+
+    first_frame = next((event for event in timed if payload_matches(event["payload"], "frame_rendered")), None)
+    if first_frame is not None:
+        frame_mono = first_frame["mono_us"]
+        zero_after_frame = [
+            key
+            for key, head in heads.items()
+            if any(s["comp"] == ZERO_CHECKSUM and s["mono_us"] > frame_mono for s in head["samples"])
+        ]
+        if zero_after_frame:
+            failures.append(f"zero checksum after first frame_rendered on: {', '.join(zero_after_frame)}")
+    return failures
+
+
+PROFILES: dict[str, Profile] = {
+    "baseline-greetd": baseline_greetd,
+    "bios-shader-greeter": bios_shader_greeter,
+}
 
 
 def main(argv: Sequence[str] | None = None) -> int:

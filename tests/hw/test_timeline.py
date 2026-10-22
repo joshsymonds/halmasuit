@@ -84,9 +84,9 @@ def journal_line(
     return json.dumps(fields)
 
 
-def crc_sample(card, crtc, t_us, unit, *, as_bytes=False):
+def crc_sample(card, crtc, t_us, unit, *, comp="00000001", as_bytes=False):
     message = (
-        f"sample card={card} crtc={crtc} t={t_us} comp=00000001 rg=00000002 "
+        f"sample card={card} crtc={crtc} t={t_us} comp={comp} rg=00000002 "
         "out=00000003 comp_sup=1 rg_sup=1 out_sup=0"
     )
     return journal_line(message, identifier="lab-crc", unit=unit, as_bytes=as_bytes)
@@ -237,7 +237,7 @@ def halmasuit_line(event, *, mono, unit=HALMASUIT_UNIT, as_bytes=False):
     )
 
 
-def frame_payload(frame_id):
+def frame_payload(frame_id, *, phash=18364758544493064720):
     return {
         "event": "frame_rendered",
         "frame_id": frame_id,
@@ -245,13 +245,25 @@ def frame_payload(frame_id):
         "clear_pixel_count": 0,
         "black_pixel_count": 0,
         "degenerate": False,
-        "phash": 18364758544493064720,
+        "phash": phash,
     }
 
 
 PHASE_PAYLOAD = {"event": "phase_entered", "phase": "drm_master_acquired"}
+WALLPAPER_PAYLOAD = {"event": "client_first_frame", "role": "wallpaper"}
 CLIENT_PAYLOAD = {"event": "client_first_frame", "role": "overlay"}
 FOREGROUND_PAYLOAD = {"event": "foreground_changed", "to": "greeter"}
+SESSION_PAYLOAD = {"event": "foreground_changed", "to": "session"}
+BIOS_PHASHES = (
+    0x0000000000000000,
+    0xFFFFFFFFFFFFFFFF,
+    0x00000000FFFFFFFF,
+    0xFFFFFFFF00000000,
+    0x5555555555555555,
+    0xAAAAAAAAAAAAAAAA,
+    0x0F0F0F0F0F0F0F0F,
+    0xF0F0F0F0F0F0F0F0,
+)
 
 
 def halmasuit_events(doc):
@@ -285,6 +297,61 @@ def run_cli(argv):
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = timeline.main(argv)
     return code, out.getvalue(), err.getvalue()
+
+
+def kernel_line(message, mono):
+    return journal_line(message, identifier="kernel", transport="kernel", source=mono)
+
+
+def bios_frame_payloads():
+    return [frame_payload(frame_id, phash=phash) for frame_id, phash in enumerate(BIOS_PHASHES)]
+
+
+def bios_lines(*, drop=(), extra=(), frames=None):
+    """A bios-shader-greeter run's journal lines: NVIDIA loads before drm_master_acquired,
+    takeover and the greeter's frames after it, the greeter in the foreground until the
+    session takes over at 2_000_000."""
+    frames = bios_frame_payloads() if frames is None else frames
+    named = {
+        "nvrm_module": kernel_line("NVRM: loading NVIDIA UNIX Open Kernel Module for x86_64", 300_000),
+        "nvrm_modeset": kernel_line(
+            "nvidia-modeset: Loading NVIDIA UNIX Open Kernel Mode Setting Driver", 310_000
+        ),
+        "nvrm_load": kernel_line("[drm] [nvidia-drm] [GPU ID 0x00000100] Loading driver", 320_000),
+        "nvrm_init": kernel_line(
+            "[drm] Initialized nvidia-drm 0.0.0 for 0000:01:00.0 on minor 1", 330_000
+        ),
+        "pre_card0": crc_sample("card0", "42", 1_000_000, INITRD_UNIT, comp="00000000"),
+        "phase": halmasuit_line(PHASE_PAYLOAD, mono=1_500_000),
+        "wallpaper": halmasuit_line(WALLPAPER_PAYLOAD, mono=1_505_000),
+        "overlay": halmasuit_line(CLIENT_PAYLOAD, mono=1_510_000),
+        "takeover": kernel_line("Console: switching to colour frame buffer device 160x45", 1_520_000),
+        "fbcon_primary": kernel_line("fbcon: nvidia-drmdrmfb (fb0) is primary device", 1_521_000),
+        "nvidia_fb": kernel_line(
+            "nvidia 0000:01:00.0: [drm] fb0: nvidia-drmdrmfb frame buffer device", 1_522_000
+        ),
+        "greeter": halmasuit_line(FOREGROUND_PAYLOAD, mono=1_530_000),
+        **{
+            f"frame{frame_id}": halmasuit_line(payload, mono=1_540_000 + 10_000 * frame_id)
+            for frame_id, payload in enumerate(frames)
+        },
+        "c0_1600": crc_sample("card0", "42", 1_600_000, ROOTFS_UNIT, comp="1a2b3c4d"),
+        "c1_1650": crc_sample("card1", "7", 1_650_000, ROOTFS_UNIT, comp="0000abcd"),
+        "c0_1700": crc_sample("card0", "42", 1_700_000, ROOTFS_UNIT, comp="5e6f7081"),
+        "c1_1800": crc_sample("card1", "7", 1_800_000, ROOTFS_UNIT, comp="0000ef01"),
+        "c0_1900": crc_sample("card0", "42", 1_900_000, ROOTFS_UNIT, comp="1a2b3c4d"),
+        "session": halmasuit_line(SESSION_PAYLOAD, mono=2_000_000),
+    }
+    return [line for name, line in named.items() if name not in drop] + list(extra)
+
+
+def bios_files(**kwargs):
+    return with_journal(complete_files(), bios_lines(**kwargs))
+
+
+def bios_failures(files):
+    with contextlib.redirect_stdout(io.StringIO()):
+        return timeline.PROFILES["bios-shader-greeter"](build(files))
 
 
 class HeaderTest(unittest.TestCase):
@@ -720,6 +787,163 @@ class BaselineTest(unittest.TestCase):
                 failures = timeline.PROFILES["baseline-greetd"](build(mutate(complete_files())))
                 self.assertTrue(failures, label)
                 self.assertTrue(any(fragment in failure for failure in failures), failures)
+
+
+class BiosShaderGreeterTest(unittest.TestCase):
+    def assert_failures(self, files, fragments):
+        failures = bios_failures(files)
+        self.assertEqual(len(failures), len(fragments), failures)
+        for failure, fragment in zip(failures, fragments):
+            self.assertIn(fragment, failure)
+
+    def test_complete_run_passes(self):
+        self.assertEqual(bios_failures(bios_files()), [])
+
+    def test_r1_ordering_checks(self):
+        cases = {
+            "drm_master_acquired phase missing": (
+                bios_files(drop={"phase"}),
+                ["drm_master_acquired"],
+            ),
+            "console switched before drm_master_acquired": (
+                bios_files(
+                    extra=[kernel_line("Console: switching to colour dummy device 80x25", 1_400_000)]
+                ),
+                ["console switched before drm_master_acquired"],
+            ),
+            "fbcon claims the primary device": (
+                bios_files(
+                    extra=[kernel_line("fbcon: nvidia-drmdrmfb (fb0) is primary device", 1_400_000)]
+                ),
+                ["claimed the primary device before drm_master_acquired"],
+            ),
+            "NVIDIA drm frame buffer device line": (
+                bios_files(
+                    extra=[
+                        kernel_line(
+                            "nvidia 0000:01:00.0: [drm] fb0: nvidia-drmdrmfb frame buffer device",
+                            1_400_000,
+                        )
+                    ]
+                ),
+                ["frame buffer device line before drm_master_acquired"],
+            ),
+            "firmware mode missing": (
+                without(bios_files(), BOOT_PARAMS),
+                ["firmware mode missing"],
+            ),
+            "BGRT logo missing": (
+                without(bios_files(), f"{BGRT}/status"),
+                ["BGRT logo missing"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_r2_frame_and_checksum_checks(self):
+        all_degenerate = [{**payload, "degenerate": True} for payload in bios_frame_payloads()]
+        one_degenerate = bios_frame_payloads()
+        one_degenerate[3]["degenerate"] = True
+        frozen = [frame_payload(frame_id, phash=0) for frame_id in range(len(BIOS_PHASHES))]
+        clear_pixels = bios_frame_payloads()
+        clear_pixels[3]["clear_pixel_count"] = 5
+        cases = {
+            "every frame degenerate": (
+                bios_files(frames=all_degenerate),
+                ["no non-degenerate frame_rendered", "degenerate frame"],
+            ),
+            "one degenerate frame is not every frame": (
+                bios_files(frames=one_degenerate),
+                ["degenerate frame"],
+            ),
+            "frames identical": (
+                bios_files(frames=frozen),
+                ["distinct phash"],
+            ),
+            "no active head after drm_master_acquired": (
+                bios_files(
+                    drop={"c0_1600", "c1_1650", "c0_1700", "c1_1800", "c0_1900"}
+                ),
+                ["no active head after drm_master_acquired"],
+            ),
+            "active head checksum zero after drm_master_acquired": (
+                bios_files(
+                    drop={"c1_1650", "c1_1800"},
+                    extra=[
+                        crc_sample("card1", "7", 1_510_000, ROOTFS_UNIT, comp="00000000"),
+                        crc_sample("card1", "7", 1_520_000, ROOTFS_UNIT, comp="00000000"),
+                    ],
+                ),
+                ["no nonzero checksum after drm_master_acquired on: card1/crtc7", "takes one value"],
+            ),
+            "active head checksum constant": (
+                bios_files(
+                    drop={"c1_1800"},
+                    extra=[crc_sample("card1", "7", 1_800_000, ROOTFS_UNIT, comp="0000abcd")],
+                ),
+                ["takes one value after drm_master_acquired on: card1/crtc7"],
+            ),
+            "clear pixel in a frame": (
+                bios_files(frames=clear_pixels),
+                ["clear_pixel_count"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_r3_overlay_and_greeter_checks(self):
+        cases = {
+            "overlay client missing": (
+                bios_files(drop={"overlay"}),
+                ["no client_first_frame{role: overlay}"],
+            ),
+            "greeter foreground missing": (
+                bios_files(drop={"greeter"}),
+                ["no foreground_changed{to: greeter}"],
+            ),
+            "zero checksum during greeter foreground": (
+                bios_files(
+                    extra=[crc_sample("card0", "42", 1_535_000, ROOTFS_UNIT, comp="00000000")]
+                ),
+                ["zero checksum during greeter foreground on: card0/crtc42"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_r4_flash_stream_checks(self):
+        cases = {
+            "wallpaper client missing": (
+                bios_files(drop={"wallpaper"}),
+                ["no client_first_frame{role:wallpaper}"],
+            ),
+            "zero checksum after first frame_rendered": (
+                bios_files(
+                    extra=[crc_sample("card0", "42", 2_100_000, ROOTFS_UNIT, comp="00000000")]
+                ),
+                ["zero checksum after first frame_rendered on: card0/crtc42"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_cli_runs_the_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = write_run(Path(tmp), bios_files())
+            code, out, _ = run_cli([str(run), "--expect", "bios-shader-greeter"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS bios-shader-greeter", out)
+
+    def test_cli_prints_each_failure_with_the_profile_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = write_run(Path(tmp), bios_files(drop={"greeter"}))
+            code, out, _ = run_cli([str(run), "--expect", "bios-shader-greeter"])
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL bios-shader-greeter: no foreground_changed{to: greeter}", out)
 
 
 class CliTest(unittest.TestCase):
