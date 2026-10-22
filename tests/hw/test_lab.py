@@ -147,6 +147,14 @@ HALMASUIT_RETURN_SECONDS = 50
 SPAWNED = {"event": "greeter_spawned", "pid": GREETER_PID}
 DIED_PRE_AUTH = {"event": "greeter_died_pre_auth", "pid": GREETER_PID}
 TERMINATED = {"event": "greeter_terminated", "pid": GREETER_PID}
+# The attended run: the two login events, the operator's return file, the login wait's deadline,
+# the refusal --attended gives for other experiment lists, and the clock cap for an untouched file.
+SESSION_OPENED = {"event": "session_opened"}
+SESSION_FIRST_FRAME = {"event": "session_client_first_frame"}
+RETURN_FILE = "return"
+ATTENDED_LOGIN_SECONDS = 1800
+ATTENDED_REFUSAL = "--attended needs exactly the halmasuit experiment"
+RUN_CAP_SECONDS = 10_000
 JOURNAL_EPOCH_US = 1792656320120487
 KERNEL_LINE = {"_TRANSPORT": "kernel", "PRIORITY": "6", "MESSAGE": "kernel line"}
 PAM_DIR = "/etc/pam.d/"
@@ -413,6 +421,8 @@ class FakeGnomon:
         live_pids: Sequence[int] = (),
         proc_error: str | None = None,
         probe_query_fails: bool = False,
+        return_file_at: float | None = None,
+        journal_outage: tuple[float, float] | None = None,
     ) -> None:
         self.lab_mode = lab_mode
         self.sessions = list(sessions)
@@ -495,6 +505,12 @@ class FakeGnomon:
         self.hold_query_failures = hold_query_failures
         self.lab_started_at = 0.0
         self.reboot_clock: list[float] = []
+        # return_file_at is when the operator touches the attended run's return file; None never
+        # does. journal_outage is the clock window in which halmasuit's journal queries fail, as
+        # an unreachable gnomon fails them.
+        self.return_file_at = return_file_at
+        self.journal_outage = journal_outage
+        self.return_checks: list[str] = []
 
     def say(self, message: str) -> None:
         self.trace.append(f"say:{message}")
@@ -559,6 +575,9 @@ class FakeGnomon:
         self.calls.append(("local", command))
         if command == ("git", "-C", REPO, "rev-parse", "HEAD"):
             return _ok(f"{REV}\n")
+        if len(command) == 3 and command[:2] == ("test", "-e") and Path(command[2]).is_absolute():
+            if Path(command[2]).name == RETURN_FILE:
+                return self._return_file(command[2])
         if len(command) == 12 and command[:8] == BUILD_PREFIX:
             match = INSTALLABLE.fullmatch(command[8])
             if (
@@ -708,6 +727,8 @@ class FakeGnomon:
             self.probe_query_times.append(self.clock.now)
             if self.probe_query_fails:
                 return lab.Result(255, "", "ssh: connect to host gnomon port 22: Connection reset by peer")
+        if self._in_journal_outage():
+            return lab.Result(255, "", "ssh: connect to host gnomon port 22: No route to host")
         if self.hold_query_failures:
             self.hold_query_failures -= 1
             return lab.Result(255, "", "ssh: connect to host gnomon port 22: No route to host")
@@ -717,6 +738,25 @@ class FakeGnomon:
         else:
             records = records[-1:]
         return _ok(journal_text(records))
+
+    def _in_journal_outage(self) -> bool:
+        if self.journal_outage is None:
+            return False
+        start, end = self.journal_outage
+        return start <= self.clock.now < end
+
+    def _return_file(self, path: str) -> lab.Result:
+        """GNU `test -e` on the attended run's return file: 0 from return_file_at on, 1 before.
+
+        A wait for a file that never appears polls forever on the FakeClock, so past
+        RUN_CAP_SECONDS the fake refuses the check.
+        """
+        if self.clock.now > RUN_CAP_SECONDS:
+            raise UnscriptedCommand(f"return file still awaited at {self.clock.now} s: {path}")
+        self.return_checks.append(path)
+        if self.return_file_at is not None and self.clock.now >= self.return_file_at:
+            return _ok()
+        return lab.Result(1, "", "")
 
     def _scripted_start(self, index: int) -> ProbeStart:
         if self.probe_script is not None:
@@ -2108,6 +2148,177 @@ class LabRunnerTest(unittest.TestCase):
                 self.assertEqual(code, 0, err)
                 self.assertNotIn(("remote", HOLD_GREETER), gnomon.calls)
                 self.assertNotIn(("remote", HOLD_NEWEST), gnomon.calls)
+
+    def test_attended_refuses_unless_the_experiments_are_exactly_halmasuit(self) -> None:
+        cases = (
+            ["baseline"],
+            ["halmasuit-production"],
+            ["halmasuit", "baseline"],
+            ["halmasuit", "halmasuit"],
+        )
+        for names in cases:
+            with self.subTest(names=names):
+                gnomon = FakeGnomon()
+                err = io.StringIO()
+                with self.assertRaises(SystemExit) as caught, contextlib.redirect_stderr(err):
+                    lab.main(
+                        [
+                            "--nix-config",
+                            NIX_CONFIG,
+                            "--repo-root",
+                            REPO,
+                            "--state-root",
+                            str(self.tmp / "refused"),
+                            "--attended",
+                            *names,
+                        ],
+                        layer=gnomon,
+                        clock=gnomon.clock,
+                    )
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn(ATTENDED_REFUSAL, err.getvalue())
+                self.assertEqual(gnomon.calls, [])
+                self.assertFalse((self.tmp / "refused").exists())
+
+    def test_login_is_seen_in_either_event_order(self) -> None:
+        orders = {
+            "session_opened first": (SESSION_OPENED, SESSION_FIRST_FRAME),
+            "session_client_first_frame first": (SESSION_FIRST_FRAME, SESSION_OPENED),
+        }
+        for order, (first, second) in orders.items():
+            with self.subTest(order=order):
+                gnomon = greeter_fixture((60, first), (61, second), return_file_at=200)
+                code, _, err = self.run_queue(["halmasuit"], gnomon, extra=["--attended"])
+                self.assertEqual(code, 0, err)
+                self.assertGreaterEqual(self.lab_return_seconds(gnomon), 200)
+                run_directory = self.single_run_dir("halmasuit")
+                self.assertEqual(set(gnomon.return_checks), {str(run_directory / RETURN_FILE)})
+                self.assertIn("PASS", self.run_log("halmasuit"))
+
+    def test_one_event_alone_is_not_a_login(self) -> None:
+        cases = {
+            "no event": [],
+            "session_opened alone": [(60, SESSION_OPENED)],
+            "session_client_first_frame alone": [(60, SESSION_FIRST_FRAME)],
+        }
+        for where, events in cases.items():
+            with self.subTest(where=where):
+                gnomon = greeter_fixture(*events)
+                code, _, err = self.run_queue(["halmasuit"], gnomon, extra=["--attended"])
+                self.assertEqual(code, 1)
+                self.assertIn("attended login did not happen: no login within 1800 seconds", err)
+                self.assertGreaterEqual(self.lab_return_seconds(gnomon), ATTENDED_LOGIN_SECONDS)
+                self.assertEqual(gnomon.events.count("reboot"), 2)
+                self.assertEqual(gnomon.events[-2:], ["rm-entry", "oneshot-clear"])
+                self.assertNotIn(LAB, gnomon.esp)
+
+    def test_return_waits_for_the_file_with_no_deadline_after_a_login(self) -> None:
+        gnomon = greeter_fixture((60, SESSION_OPENED), (61, SESSION_FIRST_FRAME), return_file_at=3000)
+        code, _, err = self.run_queue(["halmasuit"], gnomon, extra=["--attended"])
+        self.assertEqual(code, 0, err)
+        self.assertGreaterEqual(self.lab_return_seconds(gnomon), 3000)
+
+    def test_return_file_before_a_login_returns_gnomon_then_fails(self) -> None:
+        gnomon = greeter_fixture((60, SESSION_OPENED), (61, SESSION_FIRST_FRAME), return_file_at=50)
+        code, _, err = self.run_queue(["halmasuit"], gnomon, extra=["--attended"])
+        self.assertEqual(code, 1)
+        self.assertIn("attended login did not happen: the return file appeared before a login", err)
+        self.assertGreaterEqual(self.lab_return_seconds(gnomon), 50)
+        self.assertLess(self.lab_return_seconds(gnomon), 60)
+        self.assertEqual(gnomon.events.count("reboot"), 2)
+        self.assertEqual(gnomon.events[-2:], ["rm-entry", "oneshot-clear"])
+        self.assertNotIn(LAB, gnomon.esp)
+        lines = self.run_log("halmasuit")
+        self.assertIn(
+            f"no attended login: the return file appeared before a login; returning gnomon to {DEFAULT}",
+            lines,
+        )
+        self.assertIn("FAIL: attended login did not happen: the return file appeared before a login", lines)
+
+    def test_return_file_before_a_login_keeps_the_graphical_session_refusal(self) -> None:
+        gnomon = greeter_fixture(
+            (60, SESSION_OPENED),
+            (61, SESSION_FIRST_FRAME),
+            return_file_at=50,
+            login_on_lab_boot=[("c6", "user", "wayland")],
+        )
+        code, _, err = self.run_queue(["halmasuit"], gnomon, extra=["--attended"])
+        self.assertEqual(code, 1)
+        self.assertIn("refusing before return reboot", err)
+        self.assertEqual(gnomon.events.count("reboot"), 1)
+
+    def test_return_follows_the_file_with_a_graphical_session_logged_in(self) -> None:
+        gnomon = greeter_fixture(
+            (60, SESSION_OPENED),
+            (61, SESSION_FIRST_FRAME),
+            return_file_at=200,
+            login_on_lab_boot=[("c5", "user", "wayland")],
+        )
+        code, _, err = self.run_queue(["halmasuit"], gnomon, extra=["--attended"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(gnomon.events.count("reboot"), 2)
+        self.assertGreaterEqual(self.lab_return_seconds(gnomon), 200)
+
+    def test_failed_journal_query_counts_as_not_yet(self) -> None:
+        gnomon = greeter_fixture(
+            (61, SESSION_OPENED),
+            (62, SESSION_FIRST_FRAME),
+            return_file_at=200,
+            journal_outage=(60, 90),
+        )
+        code, _, err = self.run_queue(["halmasuit"], gnomon, extra=["--attended"])
+        self.assertEqual(code, 0, err)
+        self.assertGreaterEqual(self.lab_return_seconds(gnomon), 200)
+        self.assertTrue(any(line.startswith("session is up on gnomon") for line in self.run_log("halmasuit")))
+
+    def test_failed_journal_query_to_the_deadline_names_its_failure(self) -> None:
+        gnomon = greeter_fixture(
+            (61, SESSION_OPENED),
+            (62, SESSION_FIRST_FRAME),
+            journal_outage=(60, RUN_CAP_SECONDS),
+        )
+        code, _, err = self.run_queue(["halmasuit"], gnomon, extra=["--attended"])
+        self.assertEqual(code, 1)
+        lines = [line for line in self.run_log("halmasuit") if line.startswith("no attended login:")]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("no login within 1800 seconds", lines[0])
+        self.assertIn("rc 255", lines[0])
+        self.assertIn("No route to host", lines[0])
+
+    def test_hold_expiry_in_attended_mode_waits_for_no_login(self) -> None:
+        gnomon = greeter_fixture(lab_journal_ends_at=39.9)
+        code, _, err = self.run_queue(["halmasuit"], gnomon, extra=["--attended"])
+        self.assertEqual(code, 1)
+        self.assertEqual(gnomon.return_checks, [])
+        lines = self.run_log("halmasuit")
+        self.assertFalse(any(line.startswith("greeter is up") for line in lines), lines)
+        self.assertTrue(any(line.startswith("hold expired:") for line in lines), lines)
+        self.assertEqual(gnomon.events.count("reboot"), 2)
+        self.assertTrue(any(line.startswith("FAIL: lab boot hold expired") for line in lines), lines)
+
+    def test_attended_runs_no_probe_and_logs_the_hand_off_and_collection(self) -> None:
+        gnomon = greeter_fixture(
+            (60, SESSION_OPENED),
+            (61, SESSION_FIRST_FRAME),
+            return_file_at=200,
+            firmware=firmware_fixtures(),
+        )
+        code, _, err = self.run_queue(["halmasuit"], gnomon, extra=["--attended"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(gnomon.probe_starts, [])
+        self.assertFalse(any(PROBE_UNIT in argv for _, argv in gnomon.calls))
+        run_directory = self.single_run_dir("halmasuit")
+        self.assertFalse((run_directory / "probe.json").exists())
+        self.assertTrue((run_directory / "journal.json").exists())
+        self.assertTrue((run_directory / "firmware" / "acpi" / "tables" / "FPDT").exists())
+        lines = self.run_log("halmasuit")
+        self.assertTrue(any(line.startswith("greeter is up on gnomon") for line in lines), lines)
+        touch = f"touch {run_directory / RETURN_FILE}"
+        self.assertTrue(
+            any(line.startswith("session is up on gnomon") and line.endswith(touch) for line in lines),
+            lines,
+        )
+        self.assertEqual(lines[-1], "PASS")
 
 
 class NetconsoleLogTest(unittest.TestCase):
