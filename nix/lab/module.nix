@@ -8,7 +8,8 @@
 # listed PAM services, and the lab-crc scanout sampler, which runs in stage 1
 # and after switch-root. The probe option loads uinput and defines
 # lab-probe.service, an on-demand root oneshot that nothing starts on its own.
-# Every option defaults off or empty.
+# Every option defaults off or empty, except probe.consumerUser, which defaults
+# to greeter.
 #
 # Journal contract (frozen; consumed by tests/hw/timeline.py). Each entry is
 # one journal line, identified by SYSLOG_IDENTIFIER. `t` is CLOCK_MONOTONIC in
@@ -90,6 +91,12 @@ in
     crcSampler.enable = lib.mkEnableOption "the lab-crc scanout CRC sampler";
 
     probe.enable = lib.mkEnableOption "the lab-probe uinput keyboard and probe unit";
+
+    probe.consumerUser = lib.mkOption {
+      type = lib.types.str;
+      default = "greeter";
+      description = "User whose process must hold the keyboard node for the probe to type; greetd's greeter runs as greeter.";
+    };
 
     netconsole = {
       enable = lib.mkEnableOption "netconsole from the initramfs, sending kernel messages over UDP";
@@ -205,8 +212,9 @@ in
     networking.interfaces.${cfg.wolInterface}.wakeOnLan.enable = true;
 
     # Netconsole from stage 1. The module loads once the interface device
-    # exists and stays loaded across switch-root. It sends UDP only, and
-    # the firewall is not touched.
+    # exists, and the unit is Before=initrd.target so switch-root waits for
+    # modprobe to finish. The module stays loaded across switch-root. It
+    # sends UDP only, and the firewall is not touched.
     assertions = [
       {
         assertion = !cfg.netconsole.enable
@@ -220,6 +228,7 @@ in
       ++ lib.optional cfg.crcSampler.enable labCrc;
     boot.initrd.systemd.services.lab-netconsole = lib.mkIf cfg.netconsole.enable {
       wantedBy = [ "initrd.target" ];
+      before = [ "initrd.target" ];
       bindsTo = [ netconsoleDevice ];
       after = [ netconsoleDevice ];
       unitConfig.DefaultDependencies = false;
@@ -263,7 +272,7 @@ in
     systemd.services.lab-probe = lib.mkIf cfg.probe.enable {
       serviceConfig = {
         Type = "oneshot";
-        ExecStart = "${pkgs.python3}/bin/python3 ${labProbe}";
+        ExecStart = "${pkgs.python3}/bin/python3 ${labProbe} --consumer-user ${cfg.probe.consumerUser}";
         SyslogIdentifier = "lab-probe";
       };
     };

@@ -21,10 +21,13 @@ run.log and skipped.
 The baseline experiment also probes the greeter on the checked lab boot, once the display
 manager is active. The probe refuses, and never starts lab-probe.service, when the resolved
 greetd PAM stack holds a lockout module (pam_faillock, pam_tally, pam_tally2) or cannot be
-resolved. Otherwise the unit types a wrong password into greetd, and the probe passes when the
-lab boot's authpriv journal then holds a pam_unix(greetd:auth) authentication failure for
---probe-user within 60 seconds. probe.json records the outcome. A refused or failed probe fails
-the run after gnomon has returned to its default entry.
+resolved. Otherwise the runner starts lab-probe.service, whose unit types a wrong password into
+greetd, and waits up to 30 seconds after each start for the lab boot's authpriv journal to hold a
+pam_unix(greetd:auth) authentication failure for --probe-user. A start that is not matched is
+followed by another start, at most 5 starts in all, and no start begins 180 seconds after the
+first. probe.json records each start's return code and match, and the probe passes when a start
+is matched. A refused or failed probe fails the run after gnomon has returned to its default
+entry.
 Once gnomon has returned, the runner saves the lab boot's journal as journal.json in the
 run directory (`journalctl -b ID -o json`). A checked lab boot is known from the boot the
 runner saw; otherwise the lab boot is the boot list-boots lists right after the boot the
@@ -116,7 +119,9 @@ PAM_DIR = "/etc/pam.d/"
 PAM_SERVICE = "greetd"
 PROBE_UNIT = "lab-probe.service"
 PROBE_MARKER = f"pam_unix({PAM_SERVICE}:auth): authentication failure"
-PROBE_DEADLINE_SECONDS = 60
+PROBE_MAX_STARTS = 5
+PROBE_WAIT_SECONDS = 30
+PROBE_DEADLINE_SECONDS = 180
 AUTHPRIV_FACILITY = 10
 DEFAULT_PROBE_USER = "joshsymonds"
 
@@ -707,6 +712,7 @@ class Lab:
             "refused": None,
             "started": False,
             "unit_returncode": None,
+            "attempts": [],
             "matched": None,
             "passed": False,
         }
@@ -727,19 +733,33 @@ class Lab:
             probe["refused"] = f"{PAM_SERVICE} PAM stack holds lockout module(s): {', '.join(stack.lockout)}"
             return probe
         probe["started"] = True
+        first_start = self.clock.monotonic()
+        for number in range(PROBE_MAX_STARTS):
+            if number and self.clock.monotonic() - first_start >= PROBE_DEADLINE_SECONDS:
+                break
+            attempt = self._probe_start(run)
+            probe["attempts"].append(attempt)
+            if attempt["matched"] is not None:
+                break
+        last = probe["attempts"][-1]
+        probe["unit_returncode"] = last["unit_returncode"]
+        probe["matched"] = last["matched"]
+        probe["passed"] = probe["matched"] is not None
+        return probe
+
+    def _probe_start(self, run: RunLog) -> dict:
+        """Start lab-probe.service once, then wait up to PROBE_WAIT_SECONDS for the probe user's marker line."""
         start = self.layer.remote(["sudo", "-n", "systemctl", "start", PROBE_UNIT])
-        probe["unit_returncode"] = start.returncode
+        attempt: dict = {"unit_returncode": start.returncode, "matched": None}
         try:
-            probe["matched"] = self._poll(
+            attempt["matched"] = self._poll(
                 f"{PROBE_MARKER} for {self.probe_user} in the lab boot journal",
                 self._probe_line,
-                PROBE_DEADLINE_SECONDS,
+                PROBE_WAIT_SECONDS,
             )
         except LabError as err:
             run.say(f"probe: {err}")
-            return probe
-        probe["passed"] = True
-        return probe
+        return attempt
 
     def _read_pam_file(self, name: str) -> str | None:
         """One /etc/pam.d file on gnomon, or None when it does not exist; any other failure raises."""

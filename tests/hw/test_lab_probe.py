@@ -3,8 +3,9 @@
 
 The probe is exercised through its functions and its Host seams: a temporary
 tree stands in for /sys, /dev, /proc, and the uinput node, a recording fake
-stands in for the uinput ioctls, and a fake clock stands in for time. Nothing
-here opens a real device, reads the real /proc, or sleeps.
+stands in for the uinput ioctls, a fake clock stands in for time, and a fake
+passwd table stands in for the account database. Nothing here opens a real
+device, reads the real /proc or passwd database, or sleeps.
 """
 
 import contextlib
@@ -22,11 +23,22 @@ probe = importlib.import_module("lab_probe")
 
 PROBE_PID = 4100
 UDEV_PID = 311
+KEYD_PID = 1140
+LOGIND_PID = 702
 GREETER_PID = 812
+OTHER_USER_PID = 2201
 SYSNAME = "input7"
 DEVICE = "event5"
+CONSUMER_USER = "greeter"
+CONSUMER_UID = 988
+ROOT_UID = 0
+OTHER_USER_UID = 1000
+FAKE_PASSWD = {CONSUMER_USER: CONSUMER_UID}
 PASSWORD_CODES = [17, 19, 24, 49, 34, 25, 19, 24, 48, 18]  # w r o n g p r o b e
 ENTER = 28
+BACKSPACE = 14
+CLEAR_PRESSES = 32
+TYPED_KEYS = CLEAR_PRESSES + len(PASSWORD_CODES) + 1
 ALPHABET = {
     "a": 30, "b": 48, "c": 46, "d": 32, "e": 18, "f": 33, "g": 34,
     "h": 35, "i": 23, "j": 36, "k": 37, "l": 38, "m": 50, "n": 49,
@@ -41,6 +53,10 @@ def key_event(code, value):
 
 def syn_event():
     return struct.pack("<qqHHi", 0, 0, 0, 0, 0)
+
+
+def fake_lookup_uid(name):
+    return FAKE_PASSWD[name]  # KeyError for an unknown user, as pwd.getpwnam does
 
 
 class FakeClock:
@@ -109,10 +125,13 @@ class Tree:
             (input_dir / event).mkdir()
             (self.dev / event).touch()
 
-    def add_process(self, pid, comm, fd_targets):
+    def add_process(self, pid, comm, uid, fd_targets):
         proc = self.proc / str(pid)
         (proc / "fd").mkdir(parents=True)
         (proc / "comm").write_text(comm + "\n")
+        (proc / "status").write_text(
+            f"Name:\t{comm}\nState:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
+        )
         for number, target in enumerate(fd_targets):
             os.symlink(target, proc / "fd" / str(number))
 
@@ -126,6 +145,7 @@ class Tree:
             ioctl=ioctl,
             clock=clock.clock,
             sleep=clock.sleep,
+            lookup_uid=fake_lookup_uid,
         )
 
 
@@ -181,29 +201,51 @@ class HolderDetection(unittest.TestCase):
         self.tree = Tree(self._tmp.name)
         self.node = self.tree.node
 
-    def test_finds_process_holding_node(self):
-        self.tree.add_process(GREETER_PID, "halmasuit", [self.node])
-        self.assertEqual(
-            probe.holder_of(str(self.tree.proc), self.node, PROBE_PID),
-            probe.Holder(GREETER_PID, "halmasuit"),
-        )
+    def holder(self):
+        return probe.holder_of(str(self.tree.proc), self.node, PROBE_PID, CONSUMER_UID)
+
+    def test_finds_consumer_process_holding_node(self):
+        self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, [self.node])
+        self.assertEqual(self.holder(), probe.Holder(GREETER_PID, "halmasuit"))
 
     def test_skips_the_probe_itself(self):
-        self.tree.add_process(PROBE_PID, "python3", [self.node])
-        self.assertIsNone(probe.holder_of(str(self.tree.proc), self.node, PROBE_PID))
+        self.tree.add_process(PROBE_PID, "python3", CONSUMER_UID, [self.node])
+        self.assertIsNone(self.holder())
 
     def test_skips_udev_processes(self):
-        self.tree.add_process(UDEV_PID, "systemd-udevd", [self.node])
-        self.tree.add_process(UDEV_PID + 1, "(udev-worker)", [self.node])
-        self.assertIsNone(probe.holder_of(str(self.tree.proc), self.node, PROBE_PID))
+        self.tree.add_process(UDEV_PID, "systemd-udevd", CONSUMER_UID, [self.node])
+        self.tree.add_process(UDEV_PID + 1, "(udev-worker)", CONSUMER_UID, [self.node])
+        self.assertIsNone(self.holder())
 
     def test_ignores_other_nodes(self):
-        self.tree.add_process(GREETER_PID, "halmasuit", [str(self.tree.dev / "event9")])
-        self.assertIsNone(probe.holder_of(str(self.tree.proc), self.node, PROBE_PID))
+        self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, [str(self.tree.dev / "event9")])
+        self.assertIsNone(self.holder())
 
     def test_none_when_nothing_holds_node(self):
-        self.tree.add_process(GREETER_PID, "halmasuit", [])
-        self.assertIsNone(probe.holder_of(str(self.tree.proc), self.node, PROBE_PID))
+        self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, [])
+        self.assertIsNone(self.holder())
+
+    def test_root_owned_keyd_does_not_count(self):
+        self.tree.add_process(KEYD_PID, "keyd", ROOT_UID, [self.node])
+        self.assertIsNone(self.holder())
+
+    def test_root_owned_logind_does_not_count(self):
+        self.tree.add_process(LOGIND_PID, "systemd-logind", ROOT_UID, [self.node])
+        self.assertIsNone(self.holder())
+
+    def test_other_non_consumer_user_does_not_count(self):
+        self.tree.add_process(OTHER_USER_PID, "someapp", OTHER_USER_UID, [self.node])
+        self.assertIsNone(self.holder())
+
+    def test_consumer_holder_is_found_past_root_holders(self):
+        self.tree.add_process(KEYD_PID, "keyd", ROOT_UID, [self.node])
+        self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, [self.node])
+        self.assertEqual(self.holder(), probe.Holder(GREETER_PID, "halmasuit"))
+
+    def test_process_without_status_file_is_skipped(self):
+        self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, [self.node])
+        (self.tree.proc / str(GREETER_PID) / "status").unlink()
+        self.assertIsNone(self.holder())
 
 
 class Waiting(unittest.TestCase):
@@ -242,6 +284,17 @@ class SysfsNode(unittest.TestCase):
         self.assertEqual(probe.Host().dev_root, "/dev/input")
 
 
+class ConsumerArgument(unittest.TestCase):
+    def test_consumer_user_is_parsed_from_argv(self):
+        self.assertEqual(probe.parse_consumer_user(["--consumer-user", CONSUMER_USER]), CONSUMER_USER)
+
+    def test_consumer_user_is_required(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                probe.parse_consumer_user([])
+        self.assertEqual(raised.exception.code, 2)
+
+
 class ProbeRun(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -249,30 +302,39 @@ class ProbeRun(unittest.TestCase):
         self.tree = Tree(self._tmp.name)
         self.clock = FakeClock()
 
-    def test_success_types_password_and_reports_three_lines(self):
-        self.tree.add_input(SYSNAME, DEVICE)
-        self.tree.add_process(PROBE_PID, "python3", [self.tree.node])
-        self.tree.add_process(UDEV_PID, "systemd-udevd", [self.tree.node])
-        self.tree.add_process(GREETER_PID, "halmasuit", [self.tree.node])
-        ioctl = FakeUinput(SYSNAME, self.clock)
+    def run_probe(self, ioctl):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            status = probe.run(self.tree.host(ioctl, self.clock))
+            status = probe.run(self.tree.host(ioctl, self.clock), CONSUMER_USER)
+        return status, out.getvalue().splitlines()
+
+    def test_success_clears_field_then_types_password_and_reports_three_lines(self):
+        self.tree.add_input(SYSNAME, DEVICE)
+        self.tree.add_process(PROBE_PID, "python3", CONSUMER_UID, [self.tree.node])
+        self.tree.add_process(UDEV_PID, "systemd-udevd", ROOT_UID, [self.tree.node])
+        self.tree.add_process(KEYD_PID, "keyd", ROOT_UID, [self.tree.node])
+        self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, [self.tree.node])
+        ioctl = FakeUinput(SYSNAME, self.clock)
+        status, lines = self.run_probe(ioctl)
 
         self.assertEqual(status, 0)
         self.assertEqual(
-            out.getvalue().splitlines(),
+            lines,
             [
                 f"device node={self.tree.node}",
                 f"ready holder=halmasuit pid={GREETER_PID}",
-                f"typed keys={len(PASSWORD_CODES) + 1}",
+                f"typed keys={TYPED_KEYS}",
             ],
         )
+        self.assertEqual(TYPED_KEYS, 43)
         expected = []
-        for code in PASSWORD_CODES + [ENTER]:
+        for code in [BACKSPACE] * CLEAR_PRESSES + PASSWORD_CODES + [ENTER]:
             expected += [key_event(code, 1), syn_event(), key_event(code, 0), syn_event()]
         self.assertEqual(self.tree.uinput.read_bytes(), b"".join(expected))
-        self.assertEqual(sorted(set(ioctl.keybits)), sorted(set(PASSWORD_CODES + [ENTER])))
+        self.assertEqual(
+            sorted(set(ioctl.keybits)),
+            sorted(set(PASSWORD_CODES + [ENTER, BACKSPACE])),
+        )
         self.assertEqual(ioctl.requests[0], probe.UI_SET_EVBIT)
         self.assertIn(probe.UI_DEV_CREATE, ioctl.requests)
         self.assertEqual(ioctl.requests[-1], probe.UI_DEV_DESTROY)
@@ -281,42 +343,60 @@ class ProbeRun(unittest.TestCase):
     def test_node_timeout_reports_one_error_line_and_destroys(self):
         self.tree.add_input(SYSNAME)
         ioctl = FakeUinput(SYSNAME, self.clock)
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            status = probe.run(self.tree.host(ioctl, self.clock))
+        status, lines = self.run_probe(ioctl)
 
         self.assertEqual(status, 1)
-        lines = out.getvalue().splitlines()
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0].startswith("error reason="))
         self.assertEqual(ioctl.requests[-1], probe.UI_DEV_DESTROY)
 
     def test_holder_timeout_when_only_probe_and_udev_hold_node(self):
         self.tree.add_input(SYSNAME, DEVICE)
-        self.tree.add_process(PROBE_PID, "python3", [self.tree.node])
-        self.tree.add_process(UDEV_PID, "(udev-worker)", [self.tree.node])
+        self.tree.add_process(PROBE_PID, "python3", CONSUMER_UID, [self.tree.node])
+        self.tree.add_process(UDEV_PID, "(udev-worker)", ROOT_UID, [self.tree.node])
         ioctl = FakeUinput(SYSNAME, self.clock)
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            status = probe.run(self.tree.host(ioctl, self.clock))
+        status, lines = self.run_probe(ioctl)
 
         self.assertEqual(status, 1)
-        lines = out.getvalue().splitlines()
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[0], f"device node={self.tree.node}")
         self.assertTrue(lines[1].startswith("error reason="))
         self.assertEqual(ioctl.requests[-1], probe.UI_DEV_DESTROY)
         self.assertGreaterEqual(self.clock.now, 30)
 
-    def test_missing_uinput_reports_error_and_status_one(self):
-        self.tree.uinput.unlink()
+    def test_root_holders_alone_do_not_make_keyboard_ready(self):
+        self.tree.add_input(SYSNAME, DEVICE)
+        self.tree.add_process(KEYD_PID, "keyd", ROOT_UID, [self.tree.node])
+        self.tree.add_process(LOGIND_PID, "systemd-logind", ROOT_UID, [self.tree.node])
+        ioctl = FakeUinput(SYSNAME, self.clock)
+        status, lines = self.run_probe(ioctl)
+
+        self.assertEqual(status, 1)
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0], f"device node={self.tree.node}")
+        self.assertTrue(lines[1].startswith("error reason="))
+        self.assertEqual(ioctl.requests[-1], probe.UI_DEV_DESTROY)
+        self.assertGreaterEqual(self.clock.now, 30)
+
+    def test_unknown_consumer_user_reports_one_error_line_before_touching_uinput(self):
+        self.tree.add_input(SYSNAME, DEVICE)
         ioctl = FakeUinput(SYSNAME, self.clock)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            status = probe.run(self.tree.host(ioctl, self.clock))
+            status = probe.run(self.tree.host(ioctl, self.clock), "no-such-user")
 
         self.assertEqual(status, 1)
         lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("error reason="))
+        self.assertEqual(ioctl.requests, [])
+
+    def test_missing_uinput_reports_error_and_status_one(self):
+        self.tree.uinput.unlink()
+        ioctl = FakeUinput(SYSNAME, self.clock)
+        status, lines = self.run_probe(ioctl)
+
+        self.assertEqual(status, 1)
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0].startswith("error reason="))
         self.assertEqual(ioctl.requests, [])

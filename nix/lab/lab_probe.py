@@ -2,18 +2,23 @@
 """Lab-image keyboard probe: types one wrong password into the greeter.
 
 Creates a uinput virtual keyboard, waits for udev to publish its event node
-and for a process other than udev to hold that node open, types PASSWORD and
-Enter, holds the device briefly, then destroys it. PASSWORD is a fixed,
-obviously wrong constant: it is never read from anywhere and reaches the
-system only as key events.
+and for a process other than udev, running as the consumer user, to hold that
+node open, presses BackSpace 32 times to clear the focused field, types
+PASSWORD and Enter, holds the device briefly, then destroys it. PASSWORD is a
+fixed, obviously wrong constant: it is never read from anywhere and reaches
+the system only as key events.
+
+Usage: lab_probe.py --consumer-user USER
 
 On success prints `device node=`, `ready holder=`, and `typed keys=`, one
 line each. On failure prints one `error reason=` line and exits with status 1.
 """
 
+import argparse
 import dataclasses
 import fcntl
 import os
+import pwd
 import re
 import struct
 import sys
@@ -39,6 +44,8 @@ KEY_CODES = {
     "v": 47, "w": 17, "x": 45, "y": 21, "z": 44,
 }
 ENTER = 28
+KEY_BACKSPACE = 14
+CLEAR_PRESSES = 32
 
 EV_SYN = 0
 SYN_REPORT = 0
@@ -67,9 +74,13 @@ class Holder:
     comm: str
 
 
+def passwd_uid(user: str) -> int:
+    return pwd.getpwnam(user).pw_uid
+
+
 @dataclasses.dataclass(frozen=True)
 class Host:
-    """Every path, ioctl, and clock the probe touches; main() uses the defaults."""
+    """Every path, ioctl, clock, and account lookup the probe touches; main() uses the defaults."""
 
     uinput_path: str = "/dev/uinput"
     dev_root: str = "/dev/input"
@@ -79,6 +90,7 @@ class Host:
     ioctl: Callable[..., object] = fcntl.ioctl
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
+    lookup_uid: Callable[[str], int] = passwd_uid
 
 
 def ui_get_sysname(length: int) -> int:
@@ -105,14 +117,21 @@ def event_node_name(sysfs_root: str, sysname: str) -> str | None:
     return next((entry for entry in entries if EVENT_NODE.fullmatch(entry)), None)
 
 
-def holder_of(proc_root: str, node: str, self_pid: int) -> Holder | None:
+def real_uid(proc: str) -> int | None:
+    for line in Path(proc, "status").read_text().splitlines():
+        if line.startswith("Uid:"):
+            return int(line.split()[1])
+    return None
+
+
+def holder_of(proc_root: str, node: str, self_pid: int, consumer_uid: int) -> Holder | None:
     for entry in os.listdir(proc_root):
         if not entry.isdigit() or int(entry) == self_pid:
             continue
         proc = os.path.join(proc_root, entry)
         try:
             comm = Path(proc, "comm").read_text().strip()
-            if comm in UDEV_COMMS:
+            if comm in UDEV_COMMS or real_uid(proc) != consumer_uid:
                 continue
             fds = os.listdir(os.path.join(proc, "fd"))
         except OSError:
@@ -167,20 +186,20 @@ def wait_for_node(host: Host, sysname: str) -> str:
     return node
 
 
-def wait_for_holder(host: Host, node: str) -> Holder:
+def wait_for_holder(host: Host, node: str, consumer_uid: int) -> Holder:
     holder = wait_until(
-        lambda: holder_of(host.proc_root, node, host.self_pid),
+        lambda: holder_of(host.proc_root, node, host.self_pid, consumer_uid),
         timeout=WAIT_SECONDS,
         clock=host.clock,
         sleep=host.sleep,
     )
     if holder is None:
-        raise ProbeError(f"no process other than udev holds {node} within {WAIT_SECONDS}s")
+        raise ProbeError(f"no consumer-user process holds {node} within {WAIT_SECONDS}s")
     return holder
 
 
-def probe_keyboard(host: Host, fd: int) -> None:
-    codes = key_sequence(PASSWORD)
+def probe_keyboard(host: Host, fd: int, consumer_uid: int) -> None:
+    codes = [KEY_BACKSPACE] * CLEAR_PRESSES + key_sequence(PASSWORD)
     host.ioctl(fd, UI_SET_EVBIT, EV_KEY)
     for code in sorted(set(codes)):
         host.ioctl(fd, UI_SET_KEYBIT, code)
@@ -193,7 +212,7 @@ def probe_keyboard(host: Host, fd: int) -> None:
 
         node = wait_for_node(host, sysname)
         print(f"device node={node}", flush=True)
-        holder = wait_for_holder(host, node)
+        holder = wait_for_holder(host, node, consumer_uid)
         print(f"ready holder={holder.comm} pid={holder.pid}", flush=True)
 
         type_keys(lambda event: os.write(fd, event), codes, host.sleep)
@@ -208,13 +227,17 @@ def fail(reason: str) -> int:
     return 1
 
 
-def run(host: Host) -> int:
+def run(host: Host, consumer_user: str) -> int:
+    try:
+        consumer_uid = host.lookup_uid(consumer_user)
+    except KeyError:
+        return fail(f"unknown consumer user {consumer_user}")
     try:
         fd = os.open(host.uinput_path, os.O_WRONLY | os.O_NONBLOCK)
     except OSError as err:
         return fail(f"open {host.uinput_path}: {err}")
     try:
-        probe_keyboard(host, fd)
+        probe_keyboard(host, fd, consumer_uid)
     except (OSError, ProbeError) as err:
         return fail(str(err))
     finally:
@@ -222,8 +245,14 @@ def run(host: Host) -> int:
     return 0
 
 
-def main() -> int:
-    return run(Host())
+def parse_consumer_user(argv: list[str] | None) -> str:
+    parser = argparse.ArgumentParser(description="Type one wrong password into the greeter through a virtual keyboard.")
+    parser.add_argument("--consumer-user", required=True, metavar="USER", help="account whose process must hold the keyboard")
+    return parser.parse_args(argv).consumer_user
+
+
+def main(argv: list[str] | None = None) -> int:
+    return run(Host(), parse_consumer_user(argv))
 
 
 if __name__ == "__main__":

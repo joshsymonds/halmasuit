@@ -215,6 +215,15 @@ static void refresh_activity(int fd, struct head *heads, size_t count)
 	}
 }
 
+static bool any_head_active(const struct head *heads, size_t count)
+{
+	for (size_t i = 0; i < count; i++) {
+		if (heads[i].active)
+			return true;
+	}
+	return false;
+}
+
 static void sample_head(int fd, const char *card, struct head *h)
 {
 	struct drm_nvidia_get_crtc_crc32_v2_params p;
@@ -272,28 +281,22 @@ static void sample_head(int fd, const char *card, struct head *h)
 	       supported[0], supported[1], supported[2]);
 }
 
-int main(void)
+static _Noreturn void sample_forever(int fd, const char *card)
 {
-	char card[NAME_MAX + 1];
 	struct head *heads;
 	size_t count;
 	struct timespec next_refresh = { 0, 0 };
-	int fd;
-
-	if (setvbuf(stdout, NULL, _IOLBF, 0) != 0)
-		fatal("setvbuf", errno);
-	printf("start t=%" PRIu64 "\n", monotonic_us());
-
-	fd = wait_for_nvidia_card(card, sizeof card);
-	if (drmIsMaster(fd) && drmDropMaster(fd) != 0)
-		fatal("drmDropMaster", errno);
 
 	heads = read_heads(fd, &count);
 
 	for (;;) {
 		struct timespec round_start = now_mono();
 
-		if (!before(round_start, next_refresh)) {
+		/*
+		 * Activity is re-read every round while no head is active, so a
+		 * head that comes up is sampled in the round it first reads active.
+		 */
+		if (!any_head_active(heads, count) || !before(round_start, next_refresh)) {
 			refresh_activity(fd, heads, count);
 			next_refresh = add_ns(round_start, ACTIVITY_PERIOD_NS);
 		}
@@ -305,4 +308,20 @@ int main(void)
 			fatal("stdout write", errno);
 		sleep_until(add_ns(now_mono(), PACING_NS));
 	}
+}
+
+int main(void)
+{
+	char card[NAME_MAX + 1];
+	int fd;
+
+	if (setvbuf(stdout, NULL, _IOLBF, 0) != 0)
+		fatal("setvbuf", errno);
+	printf("start t=%" PRIu64 "\n", monotonic_us());
+
+	fd = wait_for_nvidia_card(card, sizeof card);
+	if (drmIsMaster(fd) && drmDropMaster(fd) != 0)
+		fatal("drmDropMaster", errno);
+
+	sample_forever(fd, card);
 }

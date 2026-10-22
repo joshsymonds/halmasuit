@@ -34,6 +34,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 import lab
 
@@ -108,6 +109,10 @@ FIRMWARE_LAYOUT = {
 FIRMWARE_LAYOUT["/sys/kernel/boot_params/data"] = "firmware/boot_params/data"
 PROBE_UNIT = "lab-probe.service"
 PROBE_USER = "joshsymonds"
+# The retry policy the probe must hold: starts, the wait after each start, and the deadline from the first start.
+PROBE_MAX_STARTS = 5
+PROBE_WAIT_SECONDS = 30
+PROBE_DEADLINE_SECONDS = 180
 PROBE_JOURNAL = ("sudo", "-n", "journalctl", "-b", "0", "-o", "cat", "--no-pager", "SYSLOG_FACILITY=10")
 PAM_DIR = "/etc/pam.d/"
 NIX_PAM_LIB = "/nix/store/0k8sd0c3i0lb8z3zqd1q3n1j9bq5vxk2-linux-pam-1.7.2/lib/security"
@@ -269,6 +274,14 @@ class FakeNetconsole:
         self.trace.append("listen:stop")
 
 
+class ProbeStart(NamedTuple):
+    """One `systemctl start` of lab-probe.service: the authpriv lines it writes, its exit status, and how long it blocks."""
+
+    lines: tuple[str, ...] = ()
+    rc: int = 0
+    seconds: float = 0.0
+
+
 class FakeGnomon:
     """Simulated gnomon behind the Layer seam.
 
@@ -304,6 +317,7 @@ class FakeGnomon:
         lab_pam_files: Mapping[str, str] | None = None,
         probe_log: Sequence[str] | None = None,
         probe_rc: int = 0,
+        probe_script: Sequence[ProbeStart] | None = None,
     ) -> None:
         self.lab_mode = lab_mode
         self.sessions = list(sessions)
@@ -361,10 +375,15 @@ class FakeGnomon:
         # lab entry's boot holds, since the lab image has its own toplevel. A name not in a tree is missing.
         self.pam_files = dict(pam_files or NIXOS_PAM)
         self.lab_pam_files = dict(lab_pam_files or NIXOS_PAM)
-        # probe_log is what lab-probe.service writes to the authpriv journal of the boot it runs on.
-        self.probe_log = [probe_line(PROBE_USER)] if probe_log is None else list(probe_log)
-        self.probe_rc = probe_rc
+        # probe_script gives each start of lab-probe.service in turn. Without it, every start writes
+        # probe_log and returns probe_rc, for as many starts as the runner may make.
+        if probe_script is None:
+            default = ProbeStart(tuple([probe_line(PROBE_USER)] if probe_log is None else probe_log), probe_rc)
+            probe_script = [default] * PROBE_MAX_STARTS
+        self.probe_script = list(probe_script)
+        self.clock = FakeClock()
         self.probe_starts: list[str] = []
+        self.probe_start_times: list[float] = []
         # authpriv maps a boot id to the SYSLOG_FACILITY=10 lines that boot's journal holds.
         self.authpriv: dict[str, list[str]] = {}
 
@@ -539,12 +558,18 @@ class FakeGnomon:
         raise UnscriptedCommand(argv)
 
     def _start_probe(self) -> lab.Result:
-        """`systemctl start` on a oneshot: returns when the probe exits, nonzero when it failed."""
+        """`systemctl start` on a oneshot: blocks for the start's duration, then returns nonzero when it failed."""
+        index = len(self.probe_starts)
+        if index >= len(self.probe_script):
+            raise UnscriptedCommand(("sudo", "-n", "systemctl", "start", PROBE_UNIT))
+        start = self.probe_script[index]
         self.probe_starts.append(self.current_boot)
+        self.probe_start_times.append(self.clock.now)
         self.trace.append("probe:start")
-        self.authpriv.setdefault(self.current_boot, []).extend(self.probe_log)
-        if self.probe_rc != 0:
-            return lab.Result(self.probe_rc, "", f"Job for {PROBE_UNIT} failed")
+        self.authpriv.setdefault(self.current_boot, []).extend(start.lines)
+        self.clock.sleep(start.seconds)
+        if start.rc != 0:
+            return lab.Result(start.rc, "", f"Job for {PROBE_UNIT} failed")
         return _ok()
 
     def _read_pam(self, name: str) -> lab.Result:
@@ -660,7 +685,7 @@ class LabRunnerTest(unittest.TestCase):
         ]
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = lab.main(argv, layer=gnomon, clock=FakeClock())
+            code = lab.main(argv, layer=gnomon, clock=gnomon.clock)
         return code, out.getvalue(), err.getvalue()
 
     def run_traced(self, name: str, gnomon: FakeGnomon) -> None:
@@ -668,7 +693,7 @@ class LabRunnerTest(unittest.TestCase):
         self.state_root = self.tmp / f"runs-{next(self.runs)}"
         runner = lab.Lab(
             gnomon,
-            FakeClock(),
+            gnomon.clock,
             repo_root=Path(REPO),
             nix_config=Path(NIX_CONFIG),
             state_root=self.state_root,
@@ -1266,6 +1291,7 @@ class LabRunnerTest(unittest.TestCase):
                 "refused": None,
                 "started": True,
                 "unit_returncode": 0,
+                "attempts": [{"unit_returncode": 0, "matched": probe_line(PROBE_USER)}],
                 "matched": probe_line(PROBE_USER),
                 "passed": True,
             },
@@ -1311,6 +1337,7 @@ class LabRunnerTest(unittest.TestCase):
         record = self.probe_record("baseline")
         self.assertIn("greeter", record["refused"])
         self.assertFalse(record["started"])
+        self.assertEqual(record["attempts"], [])
         self.assertIsNone(record["matched"])
         self.assertFalse(record["passed"])
         self.assertEqual(gnomon.events.count("reboot"), 2)
@@ -1332,6 +1359,7 @@ class LabRunnerTest(unittest.TestCase):
                     self.assertIn(module, record["refused"])
                     self.assertEqual(set(record["lockout"]), {module})
                     self.assertFalse(record["started"])
+                    self.assertEqual(record["attempts"], [])
                     self.assertIsNone(record["matched"])
                     self.assertEqual(gnomon.events.count("reboot"), 2)
 
@@ -1351,6 +1379,7 @@ class LabRunnerTest(unittest.TestCase):
                 self.assertIsNone(record["pam_files"])
                 self.assertIsNone(record["lockout"])
                 self.assertFalse(record["started"])
+                self.assertEqual(record["attempts"], [])
                 self.assertEqual(gnomon.events.count("reboot"), 2)
 
     def test_missing_user_line_fails_the_run_after_the_return(self) -> None:
@@ -1372,9 +1401,10 @@ class LabRunnerTest(unittest.TestCase):
                 code, _, err = self.run_queue(["baseline"], gnomon)
                 self.assertEqual(code, 1)
                 self.assertIn("probe did not pass", err)
-                self.assertEqual(gnomon.probe_starts, [gnomon.lab_boot])
+                self.assertEqual(gnomon.probe_starts, [gnomon.lab_boot] * PROBE_MAX_STARTS)
                 record = self.probe_record("baseline")
                 self.assertTrue(record["started"])
+                self.assertEqual(len(record["attempts"]), PROBE_MAX_STARTS)
                 self.assertIsNone(record["refused"])
                 self.assertIsNone(record["matched"])
                 self.assertFalse(record["passed"])
@@ -1388,8 +1418,85 @@ class LabRunnerTest(unittest.TestCase):
         self.assertEqual(code, 1)
         record = self.probe_record("baseline")
         self.assertEqual(record["unit_returncode"], 1)
+        self.assertEqual(gnomon.probe_starts, [gnomon.lab_boot] * PROBE_MAX_STARTS)
+        self.assertEqual(record["attempts"], [{"unit_returncode": 1, "matched": None}] * PROBE_MAX_STARTS)
         self.assertFalse(record["passed"])
         self.assertEqual(gnomon.events.count("reboot"), 2)
+
+    def test_probe_retries_until_the_line_appears_on_a_later_start(self) -> None:
+        gnomon = FakeGnomon(probe_script=[ProbeStart((), 1), ProbeStart((probe_line(PROBE_USER),), 0)])
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(gnomon.probe_starts, [gnomon.lab_boot] * 2)
+        record = self.probe_record("baseline")
+        self.assertEqual(
+            record["attempts"],
+            [
+                {"unit_returncode": 1, "matched": None},
+                {"unit_returncode": 0, "matched": probe_line(PROBE_USER)},
+            ],
+        )
+        self.assertEqual(record["unit_returncode"], 0)
+        self.assertEqual(record["matched"], probe_line(PROBE_USER))
+        self.assertTrue(record["passed"])
+
+    def test_no_start_follows_the_start_whose_wait_matched(self) -> None:
+        matched = ProbeStart((probe_line(PROBE_USER),), 0)
+        gnomon = FakeGnomon(probe_script=[matched, matched])
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(gnomon.probe_starts, [gnomon.lab_boot])
+        self.assertEqual(len(self.probe_record("baseline")["attempts"]), 1)
+
+    def test_each_attempt_records_its_own_return_code_and_match(self) -> None:
+        gnomon = FakeGnomon(
+            probe_script=[ProbeStart((), 3), ProbeStart((), 2), ProbeStart((probe_line(PROBE_USER),), 0)]
+        )
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            self.probe_record("baseline")["attempts"],
+            [
+                {"unit_returncode": 3, "matched": None},
+                {"unit_returncode": 2, "matched": None},
+                {"unit_returncode": 0, "matched": probe_line(PROBE_USER)},
+            ],
+        )
+
+    def test_at_most_five_starts_and_the_last_return_code_is_recorded(self) -> None:
+        gnomon = FakeGnomon(probe_script=[ProbeStart((), rc) for rc in range(1, 7)])
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 1)
+        self.assertIn("probe did not pass", err)
+        self.assertEqual(gnomon.probe_starts, [gnomon.lab_boot] * PROBE_MAX_STARTS)
+        record = self.probe_record("baseline")
+        self.assertEqual(
+            record["attempts"],
+            [{"unit_returncode": rc, "matched": None} for rc in range(1, PROBE_MAX_STARTS + 1)],
+        )
+        self.assertEqual(record["unit_returncode"], PROBE_MAX_STARTS)
+        self.assertIsNone(record["matched"])
+        self.assertFalse(record["passed"])
+        self.assertEqual(gnomon.events.count("reboot"), 2)
+
+    def test_each_start_is_followed_by_a_thirty_second_wait(self) -> None:
+        gnomon = FakeGnomon(probe_script=[ProbeStart((), 1)] * PROBE_MAX_STARTS)
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 1)
+        first = gnomon.probe_start_times[0]
+        self.assertEqual(
+            [at - first for at in gnomon.probe_start_times],
+            [index * PROBE_WAIT_SECONDS for index in range(PROBE_MAX_STARTS)],
+        )
+
+    def test_no_start_begins_once_180_seconds_have_passed_since_the_first(self) -> None:
+        # Each start blocks 100 s: the second begins at 130 s, and the third would begin at 260 s, past the deadline.
+        gnomon = FakeGnomon(probe_script=[ProbeStart((), 1, seconds=100)] * PROBE_MAX_STARTS)
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 1)
+        first = gnomon.probe_start_times[0]
+        self.assertEqual([at - first for at in gnomon.probe_start_times], [0, 130])
+        self.assertEqual(len(self.probe_record("baseline")["attempts"]), 2)
 
     def test_line_from_an_earlier_boot_does_not_pass(self) -> None:
         gnomon = FakeGnomon(probe_log=[])
@@ -1411,6 +1518,7 @@ class LabRunnerTest(unittest.TestCase):
                 self.assertEqual(set(record["lockout"]), {module})
                 self.assertIn(module, record["refused"])
                 self.assertFalse(record["started"])
+                self.assertEqual(record["attempts"], [])
                 self.assertEqual(gnomon.events.count("reboot"), 2)
 
     def test_lockout_only_on_the_default_boot_stack_does_not_refuse_the_lab_boot_probe(self) -> None:
