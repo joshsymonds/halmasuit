@@ -6,8 +6,9 @@ accepts only the command shapes written here and raises UnscriptedCommand on
 anything else, so no ssh, nix, sbctl, or network call can reach a real host.
 Polling deadlines elapse on FakeClock, so nothing sleeps.
 
-The shapes follow the real tools: `nix build` of config.system.build.uki
-prints a directory holding one .efi image; `sbctl sign -o OUT IN` signs with
+The shapes follow the real tools: `nix build --eval-store auto --store ssh-ng://gnomon`
+realises config.system.build.uki in gnomon's store and prints a directory
+holding one .efi image that only gnomon can list; `sbctl sign -o OUT IN` signs with
 sbctl's own db key; `bootctl list --json=short` marks the entry the loader
 boots next with isDefault, a one-shot entry included; `bootctl set-oneshot ""`
 clears the one-shot.
@@ -51,6 +52,16 @@ GIB = 1024 * MIB
 UKI_BYTES = 60 * MIB
 INSTALLABLE = re.compile(
     r"(?P<nix>.+)#labSystems\.gnomon\.(?P<exp>[a-z-]+)\.config\.system\.build\.(?P<kind>toplevel|uki)"
+)
+BUILD_PREFIX = (
+    "nix",
+    "build",
+    "--eval-store",
+    "auto",
+    "--store",
+    "ssh-ng://gnomon",
+    "--no-link",
+    "--print-out-paths",
 )
 UKI_DIR = re.compile(r"/nix/store/aaaa-(?P<exp>[a-z-]+)-uki")
 UKI_IMAGE = re.compile(r"/nix/store/aaaa-[a-z-]+-uki/" + re.escape(UKI_IMAGE_NAME))
@@ -213,26 +224,16 @@ class FakeGnomon:
         self.calls.append(("local", command))
         if command == ("git", "-C", REPO, "rev-parse", "HEAD"):
             return _ok(f"{REV}\n")
-        if len(command) == 8 and command[:4] == ("nix", "build", "--no-link", "--print-out-paths"):
-            match = INSTALLABLE.fullmatch(command[4])
+        if len(command) == 12 and command[:8] == BUILD_PREFIX:
+            match = INSTALLABLE.fullmatch(command[8])
             if (
                 match is None
                 or match["nix"] != NIX_CONFIG
-                or command[5:] != ("--override-input", "halmasuit", f"git+file://{REPO}?rev={REV}")
+                or command[9:] != ("--override-input", "halmasuit", f"git+file://{REPO}?rev={REV}")
             ):
                 raise UnscriptedCommand(command)
             self.events.append(f"build:{match['exp']}:{match['kind']}")
             return _ok(f"/nix/store/aaaa-{match['exp']}-{match['kind']}\n")
-        if len(command) == 3 and command[:2] == ("ls", "-1") and UKI_DIR.fullmatch(command[2]):
-            return _ok("".join(f"{name}\n" for name in self.uki_files))
-        if (
-            len(command) == 5
-            and command[:4] == ("nix", "copy", "--to", "ssh://gnomon")
-            and command[4].startswith("/nix/store/")
-        ):
-            kind = "uki" if UKI_DIR.fullmatch(command[4]) else "toplevel"
-            self.events.append(f"copy:{kind}")
-            return _ok()
         raise UnscriptedCommand(command)
 
     def remote(self, argv: Sequence[str]) -> lab.Result:
@@ -277,6 +278,8 @@ class FakeGnomon:
             return _ok(f"{UKI_BYTES}\n")
         if argv == ("sudo", "-n", "bootctl", "list", "--json=short"):
             return _ok(self._listing())
+        if len(argv) == 3 and argv[:2] == ("ls", "-1") and UKI_DIR.fullmatch(argv[2]):
+            return _ok("".join(f"{name}\n" for name in self.uki_files))
         if argv == ("ls", "-1", "/nix/var/nix/profiles"):
             return _ok("".join(f"{name}\n" for name in self.profiles))
         if argv == ("sudo", "-n", "cp", STAGED, ESP):
@@ -316,17 +319,15 @@ class FakeGnomon:
             self.pending = True
 
 
-BUILD_AND_COPY = [
+BUILDS = [
     "build:{exp}:toplevel",
     "build:{exp}:uki",
-    "copy:toplevel",
-    "copy:uki",
 ]
 
 
 def fault_sequence(exp: str) -> list[str]:
     return [
-        *(event.format(exp=exp) for event in BUILD_AND_COPY),
+        *(event.format(exp=exp) for event in BUILDS),
         "stage",
         "rm-entry",
         "install",
@@ -367,6 +368,40 @@ class LabRunnerTest(unittest.TestCase):
         self.assertEqual(len(found), 1, found)
         return found[0]
 
+    def test_images_are_built_in_gnomon_store_from_the_pinned_head(self) -> None:
+        gnomon = FakeGnomon()
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 0, err)
+        for kind in ("toplevel", "uki"):
+            with self.subTest(kind=kind):
+                argv = (
+                    "nix",
+                    "build",
+                    "--eval-store",
+                    "auto",
+                    "--store",
+                    "ssh-ng://gnomon",
+                    "--no-link",
+                    "--print-out-paths",
+                    f"{NIX_CONFIG}#labSystems.gnomon.baseline.config.system.build.{kind}",
+                    "--override-input",
+                    "halmasuit",
+                    f"git+file://{REPO}?rev={REV}",
+                )
+                self.assertIn(("local", argv), gnomon.calls)
+
+    def test_uki_directory_is_listed_on_gnomon(self) -> None:
+        gnomon = FakeGnomon()
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 0, err)
+        self.assertIn(("remote", ("ls", "-1", "/nix/store/aaaa-baseline-uki")), gnomon.calls)
+
+    def test_no_nix_copy_is_issued(self) -> None:
+        gnomon = FakeGnomon()
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 0, err)
+        self.assertEqual([argv for _, argv in gnomon.calls if argv[:2] == ("nix", "copy")], [])
+
     def test_baseline_boots_lab_then_returns_to_default(self) -> None:
         gnomon = FakeGnomon()
         code, _, err = self.run_queue(["baseline"], gnomon)
@@ -376,8 +411,6 @@ class LabRunnerTest(unittest.TestCase):
             [
                 "build:baseline:toplevel",
                 "build:baseline:uki",
-                "copy:toplevel",
-                "copy:uki",
                 "stage",
                 "rm-entry",
                 "install",
@@ -410,7 +443,7 @@ class LabRunnerTest(unittest.TestCase):
         self.assertEqual(
             gnomon.events,
             [
-                *(event.format(exp="fault-poweroff") for event in BUILD_AND_COPY),
+                *(event.format(exp="fault-poweroff") for event in BUILDS),
                 "stage",
                 "rm-entry",
                 "install",
@@ -431,7 +464,7 @@ class LabRunnerTest(unittest.TestCase):
         self.assertEqual(
             gnomon.events,
             [
-                *(event.format(exp="baseline") for event in BUILD_AND_COPY),
+                *(event.format(exp="baseline") for event in BUILDS),
                 "stage",
                 "rm-entry",
                 "install",
@@ -458,7 +491,6 @@ class LabRunnerTest(unittest.TestCase):
         code, _, err = self.run_queue(["fault-panic"], gnomon)
         self.assertEqual(code, 1)
         self.assertIn("exactly one", err)
-        self.assertNotIn("copy:uki", gnomon.events)
         self.assertNotIn("stage", gnomon.events)
 
     def test_esp_room_must_cover_image_plus_200_mib(self) -> None:

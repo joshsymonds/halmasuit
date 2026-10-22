@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Vermissian-side lab runner: boots gnomon into lab UKIs and back.
 
-Per experiment: build the lab toplevel and UKI from nix-config's `labSystems`
-output, copy both to gnomon, sign the UKI with the sbctl db key into a staging
-path, check the ESP has room, record the boot entries, default entry, and
-system generations, install the UKI as a one-shot ESP entry, reboot, and
-verify gnomon returns to the pre-run default with the pre-run record intact.
+Per experiment: realise the lab toplevel and UKI from nix-config's `labSystems`
+output in gnomon's store (evaluated here, built by gnomon), list the UKI image
+on gnomon, sign it with the sbctl db key into a staging path, check the ESP has
+room, record the boot entries, default entry, and system generations, install
+the UKI as a one-shot ESP entry, reboot, and verify gnomon returns to the
+pre-run default with the pre-run record intact.
 The lab entry is removed on the way out.
 
 Every remote, local, clock, and magic-packet effect goes through the `Layer`
@@ -261,11 +262,9 @@ class Lab:
         try:
             head = self._head_rev()
             run.say(f"experiment {name} from halmasuit {head}")
-            toplevel = self._build(name, "toplevel", head)
+            self._build(name, "toplevel", head)
             uki = self._build(name, "uki", head)
             image = self._uki_image(uki)
-            self._copy(toplevel)
-            self._copy(uki)
             self._stage(image)
             self._remove_entry()
             self._check_esp_room(image)
@@ -328,6 +327,10 @@ class Lab:
                 [
                     "nix",
                     "build",
+                    "--eval-store",
+                    "auto",
+                    "--store",
+                    f"ssh-ng://{GNOMON}",
                     "--no-link",
                     "--print-out-paths",
                     installable,
@@ -344,14 +347,11 @@ class Lab:
 
     def _uki_image(self, uki: str) -> str:
         """The one .efi image inside the UKI store directory."""
-        names = _ok(self.layer.local(["ls", "-1", uki]), f"list {uki}").split()
+        names = _ok(self.layer.remote(["ls", "-1", uki]), f"list {uki}").split()
         images = [name for name in names if name.endswith(".efi")]
         if len(images) != 1:
             raise LabError(f"{uki} holds {len(images)} .efi images, expected exactly one")
         return f"{uki}/{images[0]}"
-
-    def _copy(self, path: str) -> None:
-        _ok(self.layer.local(["nix", "copy", "--to", f"ssh://{GNOMON}", path]), f"nix copy {path}")
 
     def _stage(self, image: str) -> None:
         _ok(
