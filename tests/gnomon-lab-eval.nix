@@ -75,6 +75,14 @@ let
 
   armed = v: v != null && v != "0";
 
+  # initrd storePaths entries are packages or { source, target, ... } sets.
+  inStorePaths = c: pkg:
+    builtins.any (p: "${if p ? source then p.source else p}" == "${pkg}")
+      (get c [ "boot" "initrd" "systemd" "storePaths" ] [ ]);
+
+  # The CRC sampler, built from the same derivation the module stages.
+  labCrc = pkgs.callPackage ../nix/lab/lab-crc.nix { };
+
   # ── Lab instrumentation fixtures ─────────────────────────────────────
   nc = labOptions.netconsole;
   netconsoleDevice = "sys-subsystem-net-devices-${nc.interface}.device";
@@ -88,6 +96,8 @@ let
   disabledNew = (evalWith (labOptions // { enable = false; })).config;
   # The same host with netconsole off: the firewall must match it exactly.
   netconsoleOff = (evalWith (labOptions // { netconsole = nc // { enable = false; }; })).config;
+  # The same host with the CRC sampler off: neither unit may appear.
+  crcOff = (evalWith (labOptions // { crcSampler = { enable = false; }; })).config;
   # No lab settings at all: the new options must default off or empty.
   defaults = (evalWith { }).config.halmasuit.lab;
 
@@ -228,9 +238,7 @@ let
     # ── Netconsole from stage 1: outbound UDP only ───────────────────
     { ok = builtins.elem "netconsole" (get cfg [ "boot" "initrd" "availableKernelModules" ] [ ]);
       msg = "netconsole is not in boot.initrd.availableKernelModules"; }
-    # initrd storePaths entries are packages or { source, target, ... } sets.
-    { ok = builtins.any (p: "${if p ? source then p.source else p}" == "${pkgs.kmod}")
-        (get cfg [ "boot" "initrd" "systemd" "storePaths" ] [ ]);
+    { ok = inStorePaths cfg pkgs.kmod;
       msg = "kmod (modprobe) is not in boot.initrd.systemd.storePaths"; }
     { ok = (netconsoleUnit.serviceConfig.ExecStart or null)
         == "${pkgs.kmod}/bin/modprobe netconsole netconsole=+@${nc.sourceIp}/${nc.interface},${toString nc.port}@${nc.targetIp}/";
@@ -421,7 +429,38 @@ let
       rescueChecks name c ++ faultCheck name c)
     faultChecks);
 
-  allChecks = checks ++ journalChecks ++ experimentChecks;
+  # ── CRC sampler units: stage 1 and rootfs ────────────────────────────
+  crcInitrd = get cfg [ "boot" "initrd" "systemd" "services" "lab-crc-initrd" ] { };
+  crcRoot = get cfg [ "systemd" "services" "lab-crc" ] { };
+  crcUnitChecks = label: unit: [
+    { ok = (unit.serviceConfig.ExecStart or null) == "${labCrc}/bin/lab-crc";
+      msg = "${label} does not run the lab-crc sampler binary"; }
+    { ok = (unit.serviceConfig.SyslogIdentifier or null) == "lab-crc";
+      msg = "${label} lacks SyslogIdentifier=lab-crc"; }
+    { ok = (unit.serviceConfig.Restart or null) == "on-failure";
+      msg = "${label} does not restart the sampler on failure"; }
+    { ok = (unit.unitConfig.DefaultDependencies or true) == false;
+      msg = "${label} lacks DefaultDependencies=no"; }
+    { ok = builtins.elem "sysinit.target" (unit.wantedBy or [ ]);
+      msg = "${label} is not wanted by sysinit.target"; }
+  ];
+  crcChecks = crcUnitChecks "lab-crc-initrd.service" crcInitrd
+    ++ crcUnitChecks "lab-crc.service" crcRoot ++ [
+    { ok = inStorePaths cfg labCrc;
+      msg = "the lab-crc sampler is not in boot.initrd.systemd.storePaths (stage 1 would miss it)"; }
+    { ok = builtins.elem labOptions.displayManagerUnit (crcRoot.before or [ ]);
+      msg = "lab-crc.service is not Before=${labOptions.displayManagerUnit} (the display manager's DRM master must follow the drop)"; }
+    { ok = (get crcOff [ "boot" "initrd" "systemd" "services" "lab-crc-initrd" ] null) == null
+        && (get crcOff [ "systemd" "services" "lab-crc" ] null) == null
+        && !(inStorePaths crcOff labCrc);
+      msg = "crcSampler.enable = false still defines a lab-crc unit or stages the sampler"; }
+    { ok = (get disabledNew [ "boot" "initrd" "systemd" "services" "lab-crc-initrd" ] null) == null
+        && (get disabledNew [ "systemd" "services" "lab-crc" ] null) == null
+        && !(inStorePaths disabledNew labCrc);
+      msg = "enable = false (with crcSampler.enable = true) still defines a lab-crc unit or stages the sampler"; }
+  ];
+
+  allChecks = checks ++ journalChecks ++ experimentChecks ++ crcChecks;
   failures = builtins.filter (c: !c.ok) allChecks;
   report = lib.concatMapStrings
     (c: "echo ${lib.escapeShellArg "FAIL: ${c.msg}"} >&2\n")
@@ -430,5 +469,6 @@ in
 pkgs.runCommand "gnomon-lab-eval" { } ''
   ${report}
   ${lib.optionalString (failures != [ ]) "exit 1"}
+  test -x ${labCrc}/bin/lab-crc
   echo "gnomon-lab-eval: ${toString (builtins.length allChecks)} checks passed" > $out
 ''

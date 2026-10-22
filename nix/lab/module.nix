@@ -5,8 +5,9 @@
 # The module declares no specialisation and adds no generation or boot entry.
 #
 # Lab instrumentation settings: netconsole from the initramfs, U2F off for
-# listed PAM services, and the crcSampler and probe options whose units are
-# not defined here yet. Every option defaults off or empty.
+# listed PAM services, and the lab-crc scanout sampler, which runs in stage 1
+# and after switch-root. The probe option is declared here, and its unit is
+# not defined yet. Every option defaults off or empty.
 #
 # Journal contract (frozen; consumed by tests/hw/timeline.py). Each entry is
 # one journal line, identified by SYSLOG_IDENTIFIER. `t` is CLOCK_MONOTONIC in
@@ -41,6 +42,8 @@ let
   };
 
   netconsoleDevice = "sys-subsystem-net-devices-${cfg.netconsole.interface}.device";
+
+  labCrc = pkgs.callPackage ./lab-crc.nix { };
 in
 {
   options.halmasuit.lab = {
@@ -209,7 +212,9 @@ in
       }
     ];
     boot.initrd.availableKernelModules = lib.optional cfg.netconsole.enable "netconsole";
-    boot.initrd.systemd.storePaths = lib.optional cfg.netconsole.enable pkgs.kmod;
+    boot.initrd.systemd.storePaths =
+      lib.optional cfg.netconsole.enable pkgs.kmod
+      ++ lib.optional cfg.crcSampler.enable labCrc;
     boot.initrd.systemd.services.lab-netconsole = lib.mkIf cfg.netconsole.enable {
       wantedBy = [ "initrd.target" ];
       bindsTo = [ netconsoleDevice ];
@@ -219,6 +224,31 @@ in
         Type = "oneshot";
         RemainAfterExit = true;
         ExecStart = "${pkgs.kmod}/bin/modprobe netconsole netconsole=+@${cfg.netconsole.sourceIp}/${cfg.netconsole.interface},${toString cfg.netconsole.port}@${cfg.netconsole.targetIp}/";
+      };
+    };
+
+    # CRC sampler. The stage-1 unit starts as early as stage 1 allows and is
+    # stopped by the switch-root isolate. The rootfs unit is started before the
+    # display manager; the sampler opens the card and drops DRM master within
+    # microseconds of starting, long before the greeter compositor opens it.
+    # Both restart the sampler when it exits nonzero.
+    boot.initrd.systemd.services.lab-crc-initrd = lib.mkIf cfg.crcSampler.enable {
+      wantedBy = [ "sysinit.target" ];
+      unitConfig.DefaultDependencies = false;
+      serviceConfig = {
+        ExecStart = "${labCrc}/bin/lab-crc";
+        SyslogIdentifier = "lab-crc";
+        Restart = "on-failure";
+      };
+    };
+    systemd.services.lab-crc = lib.mkIf cfg.crcSampler.enable {
+      wantedBy = [ "sysinit.target" ];
+      before = [ cfg.displayManagerUnit ];
+      unitConfig.DefaultDependencies = false;
+      serviceConfig = {
+        ExecStart = "${labCrc}/bin/lab-crc";
+        SyslogIdentifier = "lab-crc";
+        Restart = "on-failure";
       };
     };
 
