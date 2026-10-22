@@ -18,6 +18,11 @@ When an experiment checks its lab boot, the runner copies gnomon's firmware and
 loader evidence (FPDT, BGRT, boot_params, and the systemd-boot efivars) into the
 run's firmware/ directory while the lab entry is up; a file gnomon lacks is noted in
 run.log and skipped.
+Once gnomon has returned, the runner saves the lab boot's journal as journal.json in the
+run directory (`journalctl -b ID -o json`). A checked lab boot is known from the boot the
+runner saw; otherwise the lab boot is the boot list-boots lists right after the boot the
+run started from. A lab boot with no journal, or a journal gnomon cannot give, is noted in
+run.log and no journal.json is written; neither changes the run's outcome.
 
 Every remote, local, clock, UDP, and magic-packet effect goes through the `Layer`
 and `Clock` objects handed to `Lab`, so test_lab.py runs the whole sequence
@@ -299,6 +304,24 @@ def parse_bootctl_list(listing: str) -> tuple[list[str], str]:
     return entries, defaults[0]
 
 
+def parse_boot_list(listing: str) -> list[str]:
+    """Boot ids in chronological order, as `journalctl --list-boots -o json` prints them."""
+    try:
+        records = json.loads(listing)
+    except json.JSONDecodeError as err:
+        raise LabError(f"journalctl --list-boots printed no JSON: {err}") from err
+    if not isinstance(records, list) or not all(
+        isinstance(record, dict) and isinstance(record.get("boot_id"), str) for record in records
+    ):
+        raise LabError("journalctl --list-boots JSON is not a list of boots with ids")
+    return [record["boot_id"] for record in records]
+
+
+def _boot_key(boot: str) -> str:
+    """A boot id with its dashes removed and lowercased, so list-boots and /proc ids compare equal."""
+    return boot.replace("-", "").lower()
+
+
 def parse_generations(profiles: str) -> tuple[int, ...]:
     numbers = []
     for name in profiles.split():
@@ -425,9 +448,11 @@ class Lab:
             self._refuse_if_graphical("refusing before reboot")
             self._reboot()
             booted_from = boot_before
+            lab_boot: str | None = None
             if plan.lab_boot_checked:
-                booted_from = self._await_boot("lab entry to boot", boot_before, LAB_ENTRY)
-                run.say(f"lab entry booted as {booted_from}")
+                lab_boot = self._await_boot("lab entry to boot", boot_before, LAB_ENTRY)
+                booted_from = lab_boot
+                run.say(f"lab entry booted as {lab_boot}")
                 self._collect_firmware(run)
                 self._refuse_if_graphical("refusing before return reboot")
                 self._reboot()
@@ -440,6 +465,7 @@ class Lab:
             else:
                 returned = self._await_boot("default entry to return", booted_from, pre.default)
             run.say(f"gnomon returned to {pre.default} as {returned}")
+            self._collect_journal(run, boot_before, lab_boot, returned)
             self._await_display_manager()
             self._remove_entry()
             _, post = self._record()
@@ -663,6 +689,50 @@ class Lab:
             destination = run.directory / _firmware_destination(remote)
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(data)
+
+    def _collect_journal(self, run: RunLog, before: str, lab_boot: str | None, returned: str) -> None:
+        """Save the lab boot's journal as journal.json; a lab boot gnomon cannot give is noted, not failed."""
+        if lab_boot is None:
+            lab_boot = self._lab_boot_after(run, before, returned)
+            if lab_boot is None:
+                return
+        # journalctl -b takes the undashed id; /proc prints boot ids dashed.
+        result = self.layer.remote(
+            ["sudo", "-n", "journalctl", "-b", _boot_key(lab_boot), "-o", "json", "--no-pager"]
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or "no output"
+            run.say(
+                f"journal: journalctl -b {lab_boot} failed (rc {result.returncode}): {detail}; "
+                "journal.json not written"
+            )
+            return
+        (run.directory / "journal.json").write_bytes(result.stdout.encode("utf-8"))
+
+    def _lab_boot_after(self, run: RunLog, before: str, returned: str) -> str | None:
+        """The boot list-boots lists right after `before`, or None when the lab boot left no journal."""
+        result = self.layer.remote(["sudo", "-n", "journalctl", "--list-boots", "-o", "json", "--no-pager"])
+        if result.returncode != 0:
+            detail = result.stderr.strip() or "no output"
+            run.say(
+                f"journal: journalctl --list-boots failed (rc {result.returncode}): {detail}; "
+                "journal.json not written"
+            )
+            return None
+        try:
+            boots = parse_boot_list(result.stdout)
+        except LabError as err:
+            run.say(f"journal: {err}; journal.json not written")
+            return None
+        keys = [_boot_key(boot) for boot in boots]
+        if _boot_key(before) not in keys:
+            run.say(f"journal: boot {before} from before the run is not listed; journal.json not written")
+            return None
+        following = keys.index(_boot_key(before)) + 1
+        if following == len(boots) or keys[following] == _boot_key(returned):
+            run.say("journal: lab boot left no journal; journal.json not written")
+            return None
+        return boots[following]
 
     def _abort(self, run: RunLog) -> None:
         run.say("aborting: removing the lab entry and clearing the one-shot")

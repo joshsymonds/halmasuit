@@ -14,6 +14,10 @@ boots next with isDefault, a one-shot entry included; `bootctl set-oneshot ""`
 clears the one-shot. `nix build` out paths are the fake's `/nix/store/aaaa-EXP-KIND`,
 and `sudo -n ln -sfnT TARGET LINK` points a GC root at a build out path, replacing
 any link already there; it fails while the GC root directory is missing.
+Boot ids are dashed UUIDs as /proc/sys/kernel/random/boot_id prints them;
+`journalctl --list-boots -o json` prints them without dashes; `journalctl -b ID -o json` takes
+only the undashed form (a dashed id fails with "Failed to add match 'ID': Invalid argument") and
+fails with "Data from the specified boot (ID) is not available" for a boot with no journal.
 """
 
 import base64
@@ -26,6 +30,7 @@ import socket
 import tempfile
 import threading
 import unittest
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -148,6 +153,21 @@ def _ok(stdout: str = "") -> lab.Result:
     return lab.Result(0, stdout, "")
 
 
+def boot_uuid(label: str) -> str:
+    """A dashed, lowercase UUID shaped like /proc/sys/kernel/random/boot_id, stable per label."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"halmasuit-test-boot:{label}"))
+
+
+def journal_of(boot: str) -> str:
+    """A boot's `journalctl -o json` output: one compact object per line, carrying the boot's undashed id."""
+    undashed = boot.replace("-", "")
+    records = [
+        {"__REALTIME_TIMESTAMP": "1000001", "_BOOT_ID": undashed, "MESSAGE": f"kernel line for {boot}"},
+        {"__REALTIME_TIMESTAMP": "1000002", "_BOOT_ID": undashed, "MESSAGE": "unicode é survives"},
+    ]
+    return "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records)
+
+
 def bootctl_json(ids: Sequence[str], defaults: Sequence[str], reported: Sequence[str] = ()) -> str:
     """`bootctl list --json=short` output: one object per entry, isDefault marks the default.
 
@@ -252,6 +272,8 @@ class FakeGnomon:
         deliveries: Mapping[str, Sequence[bytes]] | None = None,
         firmware: Mapping[str, bytes] | None = None,
         firmware_garbled: Sequence[str] = (),
+        lab_journal: bool = True,
+        list_boots_fails: bool = False,
     ) -> None:
         self.lab_mode = lab_mode
         self.sessions = list(sessions)
@@ -268,7 +290,18 @@ class FakeGnomon:
         self.pending = False
         self.powered_off = False
         self.boots = 1
-        self.current_boot = "boot-1"
+        self.current_boot = boot_uuid("boot-1")
+        # persisted maps each boot with a journal to its `journalctl -o json` text, oldest first.
+        # Two boots from before the run are already on disk, as on a machine that has run for a while.
+        self.persisted: dict[str, str] = {
+            boot_uuid("older-1"): journal_of(boot_uuid("older-1")),
+            boot_uuid("older-2"): journal_of(boot_uuid("older-2")),
+            self.current_boot: journal_of(self.current_boot),
+        }
+        # lab_journal False models the initramfs-only lab boot, which never persists a journal.
+        self.lab_journal = lab_journal
+        self.list_boots_fails = list_boots_fails
+        self.lab_boot: str | None = None
         self.selected = DEFAULT
         self.default = DEFAULT
         self.esp = {DEFAULT, OLD}
@@ -315,10 +348,14 @@ class FakeGnomon:
 
     def _boot(self) -> None:
         self.boots += 1
-        self.current_boot = f"boot-{self.boots}"
+        self.current_boot = boot_uuid(f"boot-{self.boots}")
         self.reported = set(self.esp)
         choice = self.oneshot or self.default
         self.oneshot = None
+        if choice == LAB:
+            self.lab_boot = self.current_boot
+        if choice != LAB or self.lab_journal:
+            self.persisted[self.current_boot] = journal_of(self.current_boot)
         if choice != LAB:
             self.selected = choice
             self.up = True
@@ -445,7 +482,42 @@ class FakeGnomon:
             return _ok(f"{self.selected}\x00\n")
         if len(argv) == 5 and argv[:4] == ("sudo", "-n", "base64", "-w0") and argv[4] in FIRMWARE_LAYOUT:
             return self._base64(argv[4])
+        if argv == ("sudo", "-n", "journalctl", "--list-boots", "-o", "json", "--no-pager"):
+            return self._list_boots()
+        if len(argv) == 8 and argv[:4] == ("sudo", "-n", "journalctl", "-b") and argv[5:] == (
+            "-o",
+            "json",
+            "--no-pager",
+        ):
+            return self._read_journal(argv[4])
         raise UnscriptedCommand(argv)
+
+    def _list_boots(self) -> lab.Result:
+        """`journalctl --list-boots -o json`: every boot with a journal, oldest first, ids undashed."""
+        self.trace.append("journal:list")
+        if self.list_boots_fails:
+            return lab.Result(1, "", "Failed to list boots: Input/output error")
+        boots = list(self.persisted)
+        records = [
+            {
+                "index": index - (len(boots) - 1),
+                "boot_id": boot.replace("-", ""),
+                "first_entry": 1000 * (index + 1),
+                "last_entry": 1000 * (index + 1) + 999,
+            }
+            for index, boot in enumerate(boots)
+        ]
+        return _ok(json.dumps(records, indent=4) + "\n")
+
+    def _read_journal(self, boot: str) -> lab.Result:
+        """`journalctl -b ID -o json`: the boot's journal, or the error journalctl gives for a boot with none."""
+        self.trace.append(f"journal:read:{boot}")
+        if not re.fullmatch(r"[0-9a-f]{32}", boot):
+            return lab.Result(1, "", f"Failed to add match '{boot}': Invalid argument")
+        for stored, text in self.persisted.items():
+            if stored.replace("-", "") == boot:
+                return _ok(text)
+        return lab.Result(1, "", f"Data from the specified boot ({boot}) is not available")
 
     def _base64(self, path: str) -> lab.Result:
         """GNU `base64 -w0`: one line, no trailing newline; a missing file exits 1."""
@@ -1031,6 +1103,74 @@ class LabRunnerTest(unittest.TestCase):
         )
         self.assertIn("PASS", lines)
 
+    def test_checked_lab_boot_journal_is_saved_byte_for_byte(self) -> None:
+        gnomon = FakeGnomon()
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 0, err)
+        saved = (self.single_run_dir("baseline") / "journal.json").read_bytes()
+        self.assertIsNotNone(gnomon.lab_boot)
+        self.assertEqual(saved, gnomon.persisted[gnomon.lab_boot].encode("utf-8"))
+        self.assertNotEqual(saved, gnomon.persisted[boot_uuid("boot-1")].encode("utf-8"))
+        self.assertNotEqual(saved, gnomon.persisted[gnomon.current_boot].encode("utf-8"))
+
+    def test_unchecked_lab_boot_journal_is_found_through_list_boots(self) -> None:
+        for name in ("fault-initrd", "fault-hang", "fault-panic", "fault-poweroff"):
+            with self.subTest(name=name):
+                lab_mode = "poweroff" if name == "fault-poweroff" else "returns"
+                gnomon = FakeGnomon(lab_mode=lab_mode)
+                code, _, err = self.run_queue([name], gnomon)
+                self.assertEqual(code, 0, err)
+                saved = (self.single_run_dir(name) / "journal.json").read_bytes()
+                self.assertIsNotNone(gnomon.lab_boot)
+                self.assertEqual(saved, gnomon.persisted[gnomon.lab_boot].encode("utf-8"))
+                self.assertNotEqual(saved, gnomon.persisted[gnomon.current_boot].encode("utf-8"))
+                self.assertNotEqual(saved, gnomon.persisted[boot_uuid("older-2")].encode("utf-8"))
+
+    def test_lab_boot_without_journal_is_noted_and_outcome_unchanged(self) -> None:
+        cases = (
+            ("baseline", "boots", "is not available"),
+            ("fault-panic", "returns", "left no journal"),
+        )
+        for name, lab_mode, reason in cases:
+            with self.subTest(name=name):
+                gnomon = FakeGnomon(lab_mode=lab_mode, lab_journal=False)
+                code, _, err = self.run_queue([name], gnomon)
+                self.assertEqual(code, 0, err)
+                run = self.single_run_dir(name)
+                lines = (run / "run.log").read_text(encoding="utf-8").splitlines()
+                self.assertIn("PASS", lines)
+                self.assertFalse((run / "journal.json").exists())
+                noted = [
+                    line for line in lines if line.startswith("journal:") and "journal.json not written" in line
+                ]
+                self.assertTrue(any(reason in line for line in noted), lines)
+
+    def test_journal_is_collected_only_after_gnomon_returns(self) -> None:
+        gnomon = FakeGnomon()
+        self.run_traced("baseline", gnomon)
+        returned = self.position(gnomon.trace, "say:gnomon returned to")
+        reads = [index for index, entry in enumerate(gnomon.trace) if entry.startswith("journal:")]
+        self.assertEqual(len(reads), 1, gnomon.trace)
+        self.assertGreater(reads[0], returned)
+        gnomon = FakeGnomon(lab_mode="returns")
+        self.run_traced("fault-panic", gnomon)
+        returned = self.position(gnomon.trace, "say:gnomon returned to")
+        reads = [index for index, entry in enumerate(gnomon.trace) if entry.startswith("journal:")]
+        self.assertEqual(len(reads), 2, gnomon.trace)
+        for index in reads:
+            with self.subTest(entry=gnomon.trace[index]):
+                self.assertGreater(index, returned)
+
+    def test_journal_listing_failure_is_noted_and_outcome_unchanged(self) -> None:
+        gnomon = FakeGnomon(lab_mode="returns", list_boots_fails=True)
+        code, _, err = self.run_queue(["fault-panic"], gnomon)
+        self.assertEqual(code, 0, err)
+        run = self.single_run_dir("fault-panic")
+        lines = (run / "run.log").read_text(encoding="utf-8").splitlines()
+        self.assertIn("PASS", lines)
+        self.assertTrue(any("list-boots failed" in line for line in lines), lines)
+        self.assertFalse((run / "journal.json").exists())
+
 
 class NetconsoleLogTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -1156,6 +1296,30 @@ class BootctlParseTest(unittest.TestCase):
             lab.parse_generations("system-7-link\nsystem-6-link\nsystem-link\ncurrent\n"),
             (6, 7),
         )
+
+
+class BootListParseTest(unittest.TestCase):
+    FIRST = "0123456789abcdef0123456789abcdef"
+    SECOND = "fedcba9876543210fedcba9876543210"
+
+    def test_boot_ids_come_back_in_listing_order_as_printed(self) -> None:
+        listing = json.dumps(
+            [
+                {"index": -1, "boot_id": self.FIRST, "first_entry": 1, "last_entry": 2},
+                {"index": 0, "boot_id": self.SECOND, "first_entry": 3, "last_entry": 4},
+            ]
+        )
+        self.assertEqual(lab.parse_boot_list(listing), [self.FIRST, self.SECOND])
+
+    def test_text_without_json_is_refused(self) -> None:
+        with self.assertRaises(lab.LabError):
+            lab.parse_boot_list("Failed to list boots\n")
+
+    def test_records_without_boot_ids_are_refused(self) -> None:
+        for listing in (json.dumps({"boot_id": self.FIRST}), json.dumps([{"index": 0}])):
+            with self.subTest(listing=listing):
+                with self.assertRaises(lab.LabError):
+                    lab.parse_boot_list(listing)
 
 
 if __name__ == "__main__":
