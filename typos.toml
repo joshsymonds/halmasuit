@@ -37,4 +37,7 @@ extend-exclude = [
     # #28). Contains FFmpeg API identifiers like "MaxCLL" (max
     # content light level) that typos misreads.
     "crates/halmasuit-decoder/ffmpeg_binding.rs",
+    # A scrubbed recording of a real gnomon lab boot: journal rows and
+    # scanout CRC hex (e.g. "1233ba65") that typos reads as misspellings.
+    "tests/hw/fixtures/gnomon-baseline/",
 ]
