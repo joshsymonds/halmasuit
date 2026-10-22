@@ -286,9 +286,14 @@ in
       };
     };
 
-    # Lab image: U2F off for the listed services, overriding the host's setting.
+    # Lab image: for the listed services, U2F is forced off and blank passwords
+    # are refused (allowNullPassword = false drops nullok from pam_unix's auth
+    # lines). U2F is off so a host's setting cannot prompt for a token there;
+    # blank passwords are refused because the lab's probe must not log in
+    # through a passwordless account.
     security.pam.services = lib.genAttrs cfg.u2fOffServices (_: {
       u2f.enable = lib.mkForce false;
+      allowNullPassword = lib.mkForce false;
     });
   };
 }
