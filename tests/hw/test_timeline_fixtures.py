@@ -4,8 +4,8 @@
 A fixture run is a directory under tests/hw/fixtures/ that holds
 `expected-timeline.json`; its `profile` file names the profile that must pass.
 Runs are read in place: build_timeline never writes into the fixture. The
-synthetic-baseline run also asserts its story facts by hand, so a golden file
-regenerated from a broken timeline still fails.
+synthetic-baseline and gnomon-baseline runs also assert their story facts by
+hand, so a golden file regenerated from a broken timeline still fails.
 """
 
 import errno
@@ -20,11 +20,16 @@ EXPECTED_NAME = "expected-timeline.json"
 PROFILE_NAME = "profile"
 JOURNAL_NAME = "journal.json"
 BASELINE_RUN = FIXTURE_ROOT / "synthetic-baseline"
+GNOMON_RUN = FIXTURE_ROOT / "gnomon-baseline"
 # exitbootservice_end_ns is 2_583_541_217, which floors to 2_583_541 us.
 KERNEL_ZERO_US = 2_583_541
+# Recorded gnomon boot: exitbootservice_end_ns floors to 19_664_764 us.
+GNOMON_KERNEL_ZERO_US = 19_664_764
 INITRD_UNIT = "lab-crc-initrd.service"
 HEAD_CRTC81 = "card1/crtc81"
 HEAD_CRTC91 = "card1/crtc91"
+HEAD_CRTC205 = "card1/crtc205"
+HEAD_CRTC494 = "card1/crtc494"
 COMMON_FIELDS = {
     "__REALTIME_TIMESTAMP",
     "__MONOTONIC_TIMESTAMP",
@@ -126,6 +131,19 @@ class SyntheticBaselineStoryTest(unittest.TestCase):
             if sample["unit"] == INITRD_UNIT and sample["mono_us"] > errors[0]["mono_us"]
         ]
         self.assertEqual(later, [2_412_903])
+
+
+class GnomonBaselineStoryTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.timeline = replay(GNOMON_RUN)
+
+    def test_anchor_is_fpdt_exit_boot_services_end(self):
+        self.assertEqual(self.timeline["clock"]["kernel_zero_source"], "fpdt.exitbootservice_end")
+        self.assertEqual(self.timeline["clock"]["kernel_zero_us"], GNOMON_KERNEL_ZERO_US)
+
+    def test_crc_heads_are_exactly_the_two_panel_heads(self):
+        self.assertEqual(sorted(self.timeline["heads"]), [HEAD_CRTC205, HEAD_CRTC494])
 
 
 class SyntheticBaselineShapeTest(unittest.TestCase):
