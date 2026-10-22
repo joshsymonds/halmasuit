@@ -1,0 +1,374 @@
+{
+  "run": "synthetic-baseline",
+  "boot_id": "b007b007b007b007b007b007b007b007",
+  "clock": {
+    "zero": "cpu-reset",
+    "kernel_zero_us": 2583541,
+    "kernel_zero_source": "fpdt.exitbootservice_end"
+  },
+  "firmware": {
+    "info": "EDK II 2.80",
+    "loader_init_us": 1418204,
+    "loader_exec_us": 2581700,
+    "fpdt": {
+      "firmware_start_us": 183412,
+      "bootloader_load_us": 1021557,
+      "bootloader_launch_us": 1412873,
+      "exitbootservice_start_us": 2581908,
+      "exitbootservice_end_us": 2583541
+    }
+  },
+  "firmware_mode": {
+    "width": 1024,
+    "height": 768,
+    "depth": 32,
+    "linelength": 4096,
+    "efi": true
+  },
+  "logo": {
+    "status": 1,
+    "type": 0,
+    "version": 1,
+    "xoffset": 312,
+    "yoffset": 264,
+    "width": 64,
+    "height": 48
+  },
+  "events": [
+    {
+      "t_us": 183412,
+      "mono_us": null,
+      "kind": "firmware",
+      "source": "fpdt",
+      "detail": "firmware_start_us"
+    },
+    {
+      "t_us": 1021557,
+      "mono_us": null,
+      "kind": "firmware",
+      "source": "fpdt",
+      "detail": "bootloader_load_us"
+    },
+    {
+      "t_us": 1412873,
+      "mono_us": null,
+      "kind": "firmware",
+      "source": "fpdt",
+      "detail": "bootloader_launch_us"
+    },
+    {
+      "t_us": 1418204,
+      "mono_us": null,
+      "kind": "loader",
+      "source": "efivar",
+      "detail": "LoaderTimeInitUSec"
+    },
+    {
+      "t_us": 2581700,
+      "mono_us": null,
+      "kind": "loader",
+      "source": "efivar",
+      "detail": "LoaderTimeExecUSec"
+    },
+    {
+      "t_us": 2581908,
+      "mono_us": null,
+      "kind": "firmware",
+      "source": "fpdt",
+      "detail": "exitbootservice_start_us"
+    },
+    {
+      "t_us": 2583541,
+      "mono_us": null,
+      "kind": "firmware",
+      "source": "fpdt",
+      "detail": "exitbootservice_end_us"
+    },
+    {
+      "t_us": 2695959,
+      "mono_us": 112418,
+      "kind": "kernel-display",
+      "source": "kernel",
+      "detail": "efifb: framebuffer at 0xd0000000, using 3072k, total 3072k"
+    },
+    {
+      "t_us": 2782093,
+      "mono_us": 198552,
+      "kind": "kernel-display",
+      "source": "kernel",
+      "detail": "fbcon: efifb (fb0) is primary device"
+    },
+    {
+      "t_us": 3224348,
+      "mono_us": 640807,
+      "kind": "kernel-display",
+      "source": "kernel",
+      "detail": "Console: switching to colour frame buffer device 128x48"
+    },
+    {
+      "t_us": 4486851,
+      "mono_us": 1903310,
+      "kind": "driver-display",
+      "source": "kernel",
+      "detail": "NVRM: loading NVIDIA UNIX x86_64 Kernel Module  550.120"
+    },
+    {
+      "t_us": 4504585,
+      "mono_us": 1921044,
+      "kind": "driver-display",
+      "source": "kernel",
+      "detail": "nvidia-drm: [drm] Loading driver 550.120"
+    },
+    {
+      "t_us": 4633654,
+      "mono_us": 2050113,
+      "kind": "sampler-start",
+      "source": "lab-crc-initrd.service",
+      "detail": "start t=2050113"
+    },
+    {
+      "t_us": 4703982,
+      "mono_us": 2120441,
+      "kind": "crc",
+      "source": "lab-crc-initrd.service",
+      "detail": "sample card=card1 crtc=81 t=2120441 comp=9c1d4e7a rg=00000000 out=5e02b3c8 comp_sup=1 rg_sup=0 out_sup=1"
+    },
+    {
+      "t_us": 4709545,
+      "mono_us": 2126004,
+      "kind": "crc",
+      "source": "lab-crc-initrd.service",
+      "detail": "sample card=card1 crtc=91 t=2126004 comp=3a7f10d2 rg=c81e0b44 out=0d4f9a16 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 4894313,
+      "mono_us": 2310772,
+      "kind": "crc",
+      "source": "lab-crc-initrd.service",
+      "detail": "error card=card1 crtc=91 t=2310772 errno=11"
+    },
+    {
+      "t_us": 4996444,
+      "mono_us": 2412903,
+      "kind": "crc",
+      "source": "lab-crc-initrd.service",
+      "detail": "sample card=card1 crtc=81 t=2412903 comp=9c1d4e7b rg=00000000 out=5e02b3c8 comp_sup=1 rg_sup=0 out_sup=1"
+    },
+    {
+      "t_us": 5686311,
+      "mono_us": 3102770,
+      "kind": "sampler-start",
+      "source": "lab-crc.service",
+      "detail": "start t=3102770"
+    },
+    {
+      "t_us": 5686953,
+      "mono_us": 3103412,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=81 t=3103412 comp=9c1d4e7b rg=00000000 out=5e02b3c8 comp_sup=1 rg_sup=0 out_sup=1"
+    },
+    {
+      "t_us": 5687229,
+      "mono_us": 3103688,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=91 t=3103688 comp=3a7f10d2 rg=c81e0b44 out=0d4f9a16 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 6124749,
+      "mono_us": 3541208,
+      "kind": "unit",
+      "source": "systemd",
+      "detail": "greetd.service started"
+    },
+    {
+      "t_us": 6188053,
+      "mono_us": 3604512,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=81 t=3604512 comp=7e21c05a rg=00000000 out=5e02b3c8 comp_sup=1 rg_sup=0 out_sup=1"
+    },
+    {
+      "t_us": 6188053,
+      "mono_us": 3604512,
+      "kind": "greeter",
+      "source": "card1/crtc81",
+      "detail": "first sample"
+    },
+    {
+      "t_us": 6195414,
+      "mono_us": 3611873,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=91 t=3611873 comp=b40e7d19 rg=c81e0b44 out=0d4f9a16 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 6195414,
+      "mono_us": 3611873,
+      "kind": "greeter",
+      "source": "card1/crtc91",
+      "detail": "first sample"
+    },
+    {
+      "t_us": 6295587,
+      "mono_us": 3712046,
+      "kind": "probe",
+      "source": "lab-probe",
+      "detail": "device node=/dev/input/event9"
+    },
+    {
+      "t_us": 6421751,
+      "mono_us": 3838210,
+      "kind": "probe",
+      "source": "lab-probe",
+      "detail": "ready holder=niri pid=1431"
+    },
+    {
+      "t_us": 6651972,
+      "mono_us": 4068431,
+      "kind": "probe",
+      "source": "lab-probe",
+      "detail": "typed keys=11"
+    }
+  ],
+  "heads": {
+    "card1/crtc81": {
+      "samples": [
+        {
+          "t_us": 4703982,
+          "mono_us": 2120441,
+          "unit": "lab-crc-initrd.service",
+          "comp": "9c1d4e7a",
+          "rg": "00000000",
+          "out": "5e02b3c8",
+          "comp_sup": true,
+          "rg_sup": false,
+          "out_sup": true
+        },
+        {
+          "t_us": 4996444,
+          "mono_us": 2412903,
+          "unit": "lab-crc-initrd.service",
+          "comp": "9c1d4e7b",
+          "rg": "00000000",
+          "out": "5e02b3c8",
+          "comp_sup": true,
+          "rg_sup": false,
+          "out_sup": true
+        },
+        {
+          "t_us": 5686953,
+          "mono_us": 3103412,
+          "unit": "lab-crc.service",
+          "comp": "9c1d4e7b",
+          "rg": "00000000",
+          "out": "5e02b3c8",
+          "comp_sup": true,
+          "rg_sup": false,
+          "out_sup": true
+        },
+        {
+          "t_us": 6188053,
+          "mono_us": 3604512,
+          "unit": "lab-crc.service",
+          "comp": "7e21c05a",
+          "rg": "00000000",
+          "out": "5e02b3c8",
+          "comp_sup": true,
+          "rg_sup": false,
+          "out_sup": true
+        }
+      ],
+      "errors": []
+    },
+    "card1/crtc91": {
+      "samples": [
+        {
+          "t_us": 4709545,
+          "mono_us": 2126004,
+          "unit": "lab-crc-initrd.service",
+          "comp": "3a7f10d2",
+          "rg": "c81e0b44",
+          "out": "0d4f9a16",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 5687229,
+          "mono_us": 3103688,
+          "unit": "lab-crc.service",
+          "comp": "3a7f10d2",
+          "rg": "c81e0b44",
+          "out": "0d4f9a16",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 6195414,
+          "mono_us": 3611873,
+          "unit": "lab-crc.service",
+          "comp": "b40e7d19",
+          "rg": "c81e0b44",
+          "out": "0d4f9a16",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        }
+      ],
+      "errors": [
+        {
+          "t_us": 4894313,
+          "mono_us": 2310772,
+          "unit": "lab-crc-initrd.service",
+          "errno": 11
+        }
+      ]
+    }
+  },
+  "sampler_starts": [
+    {
+      "t_us": 4633654,
+      "mono_us": 2050113,
+      "unit": "lab-crc-initrd.service"
+    },
+    {
+      "t_us": 5686311,
+      "mono_us": 3102770,
+      "unit": "lab-crc.service"
+    }
+  ],
+  "greetd_started": {
+    "t_us": 6124749,
+    "mono_us": 3541208
+  },
+  "greeter_first_appearance": {
+    "card1/crtc81": {
+      "t_us": 6188053,
+      "mono_us": 3604512
+    },
+    "card1/crtc91": {
+      "t_us": 6195414,
+      "mono_us": 3611873
+    }
+  },
+  "probe": [
+    {
+      "t_us": 6295587,
+      "mono_us": 3712046,
+      "line": "device node=/dev/input/event9"
+    },
+    {
+      "t_us": 6421751,
+      "mono_us": 3838210,
+      "line": "ready holder=niri pid=1431"
+    },
+    {
+      "t_us": 6651972,
+      "mono_us": 4068431,
+      "line": "typed keys=11"
+    }
+  ]
+}
