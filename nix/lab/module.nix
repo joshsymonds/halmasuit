@@ -205,8 +205,9 @@ in
     networking.interfaces.${cfg.wolInterface}.wakeOnLan.enable = true;
 
     # Netconsole from stage 1. The module loads once the interface device
-    # exists and stays loaded across switch-root. It sends UDP only, and
-    # the firewall is not touched.
+    # exists, and the unit is Before=initrd.target so switch-root waits for
+    # modprobe to finish. The module stays loaded across switch-root. It
+    # sends UDP only, and the firewall is not touched.
     assertions = [
       {
         assertion = !cfg.netconsole.enable
@@ -220,6 +221,7 @@ in
       ++ lib.optional cfg.crcSampler.enable labCrc;
     boot.initrd.systemd.services.lab-netconsole = lib.mkIf cfg.netconsole.enable {
       wantedBy = [ "initrd.target" ];
+      before = [ "initrd.target" ];
       bindsTo = [ netconsoleDevice ];
       after = [ netconsoleDevice ];
       unitConfig.DefaultDependencies = false;

@@ -257,6 +257,8 @@ let
     { ok = builtins.elem "initrd.target" (netconsoleUnit.wantedBy or [ ])
         && (netconsoleUnit.unitConfig.DefaultDependencies or true) == false;
       msg = "lab-netconsole is not wanted by initrd.target with DefaultDependencies=no"; }
+    { ok = builtins.elem "initrd.target" (netconsoleUnit.before or [ ]);
+      msg = "lab-netconsole is not Before=initrd.target (stage 1 can switch root before modprobe finishes)"; }
     { ok = failingAssertions cfg == [ ];
       msg = "the valid lab config fails an assertion"; }
     { ok = lib.all (f: failingAssertions (netconsoleWithEmpty f) != [ ]) [ "targetIp" "sourceIp" "interface" ];
