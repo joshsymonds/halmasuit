@@ -18,6 +18,13 @@ When an experiment checks its lab boot, the runner copies gnomon's firmware and
 loader evidence (FPDT, BGRT, boot_params, and the systemd-boot efivars) into the
 run's firmware/ directory while the lab entry is up; a file gnomon lacks is noted in
 run.log and skipped.
+The baseline experiment also probes the greeter on the checked lab boot, once the display
+manager is active. The probe refuses, and never starts lab-probe.service, when the resolved
+greetd PAM stack holds a lockout module (pam_faillock, pam_tally, pam_tally2) or cannot be
+resolved. Otherwise the unit types a wrong password into greetd, and the probe passes when the
+lab boot's authpriv journal then holds a pam_unix(greetd:auth) authentication failure for
+--probe-user within 60 seconds. probe.json records the outcome. A refused or failed probe fails
+the run after gnomon has returned to its default entry.
 Once gnomon has returned, the runner saves the lab boot's journal as journal.json in the
 run directory (`journalctl -b ID -o json`). A checked lab boot is known from the boot the
 runner saw; otherwise the lab boot is the boot list-boots lists right after the boot the
@@ -55,6 +62,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, Protocol, TypeVar
+
+import pam_stack
 
 T = TypeVar("T")
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -103,6 +112,13 @@ NETCONSOLE_PORT = 6666
 NETCONSOLE_LOG = "netconsole.log"
 UDP_MAX_DATAGRAM = 65535
 LISTEN_POLL_SECONDS = 0.2
+PAM_DIR = "/etc/pam.d/"
+PAM_SERVICE = "greetd"
+PROBE_UNIT = "lab-probe.service"
+PROBE_MARKER = f"pam_unix({PAM_SERVICE}:auth): authentication failure"
+PROBE_DEADLINE_SECONDS = 60
+AUTHPRIV_FACILITY = 10
+DEFAULT_PROBE_USER = "joshsymonds"
 
 
 class LabError(Exception):
@@ -256,14 +272,15 @@ class Plan:
 
     lab_boot_checked: bool  # the lab entry must be seen booting before the return reboot
     poweroff: bool  # gnomon powers off and returns on wake-on-LAN
+    probe: bool  # the greeter's PAM stack is probed with a wrong password on the checked lab boot
 
 
 EXPERIMENTS: dict[str, Plan] = {
-    "baseline": Plan(lab_boot_checked=True, poweroff=False),
-    "fault-initrd": Plan(lab_boot_checked=False, poweroff=False),
-    "fault-hang": Plan(lab_boot_checked=False, poweroff=False),
-    "fault-panic": Plan(lab_boot_checked=False, poweroff=False),
-    "fault-poweroff": Plan(lab_boot_checked=False, poweroff=True),
+    "baseline": Plan(lab_boot_checked=True, poweroff=False, probe=True),
+    "fault-initrd": Plan(lab_boot_checked=False, poweroff=False, probe=False),
+    "fault-hang": Plan(lab_boot_checked=False, poweroff=False, probe=False),
+    "fault-panic": Plan(lab_boot_checked=False, poweroff=False, probe=False),
+    "fault-poweroff": Plan(lab_boot_checked=False, poweroff=True, probe=False),
 }
 
 
@@ -398,6 +415,7 @@ class Lab:
         wol_iface: str,
         display_manager: str,
         netconsole_port: int,
+        probe_user: str,
         emit: Callable[[str], None],
     ) -> None:
         self.layer = layer
@@ -408,6 +426,7 @@ class Lab:
         self.wol_iface = wol_iface
         self.display_manager = display_manager
         self.netconsole_port = netconsole_port
+        self.probe_user = probe_user
         self.emit = emit
 
     def run_experiment(self, name: str) -> None:
@@ -449,11 +468,15 @@ class Lab:
             self._reboot()
             booted_from = boot_before
             lab_boot: str | None = None
+            probe: dict | None = None
             if plan.lab_boot_checked:
                 lab_boot = self._await_boot("lab entry to boot", boot_before, LAB_ENTRY)
                 booted_from = lab_boot
                 run.say(f"lab entry booted as {lab_boot}")
                 self._collect_firmware(run)
+                if plan.probe:
+                    probe = self._probe(run)
+                    run.save("probe.json", probe)
                 self._refuse_if_graphical("refusing before return reboot")
                 self._reboot()
             if plan.poweroff:
@@ -470,6 +493,8 @@ class Lab:
             self._remove_entry()
             _, post = self._record()
             _compare(pre, post)
+            if probe is not None:
+                self._check_probe(probe)
             run.say("PASS")
         except BaseException as err:
             run.say(f"FAIL: {err}")
@@ -672,6 +697,92 @@ class Lab:
 
         self._poll(f"{self.display_manager} to become active", active, DISPLAY_DEADLINE_SECONDS)
 
+    def _probe(self, run: RunLog) -> dict:
+        """Type a wrong password into greetd on the lab boot and record what the journal shows."""
+        probe: dict = {
+            "service": PAM_SERVICE,
+            "pam_files": None,
+            "pam_modules": None,
+            "lockout": None,
+            "refused": None,
+            "started": False,
+            "unit_returncode": None,
+            "matched": None,
+            "passed": False,
+        }
+        try:
+            self._await_display_manager()
+        except LabError as err:
+            probe["refused"] = f"greeter not active: {err}"
+            return probe
+        try:
+            stack = pam_stack.resolve(PAM_SERVICE, self._read_pam_file)
+        except pam_stack.PamStackError as err:
+            probe["refused"] = f"cannot resolve the {PAM_SERVICE} PAM stack: {err}"
+            return probe
+        probe["pam_files"] = list(stack.files)
+        probe["pam_modules"] = list(stack.modules)
+        probe["lockout"] = list(stack.lockout)
+        if stack.lockout:
+            probe["refused"] = f"{PAM_SERVICE} PAM stack holds lockout module(s): {', '.join(stack.lockout)}"
+            return probe
+        probe["started"] = True
+        start = self.layer.remote(["sudo", "-n", "systemctl", "start", PROBE_UNIT])
+        probe["unit_returncode"] = start.returncode
+        try:
+            probe["matched"] = self._poll(
+                f"{PROBE_MARKER} for {self.probe_user} in the lab boot journal",
+                self._probe_line,
+                PROBE_DEADLINE_SECONDS,
+            )
+        except LabError as err:
+            run.say(f"probe: {err}")
+            return probe
+        probe["passed"] = True
+        return probe
+
+    def _read_pam_file(self, name: str) -> str | None:
+        """One /etc/pam.d file on gnomon, or None when it does not exist; any other failure raises."""
+        result = self.layer.remote(["cat", f"{PAM_DIR}{name}"])
+        if result.returncode == 0:
+            return result.stdout
+        if result.returncode == 1 and "No such file or directory" in result.stderr:
+            return None
+        detail = result.stderr.strip() or "no output"
+        raise pam_stack.PamStackError(f"cannot read {PAM_DIR}{name} (rc {result.returncode}): {detail}")
+
+    def _probe_line(self) -> str | None:
+        """The lab boot's authpriv line for the probe user's greetd failure, or None while it is absent."""
+        journal = _ok(
+            self.layer.remote(
+                [
+                    "sudo",
+                    "-n",
+                    "journalctl",
+                    "-b",
+                    "0",
+                    "-o",
+                    "cat",
+                    "--no-pager",
+                    f"SYSLOG_FACILITY={AUTHPRIV_FACILITY}",
+                ]
+            ),
+            "read the lab boot's authpriv journal",
+        )
+        token = f"user={self.probe_user}"
+        for line in journal.splitlines():
+            if PROBE_MARKER in line and token in line.split():
+                return line
+        return None
+
+    def _check_probe(self, probe: dict) -> None:
+        if probe["refused"] is not None:
+            raise LabError(f"probe refused: {probe['refused']}")
+        if not probe["passed"]:
+            raise LabError(
+                f"probe did not pass: no '{PROBE_MARKER}' line for {self.probe_user} in the lab boot journal"
+            )
+
     def _collect_firmware(self, run: RunLog) -> None:
         """Copy each firmware file byte for byte; one that gnomon cannot give is noted and skipped."""
         for remote in FIRMWARE_FILES:
@@ -787,6 +898,11 @@ def main(
         default=NETCONSOLE_PORT,
         help="UDP port that receives gnomon's netconsole stream",
     )
+    parser.add_argument(
+        "--probe-user",
+        default=DEFAULT_PROBE_USER,
+        help="user whose pam_unix greetd failure must appear in the lab boot journal for the probe to pass",
+    )
     options = parser.parse_args(argv)
     runner = Lab(
         layer or SystemLayer(),
@@ -797,6 +913,7 @@ def main(
         wol_iface=options.wol_iface,
         display_manager=options.display_manager,
         netconsole_port=options.netconsole_port,
+        probe_user=options.probe_user,
         emit=print,
     )
     for name in options.experiments:
