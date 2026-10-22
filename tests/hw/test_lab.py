@@ -11,7 +11,9 @@ realises config.system.build.uki in gnomon's store and prints a directory
 holding one .efi image that only gnomon can list; `sbctl sign -o OUT IN` signs with
 sbctl's own db key; `bootctl list --json=short` marks the entry the loader
 boots next with isDefault, a one-shot entry included; `bootctl set-oneshot ""`
-clears the one-shot.
+clears the one-shot. `nix build` out paths are the fake's `/nix/store/aaaa-EXP-KIND`,
+and `sudo -n ln -sfnT TARGET LINK` points a GC root at a build out path, replacing
+any link already there; it fails while the GC root directory is missing.
 """
 
 import contextlib
@@ -21,7 +23,7 @@ import json
 import re
 import tempfile
 import unittest
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import lab
@@ -65,6 +67,13 @@ BUILD_PREFIX = (
 )
 UKI_DIR = re.compile(r"/nix/store/aaaa-(?P<exp>[a-z-]+)-uki")
 UKI_IMAGE = re.compile(r"/nix/store/aaaa-[a-z-]+-uki/" + re.escape(UKI_IMAGE_NAME))
+GC_ROOT_DIR = "/nix/var/nix/gcroots/halmasuit-lab"
+GC_LINKS = {
+    "toplevel": f"{GC_ROOT_DIR}/toplevel",
+    "uki": f"{GC_ROOT_DIR}/uki",
+}
+TOPLEVEL_OUT = re.compile(r"/nix/store/aaaa-[a-z-]+-toplevel")
+GC_TARGETS = {"toplevel": TOPLEVEL_OUT, "uki": UKI_DIR}
 
 
 class UnscriptedCommand(AssertionError):
@@ -157,6 +166,8 @@ class FakeGnomon:
         return_adds_generation: bool = False,
         display_manager: str = "active",
         uki_files: Sequence[str] = (UKI_IMAGE_NAME,),
+        gc_roots: Mapping[str, str] | None = None,
+        fail_gc_root: str | None = None,
     ) -> None:
         self.lab_mode = lab_mode
         self.sessions = list(sessions)
@@ -183,6 +194,11 @@ class FakeGnomon:
         self.oneshot: str | None = None
         self.staged = False
         self.profiles = ["system-6-link", "system-7-link"]
+        # gc_roots models links an earlier run left behind, so the directory exists
+        # with them. fail_gc_root names the GC root whose `ln` is refused.
+        self.gc_dir = gc_roots is not None
+        self.gc_roots: dict[str, str] = dict(gc_roots or {})
+        self.fail_gc_root = fail_gc_root
 
     def _boot(self) -> None:
         self.boots += 1
@@ -261,6 +277,11 @@ class FakeGnomon:
             self.esp.discard(LAB)
             self.events.append("rm-entry")
             return _ok()
+        if argv == ("sudo", "-n", "install", "-d", "-m", "0755", GC_ROOT_DIR):
+            self.gc_dir = True
+            return _ok()
+        if len(argv) == 6 and argv[:4] == ("sudo", "-n", "ln", "-sfnT") and argv[5] in GC_LINKS.values():
+            return self._link_root(argv)
         if argv == ("sudo", "-n", "install", "-d", "-m", "0700", STAGED_DIR):
             return _ok()
         if (
@@ -311,6 +332,19 @@ class FakeGnomon:
             return _ok(f"{self.selected}\x00\n")
         raise UnscriptedCommand(argv)
 
+    def _link_root(self, argv: tuple[str, ...]) -> lab.Result:
+        target, link = argv[4], argv[5]
+        kind = next(name for name, path in GC_LINKS.items() if path == link)
+        if not GC_TARGETS[kind].fullmatch(target):
+            raise UnscriptedCommand(argv)
+        if not self.gc_dir:
+            return lab.Result(1, "", f"ln: failed to create symbolic link '{link}': No such file or directory")
+        if kind == self.fail_gc_root:
+            return lab.Result(1, "", f"ln: failed to create symbolic link '{link}': Read-only file system")
+        self.gc_roots[kind] = target
+        self.events.append(f"root:{kind}")
+        return _ok()
+
     def wake(self, mac: str) -> None:
         self.woken.append(mac)
         self.events.append("wake")
@@ -319,15 +353,17 @@ class FakeGnomon:
             self.pending = True
 
 
-BUILDS = [
+BUILDS_AND_ROOTS = [
     "build:{exp}:toplevel",
     "build:{exp}:uki",
+    "root:toplevel",
+    "root:uki",
 ]
 
 
 def fault_sequence(exp: str) -> list[str]:
     return [
-        *(event.format(exp=exp) for event in BUILDS),
+        *(event.format(exp=exp) for event in BUILDS_AND_ROOTS),
         "stage",
         "rm-entry",
         "install",
@@ -411,6 +447,8 @@ class LabRunnerTest(unittest.TestCase):
             [
                 "build:baseline:toplevel",
                 "build:baseline:uki",
+                "root:toplevel",
+                "root:uki",
                 "stage",
                 "rm-entry",
                 "install",
@@ -425,6 +463,112 @@ class LabRunnerTest(unittest.TestCase):
         self.assertIsNone(gnomon.oneshot)
         self.assertEqual(gnomon.selected, DEFAULT)
         self.assertIn("PASS", (self.single_run_dir("baseline") / "run.log").read_text())
+
+    def test_gc_roots_point_at_both_out_paths_and_survive_success(self) -> None:
+        gnomon = FakeGnomon()
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            gnomon.gc_roots,
+            {
+                "toplevel": "/nix/store/aaaa-baseline-toplevel",
+                "uki": "/nix/store/aaaa-baseline-uki",
+            },
+        )
+        self.assertIn(
+            ("remote", ("sudo", "-n", "install", "-d", "-m", "0755", "/nix/var/nix/gcroots/halmasuit-lab")),
+            gnomon.calls,
+        )
+        self.assertIn(
+            (
+                "remote",
+                (
+                    "sudo",
+                    "-n",
+                    "ln",
+                    "-sfnT",
+                    "/nix/store/aaaa-baseline-toplevel",
+                    "/nix/var/nix/gcroots/halmasuit-lab/toplevel",
+                ),
+            ),
+            gnomon.calls,
+        )
+        self.assertIn(
+            (
+                "remote",
+                (
+                    "sudo",
+                    "-n",
+                    "ln",
+                    "-sfnT",
+                    "/nix/store/aaaa-baseline-uki",
+                    "/nix/var/nix/gcroots/halmasuit-lab/uki",
+                ),
+            ),
+            gnomon.calls,
+        )
+
+    def test_gc_root_failure_stops_before_staging_and_install(self) -> None:
+        uki_dir = "/nix/store/aaaa-fault-panic-uki"
+        for kind, expected in (
+            ("toplevel", ["build:fault-panic:toplevel", "build:fault-panic:uki"]),
+            ("uki", ["build:fault-panic:toplevel", "build:fault-panic:uki", "root:toplevel"]),
+        ):
+            with self.subTest(failing_root=kind):
+                gnomon = FakeGnomon(lab_mode="returns", fail_gc_root=kind)
+                code, _, err = self.run_queue(["fault-panic"], gnomon)
+                self.assertEqual(code, 1)
+                self.assertIn(f"point {kind} GC root failed", err)
+                self.assertEqual(gnomon.events, expected)
+                self.assertNotIn(("remote", ("ls", "-1", uki_dir)), gnomon.calls)
+                self.assertNotIn(LAB, gnomon.esp)
+                self.assertIsNone(gnomon.oneshot)
+
+    def test_gc_roots_survive_abort_and_only_install_and_ln_touch_them(self) -> None:
+        gnomon = FakeGnomon(lab_mode="returns", display_manager="inactive")
+        code, _, err = self.run_queue(["fault-panic"], gnomon)
+        self.assertEqual(code, 1)
+        self.assertIn("display-manager.service", err)
+        self.assertEqual(gnomon.events[-2:], ["rm-entry", "oneshot-clear"])
+        self.assertEqual(
+            gnomon.gc_roots,
+            {
+                "toplevel": "/nix/store/aaaa-fault-panic-toplevel",
+                "uki": "/nix/store/aaaa-fault-panic-uki",
+            },
+        )
+        touching = [argv for _, argv in gnomon.calls if any(GC_ROOT_DIR in part for part in argv)]
+        self.assertEqual(
+            touching,
+            [
+                ("sudo", "-n", "install", "-d", "-m", "0755", GC_ROOT_DIR),
+                ("sudo", "-n", "ln", "-sfnT", "/nix/store/aaaa-fault-panic-toplevel", GC_LINKS["toplevel"]),
+                ("sudo", "-n", "ln", "-sfnT", "/nix/store/aaaa-fault-panic-uki", GC_LINKS["uki"]),
+            ],
+        )
+
+    def test_second_run_replaces_existing_gc_roots(self) -> None:
+        old = {"toplevel": "/nix/store/aaaa-old-toplevel", "uki": "/nix/store/aaaa-old-uki"}
+        gnomon = FakeGnomon(gc_roots=old)
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            gnomon.gc_roots,
+            {
+                "toplevel": "/nix/store/aaaa-baseline-toplevel",
+                "uki": "/nix/store/aaaa-baseline-uki",
+            },
+        )
+
+    def test_failed_replacement_leaves_the_previous_link_in_place(self) -> None:
+        old = {"toplevel": "/nix/store/aaaa-old-toplevel", "uki": "/nix/store/aaaa-old-uki"}
+        gnomon = FakeGnomon(gc_roots=old, fail_gc_root="uki")
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            gnomon.gc_roots,
+            {"toplevel": "/nix/store/aaaa-baseline-toplevel", "uki": "/nix/store/aaaa-old-uki"},
+        )
 
     def test_fault_experiments_return_unaided_after_one_reboot(self) -> None:
         for name in ("fault-initrd", "fault-hang", "fault-panic"):
@@ -443,7 +587,7 @@ class LabRunnerTest(unittest.TestCase):
         self.assertEqual(
             gnomon.events,
             [
-                *(event.format(exp="fault-poweroff") for event in BUILDS),
+                *(event.format(exp="fault-poweroff") for event in BUILDS_AND_ROOTS),
                 "stage",
                 "rm-entry",
                 "install",
@@ -464,7 +608,7 @@ class LabRunnerTest(unittest.TestCase):
         self.assertEqual(
             gnomon.events,
             [
-                *(event.format(exp="baseline") for event in BUILDS),
+                *(event.format(exp="baseline") for event in BUILDS_AND_ROOTS),
                 "stage",
                 "rm-entry",
                 "install",
