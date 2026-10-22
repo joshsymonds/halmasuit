@@ -11,7 +11,7 @@ let
   pkgs = nixpkgs.legacyPackages.${system};
   lib = nixpkgs.lib;
 
-  # Distinct from the module defaults (180, 300, enp7s0, display-manager.service)
+  # Distinct from the module defaults (180, 300, enp7s0, display-manager.service, greeter)
   # so a setting that is silently dropped or wired to the wrong option fails.
   labOptions = {
     enable = true;
@@ -20,7 +20,10 @@ let
     rootfsDeadline = 421;
     wolInterface = "enp9s0";
     crcSampler.enable = true;
-    probe.enable = true;
+    probe = {
+      enable = true;
+      consumerUser = "labuser";
+    };
     netconsole = {
       enable = true;
       targetIp = "10.20.30.40";
@@ -103,7 +106,8 @@ let
   crcOff = (evalWith (labOptions // { crcSampler = { enable = false; }; })).config;
   # The same host with the probe off: neither the unit nor uinput may appear.
   probeOff = (evalWith (labOptions // { probe = { enable = false; }; })).config;
-  # No lab settings at all: the new options must default off or empty.
+  # No lab settings at all: the new options must default off or empty, except
+  # probe.consumerUser, which defaults to greeter.
   defaults = (evalWith { }).config.halmasuit.lab;
 
   # The host enables U2F globally and explicitly turns on one listed service,
@@ -234,11 +238,15 @@ let
       msg = "halmasuit.lab.crcSampler.enable does not carry its value"; }
     { ok = (get cfg [ "halmasuit" "lab" "probe" "enable" ] false) == true;
       msg = "halmasuit.lab.probe.enable does not carry its value"; }
+    { ok = (get cfg [ "halmasuit" "lab" "probe" "consumerUser" ] null) == labOptions.probe.consumerUser;
+      msg = "halmasuit.lab.probe.consumerUser does not carry its value"; }
     { ok = !defaults.crcSampler.enable && !defaults.probe.enable && !defaults.netconsole.enable
         && defaults.netconsole.targetIp == "" && defaults.netconsole.sourceIp == ""
         && defaults.netconsole.interface == "" && defaults.netconsole.port == 6666
         && defaults.u2fOffServices == [ ];
       msg = "a new lab option does not default off or empty (netconsole.port defaults to 6666)"; }
+    { ok = (get defaults [ "probe" "consumerUser" ] null) == "greeter";
+      msg = "halmasuit.lab.probe.consumerUser does not default to \"greeter\""; }
 
     # ── Netconsole from stage 1: outbound UDP only ───────────────────
     { ok = builtins.elem "netconsole" (get cfg [ "boot" "initrd" "availableKernelModules" ] [ ]);
@@ -472,8 +480,8 @@ let
   probeChecks = [
     { ok = (probeUnit.serviceConfig.Type or null) == "oneshot";
       msg = "lab-probe.service is missing or not a oneshot"; }
-    { ok = (probeUnit.serviceConfig.ExecStart or null) == "${pkgs.python3}/bin/python3 ${labProbe}";
-      msg = "lab-probe.service does not run lab_probe.py with python3"; }
+    { ok = (probeUnit.serviceConfig.ExecStart or null) == "${pkgs.python3}/bin/python3 ${labProbe} --consumer-user ${labOptions.probe.consumerUser}";
+      msg = "lab-probe.service does not run lab_probe.py --consumer-user with python3"; }
     { ok = (probeUnit.serviceConfig.SyslogIdentifier or null) == "lab-probe";
       msg = "lab-probe.service lacks SyslogIdentifier=lab-probe"; }
     { ok = lib.all (key: (probeUnit.${key} or [ ]) == [ ]) [ "wantedBy" "requiredBy" "upheldBy" ];
