@@ -26,6 +26,12 @@ own failure output (`lab-crc: <what>`, optionally `: <strerror>`), kept as a
 `crc` event whose source is its unit and which is attributed to no head. A
 `start`, `sample`, or `error` line whose fields do not parse is a malformed run.
 A lab-probe line is a `probe` event.
+A `halmasuit.service` line whose MESSAGE is a tracing JSON line carrying a
+halmasuit Event is a `halmasuit` event: its detail is the Event's `event` tag,
+its payload is the whole Event object, and its time is the line's monotonic
+time on the kernel clock. Every such line is kept, repeats included. Any other
+line from that unit is ignored, and lines from other units produce no
+`halmasuit` event.
 greetd's start is the first entry whose MESSAGE_ID is the unit-started ID and
 whose `UNIT` is `greetd.service`; it is a `unit` event.
 
@@ -64,6 +70,7 @@ LOADER_GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
 EFI_FRAMEBUFFER_TYPE = 0x70
 GREETD_STARTED_MESSAGE_ID = "39f53479d3a045ac8e11786248231fbf"
 GREETD_UNIT = "greetd.service"
+HALMASUIT_UNIT = "halmasuit.service"
 INITRD_SAMPLER_UNIT = "lab-crc-initrd.service"
 CRC_VERBS = ("start", "sample", "error")
 DISPLAY_PATTERN = re.compile(
@@ -210,6 +217,22 @@ def crc_fields(message: str) -> tuple[str, dict[str, str]]:
     return verb, dict(token.split("=", 1) for token in tokens)
 
 
+def halmasuit_payload(message: str) -> dict[str, Any] | None:
+    try:
+        outer = json.loads(message)
+    except ValueError:
+        return None
+    fields = outer.get("fields") if isinstance(outer, dict) else None
+    inner = fields.get("json") if isinstance(fields, dict) else None
+    if not isinstance(inner, str):
+        return None
+    try:
+        event = json.loads(inner)
+    except ValueError:
+        return None
+    return event if isinstance(event, dict) and "event" in event else None
+
+
 def flag(value: str) -> bool:
     if value not in ("0", "1"):
         raise ValueError(f"expected 0 or 1, got {value!r}")
@@ -249,6 +272,13 @@ def build_timeline(run: Path) -> Timeline:
             greetd = entry
             t = platform_us(zero, mono)
             events.append(make_event(t, mono, "unit", entry.identifier, "greetd.service started"))
+        if entry.unit == HALMASUIT_UNIT:
+            payload = halmasuit_payload(entry.message)
+            if payload is not None:
+                event = make_event(
+                    platform_us(zero, mono), mono, "halmasuit", HALMASUIT_UNIT, payload["event"]
+                )
+                events.append({**event, "payload": payload})
         if entry.transport == "kernel" and DISPLAY_PATTERN.search(entry.message):
             kind = "driver-display" if DRIVER_PATTERN.search(entry.message) else "kernel-display"
             events.append(make_event(platform_us(zero, mono), mono, kind, "kernel", entry.message))

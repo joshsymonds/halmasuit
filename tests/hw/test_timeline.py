@@ -27,6 +27,7 @@ BOOT_PARAMS = "firmware/boot_params/data"
 JOURNAL = "journal.json"
 INITRD_UNIT = "lab-crc-initrd.service"
 ROOTFS_UNIT = "lab-crc.service"
+HALMASUIT_UNIT = "halmasuit.service"
 FATAL_ERRNO = "lab-crc: nvidia card fd lost: No such device"
 FATAL_BARE = "lab-crc: nvidia card fd lost"
 TIMELINE_KEYS = {
@@ -212,6 +213,49 @@ def inserting_after(files, marker, *lines):
 
 def sampler_fatal(message, mono):
     return journal_line(message, identifier="lab-crc", transport="stdout", unit=ROOTFS_UNIT, mono=mono)
+
+
+def tracing_line(json_field, *, target="halmasuit::event", level="INFO"):
+    return json.dumps(
+        {
+            "timestamp": "2026-10-22T00:00:00.000000Z",
+            "level": level,
+            "fields": {"json": json_field},
+            "target": target,
+        }
+    )
+
+
+def halmasuit_line(event, *, mono, unit=HALMASUIT_UNIT, as_bytes=False):
+    return journal_line(
+        tracing_line(json.dumps(event)),
+        identifier="halmasuit",
+        transport="stdout",
+        unit=unit,
+        mono=mono,
+        as_bytes=as_bytes,
+    )
+
+
+def frame_payload(frame_id):
+    return {
+        "event": "frame_rendered",
+        "frame_id": frame_id,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": False,
+        "phash": 18364758544493064720,
+    }
+
+
+PHASE_PAYLOAD = {"event": "phase_entered", "phase": "drm_master_acquired"}
+CLIENT_PAYLOAD = {"event": "client_first_frame", "role": "overlay"}
+FOREGROUND_PAYLOAD = {"event": "foreground_changed", "to": "greeter"}
+
+
+def halmasuit_events(doc):
+    return [event for event in doc["events"] if event["kind"] == "halmasuit"]
 
 
 def write_run(root, files):
@@ -477,6 +521,111 @@ class EventTest(unittest.TestCase):
         event = one_event(doc, "greetd.service started")
         self.assertEqual(event["kind"], "unit")
         self.assertEqual(event["t_us"], KERNEL_ZERO_FPDT_US + GREETD_MONO_US)
+
+
+class HalmasuitEventTest(unittest.TestCase):
+    def test_each_event_carries_its_detail_and_exact_payload(self):
+        cases = [
+            (PHASE_PAYLOAD, 1_300_000),
+            (CLIENT_PAYLOAD, 1_310_000),
+            (FOREGROUND_PAYLOAD, 1_320_000),
+            (frame_payload(0), 1_330_000),
+        ]
+        files = with_journal(
+            complete_files(),
+            journal_of(complete_files()) + [halmasuit_line(payload, mono=mono) for payload, mono in cases],
+        )
+        doc = build(files)
+        for payload, mono in cases:
+            with self.subTest(payload["event"]):
+                self.assertEqual(
+                    one_event(doc, payload["event"]),
+                    {
+                        "t_us": KERNEL_ZERO_FPDT_US + mono,
+                        "mono_us": mono,
+                        "kind": "halmasuit",
+                        "source": HALMASUIT_UNIT,
+                        "detail": payload["event"],
+                        "payload": payload,
+                    },
+                )
+
+    def test_byte_list_message_is_decoded(self):
+        files = with_journal(
+            complete_files(),
+            journal_of(complete_files()) + [halmasuit_line(PHASE_PAYLOAD, mono=1_300_000, as_bytes=True)],
+        )
+        self.assertEqual(one_event(build(files), "phase_entered")["payload"], PHASE_PAYLOAD)
+
+    def test_every_frame_rendered_reaches_the_timeline(self):
+        frames = [frame_payload(frame_id) for frame_id in range(200)]
+        lines = [halmasuit_line(frame, mono=1_400_000 + 1_000 * frame_id) for frame_id, frame in enumerate(frames)]
+        # Identical frames at one instant are still two frames: neither may be deduplicated.
+        lines += [halmasuit_line(frame_payload(7), mono=1_700_000)] * 2
+        doc = build(with_journal(complete_files(), journal_of(complete_files()) + lines))
+        frame_events = [event for event in halmasuit_events(doc) if event["detail"] == "frame_rendered"]
+        self.assertEqual([event["payload"] for event in frame_events], frames + [frame_payload(7)] * 2)
+
+    def test_equal_times_keep_journal_order(self):
+        lines = [halmasuit_line(PHASE_PAYLOAD, mono=1_500_000), halmasuit_line(CLIENT_PAYLOAD, mono=1_500_000)]
+        doc = build(with_journal(complete_files(), journal_of(complete_files()) + lines))
+        self.assertEqual(
+            [event["detail"] for event in halmasuit_events(doc)],
+            ["phase_entered", "client_first_frame"],
+        )
+
+    def test_times_are_null_without_an_anchor(self):
+        files = without(
+            complete_files(),
+            f"{FPDT}/exitbootservice_end_ns",
+            f"{EFIVARS}/LoaderTimeExecUSec-{LOADER_GUID}",
+        )
+        doc = build(with_journal(files, journal_of(files) + [halmasuit_line(PHASE_PAYLOAD, mono=1_300_000)]))
+        event = one_event(doc, "phase_entered")
+        self.assertIsNone(event["t_us"])
+        self.assertEqual(event["mono_us"], 1_300_000)
+
+    def test_only_halmasuit_event_lines_produce_events(self):
+        lines = [
+            journal_line("plain text from the service", identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_000),
+            journal_line(
+                '{"timestamp":"2026-10-22T00:00:00Z","level":"WARN","fields":{"message":"DRM device error"},"target":"halmasuit::drm"}',
+                identifier="halmasuit",
+                transport="stdout",
+                unit=HALMASUIT_UNIT,
+                mono=1_700_100,
+            ),
+            journal_line(tracing_line("not json"), identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_110),
+            journal_line(tracing_line("[1, 2]"), identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_120),
+            journal_line(
+                tracing_line('{"phase":"drm_master_acquired"}'),
+                identifier="halmasuit",
+                transport="stdout",
+                unit=HALMASUIT_UNIT,
+                mono=1_700_130,
+            ),
+            journal_line('{"fields":"not an object"}', identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_140),
+            journal_line("42", identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_150),
+            journal_line(
+                tracing_line(json.dumps(PHASE_PAYLOAD)),
+                identifier="halmasuit",
+                transport="stdout",
+                unit="other.service",
+                mono=1_700_200,
+            ),
+            journal_line(
+                "Started halmasuit.service.",
+                identifier="systemd",
+                transport="journal",
+                unit="init.scope",
+                started_unit=HALMASUIT_UNIT,
+                mono=1_700_300,
+            ),
+            halmasuit_line(CLIENT_PAYLOAD, mono=1_700_400),
+        ]
+        doc = build(with_journal(complete_files(), journal_of(complete_files()) + lines))
+        self.assertEqual([event["mono_us"] for event in halmasuit_events(doc)], [1_700_400])
+        self.assertEqual(one_event(doc, "client_first_frame")["payload"], CLIENT_PAYLOAD)
 
 
 class FirmwareTest(unittest.TestCase):
