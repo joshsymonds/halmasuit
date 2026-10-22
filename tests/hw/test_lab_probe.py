@@ -45,6 +45,9 @@ ALPHABET = {
     "o": 24, "p": 25, "q": 16, "r": 19, "s": 31, "t": 20, "u": 22,
     "v": 47, "w": 17, "x": 45, "y": 21, "z": 44,
 }
+SYNTHETIC_USERNAME = "probeuser"
+USERNAME_CODES = [ALPHABET[char] for char in SYNTHETIC_USERNAME]  # p r o b e u s e r
+TYPED_KEYS_WITH_USERNAME = CLEAR_PRESSES + len(USERNAME_CODES) + 1 + len(PASSWORD_CODES) + 1
 
 
 def key_event(code, value):
@@ -286,13 +289,24 @@ class SysfsNode(unittest.TestCase):
 
 class ConsumerArgument(unittest.TestCase):
     def test_consumer_user_is_parsed_from_argv(self):
-        self.assertEqual(probe.parse_consumer_user(["--consumer-user", CONSUMER_USER]), CONSUMER_USER)
+        args = probe.parse_arguments(["--consumer-user", CONSUMER_USER])
+        self.assertEqual(args.consumer_user, CONSUMER_USER)
 
     def test_consumer_user_is_required(self):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as raised:
-                probe.parse_consumer_user([])
+                probe.parse_arguments([])
         self.assertEqual(raised.exception.code, 2)
+
+    def test_username_is_parsed_from_argv(self):
+        args = probe.parse_arguments(
+            ["--consumer-user", CONSUMER_USER, "--username", SYNTHETIC_USERNAME]
+        )
+        self.assertEqual(args.username, SYNTHETIC_USERNAME)
+
+    def test_username_defaults_to_empty_when_absent(self):
+        args = probe.parse_arguments(["--consumer-user", CONSUMER_USER])
+        self.assertEqual(args.username, "")
 
 
 class ProbeRun(unittest.TestCase):
@@ -302,18 +316,21 @@ class ProbeRun(unittest.TestCase):
         self.tree = Tree(self._tmp.name)
         self.clock = FakeClock()
 
-    def run_probe(self, ioctl):
+    def run_probe(self, ioctl, username=""):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            status = probe.run(self.tree.host(ioctl, self.clock), CONSUMER_USER)
+            status = probe.run(self.tree.host(ioctl, self.clock), CONSUMER_USER, username)
         return status, out.getvalue().splitlines()
 
-    def test_success_clears_field_then_types_password_and_reports_three_lines(self):
+    def add_ready_keyboard(self):
         self.tree.add_input(SYSNAME, DEVICE)
         self.tree.add_process(PROBE_PID, "python3", CONSUMER_UID, [self.tree.node])
         self.tree.add_process(UDEV_PID, "systemd-udevd", ROOT_UID, [self.tree.node])
         self.tree.add_process(KEYD_PID, "keyd", ROOT_UID, [self.tree.node])
         self.tree.add_process(GREETER_PID, "halmasuit", CONSUMER_UID, [self.tree.node])
+
+    def test_success_clears_field_then_types_password_and_reports_three_lines(self):
+        self.add_ready_keyboard()
         ioctl = FakeUinput(SYSNAME, self.clock)
         status, lines = self.run_probe(ioctl)
 
@@ -339,6 +356,57 @@ class ProbeRun(unittest.TestCase):
         self.assertIn(probe.UI_DEV_CREATE, ioctl.requests)
         self.assertEqual(ioctl.requests[-1], probe.UI_DEV_DESTROY)
         self.assertEqual(ioctl.sleep_before_destroy, 1.0)
+
+    def test_empty_username_types_todays_sequence(self):
+        self.add_ready_keyboard()
+        ioctl = FakeUinput(SYSNAME, self.clock)
+        status, lines = self.run_probe(ioctl, username="")
+
+        self.assertEqual(status, 0)
+        self.assertEqual(lines[-1], f"typed keys={TYPED_KEYS}")
+        expected = []
+        for code in [BACKSPACE] * CLEAR_PRESSES + PASSWORD_CODES + [ENTER]:
+            expected += [key_event(code, 1), syn_event(), key_event(code, 0), syn_event()]
+        self.assertEqual(self.tree.uinput.read_bytes(), b"".join(expected))
+
+    def test_username_is_typed_with_enter_before_password_with_enter(self):
+        self.add_ready_keyboard()
+        ioctl = FakeUinput(SYSNAME, self.clock)
+        status, lines = self.run_probe(ioctl, username=SYNTHETIC_USERNAME)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            lines,
+            [
+                f"device node={self.tree.node}",
+                f"ready holder=halmasuit pid={GREETER_PID}",
+                f"typed keys={TYPED_KEYS_WITH_USERNAME}",
+            ],
+        )
+        self.assertEqual(TYPED_KEYS_WITH_USERNAME, 53)
+        expected = []
+        sequence = (
+            [BACKSPACE] * CLEAR_PRESSES
+            + USERNAME_CODES + [ENTER]
+            + PASSWORD_CODES + [ENTER]
+        )
+        for code in sequence:
+            expected += [key_event(code, 1), syn_event(), key_event(code, 0), syn_event()]
+        self.assertEqual(self.tree.uinput.read_bytes(), b"".join(expected))
+        self.assertEqual(
+            sorted(set(ioctl.keybits)),
+            sorted(set(PASSWORD_CODES + USERNAME_CODES + [ENTER, BACKSPACE])),
+        )
+        self.assertEqual(ioctl.requests[-1], probe.UI_DEV_DESTROY)
+
+    def test_unmappable_username_is_refused_before_uinput_opens(self):
+        self.tree.uinput.unlink()
+        ioctl = FakeUinput(SYSNAME, self.clock)
+        status, lines = self.run_probe(ioctl, username="probe2")
+
+        self.assertEqual(status, 1)
+        self.assertEqual(lines, ["error reason=username has a character with no key code"])
+        self.assertEqual(ioctl.requests, [])
 
     def test_node_timeout_reports_one_error_line_and_destroys(self):
         self.tree.add_input(SYSNAME)
