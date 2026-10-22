@@ -8,8 +8,9 @@
 # listed PAM services, and the lab-crc scanout sampler, which runs in stage 1
 # and after switch-root. The probe option loads uinput and defines
 # lab-probe.service, an on-demand root oneshot that nothing starts on its own.
-# Every option defaults off or empty, except probe.consumerUser, which defaults
-# to greeter.
+# With probe.earlyKeyboard, the uinput keyboard holder runs from stage 1 across
+# switch-root, and lab-probe uses it. Every option defaults off or empty,
+# except probe.consumerUser, which defaults to greeter.
 #
 # Journal contract (frozen; consumed by tests/hw/timeline.py). Each entry is
 # one journal line, identified by SYSLOG_IDENTIFIER. `t` is CLOCK_MONOTONIC in
@@ -47,7 +48,11 @@ let
 
   labCrc = pkgs.callPackage ./lab-crc.nix { };
 
+  labKbd = pkgs.callPackage ./lab-probe-kbd.nix { };
+
   labProbe = ./lab_probe.py;
+
+  earlyKbd = cfg.probe.enable && cfg.probe.earlyKeyboard;
 in
 {
   options.halmasuit.lab = {
@@ -104,6 +109,15 @@ in
       description = "Username the probe types before the wrong password. Empty types only the wrong password.";
     };
 
+    probe.earlyKeyboard = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Hold the probe's uinput keyboard from stage 1 through switch-root, so it
+        exists before the greeter starts. Takes effect only with probe.enable.
+      '';
+    };
+
     netconsole = {
       enable = lib.mkEnableOption "netconsole from the initramfs, sending kernel messages over UDP";
 
@@ -144,7 +158,7 @@ in
 
   config = lib.mkIf cfg.enable {
     # Hardware watchdog: stage 1 arms it, and the rootfs keeps it armed.
-    boot.initrd.kernelModules = [ "sp5100_tco" ];
+    boot.initrd.kernelModules = [ "sp5100_tco" ] ++ lib.optional earlyKbd "uinput";
     boot.initrd.systemd.settings.Manager = watchdogManager;
     systemd.settings.Manager = watchdogManager;
 
@@ -231,7 +245,8 @@ in
     boot.initrd.availableKernelModules = lib.optional cfg.netconsole.enable "netconsole";
     boot.initrd.systemd.storePaths =
       lib.optional cfg.netconsole.enable pkgs.kmod
-      ++ lib.optional cfg.crcSampler.enable labCrc;
+      ++ lib.optional cfg.crcSampler.enable labCrc
+      ++ lib.optional earlyKbd labKbd;
     boot.initrd.systemd.services.lab-netconsole = lib.mkIf cfg.netconsole.enable {
       wantedBy = [ "initrd.target" ];
       before = [ "initrd.target" ];
@@ -276,15 +291,58 @@ in
     # runner starts it after the greeter is up. The probe types 32 BackSpace,
     # then the username and Enter when probe.username is set, then a fixed
     # wrong password and Enter. It stores no password.
+    #
+    # With probe.earlyKeyboard, lab-probe-kbd creates the keyboard in stage 1
+    # and holds it through switch-root: the initrd unit keeps the holder running
+    # across the pivot, and the rootfs unit adopts it without starting anything.
+    # The probe runs with --early-keyboard, so it writes through the holder's
+    # FIFOs and never opens /dev/uinput.
     boot.kernelModules = lib.optional cfg.probe.enable "uinput";
     systemd.services.lab-probe = lib.mkIf cfg.probe.enable {
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${pkgs.python3}/bin/python3 ${labProbe} --consumer-user ${cfg.probe.consumerUser}"
-          + lib.optionalString (cfg.probe.username != "") " --username ${lib.escapeShellArg cfg.probe.username}";
+          + lib.optionalString (cfg.probe.username != "") " --username ${lib.escapeShellArg cfg.probe.username}"
+          + lib.optionalString earlyKbd " --early-keyboard";
         SyslogIdentifier = "lab-probe";
       };
     };
+
+    boot.initrd.systemd.services.lab-probe-kbd = lib.mkIf earlyKbd {
+      description = "lab-probe uinput keyboard holder (stage 1 through switch-root)";
+      wantedBy = [ "initrd.target" ];
+      wants = [ "systemd-modules-load.service" ];
+      after = [ "systemd-modules-load.service" ];
+      before = [
+        cfg.displayManagerUnit
+        "systemd-udev-settle.service"
+        "initrd-switch-root.service"
+      ];
+      unitConfig = {
+        DefaultDependencies = false;
+        IgnoreOnIsolate = true;
+        # Keeps the holder alive through systemd's final kill at the pivot.
+        SurviveFinalKillSignal = "yes";
+      };
+      serviceConfig = {
+        Type = "notify";
+        ExecStart = "${labKbd}/bin/lab-probe-kbd";
+        SyslogIdentifier = "lab-probe-kbd";
+        KillMode = "process";
+      };
+    };
+    systemd.services.lab-probe-kbd =
+      let
+        initrdUnit = config.boot.initrd.systemd.services.lab-probe-kbd;
+      in
+      lib.mkIf earlyKbd {
+        inherit (initrdUnit) description serviceConfig;
+        unitConfig = {
+          inherit (initrdUnit.unitConfig)
+            DefaultDependencies IgnoreOnIsolate SurviveFinalKillSignal;
+        };
+        restartIfChanged = false;
+      };
 
     # Lab image: for the listed services, U2F is forced off and blank passwords
     # are refused (allowNullPassword = false drops nullok from pam_unix's auth

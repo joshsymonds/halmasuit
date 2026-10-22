@@ -85,6 +85,7 @@ let
 
   # The CRC sampler, built from the same derivation the module stages.
   labCrc = pkgs.callPackage ../nix/lab/lab-crc.nix { };
+  labKbd = pkgs.callPackage ../nix/lab/lab-probe-kbd.nix { };
 
   # Cadence harness: includes lab-crc.c unchanged and runs its real sampler
   # loop against scripted DRM and a simulated clock. The clock moves only when
@@ -374,6 +375,12 @@ let
   probeOff = (evalWith (labOptions // { probe = { enable = false; }; })).config;
   # The same host with a probe username: it must reach ExecStart as --username.
   probeUser = (evalWith (labOptions // { probe = labOptions.probe // { username = "labprobe"; }; })).config;
+  # The same host with the early keyboard on: the holder runs in stage 1 and
+  # lab-probe passes --early-keyboard.
+  earlyKbdOn = (evalWith (labOptions // { probe = labOptions.probe // { earlyKeyboard = true; }; })).config;
+  # The early keyboard with the probe off, and with the lab off: neither may define the holder.
+  earlyKbdProbeOff = (evalWith (labOptions // { probe = { enable = false; earlyKeyboard = true; }; })).config;
+  earlyKbdLabOff = (evalWith (labOptions // { enable = false; probe = labOptions.probe // { earlyKeyboard = true; }; })).config;
   # No lab settings at all: the new options must default off or empty, except
   # probe.consumerUser, which defaults to greeter.
   defaults = (evalWith { }).config.halmasuit.lab;
@@ -535,6 +542,8 @@ let
       msg = "halmasuit.lab.probe.consumerUser does not default to \"greeter\""; }
     { ok = (get defaults [ "probe" "username" ] null) == "";
       msg = "halmasuit.lab.probe.username does not default to \"\""; }
+    { ok = (get defaults [ "probe" "earlyKeyboard" ] null) == false;
+      msg = "halmasuit.lab.probe.earlyKeyboard does not default to false"; }
 
     # ── Netconsole from stage 1: outbound UDP only ───────────────────
     { ok = builtins.elem "netconsole" (get cfg [ "boot" "initrd" "availableKernelModules" ] [ ]);
@@ -801,7 +810,64 @@ let
       msg = "enable = false (with probe.enable = true) still defines lab-probe or loads uinput"; }
   ];
 
-  allChecks = checks ++ journalChecks ++ experimentChecks ++ crcChecks ++ probeChecks;
+  # ── Early keyboard holder: stage 1 through switch-root, then adopted ─
+  kbdInitrd = get earlyKbdOn [ "boot" "initrd" "systemd" "services" "lab-probe-kbd" ] { };
+  kbdRoot = get earlyKbdOn [ "systemd" "services" "lab-probe-kbd" ] { };
+  kbdUnitConfigMatches = unit: lib.all (kv: (unit.unitConfig.${kv.name} or null) == kv.value) [
+    { name = "DefaultDependencies"; value = false; }
+    { name = "IgnoreOnIsolate"; value = true; }
+    { name = "SurviveFinalKillSignal"; value = "yes"; }
+  ];
+  kbdServiceMatches = unit: lib.all (kv: (unit.serviceConfig.${kv.name} or null) == kv.value) [
+    { name = "Type"; value = "notify"; }
+    { name = "ExecStart"; value = "${labKbd}/bin/lab-probe-kbd"; }
+    { name = "KillMode"; value = "process"; }
+  ];
+  kbdAbsent = c:
+    (get c [ "boot" "initrd" "systemd" "services" "lab-probe-kbd" ] null) == null
+    && (get c [ "systemd" "services" "lab-probe-kbd" ] null) == null
+    && !(builtins.elem "uinput" (get c [ "boot" "initrd" "kernelModules" ] [ ]))
+    && !(inStorePaths c labKbd);
+  earlyKbdChecks = [
+    { ok = builtins.elem "initrd.target" (kbdInitrd.wantedBy or [ ]);
+      msg = "lab-probe-kbd (initrd) is not wanted by initrd.target"; }
+    { ok = (kbdInitrd.wants or null) == [ "systemd-modules-load.service" ]
+        && (kbdInitrd.after or null) == [ "systemd-modules-load.service" ];
+      msg = "lab-probe-kbd (initrd) does not want and order after systemd-modules-load.service"; }
+    { ok = lib.all (u: builtins.elem u (kbdInitrd.before or [ ])) [
+        labOptions.displayManagerUnit "systemd-udev-settle.service" "initrd-switch-root.service" ];
+      msg = "lab-probe-kbd (initrd) is not Before= the display manager, udev-settle and initrd-switch-root"; }
+    { ok = kbdUnitConfigMatches kbdInitrd;
+      msg = "lab-probe-kbd (initrd) lacks DefaultDependencies=no, IgnoreOnIsolate=yes or SurviveFinalKillSignal=yes"; }
+    { ok = kbdServiceMatches kbdInitrd;
+      msg = "lab-probe-kbd (initrd) lacks Type=notify, the holder ExecStart or KillMode=process"; }
+    { ok = (kbdInitrd.serviceConfig.SyslogIdentifier or null) == "lab-probe-kbd"
+        && (kbdInitrd.description or "") != "";
+      msg = "lab-probe-kbd (initrd) lacks SyslogIdentifier=lab-probe-kbd or a description"; }
+    { ok = (kbdRoot.description or null) == kbdInitrd.description
+        && kbdServiceMatches kbdRoot
+        && kbdUnitConfigMatches kbdRoot
+        && (kbdRoot.restartIfChanged or null) == false;
+      msg = "lab-probe-kbd (rootfs) does not adopt the initrd unit's description, serviceConfig and unitConfig with restartIfChanged=no"; }
+    { ok = lib.all (key: (kbdRoot.${key} or [ ]) == [ ]) [ "wantedBy" "requiredBy" "upheldBy" ];
+      msg = "lab-probe-kbd (rootfs) has a wantedBy, requiredBy or upheldBy entry (it must be adopted, never started)"; }
+    { ok = builtins.elem "uinput" (get earlyKbdOn [ "boot" "initrd" "kernelModules" ] [ ]);
+      msg = "uinput is not in boot.initrd.kernelModules when probe.earlyKeyboard is on"; }
+    { ok = inStorePaths earlyKbdOn labKbd;
+      msg = "the lab-probe-kbd holder is not in boot.initrd.systemd.storePaths"; }
+    { ok = (get earlyKbdOn [ "systemd" "services" "lab-probe" "serviceConfig" "ExecStart" ] null)
+        == "${pkgs.python3}/bin/python3 ${labProbe} --consumer-user ${labOptions.probe.consumerUser} --early-keyboard";
+      msg = "lab-probe.service does not pass --early-keyboard when probe.earlyKeyboard is on"; }
+    { ok = kbdAbsent cfg
+        && !(lib.hasInfix "--early-keyboard" (get cfg [ "systemd" "services" "lab-probe" "serviceConfig" "ExecStart" ] ""));
+      msg = "probe.earlyKeyboard defaulted off still defines the holder, loads initrd uinput stages the holder, or passes --early-keyboard"; }
+    { ok = kbdAbsent earlyKbdProbeOff && (get earlyKbdProbeOff [ "systemd" "services" "lab-probe" ] null) == null;
+      msg = "probe.enable = false (with earlyKeyboard on) still defines the holder, initrd uinput or lab-probe"; }
+    { ok = kbdAbsent earlyKbdLabOff;
+      msg = "enable = false (with earlyKeyboard on) still defines the holder or initrd uinput"; }
+  ];
+
+  allChecks = checks ++ journalChecks ++ experimentChecks ++ crcChecks ++ probeChecks ++ earlyKbdChecks;
   failures = builtins.filter (c: !c.ok) allChecks;
   report = lib.concatMapStrings
     (c: "echo ${lib.escapeShellArg "FAIL: ${c.msg}"} >&2\n")
@@ -811,6 +877,7 @@ pkgs.runCommand "gnomon-lab-eval" { } ''
   ${report}
   ${lib.optionalString (failures != [ ]) "exit 1"}
   test -x ${labCrc}/bin/lab-crc
+  test -x ${labKbd}/bin/lab-probe-kbd
   ${lib.concatMapStrings (s: "${labCrcCadence}/bin/lab-crc-cadence ${s}\n") cadenceScenarios}
   echo "gnomon-lab-eval: ${toString (builtins.length allChecks)} checks passed, ${toString (builtins.length cadenceScenarios)} lab-crc cadence scenarios passed" > $out
 ''
