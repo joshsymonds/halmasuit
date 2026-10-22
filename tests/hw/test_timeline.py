@@ -19,6 +19,7 @@ import timeline
 
 BOOT_ID = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
 GREETD_MESSAGE_ID = "39f53479d3a045ac8e11786248231fbf"
+GREETD_UNIT = "greetd.service"
 LOADER_GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
 FPDT = "firmware/acpi/fpdt/boot"
 EFIVARS = "firmware/efi/efivars"
@@ -27,6 +28,7 @@ BOOT_PARAMS = "firmware/boot_params/data"
 JOURNAL = "journal.json"
 INITRD_UNIT = "lab-crc-initrd.service"
 ROOTFS_UNIT = "lab-crc.service"
+HALMASUIT_UNIT = "halmasuit.service"
 FATAL_ERRNO = "lab-crc: nvidia card fd lost: No such device"
 FATAL_BARE = "lab-crc: nvidia card fd lost"
 TIMELINE_KEYS = {
@@ -83,9 +85,9 @@ def journal_line(
     return json.dumps(fields)
 
 
-def crc_sample(card, crtc, t_us, unit, *, as_bytes=False):
+def crc_sample(card, crtc, t_us, unit, *, comp="00000001", as_bytes=False):
     message = (
-        f"sample card={card} crtc={crtc} t={t_us} comp=00000001 rg=00000002 "
+        f"sample card={card} crtc={crtc} t={t_us} comp={comp} rg=00000002 "
         "out=00000003 comp_sup=1 rg_sup=1 out_sup=0"
     )
     return journal_line(message, identifier="lab-crc", unit=unit, as_bytes=as_bytes)
@@ -214,6 +216,61 @@ def sampler_fatal(message, mono):
     return journal_line(message, identifier="lab-crc", transport="stdout", unit=ROOTFS_UNIT, mono=mono)
 
 
+def tracing_line(json_field, *, target="halmasuit::event", level="INFO"):
+    return json.dumps(
+        {
+            "timestamp": "2026-10-22T00:00:00.000000Z",
+            "level": level,
+            "fields": {"json": json_field},
+            "target": target,
+        }
+    )
+
+
+def halmasuit_line(event, *, mono, unit=HALMASUIT_UNIT, as_bytes=False):
+    return journal_line(
+        tracing_line(json.dumps(event)),
+        identifier="halmasuit",
+        transport="stdout",
+        unit=unit,
+        mono=mono,
+        as_bytes=as_bytes,
+    )
+
+
+def frame_payload(frame_id, *, phash=18364758544493064720):
+    return {
+        "event": "frame_rendered",
+        "frame_id": frame_id,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": False,
+        "phash": phash,
+    }
+
+
+PHASE_PAYLOAD = {"event": "phase_entered", "phase": "drm_master_acquired"}
+WALLPAPER_PAYLOAD = {"event": "client_first_frame", "role": "wallpaper"}
+CLIENT_PAYLOAD = {"event": "client_first_frame", "role": "overlay"}
+FOREGROUND_PAYLOAD = {"event": "foreground_changed", "to": "greeter"}
+SESSION_PAYLOAD = {"event": "foreground_changed", "to": "session"}
+BIOS_PHASHES = (
+    0x0000000000000000,
+    0xFFFFFFFFFFFFFFFF,
+    0x00000000FFFFFFFF,
+    0xFFFFFFFF00000000,
+    0x5555555555555555,
+    0xAAAAAAAAAAAAAAAA,
+    0x0F0F0F0F0F0F0F0F,
+    0xF0F0F0F0F0F0F0F0,
+)
+
+
+def halmasuit_events(doc):
+    return [event for event in doc["events"] if event["kind"] == "halmasuit"]
+
+
 def write_run(root, files):
     run = root / "run"
     for rel, data in files.items():
@@ -241,6 +298,66 @@ def run_cli(argv):
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = timeline.main(argv)
     return code, out.getvalue(), err.getvalue()
+
+
+def kernel_line(message, mono):
+    return journal_line(message, identifier="kernel", transport="kernel", source=mono)
+
+
+def bios_frame_payloads():
+    return [frame_payload(frame_id, phash=phash) for frame_id, phash in enumerate(BIOS_PHASHES)]
+
+
+def bios_lines(*, drop=(), extra=(), frames=None):
+    """A bios-shader-greeter run's journal lines: NVIDIA loads before drm_master_acquired,
+    takeover and the greeter's frames after it, the greeter in the foreground until the
+    session takes over at 2_000_000."""
+    frames = bios_frame_payloads() if frames is None else frames
+    named = {
+        "nvrm_module": kernel_line("NVRM: loading NVIDIA UNIX Open Kernel Module for x86_64", 300_000),
+        "nvrm_modeset": kernel_line(
+            "nvidia-modeset: Loading NVIDIA UNIX Open Kernel Mode Setting Driver", 310_000
+        ),
+        "nvrm_load": kernel_line("[drm] [nvidia-drm] [GPU ID 0x00000100] Loading driver", 320_000),
+        "nvrm_init": kernel_line(
+            "[drm] Initialized nvidia-drm 0.0.0 for 0000:01:00.0 on minor 1", 330_000
+        ),
+        "pre_card0": crc_sample("card0", "42", 1_000_000, INITRD_UNIT, comp="00000000"),
+        "phase": halmasuit_line(PHASE_PAYLOAD, mono=1_500_000),
+        "wallpaper": halmasuit_line(WALLPAPER_PAYLOAD, mono=1_505_000),
+        "overlay": halmasuit_line(CLIENT_PAYLOAD, mono=1_510_000),
+        "takeover": kernel_line("Console: switching to colour frame buffer device 160x45", 1_520_000),
+        "fbcon_primary": kernel_line("fbcon: nvidia-drmdrmfb (fb0) is primary device", 1_521_000),
+        "nvidia_fb": kernel_line(
+            "nvidia 0000:01:00.0: [drm] fb0: nvidia-drmdrmfb frame buffer device", 1_522_000
+        ),
+        "greeter": halmasuit_line(FOREGROUND_PAYLOAD, mono=1_530_000),
+        **{
+            f"frame{frame_id}": halmasuit_line(payload, mono=1_540_000 + 10_000 * frame_id)
+            for frame_id, payload in enumerate(frames)
+        },
+        "c0_1600": crc_sample("card0", "42", 1_600_000, ROOTFS_UNIT, comp="1a2b3c4d"),
+        "c1_1650": crc_sample("card1", "7", 1_650_000, ROOTFS_UNIT, comp="0000abcd"),
+        "c0_1700": crc_sample("card0", "42", 1_700_000, ROOTFS_UNIT, comp="5e6f7081"),
+        "c1_1800": crc_sample("card1", "7", 1_800_000, ROOTFS_UNIT, comp="0000ef01"),
+        "c0_1900": crc_sample("card0", "42", 1_900_000, ROOTFS_UNIT, comp="1a2b3c4d"),
+        "session": halmasuit_line(SESSION_PAYLOAD, mono=2_000_000),
+    }
+    return [line for name, line in named.items() if name not in drop] + list(extra)
+
+
+def bios_files(**kwargs):
+    return with_journal(complete_files(), bios_lines(**kwargs))
+
+
+def bios_failures(files):
+    with contextlib.redirect_stdout(io.StringIO()):
+        return timeline.PROFILES["bios-shader-greeter"](build(files))
+
+
+def production_failures(files):
+    with contextlib.redirect_stdout(io.StringIO()):
+        return timeline.PROFILES["production"](build(files))
 
 
 class HeaderTest(unittest.TestCase):
@@ -479,6 +596,200 @@ class EventTest(unittest.TestCase):
         self.assertEqual(event["t_us"], KERNEL_ZERO_FPDT_US + GREETD_MONO_US)
 
 
+class HalmasuitEventTest(unittest.TestCase):
+    def test_each_event_carries_its_detail_and_exact_payload(self):
+        cases = [
+            (PHASE_PAYLOAD, 1_300_000),
+            (CLIENT_PAYLOAD, 1_310_000),
+            (FOREGROUND_PAYLOAD, 1_320_000),
+            (frame_payload(0), 1_330_000),
+        ]
+        files = with_journal(
+            complete_files(),
+            journal_of(complete_files()) + [halmasuit_line(payload, mono=mono) for payload, mono in cases],
+        )
+        doc = build(files)
+        for payload, mono in cases:
+            with self.subTest(payload["event"]):
+                self.assertEqual(
+                    one_event(doc, payload["event"]),
+                    {
+                        "t_us": KERNEL_ZERO_FPDT_US + mono,
+                        "mono_us": mono,
+                        "kind": "halmasuit",
+                        "source": HALMASUIT_UNIT,
+                        "detail": payload["event"],
+                        "payload": payload,
+                    },
+                )
+
+    def test_byte_list_message_is_decoded(self):
+        files = with_journal(
+            complete_files(),
+            journal_of(complete_files()) + [halmasuit_line(PHASE_PAYLOAD, mono=1_300_000, as_bytes=True)],
+        )
+        self.assertEqual(one_event(build(files), "phase_entered")["payload"], PHASE_PAYLOAD)
+
+    def test_every_frame_rendered_reaches_the_timeline(self):
+        frames = [frame_payload(frame_id) for frame_id in range(200)]
+        lines = [halmasuit_line(frame, mono=1_400_000 + 1_000 * frame_id) for frame_id, frame in enumerate(frames)]
+        # Identical frames at one instant are still two frames: neither may be deduplicated.
+        lines += [halmasuit_line(frame_payload(7), mono=1_700_000)] * 2
+        doc = build(with_journal(complete_files(), journal_of(complete_files()) + lines))
+        frame_events = [event for event in halmasuit_events(doc) if event["detail"] == "frame_rendered"]
+        self.assertEqual([event["payload"] for event in frame_events], frames + [frame_payload(7)] * 2)
+
+    def test_equal_times_keep_journal_order(self):
+        lines = [halmasuit_line(PHASE_PAYLOAD, mono=1_500_000), halmasuit_line(CLIENT_PAYLOAD, mono=1_500_000)]
+        doc = build(with_journal(complete_files(), journal_of(complete_files()) + lines))
+        self.assertEqual(
+            [event["detail"] for event in halmasuit_events(doc)],
+            ["phase_entered", "client_first_frame"],
+        )
+
+    def test_times_are_null_without_an_anchor(self):
+        files = without(
+            complete_files(),
+            f"{FPDT}/exitbootservice_end_ns",
+            f"{EFIVARS}/LoaderTimeExecUSec-{LOADER_GUID}",
+        )
+        doc = build(with_journal(files, journal_of(files) + [halmasuit_line(PHASE_PAYLOAD, mono=1_300_000)]))
+        event = one_event(doc, "phase_entered")
+        self.assertIsNone(event["t_us"])
+        self.assertEqual(event["mono_us"], 1_300_000)
+
+    def test_only_halmasuit_event_lines_produce_events(self):
+        lines = [
+            journal_line("plain text from the service", identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_000),
+            journal_line(
+                '{"timestamp":"2026-10-22T00:00:00Z","level":"WARN","fields":{"message":"DRM device error"},"target":"halmasuit::drm"}',
+                identifier="halmasuit",
+                transport="stdout",
+                unit=HALMASUIT_UNIT,
+                mono=1_700_100,
+            ),
+            journal_line(tracing_line("not json"), identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_110),
+            journal_line(tracing_line("[1, 2]"), identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_120),
+            journal_line(
+                tracing_line('{"phase":"drm_master_acquired"}'),
+                identifier="halmasuit",
+                transport="stdout",
+                unit=HALMASUIT_UNIT,
+                mono=1_700_130,
+            ),
+            journal_line('{"fields":"not an object"}', identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_140),
+            journal_line("42", identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_150),
+            journal_line(
+                tracing_line(json.dumps(PHASE_PAYLOAD)),
+                identifier="halmasuit",
+                transport="stdout",
+                unit="other.service",
+                mono=1_700_200,
+            ),
+            journal_line(
+                "Started halmasuit.service.",
+                identifier="systemd",
+                transport="journal",
+                unit="init.scope",
+                started_unit=HALMASUIT_UNIT,
+                mono=1_700_300,
+            ),
+            halmasuit_line(CLIENT_PAYLOAD, mono=1_700_400),
+        ]
+        doc = build(with_journal(complete_files(), journal_of(complete_files()) + lines))
+        self.assertEqual([event["mono_us"] for event in halmasuit_events(doc)], [1_700_400])
+        self.assertEqual(one_event(doc, "client_first_frame")["payload"], CLIENT_PAYLOAD)
+
+
+class NullMessageTest(unittest.TestCase):
+    def test_entries_without_a_message_yield_no_event(self):
+        null_lines = {
+            "null halmasuit": journal_line(
+                None, identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_000
+            ),
+            "number halmasuit": journal_line(
+                42, identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_010
+            ),
+            "list with a non-byte halmasuit": journal_line(
+                [300], identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_020
+            ),
+            "list with a string halmasuit": journal_line(
+                ["x", 1], identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_700_030
+            ),
+            "missing halmasuit": json.dumps(
+                {
+                    "_BOOT_ID": BOOT_ID,
+                    "_TRANSPORT": "stdout",
+                    "SYSLOG_IDENTIFIER": "halmasuit",
+                    "_SYSTEMD_UNIT": HALMASUIT_UNIT,
+                    "__MONOTONIC_TIMESTAMP": "1700040",
+                }
+            ),
+            "null kernel": journal_line(None, identifier="kernel", transport="kernel", source=1_700_050),
+            "null lab-crc sample": journal_line(None, identifier="lab-crc", unit=ROOTFS_UNIT, mono=1_700_060),
+            "null lab-crc failure": journal_line(None, identifier="lab-crc", unit=ROOTFS_UNIT, mono=1_700_070),
+            "null lab-probe": journal_line(None, identifier="lab-probe", mono=1_700_080),
+            "missing lab-probe": json.dumps(
+                {"_BOOT_ID": BOOT_ID, "SYSLOG_IDENTIFIER": "lab-probe", "__MONOTONIC_TIMESTAMP": "1700090"}
+            ),
+        }
+        expected = build()
+        for label, line in null_lines.items():
+            with self.subTest(label):
+                doc = build(with_journal(complete_files(), journal_of(complete_files()) + [line]))
+                self.assertEqual(doc, expected)
+
+    def test_greetd_start_reads_message_id_and_unit_not_message(self):
+        files = replacing_lines(
+            complete_files(),
+            "Started Greeter.",
+            journal_line(
+                None,
+                identifier="systemd",
+                started_unit=GREETD_UNIT,
+                message_id=GREETD_MESSAGE_ID,
+                mono=GREETD_MONO_US,
+            ),
+        )
+        doc = build(files)
+        self.assertEqual(one_event(doc, "greetd.service started")["t_us"], KERNEL_ZERO_FPDT_US + GREETD_MONO_US)
+        self.assertEqual(
+            doc["greetd_started"], {"t_us": KERNEL_ZERO_FPDT_US + GREETD_MONO_US, "mono_us": GREETD_MONO_US}
+        )
+        self.assertEqual(
+            doc["greeter_first_appearance"],
+            {
+                "card1/crtc7": {"t_us": KERNEL_ZERO_FPDT_US + 2_050_000, "mono_us": 2_050_000},
+                "card0/crtc42": {"t_us": KERNEL_ZERO_FPDT_US + 2_100_000, "mono_us": 2_100_000},
+            },
+        )
+
+    def test_invalid_utf8_byte_list_keeps_its_halmasuit_event(self):
+        body = tracing_line(json.dumps({**PHASE_PAYLOAD, "note": "MARK"}))
+        raw = list(body.encode().replace(b"MARK", b"\xff"))
+        line = journal_line(raw, identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_300_000)
+        doc = build(with_journal(complete_files(), journal_of(complete_files()) + [line]))
+        self.assertEqual(one_event(doc, "phase_entered")["payload"], {**PHASE_PAYLOAD, "note": "�"})
+
+    def test_null_message_entries_leave_both_profiles_passing(self):
+        nulls = [
+            journal_line(None, identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_545_000),
+            journal_line([300], identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=1_545_500),
+            journal_line(None, identifier="kernel", transport="kernel", source=1_546_000),
+            journal_line(None, identifier="lab-crc", unit=ROOTFS_UNIT, mono=1_547_000),
+            journal_line(None, identifier="lab-probe", mono=1_548_000),
+        ]
+        files = bios_files(extra=nulls)
+        self.assertEqual(bios_failures(files), [])
+        self.assertEqual(production_failures(files), [])
+        for profile in ("bios-shader-greeter", "production"):
+            with self.subTest(profile), tempfile.TemporaryDirectory() as tmp:
+                run = write_run(Path(tmp), files)
+                code, out, err = run_cli([str(run), "--expect", profile])
+                self.assertEqual(code, 0, out + err)
+                self.assertIn(f"PASS {profile}", out)
+
+
 class FirmwareTest(unittest.TestCase):
     def test_firmware_times(self):
         doc = build()
@@ -571,6 +882,298 @@ class BaselineTest(unittest.TestCase):
                 failures = timeline.PROFILES["baseline-greetd"](build(mutate(complete_files())))
                 self.assertTrue(failures, label)
                 self.assertTrue(any(fragment in failure for failure in failures), failures)
+
+
+class BiosShaderGreeterTest(unittest.TestCase):
+    def assert_failures(self, files, fragments):
+        failures = bios_failures(files)
+        self.assertEqual(len(failures), len(fragments), failures)
+        for failure, fragment in zip(failures, fragments):
+            self.assertIn(fragment, failure)
+
+    def test_complete_run_passes(self):
+        self.assertEqual(bios_failures(bios_files()), [])
+
+    def test_r1_ordering_checks(self):
+        cases = {
+            "drm_master_acquired phase missing": (
+                bios_files(drop={"phase"}),
+                ["drm_master_acquired"],
+            ),
+            "console switched before drm_master_acquired": (
+                bios_files(
+                    extra=[kernel_line("Console: switching to colour dummy device 80x25", 1_400_000)]
+                ),
+                ["console switched before drm_master_acquired"],
+            ),
+            "fbcon claims the primary device": (
+                bios_files(
+                    extra=[kernel_line("fbcon: nvidia-drmdrmfb (fb0) is primary device", 1_400_000)]
+                ),
+                ["claimed the primary device before drm_master_acquired"],
+            ),
+            "NVIDIA drm frame buffer device line": (
+                bios_files(
+                    extra=[
+                        kernel_line(
+                            "nvidia 0000:01:00.0: [drm] fb0: nvidia-drmdrmfb frame buffer device",
+                            1_400_000,
+                        )
+                    ]
+                ),
+                ["frame buffer device line before drm_master_acquired"],
+            ),
+            "firmware mode missing": (
+                without(bios_files(), BOOT_PARAMS),
+                ["firmware mode missing"],
+            ),
+            "BGRT logo missing": (
+                without(bios_files(), f"{BGRT}/status"),
+                ["BGRT logo missing"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_r2_frame_and_checksum_checks(self):
+        all_degenerate = [{**payload, "degenerate": True} for payload in bios_frame_payloads()]
+        one_degenerate = bios_frame_payloads()
+        one_degenerate[3]["degenerate"] = True
+        frozen = [frame_payload(frame_id, phash=0) for frame_id in range(len(BIOS_PHASHES))]
+        clear_pixels = bios_frame_payloads()
+        clear_pixels[3]["clear_pixel_count"] = 5
+        cases = {
+            "every frame degenerate": (
+                bios_files(frames=all_degenerate),
+                ["no non-degenerate frame_rendered", "degenerate frame"],
+            ),
+            "one degenerate frame is not every frame": (
+                bios_files(frames=one_degenerate),
+                ["degenerate frame"],
+            ),
+            "frames identical": (
+                bios_files(frames=frozen),
+                ["distinct phash"],
+            ),
+            "no active head after drm_master_acquired": (
+                bios_files(
+                    drop={"c0_1600", "c1_1650", "c0_1700", "c1_1800", "c0_1900"}
+                ),
+                ["no active head after drm_master_acquired"],
+            ),
+            "active head checksum zero after drm_master_acquired": (
+                bios_files(
+                    drop={"c1_1650", "c1_1800"},
+                    extra=[
+                        crc_sample("card1", "7", 1_510_000, ROOTFS_UNIT, comp="00000000"),
+                        crc_sample("card1", "7", 1_520_000, ROOTFS_UNIT, comp="00000000"),
+                    ],
+                ),
+                ["no nonzero checksum after drm_master_acquired on: card1/crtc7", "takes one value"],
+            ),
+            "active head checksum constant": (
+                bios_files(
+                    drop={"c1_1800"},
+                    extra=[crc_sample("card1", "7", 1_800_000, ROOTFS_UNIT, comp="0000abcd")],
+                ),
+                ["takes one value after drm_master_acquired on: card1/crtc7"],
+            ),
+            "clear pixel in a frame": (
+                bios_files(frames=clear_pixels),
+                ["clear_pixel_count"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_r3_overlay_and_greeter_checks(self):
+        cases = {
+            "overlay client missing": (
+                bios_files(drop={"overlay"}),
+                ["no client_first_frame{role: overlay}"],
+            ),
+            "greeter foreground missing": (
+                bios_files(drop={"greeter"}),
+                ["no foreground_changed{to: greeter}"],
+            ),
+            "zero checksum during greeter foreground": (
+                bios_files(
+                    extra=[crc_sample("card0", "42", 1_535_000, ROOTFS_UNIT, comp="00000000")]
+                ),
+                ["zero checksum during greeter foreground on: card0/crtc42"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_r4_flash_stream_checks(self):
+        cases = {
+            "wallpaper client missing": (
+                bios_files(drop={"wallpaper"}),
+                ["no client_first_frame{role:wallpaper}"],
+            ),
+            "zero checksum after first frame_rendered": (
+                bios_files(
+                    extra=[crc_sample("card0", "42", 2_100_000, ROOTFS_UNIT, comp="00000000")]
+                ),
+                ["zero checksum after first frame_rendered on: card0/crtc42"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_cli_runs_the_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = write_run(Path(tmp), bios_files())
+            code, out, _ = run_cli([str(run), "--expect", "bios-shader-greeter"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS bios-shader-greeter", out)
+
+    def test_cli_prints_each_failure_with_the_profile_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = write_run(Path(tmp), bios_files(drop={"greeter"}))
+            code, out, _ = run_cli([str(run), "--expect", "bios-shader-greeter"])
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL bios-shader-greeter: no foreground_changed{to: greeter}", out)
+
+
+class ProductionTest(unittest.TestCase):
+    def assert_failures(self, files, fragments):
+        failures = production_failures(files)
+        self.assertEqual(len(failures), len(fragments), failures)
+        for failure, fragment in zip(failures, fragments):
+            self.assertIn(fragment, failure)
+
+    def test_run_without_frame_rendered_passes(self):
+        self.assertEqual(production_failures(bios_files(frames=())), [])
+        self.assertTrue(bios_failures(bios_files(frames=())))
+
+    def test_run_missing_firmware_mode_and_logo_passes(self):
+        files = without(bios_files(frames=()), BOOT_PARAMS, f"{BGRT}/status")
+        self.assertEqual(production_failures(files), [])
+
+    def test_frame_stats_and_firmware_facts_are_not_checked(self):
+        cases = {
+            "every frame degenerate": bios_files(
+                frames=[{**payload, "degenerate": True} for payload in bios_frame_payloads()]
+            ),
+            "frames identical": bios_files(
+                frames=[frame_payload(frame_id, phash=0) for frame_id in range(len(BIOS_PHASHES))]
+            ),
+            "zero checksum during greeter foreground": bios_files(
+                extra=[crc_sample("card0", "42", 1_535_000, ROOTFS_UNIT, comp="00000000")]
+            ),
+            "zero checksum after first frame_rendered": bios_files(
+                extra=[crc_sample("card0", "42", 2_100_000, ROOTFS_UNIT, comp="00000000")]
+            ),
+        }
+        for label, files in cases.items():
+            with self.subTest(label):
+                self.assertEqual(production_failures(files), [])
+
+    def test_r1_ordering_checks(self):
+        cases = {
+            "drm_master_acquired phase missing": (
+                bios_files(frames=(), drop={"phase"}),
+                ["drm_master_acquired"],
+            ),
+            "console switched before drm_master_acquired": (
+                bios_files(
+                    frames=(),
+                    extra=[kernel_line("Console: switching to colour dummy device 80x25", 1_400_000)],
+                ),
+                ["console switched before drm_master_acquired"],
+            ),
+            "fbcon claims the primary device": (
+                bios_files(
+                    frames=(),
+                    extra=[kernel_line("fbcon: nvidia-drmdrmfb (fb0) is primary device", 1_400_000)],
+                ),
+                ["claimed the primary device before drm_master_acquired"],
+            ),
+            "NVIDIA drm frame buffer device line": (
+                bios_files(
+                    frames=(),
+                    extra=[
+                        kernel_line(
+                            "nvidia 0000:01:00.0: [drm] fb0: nvidia-drmdrmfb frame buffer device",
+                            1_400_000,
+                        )
+                    ],
+                ),
+                ["frame buffer device line before drm_master_acquired"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_r2_active_head_checks(self):
+        cases = {
+            "no active head after drm_master_acquired": (
+                bios_files(
+                    frames=(),
+                    drop={"c0_1600", "c1_1650", "c0_1700", "c1_1800", "c0_1900"},
+                ),
+                ["no active head after drm_master_acquired"],
+            ),
+            "active head checksum zero after drm_master_acquired": (
+                bios_files(
+                    frames=(),
+                    drop={"c1_1650", "c1_1800"},
+                    extra=[
+                        crc_sample("card1", "7", 1_510_000, ROOTFS_UNIT, comp="00000000"),
+                        crc_sample("card1", "7", 1_520_000, ROOTFS_UNIT, comp="00000000"),
+                    ],
+                ),
+                # An all-zero head has one distinct value, so it fails both checks.
+                ["no nonzero checksum after drm_master_acquired on: card1/crtc7", "takes one value"],
+            ),
+            "active head checksum constant": (
+                bios_files(
+                    frames=(),
+                    drop={"c1_1800"},
+                    extra=[crc_sample("card1", "7", 1_800_000, ROOTFS_UNIT, comp="0000abcd")],
+                ),
+                ["takes one value after drm_master_acquired on: card1/crtc7"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_r3_overlay_and_greeter_checks(self):
+        cases = {
+            "overlay client missing": (
+                bios_files(frames=(), drop={"overlay"}),
+                ["no client_first_frame{role: overlay}"],
+            ),
+            "greeter foreground missing": (
+                bios_files(frames=(), drop={"greeter"}),
+                ["no foreground_changed{to: greeter}"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_cli_runs_the_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = write_run(Path(tmp), bios_files(frames=()))
+            code, out, _ = run_cli([str(run), "--expect", "production"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS production", out)
+
+    def test_cli_prints_each_failure_with_the_profile_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = write_run(Path(tmp), bios_files(frames=(), drop={"greeter"}))
+            code, out, _ = run_cli([str(run), "--expect", "production"])
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL production: no foreground_changed{to: greeter}", out)
 
 
 class CliTest(unittest.TestCase):

@@ -114,6 +114,26 @@ PROBE_MAX_STARTS = 5
 PROBE_WAIT_SECONDS = 30
 PROBE_DEADLINE_SECONDS = 180
 PROBE_JOURNAL = ("sudo", "-n", "journalctl", "-b", "0", "-o", "cat", "--no-pager", "SYSLOG_FACILITY=10")
+HALMASUIT_UNIT = "halmasuit.service"
+GREETER_EVENT = {"event": "foreground_changed", "to": "greeter"}
+# The hold's two queries of the lab boot's journal, and the return reboot.
+HOLD_GREETER = (
+    "sudo",
+    "-n",
+    "journalctl",
+    "-b",
+    "0",
+    f"_SYSTEMD_UNIT={HALMASUIT_UNIT}",
+    "-o",
+    "json",
+    "--all",
+    "--no-pager",
+)
+HOLD_NEWEST = ("sudo", "-n", "journalctl", "-b", "0", "-n", "1", "-o", "json", "--all", "--no-pager")
+REBOOT = ("sudo", "-n", "systemctl", "reboot")
+HOLD_DEADLINE_SECONDS = 300
+JOURNAL_EPOCH_US = 1792656320120487
+KERNEL_LINE = {"_TRANSPORT": "kernel", "PRIORITY": "6", "MESSAGE": "kernel line"}
 PAM_DIR = "/etc/pam.d/"
 NIX_PAM_LIB = "/nix/store/0k8sd0c3i0lb8z3zqd1q3n1j9bq5vxk2-linux-pam-1.7.2/lib/security"
 # NixOS shapes: greetd delegates its auth to login through a substack.
@@ -149,6 +169,43 @@ def probe_line(user: str) -> str:
         "pam_unix(greetd:auth): authentication failure; logname= uid=0 euid=0 tty= "
         f"ruser= rhost=  user={user}"
     )
+
+
+def tracing_fields(inner: str, unit: str = HALMASUIT_UNIT) -> dict[str, str]:
+    """The journal fields of a halmasuit tracing-JSON line whose fields.json holds `inner`."""
+    message = {
+        "timestamp": "2026-10-22T12:00:10.000000Z",
+        "level": "INFO",
+        "fields": {"json": inner},
+        "target": "halmasuit::event",
+    }
+    return {
+        "_TRANSPORT": "stdout",
+        "SYSLOG_IDENTIFIER": "halmasuit",
+        "_SYSTEMD_UNIT": unit,
+        "PRIORITY": "6",
+        "MESSAGE": json.dumps(message, separators=(",", ":")),
+    }
+
+
+GREETER_FIELDS = tracing_fields(json.dumps(GREETER_EVENT, separators=(",", ":")))
+
+
+def journal_entry(boot: str, at: float, fields: Mapping[str, str]) -> dict[str, str]:
+    """One `journalctl -o json` record stamped `at` seconds after the boot starts; every value is a string."""
+    micros = round(at * 1_000_000)
+    return {
+        "__REALTIME_TIMESTAMP": str(JOURNAL_EPOCH_US + micros),
+        "__MONOTONIC_TIMESTAMP": str(micros),
+        "_BOOT_ID": boot,
+        "_HOSTNAME": "gnomon",
+        **fields,
+    }
+
+
+def journal_text(records: Sequence[Mapping[str, str]]) -> str:
+    """`journalctl -o json` output: one compact object per line."""
+    return "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records)
 
 
 def firmware_fixtures() -> dict[str, bytes]:
@@ -330,6 +387,10 @@ class FakeGnomon:
         probe_log: Sequence[str] | None = None,
         probe_rc: int = 0,
         probe_script: Sequence[ProbeStart] | None = None,
+        greeter_event_at: float | None = None,
+        lab_journal_ends_at: float | None = None,
+        lab_journal_extra: Sequence[tuple[float, Mapping[str, str]]] = (),
+        hold_query_failures: int = 0,
     ) -> None:
         self.lab_mode = lab_mode
         self.sessions = list(sessions)
@@ -398,6 +459,16 @@ class FakeGnomon:
         self.probe_start_times: list[float] = []
         # authpriv maps a boot id to the SYSLOG_FACILITY=10 lines that boot's journal holds.
         self.authpriv: dict[str, list[str]] = {}
+        # greeter_event_at is when halmasuit logs the greeter event, in seconds after the lab boot starts.
+        # lab_journal_ends_at is when the lab boot's journal stops growing; None keeps it growing.
+        # lab_journal_extra holds (seconds after the lab boot starts, entry fields) for other entries.
+        # hold_query_failures makes that many hold queries fail the way an unreachable gnomon does.
+        self.greeter_event_at = greeter_event_at
+        self.lab_journal_ends_at = lab_journal_ends_at
+        self.lab_journal_extra = list(lab_journal_extra)
+        self.hold_query_failures = hold_query_failures
+        self.lab_started_at = 0.0
+        self.reboot_clock: list[float] = []
 
     def say(self, message: str) -> None:
         self.trace.append(f"say:{message}")
@@ -425,6 +496,7 @@ class FakeGnomon:
         self.oneshot = None
         if choice == LAB:
             self.lab_boot = self.current_boot
+            self.lab_started_at = self.clock.now
         if choice != LAB or self.lab_journal:
             self.persisted[self.current_boot] = journal_of(self.current_boot)
         if choice != LAB:
@@ -538,8 +610,12 @@ class FakeGnomon:
             self.oneshot = None
             self._event("oneshot-clear")
             return _ok()
-        if argv == ("sudo", "-n", "systemctl", "reboot"):
+        if argv == REBOOT:
             self._event("reboot")
+            self.reboot_clock.append(self.clock.now)
+            # The lab boot's journal stops at the reboot that ends it.
+            if self.current_boot == self.lab_boot and self.lab_journal:
+                self.persisted[self.current_boot] = journal_text(self._lab_journal())
             self.up = False
             self.pending = True
             return _ok()
@@ -555,9 +631,10 @@ class FakeGnomon:
             return self._base64(argv[4])
         if argv == ("sudo", "-n", "journalctl", "--list-boots", "-o", "json", "--no-pager"):
             return self._list_boots()
-        if len(argv) == 8 and argv[:4] == ("sudo", "-n", "journalctl", "-b") and argv[5:] == (
+        if len(argv) == 9 and argv[:4] == ("sudo", "-n", "journalctl", "-b") and argv[5:] == (
             "-o",
             "json",
+            "--all",
             "--no-pager",
         ):
             return self._read_journal(argv[4])
@@ -565,9 +642,48 @@ class FakeGnomon:
             return self._start_probe()
         if argv == PROBE_JOURNAL:
             return _ok("".join(f"{line}\n" for line in self.authpriv.get(self.current_boot, [])))
+        if argv in (HOLD_GREETER, HOLD_NEWEST):
+            return self._hold_query(argv)
         if len(argv) == 2 and argv[0] == "cat" and argv[1].startswith(PAM_DIR):
             return self._read_pam(argv[1].removeprefix(PAM_DIR))
         raise UnscriptedCommand(argv)
+
+    def _lab_journal(self) -> list[dict[str, str]]:
+        """The lab boot's journal so far, oldest first, in `journalctl -o json` shape.
+
+        The kernel writes one line a second from the lab boot's start, the scripted entries
+        join them, and nothing is written after lab_journal_ends_at. Journal monotonic time is
+        the microseconds since the lab boot started, on the FakeClock.
+        """
+        elapsed = self.clock.now - self.lab_started_at
+        end = elapsed if self.lab_journal_ends_at is None else min(elapsed, self.lab_journal_ends_at)
+        stamped: list[tuple[float, Mapping[str, str]]] = [
+            (float(second), KERNEL_LINE) for second in range(int(end) + 1)
+        ]
+        if end != int(end):
+            stamped.append((end, KERNEL_LINE))
+        if self.greeter_event_at is not None:
+            stamped.append((self.greeter_event_at, GREETER_FIELDS))
+        stamped.extend(self.lab_journal_extra)
+        ordered = sorted(
+            ((at, fields) for at, fields in stamped if at <= end), key=lambda item: item[0]
+        )
+        boot = self.current_boot.replace("-", "")
+        return [journal_entry(boot, at, fields) for at, fields in ordered]
+
+    def _hold_query(self, argv: tuple[str, ...]) -> lab.Result:
+        """`journalctl -b 0` on the lab boot; the greeter query filters on the unit, the newest takes the last entry."""
+        if self.current_boot != self.lab_boot:
+            raise UnscriptedCommand(argv)
+        if self.hold_query_failures:
+            self.hold_query_failures -= 1
+            return lab.Result(255, "", "ssh: connect to host gnomon port 22: No route to host")
+        records = self._lab_journal()
+        if argv == HOLD_GREETER:
+            records = [record for record in records if record.get("_SYSTEMD_UNIT") == HALMASUIT_UNIT]
+        else:
+            records = records[-1:]
+        return _ok(journal_text(records))
 
     def _start_probe(self) -> lab.Result:
         """`systemctl start` on a oneshot: blocks for the start's duration, then returns nonzero when it failed."""
@@ -1582,6 +1698,176 @@ class LabRunnerTest(unittest.TestCase):
                 self.assertLess(index, reboots[1])
 
 
+    def run_log(self, name: str) -> list[str]:
+        return (self.single_run_dir(name) / "run.log").read_text(encoding="utf-8").splitlines()
+
+    def lab_return_seconds(self, gnomon: FakeGnomon) -> float:
+        """Seconds after the lab boot started at which the return reboot was issued."""
+        return gnomon.reboot_clock[-1] - gnomon.lab_started_at
+
+    def test_halmasuit_experiments_hold_the_lab_boot_without_a_probe(self) -> None:
+        for name in ("halmasuit", "halmasuit-production"):
+            with self.subTest(name=name):
+                gnomon = FakeGnomon(greeter_event_at=10, lab_journal_ends_at=40)
+                code, _, err = self.run_queue([name], gnomon)
+                self.assertEqual(code, 0, err)
+                self.assertIn(("remote", HOLD_NEWEST), gnomon.calls)
+                self.assertEqual(gnomon.probe_starts, [])
+                self.assertFalse(any(PROBE_UNIT in argv for _, argv in gnomon.calls))
+                self.assertFalse((self.single_run_dir(name) / "probe.json").exists())
+                self.assertEqual(gnomon.events.count("reboot"), 2)
+                self.assertEqual(gnomon.selected, DEFAULT)
+                self.assertIn("PASS", self.run_log(name))
+
+    def test_return_reboot_follows_the_greeter_event_plus_thirty_seconds(self) -> None:
+        gnomon = FakeGnomon(greeter_event_at=10)
+        code, _, err = self.run_queue(["halmasuit"], gnomon)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.lab_return_seconds(gnomon), 40)
+        saved = (self.single_run_dir("halmasuit") / "journal.json").read_text(encoding="utf-8")
+        self.assertIn("foreground_changed", saved)
+
+    def test_every_journal_json_read_carries_all(self) -> None:
+        gnomon = FakeGnomon(greeter_event_at=10, lab_journal_ends_at=40)
+        code, _, err = self.run_queue(["halmasuit"], gnomon)
+        self.assertEqual(code, 0, err)
+        json_reads = [
+            argv
+            for kind, argv in gnomon.calls
+            if kind == "remote" and "journalctl" in argv and "json" in argv and "--list-boots" not in argv
+        ]
+        self.assertIn(HOLD_GREETER, json_reads)
+        self.assertIn(HOLD_NEWEST, json_reads)
+        self.assertTrue(any(argv[4] != "0" for argv in json_reads), json_reads)
+        for argv in json_reads:
+            with self.subTest(argv=argv):
+                self.assertIn("--all", argv)
+
+    def test_greeter_entry_over_4096_bytes_still_holds_and_saves_its_full_message(self) -> None:
+        padded = json.dumps({**GREETER_EVENT, "pad": "x" * 5000}, separators=(",", ":"))
+        fields = tracing_fields(padded)
+        self.assertGreater(len(fields["MESSAGE"].encode("utf-8")), 4096)
+        gnomon = FakeGnomon(lab_journal_extra=[(10, fields)])
+        code, _, err = self.run_queue(["halmasuit"], gnomon)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.lab_return_seconds(gnomon), 40)
+        saved = (self.single_run_dir("halmasuit") / "journal.json").read_text(encoding="utf-8")
+        records = [json.loads(line) for line in saved.splitlines()]
+        saved_messages = [record.get("MESSAGE") for record in records if record.get("MESSAGE") == fields["MESSAGE"]]
+        self.assertEqual(saved_messages, [fields["MESSAGE"]])
+
+    def test_twenty_nine_point_nine_seconds_keeps_the_hold_until_the_deadline(self) -> None:
+        gnomon = FakeGnomon(greeter_event_at=10, lab_journal_ends_at=39.9)
+        code, _, err = self.run_queue(["halmasuit"], gnomon)
+        self.assertEqual(code, 1)
+        self.assertIn("lab boot hold expired", err)
+        self.assertEqual(self.lab_return_seconds(gnomon), HOLD_DEADLINE_SECONDS)
+        lines = self.run_log("halmasuit")
+        self.assertTrue(any(line.startswith("hold expired:") and "29.9 s" in line for line in lines), lines)
+
+    def test_deadline_expiry_still_returns_collects_firmware_and_journal_then_fails(self) -> None:
+        gnomon = FakeGnomon(greeter_event_at=10, lab_journal_ends_at=39.9, firmware=firmware_fixtures())
+        code, _, err = self.run_queue(["halmasuit"], gnomon)
+        self.assertEqual(code, 1)
+        run = self.single_run_dir("halmasuit")
+        self.assertEqual(gnomon.events.count("reboot"), 2)
+        self.assertEqual(gnomon.selected, DEFAULT)
+        self.assertEqual(gnomon.events[-2:], ["rm-entry", "oneshot-clear"])
+        self.assertNotIn(LAB, gnomon.esp)
+        self.assertTrue((run / "journal.json").exists())
+        self.assertTrue((run / "firmware" / "acpi" / "tables" / "FPDT").exists())
+        lines = self.run_log("halmasuit")
+        self.assertNotIn("PASS", lines)
+        self.assertTrue(any(line.startswith("FAIL: lab boot hold expired") for line in lines), lines)
+
+    def test_one_deadline_bounds_the_greeter_wait_and_the_thirty_seconds_together(self) -> None:
+        gnomon = FakeGnomon(greeter_event_at=290)
+        code, _, err = self.run_queue(["halmasuit"], gnomon)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.lab_return_seconds(gnomon), HOLD_DEADLINE_SECONDS)
+        lines = self.run_log("halmasuit")
+        self.assertTrue(any(line.startswith("hold expired:") and "10.0 s" in line for line in lines), lines)
+
+    def test_only_the_halmasuit_greeter_event_satisfies_the_hold(self) -> None:
+        cases = {
+            "another unit's greeter event": tracing_fields(
+                json.dumps(GREETER_EVENT, separators=(",", ":")), unit="other.service"
+            ),
+            "halmasuit's session event": tracing_fields(
+                json.dumps({"event": "foreground_changed", "to": "session"}, separators=(",", ":"))
+            ),
+            "halmasuit's frame event": tracing_fields(json.dumps({"event": "frame_rendered"})),
+            "a plain halmasuit tracing line": {
+                "_SYSTEMD_UNIT": HALMASUIT_UNIT,
+                "MESSAGE": json.dumps(
+                    {
+                        "timestamp": "2026-10-22T12:00:10.000000Z",
+                        "level": "INFO",
+                        "fields": {"message": "greeter ready"},
+                        "target": "halmasuit::greeter",
+                    },
+                    separators=(",", ":"),
+                ),
+            },
+            "non-JSON halmasuit text": {
+                "_SYSTEMD_UNIT": HALMASUIT_UNIT,
+                "MESSAGE": "foreground changed to greeter",
+            },
+        }
+        for where, fields in cases.items():
+            with self.subTest(where=where):
+                gnomon = FakeGnomon(lab_journal_extra=[(5, fields)])
+                code, _, err = self.run_queue(["halmasuit"], gnomon)
+                self.assertEqual(code, 1)
+                self.assertEqual(self.lab_return_seconds(gnomon), HOLD_DEADLINE_SECONDS)
+                self.assertTrue(
+                    any(
+                        line.startswith("hold expired:")
+                        and "no halmasuit.service foreground_changed to greeter event" in line
+                        for line in self.run_log("halmasuit")
+                    )
+                )
+
+    def test_unreachable_hold_queries_count_as_not_yet(self) -> None:
+        gnomon = FakeGnomon(greeter_event_at=10, hold_query_failures=2)
+        code, _, err = self.run_queue(["halmasuit"], gnomon)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.lab_return_seconds(gnomon), 40)
+
+    def test_a_hold_query_that_fails_to_the_deadline_names_its_failure_in_the_reason(self) -> None:
+        gnomon = FakeGnomon(greeter_event_at=10, hold_query_failures=10_000)
+        code, _, _ = self.run_queue(["halmasuit"], gnomon)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.lab_return_seconds(gnomon), HOLD_DEADLINE_SECONDS)
+        lines = [line for line in self.run_log("halmasuit") if line.startswith("hold expired:")]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("rc 255", lines[0])
+        self.assertIn("No route to host", lines[0])
+
+    def test_hold_queries_run_on_the_lab_boot_before_the_return_reboot(self) -> None:
+        gnomon = FakeGnomon(greeter_event_at=10)
+        self.run_traced("halmasuit", gnomon)
+        hold_calls = (("remote", HOLD_GREETER), ("remote", HOLD_NEWEST))
+        hold = [index for index, call in enumerate(gnomon.calls) if call in hold_calls]
+        reboots = [index for index, call in enumerate(gnomon.calls) if call == ("remote", REBOOT)]
+        self.assertEqual(len(reboots), 2, gnomon.calls)
+        self.assertGreater(hold[0], reboots[0])
+        self.assertLess(hold[-1], reboots[1])
+
+    def test_hold_queries_are_not_issued_on_other_experiments(self) -> None:
+        for name, lab_mode in (
+            ("baseline", "boots"),
+            ("fault-panic", "returns"),
+            ("fault-poweroff", "poweroff"),
+        ):
+            with self.subTest(name=name):
+                gnomon = FakeGnomon(lab_mode=lab_mode, greeter_event_at=10)
+                code, _, err = self.run_queue([name], gnomon)
+                self.assertEqual(code, 0, err)
+                self.assertNotIn(("remote", HOLD_GREETER), gnomon.calls)
+                self.assertNotIn(("remote", HOLD_NEWEST), gnomon.calls)
+
+
 class NetconsoleLogTest(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -1730,6 +2016,48 @@ class BootListParseTest(unittest.TestCase):
             with self.subTest(listing=listing):
                 with self.assertRaises(lab.LabError):
                     lab.parse_boot_list(listing)
+
+
+class GreeterEventParseTest(unittest.TestCase):
+    def entry(self, **fields: str) -> dict[str, str]:
+        return journal_entry(boot_uuid("lab").replace("-", ""), 10, fields)
+
+    def test_halmasuit_greeter_event_in_tracing_json_is_the_hold_event(self) -> None:
+        self.assertTrue(lab._is_greeter_event(self.entry(**GREETER_FIELDS)))
+
+    def test_only_halmasuit_service_entries_are_the_hold_event(self) -> None:
+        other = self.entry(**tracing_fields(json.dumps(GREETER_EVENT), unit="other.service"))
+        self.assertFalse(lab._is_greeter_event(other))
+        unitless = self.entry(**{key: value for key, value in GREETER_FIELDS.items() if key != "_SYSTEMD_UNIT"})
+        self.assertFalse(lab._is_greeter_event(unitless))
+
+    def test_other_halmasuit_events_and_states_are_not_the_hold_event(self) -> None:
+        for where, inner in (
+            ("session", {"event": "foreground_changed", "to": "session"}),
+            ("frame", {"event": "frame_rendered"}),
+            ("greeter as a state name", {"event": "greeter_started"}),
+            ("a JSON value that is not an event", ["foreground_changed", "greeter"]),
+        ):
+            with self.subTest(where=where):
+                fields = tracing_fields(json.dumps(inner))
+                self.assertFalse(lab._is_greeter_event(self.entry(**fields)))
+
+    def test_plain_text_and_malformed_messages_are_not_the_hold_event(self) -> None:
+        messages = (
+            "foreground changed to greeter",
+            json.dumps({"timestamp": "t", "level": "INFO", "fields": {"message": "greeter"}}),
+            json.dumps({"timestamp": "t", "level": "INFO", "fields": {"json": "not json"}}),
+            json.dumps({"timestamp": "t", "level": "INFO", "fields": "greeter"}),
+            json.dumps(["foreground_changed", "greeter"]),
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                fields = {"_SYSTEMD_UNIT": HALMASUIT_UNIT, "MESSAGE": message}
+                self.assertFalse(lab._is_greeter_event(self.entry(**fields)))
+
+    def test_a_byte_list_message_is_not_the_hold_event(self) -> None:
+        fields = {"_SYSTEMD_UNIT": HALMASUIT_UNIT, "MESSAGE": [123, 125]}
+        self.assertFalse(lab._is_greeter_event(self.entry(**fields)))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,2576 @@
+{
+  "run": "synthetic-production",
+  "boot_id": "b007b007b007b007b007b007b007b007",
+  "clock": {
+    "zero": "cpu-reset",
+    "kernel_zero_us": 2583541,
+    "kernel_zero_source": "fpdt.exitbootservice_end"
+  },
+  "firmware": {
+    "info": "EDK II 2.80",
+    "loader_init_us": 1418204,
+    "loader_exec_us": 2581700,
+    "fpdt": {
+      "firmware_start_us": 183412,
+      "bootloader_load_us": 1021557,
+      "bootloader_launch_us": 1412873,
+      "exitbootservice_start_us": 2581908,
+      "exitbootservice_end_us": 2583541
+    }
+  },
+  "firmware_mode": {
+    "width": 1024,
+    "height": 768,
+    "depth": 32,
+    "linelength": 4096,
+    "efi": true
+  },
+  "logo": {
+    "status": 1,
+    "type": 0,
+    "version": 1,
+    "xoffset": 312,
+    "yoffset": 264,
+    "width": 64,
+    "height": 48
+  },
+  "events": [
+    {
+      "t_us": 183412,
+      "mono_us": null,
+      "kind": "firmware",
+      "source": "fpdt",
+      "detail": "firmware_start_us"
+    },
+    {
+      "t_us": 1021557,
+      "mono_us": null,
+      "kind": "firmware",
+      "source": "fpdt",
+      "detail": "bootloader_load_us"
+    },
+    {
+      "t_us": 1412873,
+      "mono_us": null,
+      "kind": "firmware",
+      "source": "fpdt",
+      "detail": "bootloader_launch_us"
+    },
+    {
+      "t_us": 1418204,
+      "mono_us": null,
+      "kind": "loader",
+      "source": "efivar",
+      "detail": "LoaderTimeInitUSec"
+    },
+    {
+      "t_us": 2581700,
+      "mono_us": null,
+      "kind": "loader",
+      "source": "efivar",
+      "detail": "LoaderTimeExecUSec"
+    },
+    {
+      "t_us": 2581908,
+      "mono_us": null,
+      "kind": "firmware",
+      "source": "fpdt",
+      "detail": "exitbootservice_start_us"
+    },
+    {
+      "t_us": 2583541,
+      "mono_us": null,
+      "kind": "firmware",
+      "source": "fpdt",
+      "detail": "exitbootservice_end_us"
+    },
+    {
+      "t_us": 2695959,
+      "mono_us": 112418,
+      "kind": "kernel-display",
+      "source": "kernel",
+      "detail": "efifb: framebuffer at 0xd0000000, using 3072k, total 3072k"
+    },
+    {
+      "t_us": 4486851,
+      "mono_us": 1903310,
+      "kind": "driver-display",
+      "source": "kernel",
+      "detail": "NVRM: loading NVIDIA UNIX Open Kernel Module for x86_64  615.78.08  Release Build  (nixbld@)  "
+    },
+    {
+      "t_us": 4486943,
+      "mono_us": 1903402,
+      "kind": "driver-display",
+      "source": "kernel",
+      "detail": "nvidia-modeset: Loading NVIDIA UNIX Open Kernel Mode Setting Driver for x86_64  615.78.08  Release Build  (nixbld@)  "
+    },
+    {
+      "t_us": 4504585,
+      "mono_us": 1921044,
+      "kind": "driver-display",
+      "source": "kernel",
+      "detail": "[drm] [nvidia-drm] [GPU ID 0x00000100] Loading driver"
+    },
+    {
+      "t_us": 4522093,
+      "mono_us": 1938552,
+      "kind": "driver-display",
+      "source": "kernel",
+      "detail": "[drm] Initialized nvidia-drm 0.0.0 for 0000:01:00.0 on minor 1"
+    },
+    {
+      "t_us": 4633654,
+      "mono_us": 2050113,
+      "kind": "sampler-start",
+      "source": "lab-crc-initrd.service",
+      "detail": "start t=2050113"
+    },
+    {
+      "t_us": 4671541,
+      "mono_us": 2088000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "started",
+      "payload": {
+        "event": "started",
+        "pid": 1184,
+        "version": "0.1.0"
+      }
+    },
+    {
+      "t_us": 4673541,
+      "mono_us": 2090000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "phase_entered",
+      "payload": {
+        "event": "phase_entered",
+        "phase": "initramfs_init"
+      }
+    },
+    {
+      "t_us": 4823541,
+      "mono_us": 2240000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "phase_entered",
+      "payload": {
+        "event": "phase_entered",
+        "phase": "drm_master_acquired"
+      }
+    },
+    {
+      "t_us": 4833541,
+      "mono_us": 2250000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "phase_entered",
+      "payload": {
+        "event": "phase_entered",
+        "phase": "init"
+      }
+    },
+    {
+      "t_us": 4835541,
+      "mono_us": 2252000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "phase_entered",
+      "payload": {
+        "event": "phase_entered",
+        "phase": "wayland_ready"
+      }
+    },
+    {
+      "t_us": 4845541,
+      "mono_us": 2262000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "client_first_frame",
+      "payload": {
+        "event": "client_first_frame",
+        "role": "wallpaper"
+      }
+    },
+    {
+      "t_us": 4858541,
+      "mono_us": 2275000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "phase_entered",
+      "payload": {
+        "event": "phase_entered",
+        "phase": "scanout_active"
+      }
+    },
+    {
+      "t_us": 4884741,
+      "mono_us": 2301200,
+      "kind": "crc",
+      "source": "lab-crc-initrd.service",
+      "detail": "sample card=card1 crtc=205 t=2301200 comp=4f3406a9 rg=0513f85c out=66e51c99 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 4885941,
+      "mono_us": 2302400,
+      "kind": "crc",
+      "source": "lab-crc-initrd.service",
+      "detail": "sample card=card1 crtc=494 t=2302400 comp=92d34ffc rg=1298172d out=a712325c comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 5384741,
+      "mono_us": 2801200,
+      "kind": "crc",
+      "source": "lab-crc-initrd.service",
+      "detail": "sample card=card1 crtc=205 t=2801200 comp=d0b9a047 rg=c1a4f943 out=7ec2914e comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 5385941,
+      "mono_us": 2802400,
+      "kind": "crc",
+      "source": "lab-crc-initrd.service",
+      "detail": "sample card=card1 crtc=494 t=2802400 comp=40001c7e rg=3a679fa6 out=2036b5f6 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 5563661,
+      "mono_us": 2980120,
+      "kind": "sampler-start",
+      "source": "lab-crc.service",
+      "detail": "start t=2980120"
+    },
+    {
+      "t_us": 5568541,
+      "mono_us": 2985000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "phase_entered",
+      "payload": {
+        "event": "phase_entered",
+        "phase": "rootfs_ready"
+      }
+    },
+    {
+      "t_us": 5573541,
+      "mono_us": 2990000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "phase_entered",
+      "payload": {
+        "event": "phase_entered",
+        "phase": "greetd_ready"
+      }
+    },
+    {
+      "t_us": 5578541,
+      "mono_us": 2995000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "greeter_spawned",
+      "payload": {
+        "event": "greeter_spawned",
+        "pid": 1459
+      }
+    },
+    {
+      "t_us": 5579541,
+      "mono_us": 2996000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "foreground_changed",
+      "payload": {
+        "event": "foreground_changed",
+        "to": "greeter"
+      }
+    },
+    {
+      "t_us": 5581541,
+      "mono_us": 2998000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "phase_entered",
+      "payload": {
+        "event": "phase_entered",
+        "phase": "deprivileged"
+      }
+    },
+    {
+      "t_us": 5593541,
+      "mono_us": 3010000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "client_first_frame",
+      "payload": {
+        "event": "client_first_frame",
+        "role": "overlay"
+      }
+    },
+    {
+      "t_us": 5884741,
+      "mono_us": 3301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=3301200 comp=d2a5bcbb rg=b76dec7f out=8299a980 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 5885941,
+      "mono_us": 3302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=3302400 comp=93011392 rg=a9332b60 out=3fa7f4bb comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 6384741,
+      "mono_us": 3801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=3801200 comp=9317a249 rg=2da0f0fc out=b9443a3b comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 6385941,
+      "mono_us": 3802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=3802400 comp=b55fe992 rg=ab1c99c1 out=942572a5 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 6884741,
+      "mono_us": 4301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=4301200 comp=ec5df931 rg=c85266d4 out=46cfd237 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 6885941,
+      "mono_us": 4302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=4302400 comp=dd968030 rg=f248bb13 out=4943046e comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 7384741,
+      "mono_us": 4801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=4801200 comp=ff361cd8 rg=f240e763 out=66ad3018 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 7385941,
+      "mono_us": 4802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=4802400 comp=4458c008 rg=3ee3d94c out=b4ffbd83 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 7884741,
+      "mono_us": 5301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=5301200 comp=9aee3bd2 rg=2bc7b273 out=059af9e5 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 7885941,
+      "mono_us": 5302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=5302400 comp=a2332415 rg=f0c53beb out=669fe515 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 8384741,
+      "mono_us": 5801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=5801200 comp=f2df0c5a rg=6c9d4f53 out=ff6f5dac comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 8385941,
+      "mono_us": 5802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=5802400 comp=8af11ccf rg=7e62a2e6 out=7e62a2e6 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 8884741,
+      "mono_us": 6301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=6301200 comp=18af1bd5 rg=200eb9a5 out=c47c3a7c comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 8885941,
+      "mono_us": 6302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=6302400 comp=3662cf31 rg=763b3a18 out=41508c8c comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 9384741,
+      "mono_us": 6801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=6801200 comp=45cb8820 rg=7d767b86 out=20f3d009 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 9385941,
+      "mono_us": 6802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=6802400 comp=1d9c2035 rg=ee8b0fd1 out=e202299e comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 9884741,
+      "mono_us": 7301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=7301200 comp=7253ee12 rg=c334ae48 out=3711ac23 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 9885941,
+      "mono_us": 7302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=7302400 comp=83450dca rg=ce880387 out=76c8b7ce comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 10384741,
+      "mono_us": 7801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=7801200 comp=0edf44da rg=24b1191a out=d8ecbc6d comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 10385941,
+      "mono_us": 7802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=7802400 comp=9aefe4e0 rg=98df0977 out=54632f82 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 10884741,
+      "mono_us": 8301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=8301200 comp=1d5946e6 rg=6b0d3042 out=2d8ff6cc comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 10885941,
+      "mono_us": 8302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=8302400 comp=e4e51013 rg=05f68003 out=7ae7aab5 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 11384741,
+      "mono_us": 8801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=8801200 comp=a51b88e5 rg=779530e3 out=335d1a38 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 11385941,
+      "mono_us": 8802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=8802400 comp=7931ab8a rg=bac0ccf9 out=98fc366c comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 11884741,
+      "mono_us": 9301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=9301200 comp=a6862e81 rg=26d7d4e9 out=9375e25f comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 11885941,
+      "mono_us": 9302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=9302400 comp=0ca469fd rg=ee432b6a out=c61b88c4 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 12384741,
+      "mono_us": 9801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=9801200 comp=0f26877b rg=6998b606 out=74c4ab74 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 12385941,
+      "mono_us": 9802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=9802400 comp=064bb23b rg=4aab4b25 out=2543ef35 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 12884741,
+      "mono_us": 10301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=10301200 comp=0a303eea rg=ff20ebd6 out=ff20ebd6 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 12885941,
+      "mono_us": 10302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=10302400 comp=5129e85a rg=750f8a42 out=88dabf8e comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 13384741,
+      "mono_us": 10801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=10801200 comp=dc3d032f rg=6fc00d8a out=61b754d7 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 13385941,
+      "mono_us": 10802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=10802400 comp=5f683778 rg=85bce3cb out=03b879f9 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 13884741,
+      "mono_us": 11301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=11301200 comp=2e8f3478 rg=0dbf602d out=d3fadc1b comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 13885941,
+      "mono_us": 11302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=11302400 comp=caec8a9d rg=acb858ad out=8527b3ec comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 14384741,
+      "mono_us": 11801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=11801200 comp=efcf267d rg=459470c1 out=add0dcea comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 14385941,
+      "mono_us": 11802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=11802400 comp=f06118c6 rg=21dc83ad out=df94a526 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 14884741,
+      "mono_us": 12301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=12301200 comp=608a223f rg=379f37be out=d7846080 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 14885941,
+      "mono_us": 12302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=12302400 comp=7f55ca71 rg=4f205911 out=6e1abdaa comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 15384741,
+      "mono_us": 12801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=12801200 comp=6251118d rg=eb94d3c5 out=9dc52476 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 15385941,
+      "mono_us": 12802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=12802400 comp=511d958b rg=6ec44c94 out=f19cecb6 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 15884741,
+      "mono_us": 13301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=13301200 comp=b4f71ed9 rg=31c3802d out=993231ef comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 15885941,
+      "mono_us": 13302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=13302400 comp=6c6ab7ee rg=7e7fca17 out=86bd26b6 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 16384741,
+      "mono_us": 13801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=13801200 comp=ea63a31e rg=9c6e24b4 out=a801a297 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 16385941,
+      "mono_us": 13802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=13802400 comp=29659ad9 rg=1302cc70 out=dbff1bc0 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 16884741,
+      "mono_us": 14301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=14301200 comp=2b0b26ee rg=75c0ad4d out=3c5f6014 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 16885941,
+      "mono_us": 14302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=14302400 comp=56eb96a2 rg=8dbb90ec out=59ad7351 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 17384741,
+      "mono_us": 14801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=14801200 comp=b470971b rg=dbcfbc45 out=7225333f comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 17385941,
+      "mono_us": 14802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=14802400 comp=80015fb7 rg=eb1a9315 out=5633d7a8 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 17884741,
+      "mono_us": 15301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=15301200 comp=e3a8b339 rg=b7f92078 out=2ee7879e comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 17885941,
+      "mono_us": 15302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=15302400 comp=91f732ec rg=a75f1685 out=65157cf0 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 18384741,
+      "mono_us": 15801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=15801200 comp=7386229d rg=36e823f9 out=53a62598 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 18385941,
+      "mono_us": 15802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=15802400 comp=e66672e8 rg=71ee7f06 out=14359647 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 18884741,
+      "mono_us": 16301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=16301200 comp=1f1c8cc0 rg=ca87d17a out=8a69fc87 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 18885941,
+      "mono_us": 16302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=16302400 comp=29efcd14 rg=1fcb31f1 out=fbf04ece comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 19384741,
+      "mono_us": 16801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=16801200 comp=dd7fca86 rg=436c3ca1 out=56e3d40d comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 19385941,
+      "mono_us": 16802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=16802400 comp=9b96d33b rg=91096928 out=1c8e7774 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 19884741,
+      "mono_us": 17301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=17301200 comp=e944ab84 rg=e944ab84 out=ed5c4da1 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 19885941,
+      "mono_us": 17302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=17302400 comp=f7540576 rg=9746b183 out=aa11ff51 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 20384741,
+      "mono_us": 17801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=17801200 comp=cd486ad1 rg=c665fd63 out=774375f4 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 20385941,
+      "mono_us": 17802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=17802400 comp=7a12b055 rg=bc91314d out=fccdefcf comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 20884741,
+      "mono_us": 18301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=18301200 comp=5eb8f8aa rg=e89cba94 out=94b5a6c2 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 20885941,
+      "mono_us": 18302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=18302400 comp=c8a2176c rg=c98c7764 out=a9167753 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 21384741,
+      "mono_us": 18801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=18801200 comp=e359925b rg=54e2321a out=5db02215 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 21385941,
+      "mono_us": 18802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=18802400 comp=623b84ff rg=83dca495 out=52768174 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 21884741,
+      "mono_us": 19301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=19301200 comp=c7c04db3 rg=4ce99161 out=52004601 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 21885941,
+      "mono_us": 19302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=19302400 comp=a1827620 rg=dfcddc4a out=02f26e12 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 22384741,
+      "mono_us": 19801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=19801200 comp=a7cda92d rg=b8544fb1 out=18aab551 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 22385941,
+      "mono_us": 19802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=19802400 comp=f9f09cf2 rg=fec6a69c out=fec6a69c comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 22884741,
+      "mono_us": 20301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=20301200 comp=515fd872 rg=37c37e27 out=c7843ccf comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 22885941,
+      "mono_us": 20302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=20302400 comp=8cc6f81d rg=c9a8f5bc out=05eb9d68 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 23384741,
+      "mono_us": 20801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=20801200 comp=6cd0e6e8 rg=bd3a9a19 out=73a664c6 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 23385941,
+      "mono_us": 20802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=20802400 comp=f9ab764f rg=f9505862 out=5df2da6a comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 23884741,
+      "mono_us": 21301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=21301200 comp=7aeee0e5 rg=8ddd7880 out=0b75ca18 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 23885941,
+      "mono_us": 21302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=21302400 comp=27193ff2 rg=2e69a8a1 out=2b3f9a1b comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 24384741,
+      "mono_us": 21801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=21801200 comp=558d02bd rg=b49af850 out=19253dd3 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 24385941,
+      "mono_us": 21802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=21802400 comp=0dc5682c rg=62cb022e out=86878599 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 24884741,
+      "mono_us": 22301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=22301200 comp=ff03538c rg=3554556f out=b4ae766a comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 24885941,
+      "mono_us": 22302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=22302400 comp=424dcf81 rg=804eb25b out=144e0279 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 25384741,
+      "mono_us": 22801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=22801200 comp=b30708fe rg=c58ecab3 out=36b37371 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 25385941,
+      "mono_us": 22802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=22802400 comp=688591d0 rg=56d5be3c out=f4f2655a comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 25884741,
+      "mono_us": 23301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=23301200 comp=ee81cb7f rg=4a90f88c out=5d48af84 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 25885941,
+      "mono_us": 23302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=23302400 comp=236d9733 rg=1eb943d2 out=5289eaa3 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 26384741,
+      "mono_us": 23801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=23801200 comp=620f873a rg=77a0bafc out=f3b284b4 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 26385941,
+      "mono_us": 23802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=23802400 comp=18e89be2 rg=7ee0608e out=1db337b2 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 26884741,
+      "mono_us": 24301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=24301200 comp=0bfd43c3 rg=a4f38df1 out=ed64145c comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 26885941,
+      "mono_us": 24302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=24302400 comp=494a65af rg=76cd5e5c out=1e58aadc comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 27384741,
+      "mono_us": 24801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=24801200 comp=14d59581 rg=46eaa7bd out=db6ebde6 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 27385941,
+      "mono_us": 24802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=24802400 comp=e300fb0f rg=7f10fdda out=f47dbcc6 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 27884741,
+      "mono_us": 25301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=25301200 comp=96286a79 rg=0e8bbb87 out=e697bafd comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 27885941,
+      "mono_us": 25302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=25302400 comp=90cd1fa0 rg=5c815ca0 out=471dbf5c comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 28384741,
+      "mono_us": 25801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=25801200 comp=b4757dfc rg=9f8c1096 out=e0a6021a comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 28385941,
+      "mono_us": 25802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=25802400 comp=686f8614 rg=6cba5ac2 out=aef95ada comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 28884741,
+      "mono_us": 26301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=26301200 comp=ec70e281 rg=c60ca82e out=311b2da5 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 28885941,
+      "mono_us": 26302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=26302400 comp=4b31558f rg=5c4bd87e out=753d4f4b comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 29384741,
+      "mono_us": 26801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=26801200 comp=44db173d rg=3220c7a2 out=a38c6071 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 29385941,
+      "mono_us": 26802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=26802400 comp=29f51ac2 rg=53e9086c out=05e1eae0 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 29884741,
+      "mono_us": 27301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=27301200 comp=e9f5f707 rg=6c8646b0 out=9b6e704e comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 29885941,
+      "mono_us": 27302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=27302400 comp=67c69c94 rg=25bb0fd5 out=9a910778 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 30384741,
+      "mono_us": 27801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=27801200 comp=27cf0897 rg=b268dadd out=5464bdf1 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 30385941,
+      "mono_us": 27802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=27802400 comp=d9230b4e rg=dc40567c out=996de43d comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 30884741,
+      "mono_us": 28301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=28301200 comp=dd3bc6a8 rg=1dbc4c5f out=775b2d20 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 30885941,
+      "mono_us": 28302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=28302400 comp=183a3907 rg=56f9b4a3 out=3d2a7e65 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 31384741,
+      "mono_us": 28801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=28801200 comp=1b3c26ac rg=9b9544a1 out=c5108ed4 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 31385941,
+      "mono_us": 28802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=28802400 comp=0847b43e rg=a289c35c out=1ad9b6e0 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 31884741,
+      "mono_us": 29301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=29301200 comp=9193325f rg=9745825d out=7a6a68f8 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 31885941,
+      "mono_us": 29302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=29302400 comp=c4d7872f rg=e94f15dc out=a8bcec19 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 32384741,
+      "mono_us": 29801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=29801200 comp=8efa26a5 rg=aba6e153 out=a9c31ace comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 32385941,
+      "mono_us": 29802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=29802400 comp=19c20409 rg=e14c1fb9 out=d7b8512a comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 32884741,
+      "mono_us": 30301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=30301200 comp=bf9bebe4 rg=3a52c007 out=009410c3 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 32885941,
+      "mono_us": 30302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=30302400 comp=15dfba6a rg=6d7181db out=6c692a6f comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 33384741,
+      "mono_us": 30801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=30801200 comp=506771ff rg=2e329c61 out=70712dff comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 33385941,
+      "mono_us": 30802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=30802400 comp=cc081b3d rg=7b8a6b7a out=5381b5d1 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 33884741,
+      "mono_us": 31301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=31301200 comp=ee36017b rg=a19279a1 out=8a45cad4 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 33885941,
+      "mono_us": 31302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=31302400 comp=9b0914c9 rg=e2d46593 out=4e8384d9 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 34384741,
+      "mono_us": 31801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=31801200 comp=4e718cca rg=a076a7ce out=ad5c2aab comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 34385941,
+      "mono_us": 31802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=31802400 comp=1e431000 rg=b6e7c440 out=84faa750 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 34884741,
+      "mono_us": 32301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=32301200 comp=6db902bf rg=71b2757a out=4af39693 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 34885941,
+      "mono_us": 32302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=32302400 comp=1eaed89e rg=a103a3dc out=c39bca3f comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 35384741,
+      "mono_us": 32801200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=32801200 comp=89dbf5cb rg=89dbf5cb out=56a854a9 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 35385941,
+      "mono_us": 32802400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=32802400 comp=60e3180c rg=4b7d5c7f out=8c9f513b comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 35884741,
+      "mono_us": 33301200,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=205 t=33301200 comp=7fc29d5c rg=c521c866 out=c521c866 comp_sup=1 rg_sup=1 out_sup=1"
+    },
+    {
+      "t_us": 35885941,
+      "mono_us": 33302400,
+      "kind": "crc",
+      "source": "lab-crc.service",
+      "detail": "sample card=card1 crtc=494 t=33302400 comp=4f4716d5 rg=e23fb0e1 out=3d8b7be6 comp_sup=1 rg_sup=1 out_sup=1"
+    }
+  ],
+  "heads": {
+    "card1/crtc205": {
+      "samples": [
+        {
+          "t_us": 4884741,
+          "mono_us": 2301200,
+          "unit": "lab-crc-initrd.service",
+          "comp": "4f3406a9",
+          "rg": "0513f85c",
+          "out": "66e51c99",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 5384741,
+          "mono_us": 2801200,
+          "unit": "lab-crc-initrd.service",
+          "comp": "d0b9a047",
+          "rg": "c1a4f943",
+          "out": "7ec2914e",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 5884741,
+          "mono_us": 3301200,
+          "unit": "lab-crc.service",
+          "comp": "d2a5bcbb",
+          "rg": "b76dec7f",
+          "out": "8299a980",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 6384741,
+          "mono_us": 3801200,
+          "unit": "lab-crc.service",
+          "comp": "9317a249",
+          "rg": "2da0f0fc",
+          "out": "b9443a3b",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 6884741,
+          "mono_us": 4301200,
+          "unit": "lab-crc.service",
+          "comp": "ec5df931",
+          "rg": "c85266d4",
+          "out": "46cfd237",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 7384741,
+          "mono_us": 4801200,
+          "unit": "lab-crc.service",
+          "comp": "ff361cd8",
+          "rg": "f240e763",
+          "out": "66ad3018",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 7884741,
+          "mono_us": 5301200,
+          "unit": "lab-crc.service",
+          "comp": "9aee3bd2",
+          "rg": "2bc7b273",
+          "out": "059af9e5",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 8384741,
+          "mono_us": 5801200,
+          "unit": "lab-crc.service",
+          "comp": "f2df0c5a",
+          "rg": "6c9d4f53",
+          "out": "ff6f5dac",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 8884741,
+          "mono_us": 6301200,
+          "unit": "lab-crc.service",
+          "comp": "18af1bd5",
+          "rg": "200eb9a5",
+          "out": "c47c3a7c",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 9384741,
+          "mono_us": 6801200,
+          "unit": "lab-crc.service",
+          "comp": "45cb8820",
+          "rg": "7d767b86",
+          "out": "20f3d009",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 9884741,
+          "mono_us": 7301200,
+          "unit": "lab-crc.service",
+          "comp": "7253ee12",
+          "rg": "c334ae48",
+          "out": "3711ac23",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 10384741,
+          "mono_us": 7801200,
+          "unit": "lab-crc.service",
+          "comp": "0edf44da",
+          "rg": "24b1191a",
+          "out": "d8ecbc6d",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 10884741,
+          "mono_us": 8301200,
+          "unit": "lab-crc.service",
+          "comp": "1d5946e6",
+          "rg": "6b0d3042",
+          "out": "2d8ff6cc",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 11384741,
+          "mono_us": 8801200,
+          "unit": "lab-crc.service",
+          "comp": "a51b88e5",
+          "rg": "779530e3",
+          "out": "335d1a38",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 11884741,
+          "mono_us": 9301200,
+          "unit": "lab-crc.service",
+          "comp": "a6862e81",
+          "rg": "26d7d4e9",
+          "out": "9375e25f",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 12384741,
+          "mono_us": 9801200,
+          "unit": "lab-crc.service",
+          "comp": "0f26877b",
+          "rg": "6998b606",
+          "out": "74c4ab74",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 12884741,
+          "mono_us": 10301200,
+          "unit": "lab-crc.service",
+          "comp": "0a303eea",
+          "rg": "ff20ebd6",
+          "out": "ff20ebd6",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 13384741,
+          "mono_us": 10801200,
+          "unit": "lab-crc.service",
+          "comp": "dc3d032f",
+          "rg": "6fc00d8a",
+          "out": "61b754d7",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 13884741,
+          "mono_us": 11301200,
+          "unit": "lab-crc.service",
+          "comp": "2e8f3478",
+          "rg": "0dbf602d",
+          "out": "d3fadc1b",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 14384741,
+          "mono_us": 11801200,
+          "unit": "lab-crc.service",
+          "comp": "efcf267d",
+          "rg": "459470c1",
+          "out": "add0dcea",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 14884741,
+          "mono_us": 12301200,
+          "unit": "lab-crc.service",
+          "comp": "608a223f",
+          "rg": "379f37be",
+          "out": "d7846080",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 15384741,
+          "mono_us": 12801200,
+          "unit": "lab-crc.service",
+          "comp": "6251118d",
+          "rg": "eb94d3c5",
+          "out": "9dc52476",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 15884741,
+          "mono_us": 13301200,
+          "unit": "lab-crc.service",
+          "comp": "b4f71ed9",
+          "rg": "31c3802d",
+          "out": "993231ef",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 16384741,
+          "mono_us": 13801200,
+          "unit": "lab-crc.service",
+          "comp": "ea63a31e",
+          "rg": "9c6e24b4",
+          "out": "a801a297",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 16884741,
+          "mono_us": 14301200,
+          "unit": "lab-crc.service",
+          "comp": "2b0b26ee",
+          "rg": "75c0ad4d",
+          "out": "3c5f6014",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 17384741,
+          "mono_us": 14801200,
+          "unit": "lab-crc.service",
+          "comp": "b470971b",
+          "rg": "dbcfbc45",
+          "out": "7225333f",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 17884741,
+          "mono_us": 15301200,
+          "unit": "lab-crc.service",
+          "comp": "e3a8b339",
+          "rg": "b7f92078",
+          "out": "2ee7879e",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 18384741,
+          "mono_us": 15801200,
+          "unit": "lab-crc.service",
+          "comp": "7386229d",
+          "rg": "36e823f9",
+          "out": "53a62598",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 18884741,
+          "mono_us": 16301200,
+          "unit": "lab-crc.service",
+          "comp": "1f1c8cc0",
+          "rg": "ca87d17a",
+          "out": "8a69fc87",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 19384741,
+          "mono_us": 16801200,
+          "unit": "lab-crc.service",
+          "comp": "dd7fca86",
+          "rg": "436c3ca1",
+          "out": "56e3d40d",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 19884741,
+          "mono_us": 17301200,
+          "unit": "lab-crc.service",
+          "comp": "e944ab84",
+          "rg": "e944ab84",
+          "out": "ed5c4da1",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 20384741,
+          "mono_us": 17801200,
+          "unit": "lab-crc.service",
+          "comp": "cd486ad1",
+          "rg": "c665fd63",
+          "out": "774375f4",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 20884741,
+          "mono_us": 18301200,
+          "unit": "lab-crc.service",
+          "comp": "5eb8f8aa",
+          "rg": "e89cba94",
+          "out": "94b5a6c2",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 21384741,
+          "mono_us": 18801200,
+          "unit": "lab-crc.service",
+          "comp": "e359925b",
+          "rg": "54e2321a",
+          "out": "5db02215",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 21884741,
+          "mono_us": 19301200,
+          "unit": "lab-crc.service",
+          "comp": "c7c04db3",
+          "rg": "4ce99161",
+          "out": "52004601",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 22384741,
+          "mono_us": 19801200,
+          "unit": "lab-crc.service",
+          "comp": "a7cda92d",
+          "rg": "b8544fb1",
+          "out": "18aab551",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 22884741,
+          "mono_us": 20301200,
+          "unit": "lab-crc.service",
+          "comp": "515fd872",
+          "rg": "37c37e27",
+          "out": "c7843ccf",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 23384741,
+          "mono_us": 20801200,
+          "unit": "lab-crc.service",
+          "comp": "6cd0e6e8",
+          "rg": "bd3a9a19",
+          "out": "73a664c6",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 23884741,
+          "mono_us": 21301200,
+          "unit": "lab-crc.service",
+          "comp": "7aeee0e5",
+          "rg": "8ddd7880",
+          "out": "0b75ca18",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 24384741,
+          "mono_us": 21801200,
+          "unit": "lab-crc.service",
+          "comp": "558d02bd",
+          "rg": "b49af850",
+          "out": "19253dd3",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 24884741,
+          "mono_us": 22301200,
+          "unit": "lab-crc.service",
+          "comp": "ff03538c",
+          "rg": "3554556f",
+          "out": "b4ae766a",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 25384741,
+          "mono_us": 22801200,
+          "unit": "lab-crc.service",
+          "comp": "b30708fe",
+          "rg": "c58ecab3",
+          "out": "36b37371",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 25884741,
+          "mono_us": 23301200,
+          "unit": "lab-crc.service",
+          "comp": "ee81cb7f",
+          "rg": "4a90f88c",
+          "out": "5d48af84",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 26384741,
+          "mono_us": 23801200,
+          "unit": "lab-crc.service",
+          "comp": "620f873a",
+          "rg": "77a0bafc",
+          "out": "f3b284b4",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 26884741,
+          "mono_us": 24301200,
+          "unit": "lab-crc.service",
+          "comp": "0bfd43c3",
+          "rg": "a4f38df1",
+          "out": "ed64145c",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 27384741,
+          "mono_us": 24801200,
+          "unit": "lab-crc.service",
+          "comp": "14d59581",
+          "rg": "46eaa7bd",
+          "out": "db6ebde6",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 27884741,
+          "mono_us": 25301200,
+          "unit": "lab-crc.service",
+          "comp": "96286a79",
+          "rg": "0e8bbb87",
+          "out": "e697bafd",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 28384741,
+          "mono_us": 25801200,
+          "unit": "lab-crc.service",
+          "comp": "b4757dfc",
+          "rg": "9f8c1096",
+          "out": "e0a6021a",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 28884741,
+          "mono_us": 26301200,
+          "unit": "lab-crc.service",
+          "comp": "ec70e281",
+          "rg": "c60ca82e",
+          "out": "311b2da5",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 29384741,
+          "mono_us": 26801200,
+          "unit": "lab-crc.service",
+          "comp": "44db173d",
+          "rg": "3220c7a2",
+          "out": "a38c6071",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 29884741,
+          "mono_us": 27301200,
+          "unit": "lab-crc.service",
+          "comp": "e9f5f707",
+          "rg": "6c8646b0",
+          "out": "9b6e704e",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 30384741,
+          "mono_us": 27801200,
+          "unit": "lab-crc.service",
+          "comp": "27cf0897",
+          "rg": "b268dadd",
+          "out": "5464bdf1",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 30884741,
+          "mono_us": 28301200,
+          "unit": "lab-crc.service",
+          "comp": "dd3bc6a8",
+          "rg": "1dbc4c5f",
+          "out": "775b2d20",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 31384741,
+          "mono_us": 28801200,
+          "unit": "lab-crc.service",
+          "comp": "1b3c26ac",
+          "rg": "9b9544a1",
+          "out": "c5108ed4",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 31884741,
+          "mono_us": 29301200,
+          "unit": "lab-crc.service",
+          "comp": "9193325f",
+          "rg": "9745825d",
+          "out": "7a6a68f8",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 32384741,
+          "mono_us": 29801200,
+          "unit": "lab-crc.service",
+          "comp": "8efa26a5",
+          "rg": "aba6e153",
+          "out": "a9c31ace",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 32884741,
+          "mono_us": 30301200,
+          "unit": "lab-crc.service",
+          "comp": "bf9bebe4",
+          "rg": "3a52c007",
+          "out": "009410c3",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 33384741,
+          "mono_us": 30801200,
+          "unit": "lab-crc.service",
+          "comp": "506771ff",
+          "rg": "2e329c61",
+          "out": "70712dff",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 33884741,
+          "mono_us": 31301200,
+          "unit": "lab-crc.service",
+          "comp": "ee36017b",
+          "rg": "a19279a1",
+          "out": "8a45cad4",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 34384741,
+          "mono_us": 31801200,
+          "unit": "lab-crc.service",
+          "comp": "4e718cca",
+          "rg": "a076a7ce",
+          "out": "ad5c2aab",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 34884741,
+          "mono_us": 32301200,
+          "unit": "lab-crc.service",
+          "comp": "6db902bf",
+          "rg": "71b2757a",
+          "out": "4af39693",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 35384741,
+          "mono_us": 32801200,
+          "unit": "lab-crc.service",
+          "comp": "89dbf5cb",
+          "rg": "89dbf5cb",
+          "out": "56a854a9",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 35884741,
+          "mono_us": 33301200,
+          "unit": "lab-crc.service",
+          "comp": "7fc29d5c",
+          "rg": "c521c866",
+          "out": "c521c866",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        }
+      ],
+      "errors": []
+    },
+    "card1/crtc494": {
+      "samples": [
+        {
+          "t_us": 4885941,
+          "mono_us": 2302400,
+          "unit": "lab-crc-initrd.service",
+          "comp": "92d34ffc",
+          "rg": "1298172d",
+          "out": "a712325c",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 5385941,
+          "mono_us": 2802400,
+          "unit": "lab-crc-initrd.service",
+          "comp": "40001c7e",
+          "rg": "3a679fa6",
+          "out": "2036b5f6",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 5885941,
+          "mono_us": 3302400,
+          "unit": "lab-crc.service",
+          "comp": "93011392",
+          "rg": "a9332b60",
+          "out": "3fa7f4bb",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 6385941,
+          "mono_us": 3802400,
+          "unit": "lab-crc.service",
+          "comp": "b55fe992",
+          "rg": "ab1c99c1",
+          "out": "942572a5",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 6885941,
+          "mono_us": 4302400,
+          "unit": "lab-crc.service",
+          "comp": "dd968030",
+          "rg": "f248bb13",
+          "out": "4943046e",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 7385941,
+          "mono_us": 4802400,
+          "unit": "lab-crc.service",
+          "comp": "4458c008",
+          "rg": "3ee3d94c",
+          "out": "b4ffbd83",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 7885941,
+          "mono_us": 5302400,
+          "unit": "lab-crc.service",
+          "comp": "a2332415",
+          "rg": "f0c53beb",
+          "out": "669fe515",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 8385941,
+          "mono_us": 5802400,
+          "unit": "lab-crc.service",
+          "comp": "8af11ccf",
+          "rg": "7e62a2e6",
+          "out": "7e62a2e6",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 8885941,
+          "mono_us": 6302400,
+          "unit": "lab-crc.service",
+          "comp": "3662cf31",
+          "rg": "763b3a18",
+          "out": "41508c8c",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 9385941,
+          "mono_us": 6802400,
+          "unit": "lab-crc.service",
+          "comp": "1d9c2035",
+          "rg": "ee8b0fd1",
+          "out": "e202299e",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 9885941,
+          "mono_us": 7302400,
+          "unit": "lab-crc.service",
+          "comp": "83450dca",
+          "rg": "ce880387",
+          "out": "76c8b7ce",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 10385941,
+          "mono_us": 7802400,
+          "unit": "lab-crc.service",
+          "comp": "9aefe4e0",
+          "rg": "98df0977",
+          "out": "54632f82",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 10885941,
+          "mono_us": 8302400,
+          "unit": "lab-crc.service",
+          "comp": "e4e51013",
+          "rg": "05f68003",
+          "out": "7ae7aab5",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 11385941,
+          "mono_us": 8802400,
+          "unit": "lab-crc.service",
+          "comp": "7931ab8a",
+          "rg": "bac0ccf9",
+          "out": "98fc366c",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 11885941,
+          "mono_us": 9302400,
+          "unit": "lab-crc.service",
+          "comp": "0ca469fd",
+          "rg": "ee432b6a",
+          "out": "c61b88c4",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 12385941,
+          "mono_us": 9802400,
+          "unit": "lab-crc.service",
+          "comp": "064bb23b",
+          "rg": "4aab4b25",
+          "out": "2543ef35",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 12885941,
+          "mono_us": 10302400,
+          "unit": "lab-crc.service",
+          "comp": "5129e85a",
+          "rg": "750f8a42",
+          "out": "88dabf8e",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 13385941,
+          "mono_us": 10802400,
+          "unit": "lab-crc.service",
+          "comp": "5f683778",
+          "rg": "85bce3cb",
+          "out": "03b879f9",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 13885941,
+          "mono_us": 11302400,
+          "unit": "lab-crc.service",
+          "comp": "caec8a9d",
+          "rg": "acb858ad",
+          "out": "8527b3ec",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 14385941,
+          "mono_us": 11802400,
+          "unit": "lab-crc.service",
+          "comp": "f06118c6",
+          "rg": "21dc83ad",
+          "out": "df94a526",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 14885941,
+          "mono_us": 12302400,
+          "unit": "lab-crc.service",
+          "comp": "7f55ca71",
+          "rg": "4f205911",
+          "out": "6e1abdaa",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 15385941,
+          "mono_us": 12802400,
+          "unit": "lab-crc.service",
+          "comp": "511d958b",
+          "rg": "6ec44c94",
+          "out": "f19cecb6",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 15885941,
+          "mono_us": 13302400,
+          "unit": "lab-crc.service",
+          "comp": "6c6ab7ee",
+          "rg": "7e7fca17",
+          "out": "86bd26b6",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 16385941,
+          "mono_us": 13802400,
+          "unit": "lab-crc.service",
+          "comp": "29659ad9",
+          "rg": "1302cc70",
+          "out": "dbff1bc0",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 16885941,
+          "mono_us": 14302400,
+          "unit": "lab-crc.service",
+          "comp": "56eb96a2",
+          "rg": "8dbb90ec",
+          "out": "59ad7351",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 17385941,
+          "mono_us": 14802400,
+          "unit": "lab-crc.service",
+          "comp": "80015fb7",
+          "rg": "eb1a9315",
+          "out": "5633d7a8",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 17885941,
+          "mono_us": 15302400,
+          "unit": "lab-crc.service",
+          "comp": "91f732ec",
+          "rg": "a75f1685",
+          "out": "65157cf0",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 18385941,
+          "mono_us": 15802400,
+          "unit": "lab-crc.service",
+          "comp": "e66672e8",
+          "rg": "71ee7f06",
+          "out": "14359647",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 18885941,
+          "mono_us": 16302400,
+          "unit": "lab-crc.service",
+          "comp": "29efcd14",
+          "rg": "1fcb31f1",
+          "out": "fbf04ece",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 19385941,
+          "mono_us": 16802400,
+          "unit": "lab-crc.service",
+          "comp": "9b96d33b",
+          "rg": "91096928",
+          "out": "1c8e7774",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 19885941,
+          "mono_us": 17302400,
+          "unit": "lab-crc.service",
+          "comp": "f7540576",
+          "rg": "9746b183",
+          "out": "aa11ff51",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 20385941,
+          "mono_us": 17802400,
+          "unit": "lab-crc.service",
+          "comp": "7a12b055",
+          "rg": "bc91314d",
+          "out": "fccdefcf",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 20885941,
+          "mono_us": 18302400,
+          "unit": "lab-crc.service",
+          "comp": "c8a2176c",
+          "rg": "c98c7764",
+          "out": "a9167753",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 21385941,
+          "mono_us": 18802400,
+          "unit": "lab-crc.service",
+          "comp": "623b84ff",
+          "rg": "83dca495",
+          "out": "52768174",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 21885941,
+          "mono_us": 19302400,
+          "unit": "lab-crc.service",
+          "comp": "a1827620",
+          "rg": "dfcddc4a",
+          "out": "02f26e12",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 22385941,
+          "mono_us": 19802400,
+          "unit": "lab-crc.service",
+          "comp": "f9f09cf2",
+          "rg": "fec6a69c",
+          "out": "fec6a69c",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 22885941,
+          "mono_us": 20302400,
+          "unit": "lab-crc.service",
+          "comp": "8cc6f81d",
+          "rg": "c9a8f5bc",
+          "out": "05eb9d68",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 23385941,
+          "mono_us": 20802400,
+          "unit": "lab-crc.service",
+          "comp": "f9ab764f",
+          "rg": "f9505862",
+          "out": "5df2da6a",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 23885941,
+          "mono_us": 21302400,
+          "unit": "lab-crc.service",
+          "comp": "27193ff2",
+          "rg": "2e69a8a1",
+          "out": "2b3f9a1b",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 24385941,
+          "mono_us": 21802400,
+          "unit": "lab-crc.service",
+          "comp": "0dc5682c",
+          "rg": "62cb022e",
+          "out": "86878599",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 24885941,
+          "mono_us": 22302400,
+          "unit": "lab-crc.service",
+          "comp": "424dcf81",
+          "rg": "804eb25b",
+          "out": "144e0279",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 25385941,
+          "mono_us": 22802400,
+          "unit": "lab-crc.service",
+          "comp": "688591d0",
+          "rg": "56d5be3c",
+          "out": "f4f2655a",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 25885941,
+          "mono_us": 23302400,
+          "unit": "lab-crc.service",
+          "comp": "236d9733",
+          "rg": "1eb943d2",
+          "out": "5289eaa3",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 26385941,
+          "mono_us": 23802400,
+          "unit": "lab-crc.service",
+          "comp": "18e89be2",
+          "rg": "7ee0608e",
+          "out": "1db337b2",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 26885941,
+          "mono_us": 24302400,
+          "unit": "lab-crc.service",
+          "comp": "494a65af",
+          "rg": "76cd5e5c",
+          "out": "1e58aadc",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 27385941,
+          "mono_us": 24802400,
+          "unit": "lab-crc.service",
+          "comp": "e300fb0f",
+          "rg": "7f10fdda",
+          "out": "f47dbcc6",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 27885941,
+          "mono_us": 25302400,
+          "unit": "lab-crc.service",
+          "comp": "90cd1fa0",
+          "rg": "5c815ca0",
+          "out": "471dbf5c",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 28385941,
+          "mono_us": 25802400,
+          "unit": "lab-crc.service",
+          "comp": "686f8614",
+          "rg": "6cba5ac2",
+          "out": "aef95ada",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 28885941,
+          "mono_us": 26302400,
+          "unit": "lab-crc.service",
+          "comp": "4b31558f",
+          "rg": "5c4bd87e",
+          "out": "753d4f4b",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 29385941,
+          "mono_us": 26802400,
+          "unit": "lab-crc.service",
+          "comp": "29f51ac2",
+          "rg": "53e9086c",
+          "out": "05e1eae0",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 29885941,
+          "mono_us": 27302400,
+          "unit": "lab-crc.service",
+          "comp": "67c69c94",
+          "rg": "25bb0fd5",
+          "out": "9a910778",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 30385941,
+          "mono_us": 27802400,
+          "unit": "lab-crc.service",
+          "comp": "d9230b4e",
+          "rg": "dc40567c",
+          "out": "996de43d",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 30885941,
+          "mono_us": 28302400,
+          "unit": "lab-crc.service",
+          "comp": "183a3907",
+          "rg": "56f9b4a3",
+          "out": "3d2a7e65",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 31385941,
+          "mono_us": 28802400,
+          "unit": "lab-crc.service",
+          "comp": "0847b43e",
+          "rg": "a289c35c",
+          "out": "1ad9b6e0",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 31885941,
+          "mono_us": 29302400,
+          "unit": "lab-crc.service",
+          "comp": "c4d7872f",
+          "rg": "e94f15dc",
+          "out": "a8bcec19",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 32385941,
+          "mono_us": 29802400,
+          "unit": "lab-crc.service",
+          "comp": "19c20409",
+          "rg": "e14c1fb9",
+          "out": "d7b8512a",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 32885941,
+          "mono_us": 30302400,
+          "unit": "lab-crc.service",
+          "comp": "15dfba6a",
+          "rg": "6d7181db",
+          "out": "6c692a6f",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 33385941,
+          "mono_us": 30802400,
+          "unit": "lab-crc.service",
+          "comp": "cc081b3d",
+          "rg": "7b8a6b7a",
+          "out": "5381b5d1",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 33885941,
+          "mono_us": 31302400,
+          "unit": "lab-crc.service",
+          "comp": "9b0914c9",
+          "rg": "e2d46593",
+          "out": "4e8384d9",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 34385941,
+          "mono_us": 31802400,
+          "unit": "lab-crc.service",
+          "comp": "1e431000",
+          "rg": "b6e7c440",
+          "out": "84faa750",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 34885941,
+          "mono_us": 32302400,
+          "unit": "lab-crc.service",
+          "comp": "1eaed89e",
+          "rg": "a103a3dc",
+          "out": "c39bca3f",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 35385941,
+          "mono_us": 32802400,
+          "unit": "lab-crc.service",
+          "comp": "60e3180c",
+          "rg": "4b7d5c7f",
+          "out": "8c9f513b",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        },
+        {
+          "t_us": 35885941,
+          "mono_us": 33302400,
+          "unit": "lab-crc.service",
+          "comp": "4f4716d5",
+          "rg": "e23fb0e1",
+          "out": "3d8b7be6",
+          "comp_sup": true,
+          "rg_sup": true,
+          "out_sup": true
+        }
+      ],
+      "errors": []
+    }
+  },
+  "sampler_starts": [
+    {
+      "t_us": 4633654,
+      "mono_us": 2050113,
+      "unit": "lab-crc-initrd.service"
+    },
+    {
+      "t_us": 5563661,
+      "mono_us": 2980120,
+      "unit": "lab-crc.service"
+    }
+  ],
+  "greetd_started": null,
+  "greeter_first_appearance": {},
+  "probe": []
+}

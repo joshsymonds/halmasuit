@@ -26,8 +26,18 @@ own failure output (`lab-crc: <what>`, optionally `: <strerror>`), kept as a
 `crc` event whose source is its unit and which is attributed to no head. A
 `start`, `sample`, or `error` line whose fields do not parse is a malformed run.
 A lab-probe line is a `probe` event.
+A `halmasuit.service` line whose MESSAGE is a tracing JSON line carrying a
+halmasuit Event is a `halmasuit` event: its detail is the Event's `event` tag,
+its payload is the whole Event object, and its time is the line's monotonic
+time on the kernel clock. Every such line is kept, repeats included. Any other
+line from that unit is ignored, and lines from other units produce no
+`halmasuit` event.
 greetd's start is the first entry whose MESSAGE_ID is the unit-started ID and
-whose `UNIT` is `greetd.service`; it is a `unit` event.
+whose `UNIT` is `greetd.service`; it is a `unit` event. That start is read from
+MESSAGE_ID and UNIT and does not depend on MESSAGE. A journal entry whose MESSAGE
+is null, missing, or neither a string nor a list of byte values 0-255 yields no
+event derived from its message, of any kind. A list of byte values is decoded as
+UTF-8 with replacement and then treated as a string.
 
 Greeter first appearance. Per head, the first sample whose monotonic time is
 strictly after greetd's start.
@@ -35,11 +45,35 @@ strictly after greetd's start.
 Profiles map a name to a function that returns failure messages for a timeline.
 `main` writes `timeline.json` into the run directory, prints each failure, and
 exits 0 only when the chosen profile passes.
+
+Profile `bios-shader-greeter` checks a run whose greeter is drawn by halmasuit
+itself after the firmware console. M is the first `drm_master_acquired` phase
+with a monotonic time. Display lines are checked against M, so the NVIDIA
+driver may load before M but may not take the console over before it. The
+checks, one message each when they fail: M exists; no console switch, no fbcon
+primary-device claim, and no NVIDIA frame-buffer-device line before M; the
+firmware mode and BGRT logo are present; at least one frame is not degenerate;
+`assert_animating` passes over every halmasuit payload; every head with a
+sample after M has a nonzero checksum there and at least two distinct values;
+an overlay `client_first_frame` and a greeter `foreground_changed` exist; no
+sample from the greeter's foreground until the next session foreground is zero;
+`assert_no_flash_stream` passes; no sample after the first `frame_rendered` is
+zero. A display line with no monotonic time counts as before M.
+
+Profile `production` checks a run whose halmasuit build emits no `frame_rendered`.
+It applies the same M rule and the same messages as `bios-shader-greeter` to
+the checks it shares with it: no console switch, fbcon primary-device claim, or
+NVIDIA frame-buffer-device line before M; at least one head active after M, with
+a nonzero checksum and at least two distinct values there; an overlay
+`client_first_frame` and a greeter `foreground_changed`. It checks nothing else:
+no firmware mode, BGRT logo, frame stats, `assert_animating`, flash stream,
+greeter-window checksum, or checksum after the first frame.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import re
 import struct
@@ -51,6 +85,13 @@ from typing import Any
 
 Timeline = dict[str, Any]
 Profile = Callable[[Timeline], list[str]]
+
+# tests/lib holds the phash and no-flash assertions the bios profile reuses. It
+# is not a package, so its modules are imported by path.
+TESTS_LIB = Path(__file__).resolve().parents[1] / "lib"
+sys.path.insert(0, str(TESTS_LIB))
+phash_progression = importlib.import_module("phash_progression")
+visual = importlib.import_module("visual")
 
 FPDT_NAMES = (
     "firmware_start",
@@ -64,6 +105,7 @@ LOADER_GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
 EFI_FRAMEBUFFER_TYPE = 0x70
 GREETD_STARTED_MESSAGE_ID = "39f53479d3a045ac8e11786248231fbf"
 GREETD_UNIT = "greetd.service"
+HALMASUIT_UNIT = "halmasuit.service"
 INITRD_SAMPLER_UNIT = "lab-crc-initrd.service"
 CRC_VERBS = ("start", "sample", "error")
 DISPLAY_PATTERN = re.compile(
@@ -76,7 +118,7 @@ TIMELINE_NAME = "timeline.json"
 
 @dataclass(frozen=True)
 class JournalEntry:
-    message: str
+    message: str | None
     identifier: str
     transport: str
     unit: str
@@ -92,10 +134,12 @@ class KernelZero:
     source: str | None
 
 
-def decode_message(raw: str | list[int]) -> str:
-    if isinstance(raw, list):
+def decode_message(raw: object) -> str | None:
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list) and all(type(byte) is int and 0 <= byte <= 255 for byte in raw):
         return bytes(raw).decode("utf-8", errors="replace")
-    return raw
+    return None
 
 
 def monotonic_us(fields: dict[str, str]) -> int | None:
@@ -113,7 +157,7 @@ def read_journal(path: Path) -> list[JournalEntry]:
         fields = json.loads(line)
         entries.append(
             JournalEntry(
-                message=decode_message(fields.get("MESSAGE", "")),
+                message=decode_message(fields.get("MESSAGE")),
                 identifier=fields.get("SYSLOG_IDENTIFIER", ""),
                 transport=fields.get("_TRANSPORT", ""),
                 unit=fields.get("_SYSTEMD_UNIT", ""),
@@ -210,6 +254,22 @@ def crc_fields(message: str) -> tuple[str, dict[str, str]]:
     return verb, dict(token.split("=", 1) for token in tokens)
 
 
+def halmasuit_payload(message: str) -> dict[str, Any] | None:
+    try:
+        outer = json.loads(message)
+    except ValueError:
+        return None
+    fields = outer.get("fields") if isinstance(outer, dict) else None
+    inner = fields.get("json") if isinstance(fields, dict) else None
+    if not isinstance(inner, str):
+        return None
+    try:
+        event = json.loads(inner)
+    except ValueError:
+        return None
+    return event if isinstance(event, dict) and "event" in event else None
+
+
 def flag(value: str) -> bool:
     if value not in ("0", "1"):
         raise ValueError(f"expected 0 or 1, got {value!r}")
@@ -249,6 +309,15 @@ def build_timeline(run: Path) -> Timeline:
             greetd = entry
             t = platform_us(zero, mono)
             events.append(make_event(t, mono, "unit", entry.identifier, "greetd.service started"))
+        if entry.message is None:
+            continue
+        if entry.unit == HALMASUIT_UNIT:
+            payload = halmasuit_payload(entry.message)
+            if payload is not None:
+                event = make_event(
+                    platform_us(zero, mono), mono, "halmasuit", HALMASUIT_UNIT, payload["event"]
+                )
+                events.append({**event, "payload": payload})
         if entry.transport == "kernel" and DISPLAY_PATTERN.search(entry.message):
             kind = "driver-display" if DRIVER_PATTERN.search(entry.message) else "kernel-display"
             events.append(make_event(platform_us(zero, mono), mono, kind, "kernel", entry.message))
@@ -361,7 +430,159 @@ def baseline_greetd(timeline: Timeline) -> list[str]:
     return failures
 
 
-PROFILES: dict[str, Profile] = {"baseline-greetd": baseline_greetd}
+ZERO_CHECKSUM = "00000000"
+DRM_MASTER_PHASE = "drm_master_acquired"
+DISPLAY_KINDS = ("kernel-display", "driver-display")
+
+
+def payload_matches(payload: dict[str, Any], name: str, **fields: Any) -> bool:
+    return payload.get("event") == name and all(payload.get(key) == value for key, value in fields.items())
+
+
+def foreground_window(timed: list[dict[str, Any]]) -> tuple[int | None, int | None]:
+    """The greeter's first foreground time and the next session foreground time.
+
+    The end is None while no session foreground follows the greeter's.
+    """
+    start = None
+    for event in timed:
+        payload = event["payload"]
+        if payload.get("event") != "foreground_changed":
+            continue
+        if start is None and payload.get("to") == "greeter":
+            start = event["mono_us"]
+        elif start is not None and payload.get("to") == "session":
+            return start, event["mono_us"]
+    return start, None
+
+
+def drm_master_check(timed: list[dict[str, Any]]) -> tuple[list[str], int | None]:
+    master = next(
+        (event for event in timed if payload_matches(event["payload"], "phase_entered", phase=DRM_MASTER_PHASE)),
+        None,
+    )
+    if master is None:
+        return ["drm_master_acquired missing"], None
+    return [], master["mono_us"]
+
+
+def display_before_master_failures(display: list[dict[str, Any]], m: int | None) -> list[str]:
+    if m is None:
+        return []
+    before_master = [event for event in display if event["mono_us"] is None or event["mono_us"] < m]
+    failures: list[str] = []
+    if any("Console: switching" in event["detail"] for event in before_master):
+        failures.append("fbcon console switched before drm_master_acquired")
+    if any("is primary device" in event["detail"] and "fbcon" in event["detail"] for event in before_master):
+        failures.append("fbcon claimed the primary device before drm_master_acquired")
+    if any(
+        DRIVER_PATTERN.search(event["detail"]) and "frame buffer device" in event["detail"]
+        for event in before_master
+    ):
+        failures.append("NVIDIA drm frame buffer device line before drm_master_acquired")
+    return failures
+
+
+def active_head_failures(heads: dict[str, Any], m: int | None) -> list[str]:
+    if m is None:
+        return []
+    failures: list[str] = []
+    active = {key: [sample for sample in head["samples"] if sample["mono_us"] > m] for key, head in heads.items()}
+    active = {key: samples for key, samples in active.items() if samples}
+    if not active:
+        failures.append("no active head after drm_master_acquired")
+    zero_only = [key for key, samples in active.items() if all(s["comp"] == ZERO_CHECKSUM for s in samples)]
+    if zero_only:
+        failures.append(f"no nonzero checksum after drm_master_acquired on: {', '.join(zero_only)}")
+    constant = [key for key, samples in active.items() if len({s["comp"] for s in samples}) < 2]
+    if constant:
+        failures.append(f"checksum takes one value after drm_master_acquired on: {', '.join(constant)}")
+    return failures
+
+
+def client_and_foreground_failures(payloads: list[dict[str, Any]]) -> list[str]:
+    failures: list[str] = []
+    if not any(payload_matches(payload, "client_first_frame", role="overlay") for payload in payloads):
+        failures.append("no client_first_frame{role: overlay}")
+    if not any(payload_matches(payload, "foreground_changed", to="greeter") for payload in payloads):
+        failures.append("no foreground_changed{to: greeter}")
+    return failures
+
+
+def bios_shader_greeter(timeline: Timeline) -> list[str]:
+    events = timeline["events"]
+    halmasuit = [event for event in events if event["kind"] == "halmasuit"]
+    timed = [event for event in halmasuit if event["mono_us"] is not None]
+    payloads = [event["payload"] for event in halmasuit]
+    display = [event for event in events if event["kind"] in DISPLAY_KINDS]
+    heads = timeline["heads"]
+
+    failures, m = drm_master_check(timed)
+    failures += display_before_master_failures(display, m)
+
+    if timeline["firmware_mode"] is None:
+        failures.append("firmware mode missing")
+    if timeline["logo"] is None:
+        failures.append("BGRT logo missing")
+
+    if not any(payload["event"] == "frame_rendered" and payload.get("degenerate") is False for payload in payloads):
+        failures.append("no non-degenerate frame_rendered")
+    try:
+        phash_progression.assert_animating(payloads)
+    except AssertionError as exc:
+        failures.append(str(exc))
+
+    failures += active_head_failures(heads, m)
+    failures += client_and_foreground_failures(payloads)
+    start, end = foreground_window(timed)
+    if start is not None:
+        zero_in_greeter = [
+            key
+            for key, head in heads.items()
+            if any(
+                s["comp"] == ZERO_CHECKSUM and s["mono_us"] >= start and (end is None or s["mono_us"] < end)
+                for s in head["samples"]
+            )
+        ]
+        if zero_in_greeter:
+            failures.append(f"zero checksum during greeter foreground on: {', '.join(zero_in_greeter)}")
+
+    try:
+        visual.assert_no_flash_stream(None, events=payloads)
+    except AssertionError as exc:
+        failures.append(str(exc))
+
+    first_frame = next((event for event in timed if payload_matches(event["payload"], "frame_rendered")), None)
+    if first_frame is not None:
+        frame_mono = first_frame["mono_us"]
+        zero_after_frame = [
+            key
+            for key, head in heads.items()
+            if any(s["comp"] == ZERO_CHECKSUM and s["mono_us"] > frame_mono for s in head["samples"])
+        ]
+        if zero_after_frame:
+            failures.append(f"zero checksum after first frame_rendered on: {', '.join(zero_after_frame)}")
+    return failures
+
+
+def production(timeline: Timeline) -> list[str]:
+    halmasuit = [event for event in timeline["events"] if event["kind"] == "halmasuit"]
+    timed = [event for event in halmasuit if event["mono_us"] is not None]
+    payloads = [event["payload"] for event in halmasuit]
+    display = [event for event in timeline["events"] if event["kind"] in DISPLAY_KINDS]
+
+    failures, m = drm_master_check(timed)
+    failures += display_before_master_failures(display, m)
+    failures += active_head_failures(timeline["heads"], m)
+    failures += client_and_foreground_failures(payloads)
+    return failures
+
+
+PROFILES: dict[str, Profile] = {
+    "baseline-greetd": baseline_greetd,
+    "bios-shader-greeter": bios_shader_greeter,
+    "production": production,
+}
 
 
 def main(argv: Sequence[str] | None = None) -> int:

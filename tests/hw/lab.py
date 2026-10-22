@@ -29,8 +29,14 @@ followed by another start, at most 5 starts in all, and no start begins 180 seco
 first. probe.json records each start's return code and match, and the probe passes when a start
 is matched. A refused or failed probe fails the run after gnomon has returned to its default
 entry.
+The halmasuit and halmasuit-production experiments hold the checked lab boot before the return
+reboot instead of probing it. The runner polls the lab boot's journal every 5 seconds for
+halmasuit.service's greeter event (foreground_changed to greeter), then for the lab boot's newest
+entry to be at least 30 seconds past that event on the journal's monotonic clock. One 300 second
+deadline covers both waits. When it passes first, the runner notes why in run.log, returns gnomon
+to its default entry, collects the journal as usual, and fails the run after the return.
 Once gnomon has returned, the runner saves the lab boot's journal as journal.json in the
-run directory (`journalctl -b ID -o json`). A checked lab boot is known from the boot the
+run directory (`journalctl -b ID -o json --all`). A checked lab boot is known from the boot the
 runner saw; otherwise the lab boot is the boot list-boots lists right after the boot the
 run started from. A lab boot with no journal, or a journal gnomon cannot give, is noted in
 run.log and no journal.json is written; neither changes the run's outcome.
@@ -125,6 +131,10 @@ PROBE_WAIT_SECONDS = 30
 PROBE_DEADLINE_SECONDS = 180
 AUTHPRIV_FACILITY = 10
 DEFAULT_PROBE_USER = "joshsymonds"
+HALMASUIT_UNIT = "halmasuit.service"
+HOLD_DEADLINE_SECONDS = 300
+HOLD_AFTER_GREETER_SECONDS = 30
+MICROSECONDS_PER_SECOND = 1_000_000
 
 
 class LabError(Exception):
@@ -279,14 +289,17 @@ class Plan:
     lab_boot_checked: bool  # the lab entry must be seen booting before the return reboot
     poweroff: bool  # gnomon powers off and returns on wake-on-LAN
     probe: bool  # the greeter's PAM stack is probed with a wrong password on the checked lab boot
+    hold: bool  # the checked lab boot is held until the greeter event is 30 s old, before the return reboot
 
 
 EXPERIMENTS: dict[str, Plan] = {
-    "baseline": Plan(lab_boot_checked=True, poweroff=False, probe=True),
-    "fault-initrd": Plan(lab_boot_checked=False, poweroff=False, probe=False),
-    "fault-hang": Plan(lab_boot_checked=False, poweroff=False, probe=False),
-    "fault-panic": Plan(lab_boot_checked=False, poweroff=False, probe=False),
-    "fault-poweroff": Plan(lab_boot_checked=False, poweroff=True, probe=False),
+    "baseline": Plan(lab_boot_checked=True, poweroff=False, probe=True, hold=False),
+    "fault-initrd": Plan(lab_boot_checked=False, poweroff=False, probe=False, hold=False),
+    "fault-hang": Plan(lab_boot_checked=False, poweroff=False, probe=False, hold=False),
+    "fault-panic": Plan(lab_boot_checked=False, poweroff=False, probe=False, hold=False),
+    "fault-poweroff": Plan(lab_boot_checked=False, poweroff=True, probe=False, hold=False),
+    "halmasuit": Plan(lab_boot_checked=True, poweroff=False, probe=False, hold=True),
+    "halmasuit-production": Plan(lab_boot_checked=True, poweroff=False, probe=False, hold=True),
 }
 
 
@@ -371,6 +384,49 @@ def _int(text: str, what: str) -> int:
 def _last_line(text: str) -> str:
     lines = [line for line in text.splitlines() if line.strip()]
     return lines[-1] if lines else ""
+
+
+def _journal_records(text: str) -> list[dict]:
+    """The entries of `journalctl -o json` output, one JSON object per line."""
+    records = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as err:
+            raise LabError(f"journalctl printed a line that is not JSON: {err}") from err
+        if not isinstance(record, dict):
+            raise LabError("journalctl printed a line that is not a JSON object")
+        records.append(record)
+    return records
+
+
+def _is_greeter_event(record: dict) -> bool:
+    """Whether a journal entry is halmasuit's greeter Event.
+
+    halmasuit's tracing-JSON line carries the Event as a JSON string in fields.json. Any other
+    entry, from another unit or a plain or non-JSON halmasuit line, is not the greeter event.
+    """
+    if record.get("_SYSTEMD_UNIT") != HALMASUIT_UNIT or not isinstance(record.get("MESSAGE"), str):
+        return False
+    try:
+        event = json.loads(json.loads(record["MESSAGE"])["fields"]["json"])
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return False
+    return (
+        isinstance(event, dict)
+        and event.get("event") == "foreground_changed"
+        and event.get("to") == "greeter"
+    )
+
+
+def _monotonic_us(record: dict) -> int:
+    """A journal entry's monotonic time in microseconds."""
+    stamp = record.get("__MONOTONIC_TIMESTAMP")
+    if not isinstance(stamp, str):
+        raise LabError("journal entry has no __MONOTONIC_TIMESTAMP")
+    return _int(stamp, "journal monotonic time")
 
 
 def _ok(result: Result, what: str) -> str:
@@ -475,6 +531,7 @@ class Lab:
             booted_from = boot_before
             lab_boot: str | None = None
             probe: dict | None = None
+            hold_reason: str | None = None
             if plan.lab_boot_checked:
                 lab_boot = self._await_boot("lab entry to boot", boot_before, LAB_ENTRY)
                 booted_from = lab_boot
@@ -483,6 +540,10 @@ class Lab:
                 if plan.probe:
                     probe = self._probe(run)
                     run.save("probe.json", probe)
+                if plan.hold:
+                    hold_reason = self._hold()
+                    if hold_reason is not None:
+                        run.say(f"hold expired: {hold_reason}; returning gnomon to {pre.default}")
                 self._refuse_if_graphical("refusing before return reboot")
                 self._reboot()
             if plan.poweroff:
@@ -501,6 +562,8 @@ class Lab:
             _compare(pre, post)
             if probe is not None:
                 self._check_probe(probe)
+            if hold_reason is not None:
+                raise LabError("lab boot hold expired before the return reboot")
             run.say("PASS")
         except BaseException as err:
             run.say(f"FAIL: {err}")
@@ -812,6 +875,91 @@ class Lab:
                 f"probe did not pass: no '{PROBE_MARKER}' line for {self.probe_user} in the lab boot journal"
             )
 
+    def _hold(self) -> str | None:
+        """Hold the lab boot until its greeter event is 30 s old in its journal.
+
+        Returns None once held, or why the 300 second deadline passed first. Each query that
+        fails or prints unreadable output counts as not yet, and the last such problem is
+        part of the reason.
+        """
+        greeter: int | None = None
+        newest: int | None = None
+        problem = ""
+
+        def held() -> bool | None:
+            nonlocal greeter, newest, problem
+            newest = None
+            try:
+                if greeter is None:
+                    greeter = self._greeter_event_us()
+                if greeter is None:
+                    return None
+                newest = self._newest_entry_us()
+            except LabError as err:
+                problem = str(err)
+                return None
+            if newest is not None and newest - greeter >= HOLD_AFTER_GREETER_SECONDS * MICROSECONDS_PER_SECOND:
+                return True
+            return None
+
+        try:
+            self._poll(
+                "the greeter event and 30 s of lab boot journal after it",
+                held,
+                HOLD_DEADLINE_SECONDS,
+            )
+        except LabError:
+            return self._hold_reason(greeter, newest, problem)
+        return None
+
+    @staticmethod
+    def _hold_reason(greeter: int | None, newest: int | None, problem: str) -> str:
+        if greeter is None:
+            reason = (
+                f"no {HALMASUIT_UNIT} foreground_changed to greeter event in the lab boot journal "
+                f"within {HOLD_DEADLINE_SECONDS} seconds"
+            )
+        elif newest is None:
+            reason = "the lab boot journal's newest entry was not readable after the greeter event"
+        else:
+            past = (newest - greeter) / MICROSECONDS_PER_SECOND
+            reason = (
+                f"the lab boot's newest journal entry was {past:.1f} s past the greeter event at the "
+                f"{HOLD_DEADLINE_SECONDS} second deadline; {HOLD_AFTER_GREETER_SECONDS} s needed"
+            )
+        if problem:
+            reason += f"; last read problem: {problem}"
+        return reason
+
+    def _greeter_event_us(self) -> int | None:
+        """Journal monotonic time of the lab boot's first halmasuit greeter event, or None while there is none."""
+        result = self.layer.remote(
+            [
+                "sudo",
+                "-n",
+                "journalctl",
+                "-b",
+                "0",
+                f"_SYSTEMD_UNIT={HALMASUIT_UNIT}",
+                "-o",
+                "json",
+                "--all",
+                "--no-pager",
+            ]
+        )
+        for record in _journal_records(_ok(result, f"read {HALMASUIT_UNIT}'s lab boot journal")):
+            if _is_greeter_event(record):
+                return _monotonic_us(record)
+        return None
+
+    def _newest_entry_us(self) -> int | None:
+        """Journal monotonic time of the lab boot's newest entry, or None while the journal is empty."""
+        result = self.layer.remote(
+            ["sudo", "-n", "journalctl", "-b", "0", "-n", "1", "-o", "json", "--all", "--no-pager"]
+        )
+        records = _journal_records(_ok(result, "read the lab boot journal's newest entry"))
+        return _monotonic_us(records[-1]) if records else None
+
     def _collect_firmware(self, run: RunLog) -> None:
         """Copy each firmware file byte for byte; one that gnomon cannot give is noted and skipped."""
         for remote in FIRMWARE_FILES:
@@ -838,7 +986,7 @@ class Lab:
                 return
         # journalctl -b takes the undashed id; /proc prints boot ids dashed.
         result = self.layer.remote(
-            ["sudo", "-n", "journalctl", "-b", _boot_key(lab_boot), "-o", "json", "--no-pager"]
+            ["sudo", "-n", "journalctl", "-b", _boot_key(lab_boot), "-o", "json", "--all", "--no-pager"]
         )
         if result.returncode != 0:
             detail = result.stderr.strip() or "no output"
