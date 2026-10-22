@@ -36,7 +36,7 @@ entry to be at least 30 seconds past that event on the journal's monotonic clock
 deadline covers both waits. When it passes first, the runner notes why in run.log, returns gnomon
 to its default entry, collects the journal as usual, and fails the run after the return.
 Once gnomon has returned, the runner saves the lab boot's journal as journal.json in the
-run directory (`journalctl -b ID -o json`). A checked lab boot is known from the boot the
+run directory (`journalctl -b ID -o json --all`). A checked lab boot is known from the boot the
 runner saw; otherwise the lab boot is the boot list-boots lists right after the boot the
 run started from. A lab boot with no journal, or a journal gnomon cannot give, is noted in
 run.log and no journal.json is written; neither changes the run's outcome.
@@ -943,6 +943,7 @@ class Lab:
                 f"_SYSTEMD_UNIT={HALMASUIT_UNIT}",
                 "-o",
                 "json",
+                "--all",
                 "--no-pager",
             ]
         )
@@ -954,7 +955,7 @@ class Lab:
     def _newest_entry_us(self) -> int | None:
         """Journal monotonic time of the lab boot's newest entry, or None while the journal is empty."""
         result = self.layer.remote(
-            ["sudo", "-n", "journalctl", "-b", "0", "-n", "1", "-o", "json", "--no-pager"]
+            ["sudo", "-n", "journalctl", "-b", "0", "-n", "1", "-o", "json", "--all", "--no-pager"]
         )
         records = _journal_records(_ok(result, "read the lab boot journal's newest entry"))
         return _monotonic_us(records[-1]) if records else None
@@ -985,7 +986,7 @@ class Lab:
                 return
         # journalctl -b takes the undashed id; /proc prints boot ids dashed.
         result = self.layer.remote(
-            ["sudo", "-n", "journalctl", "-b", _boot_key(lab_boot), "-o", "json", "--no-pager"]
+            ["sudo", "-n", "journalctl", "-b", _boot_key(lab_boot), "-o", "json", "--all", "--no-pager"]
         )
         if result.returncode != 0:
             detail = result.stderr.strip() or "no output"

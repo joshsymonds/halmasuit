@@ -126,9 +126,10 @@ HOLD_GREETER = (
     f"_SYSTEMD_UNIT={HALMASUIT_UNIT}",
     "-o",
     "json",
+    "--all",
     "--no-pager",
 )
-HOLD_NEWEST = ("sudo", "-n", "journalctl", "-b", "0", "-n", "1", "-o", "json", "--no-pager")
+HOLD_NEWEST = ("sudo", "-n", "journalctl", "-b", "0", "-n", "1", "-o", "json", "--all", "--no-pager")
 REBOOT = ("sudo", "-n", "systemctl", "reboot")
 HOLD_DEADLINE_SECONDS = 300
 JOURNAL_EPOCH_US = 1792656320120487
@@ -630,9 +631,10 @@ class FakeGnomon:
             return self._base64(argv[4])
         if argv == ("sudo", "-n", "journalctl", "--list-boots", "-o", "json", "--no-pager"):
             return self._list_boots()
-        if len(argv) == 8 and argv[:4] == ("sudo", "-n", "journalctl", "-b") and argv[5:] == (
+        if len(argv) == 9 and argv[:4] == ("sudo", "-n", "journalctl", "-b") and argv[5:] == (
             "-o",
             "json",
+            "--all",
             "--no-pager",
         ):
             return self._read_journal(argv[4])
@@ -1724,6 +1726,35 @@ class LabRunnerTest(unittest.TestCase):
         self.assertEqual(self.lab_return_seconds(gnomon), 40)
         saved = (self.single_run_dir("halmasuit") / "journal.json").read_text(encoding="utf-8")
         self.assertIn("foreground_changed", saved)
+
+    def test_every_journal_json_read_carries_all(self) -> None:
+        gnomon = FakeGnomon(greeter_event_at=10, lab_journal_ends_at=40)
+        code, _, err = self.run_queue(["halmasuit"], gnomon)
+        self.assertEqual(code, 0, err)
+        json_reads = [
+            argv
+            for kind, argv in gnomon.calls
+            if kind == "remote" and "journalctl" in argv and "json" in argv and "--list-boots" not in argv
+        ]
+        self.assertIn(HOLD_GREETER, json_reads)
+        self.assertIn(HOLD_NEWEST, json_reads)
+        self.assertTrue(any(argv[4] != "0" for argv in json_reads), json_reads)
+        for argv in json_reads:
+            with self.subTest(argv=argv):
+                self.assertIn("--all", argv)
+
+    def test_greeter_entry_over_4096_bytes_still_holds_and_saves_its_full_message(self) -> None:
+        padded = json.dumps({**GREETER_EVENT, "pad": "x" * 5000}, separators=(",", ":"))
+        fields = tracing_fields(padded)
+        self.assertGreater(len(fields["MESSAGE"].encode("utf-8")), 4096)
+        gnomon = FakeGnomon(lab_journal_extra=[(10, fields)])
+        code, _, err = self.run_queue(["halmasuit"], gnomon)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.lab_return_seconds(gnomon), 40)
+        saved = (self.single_run_dir("halmasuit") / "journal.json").read_text(encoding="utf-8")
+        records = [json.loads(line) for line in saved.splitlines()]
+        saved_messages = [record.get("MESSAGE") for record in records if record.get("MESSAGE") == fields["MESSAGE"]]
+        self.assertEqual(saved_messages, [fields["MESSAGE"]])
 
     def test_twenty_nine_point_nine_seconds_keeps_the_hold_until_the_deadline(self) -> None:
         gnomon = FakeGnomon(greeter_event_at=10, lab_journal_ends_at=39.9)
