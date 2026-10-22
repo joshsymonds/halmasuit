@@ -372,6 +372,8 @@ let
   crcOff = (evalWith (labOptions // { crcSampler = { enable = false; }; })).config;
   # The same host with the probe off: neither the unit nor uinput may appear.
   probeOff = (evalWith (labOptions // { probe = { enable = false; }; })).config;
+  # The same host with a probe username: it must reach ExecStart as --username.
+  probeUser = (evalWith (labOptions // { probe = labOptions.probe // { username = "labprobe"; }; })).config;
   # No lab settings at all: the new options must default off or empty, except
   # probe.consumerUser, which defaults to greeter.
   defaults = (evalWith { }).config.halmasuit.lab;
@@ -513,6 +515,8 @@ let
       msg = "a new lab option does not default off or empty (netconsole.port defaults to 6666)"; }
     { ok = (get defaults [ "probe" "consumerUser" ] null) == "greeter";
       msg = "halmasuit.lab.probe.consumerUser does not default to \"greeter\""; }
+    { ok = (get defaults [ "probe" "username" ] null) == "";
+      msg = "halmasuit.lab.probe.username does not default to \"\""; }
 
     # ── Netconsole from stage 1: outbound UDP only ───────────────────
     { ok = builtins.elem "netconsole" (get cfg [ "boot" "initrd" "availableKernelModules" ] [ ]);
@@ -748,6 +752,10 @@ let
       msg = "lab-probe.service is missing or not a oneshot"; }
     { ok = (probeUnit.serviceConfig.ExecStart or null) == "${pkgs.python3}/bin/python3 ${labProbe} --consumer-user ${labOptions.probe.consumerUser}";
       msg = "lab-probe.service does not run lab_probe.py --consumer-user with python3"; }
+    { ok = (get probeUser [ "systemd" "services" "lab-probe" "serviceConfig" "ExecStart" ] null) == "${pkgs.python3}/bin/python3 ${labProbe} --consumer-user ${labOptions.probe.consumerUser} --username labprobe";
+      msg = "lab-probe.service does not pass a set probe.username as --username"; }
+    { ok = !lib.hasInfix "--username" (probeUnit.serviceConfig.ExecStart or "");
+      msg = "lab-probe.service passes --username while probe.username is empty"; }
     { ok = (probeUnit.serviceConfig.SyslogIdentifier or null) == "lab-probe";
       msg = "lab-probe.service lacks SyslogIdentifier=lab-probe"; }
     { ok = lib.all (key: (probeUnit.${key} or [ ]) == [ ]) [ "wantedBy" "requiredBy" "upheldBy" ];

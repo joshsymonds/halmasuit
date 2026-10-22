@@ -98,6 +98,12 @@ in
       description = "User whose process must hold the keyboard node for the probe to type; greetd's greeter runs as greeter.";
     };
 
+    probe.username = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "Username the probe types before the wrong password. Empty types only the wrong password.";
+    };
+
     netconsole = {
       enable = lib.mkEnableOption "netconsole from the initramfs, sending kernel messages over UDP";
 
@@ -267,12 +273,15 @@ in
     # Keyboard probe. uinput loads at boot so the probe can create its virtual
     # keyboard on demand. lab-probe.service has no wantedBy, requiredBy,
     # upheldBy, timer, path, or socket, so only an explicit start runs it. The
-    # runner starts it after the greeter is up.
+    # runner starts it after the greeter is up. The probe types 32 BackSpace,
+    # then the username and Enter when probe.username is set, then a fixed
+    # wrong password and Enter. It stores no password.
     boot.kernelModules = lib.optional cfg.probe.enable "uinput";
     systemd.services.lab-probe = lib.mkIf cfg.probe.enable {
       serviceConfig = {
         Type = "oneshot";
-        ExecStart = "${pkgs.python3}/bin/python3 ${labProbe} --consumer-user ${cfg.probe.consumerUser}";
+        ExecStart = "${pkgs.python3}/bin/python3 ${labProbe} --consumer-user ${cfg.probe.consumerUser}"
+          + lib.optionalString (cfg.probe.username != "") " --username ${lib.escapeShellArg cfg.probe.username}";
         SyslogIdentifier = "lab-probe";
       };
     };
