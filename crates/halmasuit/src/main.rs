@@ -147,8 +147,10 @@ struct HalmasuitState {
     /// `render_with_elements` from the commit-driven render path.
     layer_shell_state: WlrLayerShellState,
     /// `zwp_linux_dmabuf_v1` state. The global is created at startup
-    /// from the renderer's supported dmabuf formats; the
-    /// `dmabuf_state` field stores the smithay-side bookkeeping and
+    /// from the renderer's supported dmabuf formats, with default
+    /// feedback naming the opened DRM device's render node as main
+    /// device (version 6); without a render node it stays at version 3.
+    /// The `dmabuf_state` field stores the smithay-side bookkeeping and
     /// is referenced via `DmabufHandler`. On the SKIP (no-DRM)
     /// path there is no renderer, so no global is advertised —
     /// clients fall back to wl_shm cleanly. R10 (convergence).
@@ -4879,9 +4881,12 @@ fn main() -> io::Result<()> {
     // clients prefer dmabuf over wl_shm — without this global they
     // operate at significantly degraded performance and extra wedge
     // surface area. Format list comes from the renderer's
-    // `dmabuf_formats()` when the DRM backend is present; on the
-    // SKIP path (no renderer) we don't advertise the global at all
-    // (advertising a global we can't serve is the
+    // `dmabuf_formats()` when the DRM backend is present. The default
+    // feedback names the opened DRM device's render node as main
+    // device, so a client's EGL selects the GPU halmasuit renders on;
+    // without a render node the global stays at version 3 with no
+    // feedback. On the SKIP path (no renderer) we don't advertise the
+    // global at all (advertising a global we can't serve is the
     // `linux-dmabuf-v1`-lie anti-pattern the epic codifies).
     // Phase B: wp_viewporter — crop+scale-to-output (subsurface
     // scaling, HiDPI fractional-scale composition). Both Qt 6 and
@@ -4999,11 +5004,36 @@ fn main() -> io::Result<()> {
     let dmabuf_global = drm_backend.as_ref().map(|b| {
         use smithay::backend::renderer::ImportDma;
         let formats: Vec<_> = b.renderer.dmabuf_formats().into_iter().collect();
-        tracing::info!(
-            count = formats.len(),
-            "advertising zwp_linux_dmabuf_v1 with renderer-derived format tranche"
-        );
-        dmabuf_state.create_global::<HalmasuitState>(&display_handle, formats)
+        let feedback = b.dmabuf_main_device.and_then(|main_device| {
+            match smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(main_device, formats.clone())
+                .build()
+            {
+                Ok(feedback) => Some(feedback),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "building dmabuf default feedback failed; zwp_linux_dmabuf_v1 stays at version 3"
+                    );
+                    None
+                }
+            }
+        });
+        if let Some(feedback) = feedback {
+            tracing::info!(
+                count = formats.len(),
+                "advertising zwp_linux_dmabuf_v1 with default feedback from the render node"
+            );
+            dmabuf_state.create_global_with_default_feedback::<HalmasuitState>(
+                &display_handle,
+                &feedback,
+            )
+        } else {
+            tracing::info!(
+                count = formats.len(),
+                "advertising zwp_linux_dmabuf_v1 version 3 with renderer-derived format tranche"
+            );
+            dmabuf_state.create_global::<HalmasuitState>(&display_handle, formats)
+        }
     });
 
     // Bind the Wayland listening socket. smithay's ListeningSocketSource
