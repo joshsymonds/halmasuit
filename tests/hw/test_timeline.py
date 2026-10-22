@@ -354,6 +354,11 @@ def bios_failures(files):
         return timeline.PROFILES["bios-shader-greeter"](build(files))
 
 
+def production_failures(files):
+    with contextlib.redirect_stdout(io.StringIO()):
+        return timeline.PROFILES["production"](build(files))
+
+
 class HeaderTest(unittest.TestCase):
     def test_document_has_frozen_keys_and_identity(self):
         doc = build()
@@ -944,6 +949,141 @@ class BiosShaderGreeterTest(unittest.TestCase):
             code, out, _ = run_cli([str(run), "--expect", "bios-shader-greeter"])
         self.assertEqual(code, 1)
         self.assertIn("FAIL bios-shader-greeter: no foreground_changed{to: greeter}", out)
+
+
+class ProductionTest(unittest.TestCase):
+    def assert_failures(self, files, fragments):
+        failures = production_failures(files)
+        self.assertEqual(len(failures), len(fragments), failures)
+        for failure, fragment in zip(failures, fragments):
+            self.assertIn(fragment, failure)
+
+    def test_run_without_frame_rendered_passes(self):
+        self.assertEqual(production_failures(bios_files(frames=())), [])
+        self.assertTrue(bios_failures(bios_files(frames=())))
+
+    def test_run_missing_firmware_mode_and_logo_passes(self):
+        files = without(bios_files(frames=()), BOOT_PARAMS, f"{BGRT}/status")
+        self.assertEqual(production_failures(files), [])
+
+    def test_frame_stats_and_firmware_facts_are_not_checked(self):
+        cases = {
+            "every frame degenerate": bios_files(
+                frames=[{**payload, "degenerate": True} for payload in bios_frame_payloads()]
+            ),
+            "frames identical": bios_files(
+                frames=[frame_payload(frame_id, phash=0) for frame_id in range(len(BIOS_PHASHES))]
+            ),
+            "zero checksum during greeter foreground": bios_files(
+                extra=[crc_sample("card0", "42", 1_535_000, ROOTFS_UNIT, comp="00000000")]
+            ),
+            "zero checksum after first frame_rendered": bios_files(
+                extra=[crc_sample("card0", "42", 2_100_000, ROOTFS_UNIT, comp="00000000")]
+            ),
+        }
+        for label, files in cases.items():
+            with self.subTest(label):
+                self.assertEqual(production_failures(files), [])
+
+    def test_r1_ordering_checks(self):
+        cases = {
+            "drm_master_acquired phase missing": (
+                bios_files(frames=(), drop={"phase"}),
+                ["drm_master_acquired"],
+            ),
+            "console switched before drm_master_acquired": (
+                bios_files(
+                    frames=(),
+                    extra=[kernel_line("Console: switching to colour dummy device 80x25", 1_400_000)],
+                ),
+                ["console switched before drm_master_acquired"],
+            ),
+            "fbcon claims the primary device": (
+                bios_files(
+                    frames=(),
+                    extra=[kernel_line("fbcon: nvidia-drmdrmfb (fb0) is primary device", 1_400_000)],
+                ),
+                ["claimed the primary device before drm_master_acquired"],
+            ),
+            "NVIDIA drm frame buffer device line": (
+                bios_files(
+                    frames=(),
+                    extra=[
+                        kernel_line(
+                            "nvidia 0000:01:00.0: [drm] fb0: nvidia-drmdrmfb frame buffer device",
+                            1_400_000,
+                        )
+                    ],
+                ),
+                ["frame buffer device line before drm_master_acquired"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_r2_active_head_checks(self):
+        cases = {
+            "no active head after drm_master_acquired": (
+                bios_files(
+                    frames=(),
+                    drop={"c0_1600", "c1_1650", "c0_1700", "c1_1800", "c0_1900"},
+                ),
+                ["no active head after drm_master_acquired"],
+            ),
+            "active head checksum zero after drm_master_acquired": (
+                bios_files(
+                    frames=(),
+                    drop={"c1_1650", "c1_1800"},
+                    extra=[
+                        crc_sample("card1", "7", 1_510_000, ROOTFS_UNIT, comp="00000000"),
+                        crc_sample("card1", "7", 1_520_000, ROOTFS_UNIT, comp="00000000"),
+                    ],
+                ),
+                # An all-zero head has one distinct value, so it fails both checks.
+                ["no nonzero checksum after drm_master_acquired on: card1/crtc7", "takes one value"],
+            ),
+            "active head checksum constant": (
+                bios_files(
+                    frames=(),
+                    drop={"c1_1800"},
+                    extra=[crc_sample("card1", "7", 1_800_000, ROOTFS_UNIT, comp="0000abcd")],
+                ),
+                ["takes one value after drm_master_acquired on: card1/crtc7"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_r3_overlay_and_greeter_checks(self):
+        cases = {
+            "overlay client missing": (
+                bios_files(frames=(), drop={"overlay"}),
+                ["no client_first_frame{role: overlay}"],
+            ),
+            "greeter foreground missing": (
+                bios_files(frames=(), drop={"greeter"}),
+                ["no foreground_changed{to: greeter}"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_cli_runs_the_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = write_run(Path(tmp), bios_files(frames=()))
+            code, out, _ = run_cli([str(run), "--expect", "production"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS production", out)
+
+    def test_cli_prints_each_failure_with_the_profile_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = write_run(Path(tmp), bios_files(frames=(), drop={"greeter"}))
+            code, out, _ = run_cli([str(run), "--expect", "production"])
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL production: no foreground_changed{to: greeter}", out)
 
 
 class CliTest(unittest.TestCase):
