@@ -16,6 +16,7 @@ and `sudo -n ln -sfnT TARGET LINK` points a GC root at a build out path, replaci
 any link already there; it fails while the GC root directory is missing.
 """
 
+import base64
 import contextlib
 import io
 import itertools
@@ -77,6 +78,62 @@ GC_LINKS = {
 }
 TOPLEVEL_OUT = re.compile(r"/nix/store/aaaa-[a-z-]+-toplevel")
 GC_TARGETS = {"toplevel": TOPLEVEL_OUT, "uki": UKI_DIR}
+LOADER_GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+# Remote path -> run-directory destination (frozen run layout E1-D6).
+FIRMWARE_LAYOUT = {
+    f"/sys/firmware/{name}": f"firmware/{name}"
+    for name in (
+        "acpi/tables/FPDT",
+        "acpi/fpdt/boot/firmware_start_ns",
+        "acpi/fpdt/boot/bootloader_load_ns",
+        "acpi/fpdt/boot/bootloader_launch_ns",
+        "acpi/fpdt/boot/exitbootservice_start_ns",
+        "acpi/fpdt/boot/exitbootservice_end_ns",
+        "acpi/bgrt/status",
+        "acpi/bgrt/type",
+        "acpi/bgrt/version",
+        "acpi/bgrt/xoffset",
+        "acpi/bgrt/yoffset",
+        "acpi/bgrt/image",
+        f"efi/efivars/LoaderTimeInitUSec-{LOADER_GUID}",
+        f"efi/efivars/LoaderTimeExecUSec-{LOADER_GUID}",
+        f"efi/efivars/LoaderFirmwareInfo-{LOADER_GUID}",
+    )
+}
+FIRMWARE_LAYOUT["/sys/kernel/boot_params/data"] = "firmware/boot_params/data"
+
+
+def firmware_fixtures() -> dict[str, bytes]:
+    """Each firmware file's bytes in the shape the kernel serves it.
+
+    sysfs files are decimal text with a trailing newline; efivarfs files start with a
+    4-byte attributes word, and systemd-boot's variables hold NUL-terminated UTF-16LE text
+    (LoaderTime* a decimal microsecond count, LoaderFirmwareInfo the firmware vendor);
+    FPDT, BGRT image and boot_params are binary and include bytes that text mode would mangle.
+    """
+    binary = bytes(range(256)) + b"\r\n\x00\xff"
+    attributes = b"\x06\x00\x00\x00"
+    return {
+        "/sys/firmware/acpi/tables/FPDT": b"FPDT" + binary,
+        "/sys/firmware/acpi/fpdt/boot/firmware_start_ns": b"1004000\n",
+        "/sys/firmware/acpi/fpdt/boot/bootloader_load_ns": b"2008000\n",
+        "/sys/firmware/acpi/fpdt/boot/bootloader_launch_ns": b"3012000\n",
+        "/sys/firmware/acpi/fpdt/boot/exitbootservice_start_ns": b"4016000\n",
+        "/sys/firmware/acpi/fpdt/boot/exitbootservice_end_ns": b"5020000\n",
+        "/sys/firmware/acpi/bgrt/status": b"1\n",
+        "/sys/firmware/acpi/bgrt/type": b"0\n",
+        "/sys/firmware/acpi/bgrt/version": b"1\n",
+        "/sys/firmware/acpi/bgrt/xoffset": b"312\n",
+        "/sys/firmware/acpi/bgrt/yoffset": b"184\n",
+        "/sys/firmware/acpi/bgrt/image": b"BM" + binary,
+        "/sys/kernel/boot_params/data": binary * 4,
+        f"/sys/firmware/efi/efivars/LoaderTimeInitUSec-{LOADER_GUID}": attributes
+        + "1234567\x00".encode("utf-16-le"),
+        f"/sys/firmware/efi/efivars/LoaderTimeExecUSec-{LOADER_GUID}": attributes
+        + "2345678\x00".encode("utf-16-le"),
+        f"/sys/firmware/efi/efivars/LoaderFirmwareInfo-{LOADER_GUID}": attributes
+        + "EDK II 1.00\x00".encode("utf-16-le"),
+    }
 
 
 class UnscriptedCommand(AssertionError):
@@ -193,6 +250,8 @@ class FakeGnomon:
         fail_gc_root: str | None = None,
         bind_fails: bool = False,
         deliveries: Mapping[str, Sequence[bytes]] | None = None,
+        firmware: Mapping[str, bytes] | None = None,
+        firmware_garbled: Sequence[str] = (),
     ) -> None:
         self.lab_mode = lab_mode
         self.sessions = list(sessions)
@@ -231,6 +290,10 @@ class FakeGnomon:
         self.deliveries = dict(deliveries or {})
         self.netconsole_ports: list[int] = []
         self.listener: FakeNetconsole | None = None
+        # firmware maps a path to the bytes gnomon serves; a path not in it is absent.
+        # firmware_garbled names paths whose base64 output is not valid base64.
+        self.firmware = dict(firmware or {})
+        self.firmware_garbled = tuple(firmware_garbled)
 
     def say(self, message: str) -> None:
         self.trace.append(f"say:{message}")
@@ -380,7 +443,18 @@ class FakeGnomon:
             return lab.Result(3, "inactive\n", "")
         if argv == SELECTED:
             return _ok(f"{self.selected}\x00\n")
+        if len(argv) == 5 and argv[:4] == ("sudo", "-n", "base64", "-w0") and argv[4] in FIRMWARE_LAYOUT:
+            return self._base64(argv[4])
         raise UnscriptedCommand(argv)
+
+    def _base64(self, path: str) -> lab.Result:
+        """GNU `base64 -w0`: one line, no trailing newline; a missing file exits 1."""
+        self.trace.append(f"base64:{path}")
+        if path in self.firmware_garbled:
+            return _ok("!!not base64!!")
+        if path not in self.firmware:
+            return lab.Result(1, "", f"base64: {path}: No such file or directory")
+        return _ok(base64.b64encode(self.firmware[path]).decode("ascii"))
 
     def _link_root(self, argv: tuple[str, ...]) -> lab.Result:
         target, link = argv[4], argv[5]
@@ -409,6 +483,10 @@ BUILDS_AND_ROOTS = [
     "root:toplevel",
     "root:uki",
 ]
+
+
+def base64_calls(gnomon: FakeGnomon) -> list[tuple[str, ...]]:
+    return [argv for _, argv in gnomon.calls if argv[:3] == ("sudo", "-n", "base64")]
 
 
 def fault_sequence(exp: str) -> list[str]:
@@ -872,6 +950,86 @@ class LabRunnerTest(unittest.TestCase):
         self.assertLess(self.position(gnomon.trace, "say:FAIL"), self.position(gnomon.trace, "listen:stop"))
         self.assertEqual(gnomon.trace[-1], "listen:stop")
         self.assertFalse(gnomon.listener.open)
+
+    def test_firmware_bytes_land_at_the_frozen_run_layout(self) -> None:
+        fixtures = firmware_fixtures()
+        gnomon = FakeGnomon(firmware=fixtures)
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 0, err)
+        run = self.single_run_dir("baseline")
+        collected = {
+            path.relative_to(run).as_posix() for path in (run / "firmware").rglob("*") if path.is_file()
+        }
+        self.assertEqual(collected, set(FIRMWARE_LAYOUT.values()))
+        for remote, relative in FIRMWARE_LAYOUT.items():
+            with self.subTest(remote=remote):
+                self.assertEqual((run / relative).read_bytes(), fixtures[remote])
+
+    def test_firmware_is_copied_between_the_checked_lab_boot_and_the_return_reboot(self) -> None:
+        gnomon = FakeGnomon(firmware=firmware_fixtures())
+        self.run_traced("baseline", gnomon)
+        trace = gnomon.trace
+        reboots = [index for index, entry in enumerate(trace) if entry == "reboot"]
+        self.assertEqual(len(reboots), 2, trace)
+        booted = self.position(trace, "say:lab entry booted")
+        copies = [index for index, entry in enumerate(trace) if entry.startswith("base64:")]
+        self.assertEqual(len(copies), len(FIRMWARE_LAYOUT), trace)
+        self.assertLess(reboots[0], booted)
+        for index in copies:
+            with self.subTest(entry=trace[index]):
+                self.assertLess(booted, index)
+                self.assertLess(index, reboots[1])
+
+    def test_firmware_is_not_copied_without_a_checked_lab_boot(self) -> None:
+        cases = (
+            ("fault-panic", "returns", 0),
+            ("fault-poweroff", "poweroff", 0),
+            ("baseline", "returns", 1),
+        )
+        for name, lab_mode, code_expected in cases:
+            with self.subTest(name=name, lab_mode=lab_mode):
+                gnomon = FakeGnomon(lab_mode=lab_mode, firmware=firmware_fixtures())
+                code, _, err = self.run_queue([name], gnomon)
+                self.assertEqual(code, code_expected, err)
+                self.assertEqual(base64_calls(gnomon), [])
+                self.assertFalse((self.single_run_dir(name) / "firmware").exists())
+
+    def test_missing_firmware_file_is_noted_and_collection_goes_on(self) -> None:
+        fixtures = firmware_fixtures()
+        absent = [remote for remote in fixtures if "/acpi/bgrt/" in remote]
+        for remote in absent:
+            del fixtures[remote]
+        gnomon = FakeGnomon(firmware=fixtures)
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 0, err)
+        run = self.single_run_dir("baseline")
+        lines = (run / "run.log").read_text(encoding="utf-8").splitlines()
+        for remote in absent:
+            with self.subTest(remote=remote):
+                self.assertTrue(
+                    any(remote in line and "No such file or directory" in line for line in lines), lines
+                )
+                self.assertFalse((run / FIRMWARE_LAYOUT[remote]).exists())
+        self.assertIn("PASS", lines)
+        for remote, relative in FIRMWARE_LAYOUT.items():
+            if remote in fixtures:
+                with self.subTest(remote=remote):
+                    self.assertEqual((run / relative).read_bytes(), fixtures[remote])
+
+    def test_undecodable_firmware_output_is_noted_and_skipped(self) -> None:
+        garbled = "/sys/firmware/acpi/fpdt/boot/bootloader_load_ns"
+        gnomon = FakeGnomon(firmware=firmware_fixtures(), firmware_garbled=[garbled])
+        code, _, err = self.run_queue(["baseline"], gnomon)
+        self.assertEqual(code, 0, err)
+        run = self.single_run_dir("baseline")
+        lines = (run / "run.log").read_text(encoding="utf-8").splitlines()
+        self.assertTrue(any(garbled in line and "undecodable" in line for line in lines), lines)
+        self.assertFalse((run / FIRMWARE_LAYOUT[garbled]).exists())
+        self.assertEqual(
+            (run / FIRMWARE_LAYOUT["/sys/kernel/boot_params/data"]).read_bytes(),
+            firmware_fixtures()["/sys/kernel/boot_params/data"],
+        )
+        self.assertIn("PASS", lines)
 
 
 class NetconsoleLogTest(unittest.TestCase):

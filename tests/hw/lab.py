@@ -14,6 +14,10 @@ links, and the runner never removes them, so a failed or aborted run leaves them
 in place. The roots keep the images in gnomon's store until someone removes them.
 They are not system generations and create no boot entries.
 The lab entry is removed on the way out.
+When an experiment checks its lab boot, the runner copies gnomon's firmware and
+loader evidence (FPDT, BGRT, boot_params, and the systemd-boot efivars) into the
+run's firmware/ directory while the lab entry is up; a file gnomon lacks is noted in
+run.log and skipped.
 
 Every remote, local, clock, UDP, and magic-packet effect goes through the `Layer`
 and `Clock` objects handed to `Lab`, so test_lab.py runs the whole sequence
@@ -32,6 +36,7 @@ the one-shot before the runner exits.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import re
 import shlex
@@ -58,6 +63,28 @@ GC_TOPLEVEL = f"{GC_ROOT_DIR}/toplevel"
 GC_UKI = f"{GC_ROOT_DIR}/uki"
 BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
 SELECTED_VAR = "/sys/firmware/efi/efivars/LoaderEntrySelected-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+LOADER_GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+FIRMWARE_ROOT = "/sys/firmware/"
+BOOT_PARAMS_DATA = "/sys/kernel/boot_params/data"
+# Copied from gnomon while the lab entry is up; the run-directory layout is frozen (E1-D6).
+FIRMWARE_FILES = (
+    "/sys/firmware/acpi/tables/FPDT",
+    "/sys/firmware/acpi/fpdt/boot/firmware_start_ns",
+    "/sys/firmware/acpi/fpdt/boot/bootloader_load_ns",
+    "/sys/firmware/acpi/fpdt/boot/bootloader_launch_ns",
+    "/sys/firmware/acpi/fpdt/boot/exitbootservice_start_ns",
+    "/sys/firmware/acpi/fpdt/boot/exitbootservice_end_ns",
+    "/sys/firmware/acpi/bgrt/status",
+    "/sys/firmware/acpi/bgrt/type",
+    "/sys/firmware/acpi/bgrt/version",
+    "/sys/firmware/acpi/bgrt/xoffset",
+    "/sys/firmware/acpi/bgrt/yoffset",
+    "/sys/firmware/acpi/bgrt/image",
+    BOOT_PARAMS_DATA,
+    f"/sys/firmware/efi/efivars/LoaderTimeInitUSec-{LOADER_GUID}",
+    f"/sys/firmware/efi/efivars/LoaderTimeExecUSec-{LOADER_GUID}",
+    f"/sys/firmware/efi/efivars/LoaderFirmwareInfo-{LOADER_GUID}",
+)
 ESP_MARGIN_BYTES = 200 * 1024 * 1024
 GRAPHICAL_TYPES = frozenset({"wayland", "x11", "mir"})
 MAC_PATTERN = re.compile(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}")
@@ -281,6 +308,13 @@ def parse_generations(profiles: str) -> tuple[int, ...]:
     return tuple(sorted(numbers))
 
 
+def _firmware_destination(remote: str) -> Path:
+    """Where a firmware file lands in the run directory: firmware/<path under /sys/firmware>."""
+    if remote == BOOT_PARAMS_DATA:
+        return Path("firmware/boot_params/data")
+    return Path("firmware") / remote.removeprefix(FIRMWARE_ROOT)
+
+
 def _int(text: str, what: str) -> int:
     try:
         return int(text)
@@ -394,6 +428,7 @@ class Lab:
             if plan.lab_boot_checked:
                 booted_from = self._await_boot("lab entry to boot", boot_before, LAB_ENTRY)
                 run.say(f"lab entry booted as {booted_from}")
+                self._collect_firmware(run)
                 self._refuse_if_graphical("refusing before return reboot")
                 self._reboot()
             if plan.poweroff:
@@ -610,6 +645,24 @@ class Lab:
             return True if result.returncode == 0 and result.stdout.strip() == "active" else None
 
         self._poll(f"{self.display_manager} to become active", active, DISPLAY_DEADLINE_SECONDS)
+
+    def _collect_firmware(self, run: RunLog) -> None:
+        """Copy each firmware file byte for byte; one that gnomon cannot give is noted and skipped."""
+        for remote in FIRMWARE_FILES:
+            result = self.layer.remote(["sudo", "-n", "base64", "-w0", remote])
+            if result.returncode != 0:
+                detail = result.stderr.strip() or "no output"
+                run.say(f"firmware: {remote} unavailable: {detail}")
+                continue
+            try:
+                # validate=True: a character outside the base64 alphabet is undecodable, not dropped.
+                data = base64.b64decode(result.stdout, validate=True)
+            except ValueError as err:
+                run.say(f"firmware: {remote} unavailable: undecodable base64 output ({err})")
+                continue
+            destination = run.directory / _firmware_destination(remote)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
 
     def _abort(self, run: RunLog) -> None:
         run.say("aborting: removing the lab entry and clearing the one-shot")
