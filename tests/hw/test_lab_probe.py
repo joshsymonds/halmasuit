@@ -36,6 +36,9 @@ OTHER_USER_UID = 1000
 FAKE_PASSWD = {CONSUMER_USER: CONSUMER_UID}
 PASSWORD_CODES = [17, 19, 24, 49, 34, 25, 19, 24, 48, 18]  # w r o n g p r o b e
 ENTER = 28
+BACKSPACE = 14
+CLEAR_PRESSES = 32
+TYPED_KEYS = CLEAR_PRESSES + len(PASSWORD_CODES) + 1
 ALPHABET = {
     "a": 30, "b": 48, "c": 46, "d": 32, "e": 18, "f": 33, "g": 34,
     "h": 35, "i": 23, "j": 36, "k": 37, "l": 38, "m": 50, "n": 49,
@@ -305,7 +308,7 @@ class ProbeRun(unittest.TestCase):
             status = probe.run(self.tree.host(ioctl, self.clock), CONSUMER_USER)
         return status, out.getvalue().splitlines()
 
-    def test_success_types_password_and_reports_three_lines(self):
+    def test_success_clears_field_then_types_password_and_reports_three_lines(self):
         self.tree.add_input(SYSNAME, DEVICE)
         self.tree.add_process(PROBE_PID, "python3", CONSUMER_UID, [self.tree.node])
         self.tree.add_process(UDEV_PID, "systemd-udevd", ROOT_UID, [self.tree.node])
@@ -320,14 +323,18 @@ class ProbeRun(unittest.TestCase):
             [
                 f"device node={self.tree.node}",
                 f"ready holder=halmasuit pid={GREETER_PID}",
-                f"typed keys={len(PASSWORD_CODES) + 1}",
+                f"typed keys={TYPED_KEYS}",
             ],
         )
+        self.assertEqual(TYPED_KEYS, 43)
         expected = []
-        for code in PASSWORD_CODES + [ENTER]:
+        for code in [BACKSPACE] * CLEAR_PRESSES + PASSWORD_CODES + [ENTER]:
             expected += [key_event(code, 1), syn_event(), key_event(code, 0), syn_event()]
         self.assertEqual(self.tree.uinput.read_bytes(), b"".join(expected))
-        self.assertEqual(sorted(set(ioctl.keybits)), sorted(set(PASSWORD_CODES + [ENTER])))
+        self.assertEqual(
+            sorted(set(ioctl.keybits)),
+            sorted(set(PASSWORD_CODES + [ENTER, BACKSPACE])),
+        )
         self.assertEqual(ioctl.requests[0], probe.UI_SET_EVBIT)
         self.assertIn(probe.UI_DEV_CREATE, ioctl.requests)
         self.assertEqual(ioctl.requests[-1], probe.UI_DEV_DESTROY)

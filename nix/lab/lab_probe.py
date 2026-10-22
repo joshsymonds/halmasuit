@@ -3,9 +3,10 @@
 
 Creates a uinput virtual keyboard, waits for udev to publish its event node
 and for a process other than udev, running as the consumer user, to hold that
-node open, types PASSWORD and Enter, holds the device briefly, then destroys
-it. PASSWORD is a fixed, obviously wrong constant: it is never read from
-anywhere and reaches the system only as key events.
+node open, presses BackSpace 32 times to clear the focused field, types
+PASSWORD and Enter, holds the device briefly, then destroys it. PASSWORD is a
+fixed, obviously wrong constant: it is never read from anywhere and reaches
+the system only as key events.
 
 Usage: lab_probe.py --consumer-user USER
 
@@ -43,6 +44,8 @@ KEY_CODES = {
     "v": 47, "w": 17, "x": 45, "y": 21, "z": 44,
 }
 ENTER = 28
+KEY_BACKSPACE = 14
+CLEAR_PRESSES = 32
 
 EV_SYN = 0
 SYN_REPORT = 0
@@ -196,7 +199,7 @@ def wait_for_holder(host: Host, node: str, consumer_uid: int) -> Holder:
 
 
 def probe_keyboard(host: Host, fd: int, consumer_uid: int) -> None:
-    codes = key_sequence(PASSWORD)
+    codes = [KEY_BACKSPACE] * CLEAR_PRESSES + key_sequence(PASSWORD)
     host.ioctl(fd, UI_SET_EVBIT, EV_KEY)
     for code in sorted(set(codes)):
         host.ioctl(fd, UI_SET_KEYBIT, code)
