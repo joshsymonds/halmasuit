@@ -255,6 +255,9 @@ WALLPAPER_PAYLOAD = {"event": "client_first_frame", "role": "wallpaper"}
 CLIENT_PAYLOAD = {"event": "client_first_frame", "role": "overlay"}
 FOREGROUND_PAYLOAD = {"event": "foreground_changed", "to": "greeter"}
 SESSION_PAYLOAD = {"event": "foreground_changed", "to": "session"}
+STARTED_PAYLOAD = {"event": "started", "pid": 1184, "version": "0.1.0"}
+SESSION_OPENED_PAYLOAD = {"event": "session_opened"}
+SESSION_FIRST_FRAME_PAYLOAD = {"event": "session_client_first_frame"}
 BIOS_PHASHES = (
     0x0000000000000000,
     0xFFFFFFFFFFFFFFFF,
@@ -358,6 +361,39 @@ def bios_failures(files):
 def production_failures(files):
     with contextlib.redirect_stdout(io.StringIO()):
         return timeline.PROFILES["production"](build(files))
+
+
+def attended_frame_payloads():
+    return [frame_payload(frame_id) for frame_id in range(4)]
+
+
+def attended_lines(*, drop=(), extra=(), frames=None):
+    """An attended-login run's halmasuit lines: one started, the wallpaper's first frame and
+    the greeter's foreground, then frames on both sides of session_opened at 2_000_000, and
+    the session's foreground and first frame after it."""
+    frames = attended_frame_payloads() if frames is None else frames
+    named = {
+        "started": halmasuit_line(STARTED_PAYLOAD, mono=1_000_000),
+        "wallpaper": halmasuit_line(WALLPAPER_PAYLOAD, mono=1_100_000),
+        "greeter": halmasuit_line(FOREGROUND_PAYLOAD, mono=1_200_000),
+        **{
+            f"frame{frame_id}": halmasuit_line(payload, mono=1_300_000 + 400_000 * frame_id)
+            for frame_id, payload in enumerate(frames)
+        },
+        "opened": halmasuit_line(SESSION_OPENED_PAYLOAD, mono=2_000_000),
+        "session": halmasuit_line(SESSION_PAYLOAD, mono=2_000_500),
+        "session_frame": halmasuit_line(SESSION_FIRST_FRAME_PAYLOAD, mono=2_010_000),
+    }
+    return [line for name, line in named.items() if name not in drop] + list(extra)
+
+
+def attended_files(**kwargs):
+    return with_journal(complete_files(), attended_lines(**kwargs))
+
+
+def attended_failures(files):
+    with contextlib.redirect_stdout(io.StringIO()):
+        return timeline.PROFILES["attended-login"](build(files))
 
 
 class HeaderTest(unittest.TestCase):
@@ -1174,6 +1210,83 @@ class ProductionTest(unittest.TestCase):
             code, out, _ = run_cli([str(run), "--expect", "production"])
         self.assertEqual(code, 1)
         self.assertIn("FAIL production: no foreground_changed{to: greeter}", out)
+
+
+class AttendedLoginTest(unittest.TestCase):
+    def assert_failures(self, files, fragments):
+        failures = attended_failures(files)
+        self.assertEqual(len(failures), len(fragments), failures)
+        for failure, fragment in zip(failures, fragments):
+            self.assertIn(fragment, failure)
+
+    def test_complete_run_passes(self):
+        self.assertEqual(attended_failures(attended_files()), [])
+
+    def test_session_events_are_required(self):
+        cases = {
+            "session_opened missing": (attended_files(drop={"opened"}), ["no session_opened"]),
+            "session_client_first_frame missing": (
+                attended_files(drop={"session_frame"}),
+                ["no session_client_first_frame"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_exactly_one_started_before_session_opened(self):
+        cases = {
+            "zero started": (
+                attended_files(drop={"started"}),
+                ["0 halmasuit started events; expected exactly one"],
+            ),
+            "two started": (
+                attended_files(extra=[halmasuit_line(STARTED_PAYLOAD, mono=1_050_000)]),
+                ["2 halmasuit started events; expected exactly one"],
+            ),
+            "two started, one after session_opened": (
+                attended_files(extra=[halmasuit_line(STARTED_PAYLOAD, mono=2_100_000)]),
+                ["2 halmasuit started events; expected exactly one"],
+            ),
+            "started after session_opened": (
+                attended_files(drop={"started"}, extra=[halmasuit_line(STARTED_PAYLOAD, mono=2_100_000)]),
+                ["halmasuit started after session_opened"],
+            ),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_no_flash_stream_is_checked(self):
+        frames = attended_frame_payloads()
+        cases = {
+            "frame with a nonzero clear_pixel_count": (
+                attended_files(frames=[frames[0], {**frames[1], "clear_pixel_count": 5}, *frames[2:]]),
+                ["clear_pixel_count != 0"],
+            ),
+            "degenerate frame": (
+                attended_files(frames=[frames[0], {**frames[1], "degenerate": True}, *frames[2:]]),
+                ["degenerate frame"],
+            ),
+            "no frames": (attended_files(frames=()), ["no frame_rendered events"]),
+        }
+        for label, (files, fragments) in cases.items():
+            with self.subTest(label):
+                self.assert_failures(files, fragments)
+
+    def test_cli_runs_the_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = write_run(Path(tmp), attended_files())
+            code, out, _ = run_cli([str(run), "--expect", "attended-login"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS attended-login", out)
+
+    def test_cli_prints_each_failure_with_the_profile_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = write_run(Path(tmp), attended_files(drop={"opened"}))
+            code, out, _ = run_cli([str(run), "--expect", "attended-login"])
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL attended-login: no session_opened", out)
 
 
 class CliTest(unittest.TestCase):
