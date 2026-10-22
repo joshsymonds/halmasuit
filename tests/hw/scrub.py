@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import string
 import sys
 from pathlib import Path
 from typing import NamedTuple
@@ -36,12 +37,12 @@ DASHED_UUID = re.compile(
 )
 MAC = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5}(?![0-9a-fA-F])")
 IPV4_CANDIDATE = re.compile(r"(?<!\d)(?<!\d\.)\d{1,3}(?:\.\d{1,3}){3}(?!\.?\d)")
-# A candidate is a maximal run of hex digits and colons. A run glued to an ASCII
-# word character on either side is part of a word (`halmasuit::event`), not an
-# address; non-ASCII neighbours, such as 0xFF fill in a binary recording, do not
-# glue. The atomic group keeps the run whole, so no shorter run ending before a
-# colon is tried.
-IPV6_CANDIDATE = re.compile(r"(?<![\w:])(?>[0-9a-fA-F:]+)(?!\w)", re.ASCII)
+# A candidate is a maximal run of hex digits and colons. A run is a language path
+# separator, not an address, when an ASCII identifier character sits directly
+# before and directly after it and its only colons are one `::` (`halmasuit::event`,
+# `smithay::backend::drm`). Every other run is parsed as an address.
+IPV6_CANDIDATE = re.compile(r"[0-9a-fA-F:]+")
+ASCII_IDENT = frozenset(string.ascii_letters + string.digits + "_")
 DOC_IPV4 = tuple(
     ipaddress.ip_network(net)
     for net in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")
@@ -64,6 +65,15 @@ def _texts(data: bytes) -> list[str]:
     ]
 
 
+def _is_path_separator(text: str, match: re.Match[str]) -> bool:
+    token = match.group()
+    if token.count(":") != 2 or "::" not in token:
+        return False
+    before = text[match.start() - 1] if match.start() > 0 else ""
+    after = text[match.end()] if match.end() < len(text) else ""
+    return before in ASCII_IDENT and after in ASCII_IDENT
+
+
 def _scan_text(text: str) -> list[tuple[str, str]]:
     hits: list[tuple[str, str]] = []
     for match in HEX32.finditer(text):
@@ -83,7 +93,7 @@ def _scan_text(text: str) -> list[tuple[str, str]]:
             hits.append(("ipv4", match.group()))
     for match in IPV6_CANDIDATE.finditer(text):
         token = match.group()
-        if token.count(":") < 2:
+        if token.count(":") < 2 or _is_path_separator(text, match):
             continue
         try:
             addr6 = ipaddress.IPv6Address(token)

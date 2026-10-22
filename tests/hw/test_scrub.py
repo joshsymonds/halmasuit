@@ -112,10 +112,37 @@ class Ipv6Test(unittest.TestCase):
     def test_clock_time_is_not_an_address(self):
         self.assertEqual(hits(b"12:34:56"), [])
 
-    def test_candidate_glued_to_a_word_is_not_an_address(self):
-        for text in ("halmasuit::event", "v2606:4700::1111", "fe80::1g", "fe80::1:g"):
+    def test_path_separator_between_identifiers_is_not_an_address(self):
+        for text in ("halmasuit::event", "smithay::backend::drm"):
             with self.subTest(text=text):
                 self.assertEqual(hits(text.encode()), [])
+
+    def test_path_separator_needs_identifier_on_both_sides(self):
+        for text, expected in (
+            ("::e", [("ipv6", "::e")]),
+            ("halmasuit::", [("ipv6", "::")]),
+            ("xa:b::cy", [("ipv6", "a:b::c")]),
+            ("é::eé", [("ipv6", "::e")]),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(hits(text.encode()), expected)
+
+    def test_candidate_glued_to_a_word_is_an_address(self):
+        for text, addr in (
+            ("ipv6:2600:1700:abcd::1", "6:2600:1700:abcd::1"),
+            ("eth0:fe80::1", "0:fe80::1"),
+            ("tcp6:2600:1700::5", "6:2600:1700::5"),
+            ("src:2600:1700::5", "c:2600:1700::5"),
+            ("2600:1700::5x", "2600:1700::5"),
+            ("from2600:1700::5", "2600:1700::5"),
+            ("v2606:4700::1111", "2606:4700::1111"),
+            ("fe80::1g", "fe80::1"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(hits(text.encode()), [("ipv6", addr)])
+
+    def test_run_ending_in_a_colon_is_not_an_address(self):
+        self.assertEqual(hits(b"fe80::1:g"), [])
 
     def test_tracing_target_in_journal_row_is_not_flagged(self):
         row = (
@@ -140,6 +167,8 @@ class Ipv6Test(unittest.TestCase):
             ("inet6 fe80::1/64", "fe80::1"),
             ("[2600:1700::5]:443", "2600:1700::5"),
             ("src=2600:1700::5", "2600:1700::5"),
+            ("addr=2600:1700::5", "2600:1700::5"),
+            ('"2600:1700::5"', "2600:1700::5"),
         ):
             with self.subTest(text=text):
                 self.assertEqual(hits(text.encode()), [("ipv6", addr)])
