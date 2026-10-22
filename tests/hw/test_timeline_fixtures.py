@@ -4,9 +4,9 @@
 A fixture run is a directory under tests/hw/fixtures/ that holds
 `expected-timeline.json`; its `profile` file names the profile that must pass.
 Runs are read in place: build_timeline never writes into the fixture. The
-synthetic-baseline, gnomon-baseline, synthetic-bios-shader-greeter, and
-synthetic-production runs also assert their story facts by hand, so a golden
-file regenerated from a broken timeline still fails.
+synthetic-baseline, gnomon-baseline, synthetic-bios-shader-greeter,
+synthetic-production, and synthetic-attended-login runs also assert their story
+facts by hand, so a golden file regenerated from a broken timeline still fails.
 """
 
 import errno
@@ -27,6 +27,7 @@ BASELINE_RUN = FIXTURE_ROOT / "synthetic-baseline"
 GNOMON_RUN = FIXTURE_ROOT / "gnomon-baseline"
 BIOS_RUN = FIXTURE_ROOT / "synthetic-bios-shader-greeter"
 PRODUCTION_RUN = FIXTURE_ROOT / "synthetic-production"
+ATTENDED_RUN = FIXTURE_ROOT / "synthetic-attended-login"
 # exitbootservice_end_ns is 2_583_541_217, which floors to 2_583_541 us.
 KERNEL_ZERO_US = 2_583_541
 # Recorded gnomon boot: exitbootservice_end_ns floors to 19_664_764 us.
@@ -156,6 +157,9 @@ class FixtureReplayTest(unittest.TestCase):
 
     def test_production_fixture_is_committed(self):
         self.assertIn(PRODUCTION_RUN, fixture_runs())
+
+    def test_attended_fixture_is_committed(self):
+        self.assertIn(ATTENDED_RUN, fixture_runs())
 
     def test_every_fixture_matches_expected_timeline(self):
         for run in fixture_runs():
@@ -702,6 +706,216 @@ class ProductionShapeTest(unittest.TestCase):
     def test_halmasuit_lines_come_from_one_process(self):
         pids = {row["_PID"] for row in self.rows if row.get("_SYSTEMD_UNIT") == HALMASUIT_UNIT}
         self.assertEqual(pids, {HALMASUIT_PID})
+
+    def test_sample_lines_match_the_lab_crc_shape(self):
+        samples = [row for row in self.rows if row.get("_SYSTEMD_UNIT") in (INITRD_UNIT, ROOTFS_UNIT)]
+        messages = [row["MESSAGE"] for row in samples if row["MESSAGE"].startswith("sample ")]
+        self.assertTrue(messages)
+        for message in messages:
+            with self.subTest(message=message):
+                self.assertRegex(message, SAMPLE_LINE)
+
+
+# The attended run: the greeter comes up as in the bios run, then a person logs in at it. Times are on the
+# kernel clock. The login is requested at least 30 s after the greeter takes foreground, and frames and
+# CRC samples run at least 10 s past the session foreground.
+SESSION_REQUESTED_MONO = 36_000_000
+SESSION_OPENED_MONO = 36_020_000
+SESSION_LEADER_ARMED_MONO = 36_030_000
+SESSION_FIRST_FRAME_MONO = 36_200_000
+GREETER_KILL_FAILED_MONO = 36_210_000
+SESSION_FOREGROUND_MONO = 36_220_000
+ATTENDED_FRAME_COUNT = 109
+ATTENDED_SAMPLE_TICKS = (2_300_000, 2_800_000) + tuple(3_300_000 + 500_000 * k for k in range(107))
+TAIL_MONO = SESSION_FOREGROUND_MONO + 10_000_000
+ATTENDED_LOGIN_STORY = [
+    (SESSION_REQUESTED_MONO, {"event": "session_requested", "uid": 1000, "gid": 100}),
+    (SESSION_OPENED_MONO, {"event": "session_opened"}),
+    (SESSION_LEADER_ARMED_MONO, {"event": "session_leader_pidfd_armed"}),
+    (SESSION_FIRST_FRAME_MONO, {"event": "session_client_first_frame"}),
+    (
+        GREETER_KILL_FAILED_MONO,
+        {"event": "greeter_kill_failed", "pid": GREETER_PID, "error": "No such process (os error 3)"},
+    ),
+    (SESSION_FOREGROUND_MONO, {"event": "foreground_changed", "to": "session"}),
+]
+
+
+class AttendedLoginStoryTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.timeline = replay(ATTENDED_RUN)
+        cls.events = cls.timeline["events"]
+        cls.halmasuit = [event for event in cls.events if event["kind"] == "halmasuit"]
+        cls.frames = [event for event in cls.halmasuit if event["payload"]["event"] == "frame_rendered"]
+        cls.story = [
+            (event["mono_us"], event["payload"])
+            for event in cls.halmasuit
+            if event["payload"]["event"] != "frame_rendered"
+        ]
+
+    def test_anchor_is_fpdt_exit_boot_services_end(self):
+        self.assertEqual(self.timeline["clock"]["kernel_zero_source"], "fpdt.exitbootservice_end")
+        self.assertEqual(self.timeline["clock"]["kernel_zero_us"], KERNEL_ZERO_US)
+
+    def test_every_halmasuit_line_reaches_the_timeline(self):
+        lines = [row for row in journal_rows(ATTENDED_RUN) if row.get("_SYSTEMD_UNIT") == HALMASUIT_UNIT]
+        self.assertEqual(len(self.halmasuit), len(lines))
+        self.assertEqual(len(self.frames), ATTENDED_FRAME_COUNT)
+
+    def test_no_probe_lines_are_emitted(self):
+        self.assertEqual(self.timeline["probe"], [])
+
+    def test_greeter_comes_up_as_in_the_bios_run(self):
+        self.assertEqual(self.story[: len(EXPECTED_HALMASUIT_STORY)], EXPECTED_HALMASUIT_STORY)
+
+    def test_login_events_are_in_order_after_the_greeter(self):
+        self.assertEqual(self.story, EXPECTED_HALMASUIT_STORY + ATTENDED_LOGIN_STORY)
+
+    def test_exactly_one_started_event(self):
+        started = [event for event in self.halmasuit if event["payload"]["event"] == "started"]
+        self.assertEqual([event["mono_us"] for event in started], [HALMASUIT_STARTED_MONO])
+
+    def test_session_is_requested_at_least_thirty_seconds_after_the_greeter(self):
+        self.assertGreaterEqual(SESSION_REQUESTED_MONO - GREETER_MONO, 30_000_000)
+
+    def test_frames_run_every_half_second_from_the_first_frame(self):
+        self.assertEqual(
+            [event["mono_us"] for event in self.frames],
+            [FIRST_FRAME_MONO + FRAME_INTERVAL_US * k for k in range(ATTENDED_FRAME_COUNT)],
+        )
+        self.assertEqual(
+            [event["payload"]["frame_id"] for event in self.frames], list(range(ATTENDED_FRAME_COUNT))
+        )
+
+    def test_frames_render_on_both_sides_of_the_swap(self):
+        before = [event for event in self.frames if event["mono_us"] < SESSION_FOREGROUND_MONO]
+        after = [event for event in self.frames if event["mono_us"] > SESSION_FOREGROUND_MONO]
+        self.assertTrue(before)
+        self.assertTrue(after)
+
+    def test_frames_continue_ten_seconds_past_the_session_foreground(self):
+        self.assertGreaterEqual(self.frames[-1]["mono_us"], TAIL_MONO)
+
+    def test_wallpaper_is_the_one_first_frame_before_every_frame(self):
+        wallpaper = [
+            event["mono_us"]
+            for event in self.halmasuit
+            if event["payload"] == {"event": "client_first_frame", "role": "wallpaper"}
+        ]
+        self.assertEqual(wallpaper, [WALLPAPER_MONO])
+        for event in self.frames:
+            with self.subTest(frame_id=event["payload"]["frame_id"]):
+                self.assertLess(WALLPAPER_MONO, event["mono_us"])
+
+    def test_initial_render_is_frame_zero_between_wallpaper_and_scanout(self):
+        scanout = next(
+            event["mono_us"]
+            for event in self.halmasuit
+            if event["payload"] == {"event": "phase_entered", "phase": "scanout_active"}
+        )
+        self.assertEqual(self.frames[0]["payload"]["frame_id"], 0)
+        self.assertLess(self.frames[0]["mono_us"], scanout)
+
+    def test_every_frame_is_clean_and_full_size(self):
+        for event in self.frames:
+            with self.subTest(frame_id=event["payload"]["frame_id"]):
+                payload = event["payload"]
+                self.assertEqual(payload["clear_pixel_count"], 0)
+                self.assertEqual(payload["black_pixel_count"], 0)
+                self.assertFalse(payload["degenerate"])
+                self.assertEqual(payload["pixel_count"], FRAME_PIXELS)
+
+    def test_greeter_takes_foreground_before_the_overlay_first_frame(self):
+        overlay = [
+            event["mono_us"]
+            for event in self.halmasuit
+            if event["payload"] == {"event": "client_first_frame", "role": "overlay"}
+        ]
+        self.assertEqual(overlay, [OVERLAY_MONO])
+        greeter = [
+            event["mono_us"]
+            for event in self.halmasuit
+            if event["payload"] == {"event": "foreground_changed", "to": "greeter"}
+        ]
+        self.assertEqual(greeter, [GREETER_MONO])
+
+    def test_panel_heads_sample_every_tick_through_the_session(self):
+        self.assertEqual(sorted(self.timeline["heads"]), sorted(PANEL_HEADS))
+        for key in PANEL_HEADS:
+            with self.subTest(head=key):
+                samples = self.timeline["heads"][key]["samples"]
+                expected = [tick + PANEL_SAMPLE_DELAY_US[key] for tick in ATTENDED_SAMPLE_TICKS]
+                self.assertEqual([sample["mono_us"] for sample in samples], expected)
+                self.assertGreaterEqual(ATTENDED_SAMPLE_TICKS[-1], TAIL_MONO)
+
+    def test_attended_login_profile_passes(self):
+        self.assertEqual(timeline.attended_login(self.timeline), [])
+
+
+class AttendedLoginShapeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.rows = journal_rows(ATTENDED_RUN)
+
+    def test_every_value_is_a_string(self):
+        for row in self.rows:
+            for key, value in row.items():
+                with self.subTest(key=key):
+                    self.assertIsInstance(value, str)
+
+    def test_every_line_carries_the_common_fields(self):
+        for row in self.rows:
+            with self.subTest(message=row["MESSAGE"]):
+                self.assertLessEqual(COMMON_FIELDS, set(row))
+
+    def test_kernel_lines_carry_source_time_and_no_user_or_group(self):
+        kernel = [row for row in self.rows if row["_TRANSPORT"] == "kernel"]
+        self.assertTrue(kernel)
+        for row in kernel:
+            with self.subTest(message=row["MESSAGE"]):
+                self.assertIn("_SOURCE_MONOTONIC_TIMESTAMP", row)
+                self.assertNotIn("_UID", row)
+                self.assertNotIn("_GID", row)
+
+    def test_systemd_lines_carry_their_job_fields(self):
+        systemd = [row for row in self.rows if row.get("_PID") == "1"]
+        self.assertTrue(systemd)
+        for row in systemd:
+            with self.subTest(message=row["MESSAGE"]):
+                self.assertLessEqual(SYSTEMD_FIELDS, set(row))
+
+    def test_unit_stdout_lines_carry_their_unit(self):
+        unit = [row for row in self.rows if row["_TRANSPORT"] == "stdout"]
+        self.assertTrue(unit)
+        for row in unit:
+            with self.subTest(message=row["MESSAGE"]):
+                self.assertLessEqual(UNIT_STDOUT_FIELDS, set(row))
+
+    def test_halmasuit_lines_are_compositor_stdout_with_tracing_json_as_root(self):
+        halmasuit = [row for row in self.rows if row.get("_SYSTEMD_UNIT") == HALMASUIT_UNIT]
+        self.assertTrue(halmasuit)
+        for row in halmasuit:
+            with self.subTest(message=row["MESSAGE"]):
+                self.assertEqual(row["_TRANSPORT"], "stdout")
+                self.assertEqual(row["SYSLOG_IDENTIFIER"], "halmasuit")
+                self.assertEqual(row["_COMM"], "halmasuit")
+                self.assertEqual(row["_UID"], HALMASUIT_STREAM_ID)
+                self.assertEqual(row["_GID"], HALMASUIT_STREAM_ID)
+                outer = json.loads(row["MESSAGE"])
+                self.assertEqual(set(outer), {"timestamp", "level", "fields", "target"})
+                self.assertEqual(outer["level"], "INFO")
+                self.assertEqual(outer["target"], "halmasuit::event")
+                self.assertEqual(set(outer["fields"]), {"json"})
+                self.assertIn("event", json.loads(outer["fields"]["json"]))
+                self.assertEqual(outer["timestamp"], rfc3339(row["__REALTIME_TIMESTAMP"]))
+
+    def test_halmasuit_lines_come_from_one_process(self):
+        pids = {row["_PID"] for row in self.rows if row.get("_SYSTEMD_UNIT") == HALMASUIT_UNIT}
+        self.assertEqual(pids, {HALMASUIT_PID})
+
+    def test_no_lab_probe_lines_are_written(self):
+        self.assertFalse(any(row["SYSLOG_IDENTIFIER"] == "lab-probe" for row in self.rows))
 
     def test_sample_lines_match_the_lab_crc_shape(self):
         samples = [row for row in self.rows if row.get("_SYSTEMD_UNIT") in (INITRD_UNIT, ROOTFS_UNIT)]
