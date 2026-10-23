@@ -1574,6 +1574,18 @@
           halmasuit-session                   = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
         };
+        # The production session path: the system's niri-session,
+        # launched with no env of its own, reaches halmasuit and
+        # registers with logind.
+        halmasuit-session-handover = import ./tests/halmasuit-session-handover.nix {
+          system = "x86_64-linux";
+          niri-flake = niriFlake;
+          inherit nixpkgs;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+          halmasuit-vm-client               = self.packages.x86_64-linux.halmasuit-vm-client;
+        };
         # Keyboard focus stays on one greeter layer surface while
         # several keyboard-interactive ones repaint.
         halmasuit-greeter-focus = import ./tests/halmasuit-greeter-focus.nix {

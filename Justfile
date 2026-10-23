@@ -136,6 +136,7 @@ test-vm jobs="":
         visual-wallpaper-event
         halmasuit-input
         halmasuit-greeter-focus
+        halmasuit-session-handover
         visual-halmasuit-clear
         visual-halmasuit-layer
         visual-halmasuit-splash

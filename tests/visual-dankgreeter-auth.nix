@@ -20,15 +20,12 @@
 #     → halmasuit-session broker relay (SO_PEERCRED-gated)
 #     → real pam_unix → session_opened
 #
-# The downstream session leader (niri-session) is environment-
-# dependent: in production it sets up dbus-activation-environment,
-# user@1001.service, etc. — none of which exist in the headless
-# test VM. So this test asserts the chain ending at
-# `Event::SessionOpened`, which is the load-bearing R13(b)
-# milestone: "credentials typed at DMS authenticate through the
-# broker." Downstream niri boot is gated by visual-niri-session
-# (which uses a direct niri command, no niri-session wrapper, to
-# isolate from the same VM environment gap).
+# This test asserts the chain ending at `Event::SessionOpened`, the
+# R13(b) milestone: "credentials typed at DMS authenticate through
+# the broker." What the session does next is gated elsewhere:
+# halmasuit-session-handover runs the system's niri-session through
+# pam_systemd and the user manager, and visual-niri-session runs a
+# direct niri command for the frame-level swap golden.
 
 {
   system,

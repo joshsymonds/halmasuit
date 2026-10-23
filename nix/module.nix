@@ -30,6 +30,79 @@ let
   brokerPeerUid =
     if cfg.enable || cfg.fromInitrd.enable then cfg.compositorUid else cfg.greeterUid;
 
+  # niri nested in halmasuit as the user's session (see
+  # `niriSession`). `niri --session` strips WAYLAND_DISPLAY and starts
+  # on the TTY, so this session runs plain `niri`, which stays a
+  # Wayland client of halmasuit, and does the session duties
+  # `--session` would: import niri's own display into the user manager
+  # and the D-Bus activation env, and only then let the unit finish
+  # starting, so graphical-session.target (and the user's shell) start
+  # against niri rather than halmasuit.
+  niriSessionVars = "WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE NIRI_SOCKET";
+
+  # Spawned by niri at startup (`niri -- <cmd>`), so it carries niri's
+  # WAYLAND_DISPLAY and NIRI_SOCKET. niri runs it in a scope of its
+  # own, outside the unit's cgroup, where systemd would drop an
+  # sd_notify; it marks the import done with a file instead.
+  niriSessionReadyMarker = "$XDG_RUNTIME_DIR/halmasuit-niri.ready";
+  niriSessionReady = pkgs.writeShellScript "halmasuit-niri-ready" ''
+    ${pkgs.systemd}/bin/systemctl --user import-environment ${niriSessionVars}
+    ${pkgs.dbus}/bin/dbus-update-activation-environment ${niriSessionVars}
+    ${pkgs.coreutils}/bin/touch "${niriSessionReadyMarker}"
+  '';
+
+  # The unit's ExecStartPost: holds the unit in "activating" until the
+  # ready script has imported niri's display. TimeoutStartSec bounds it
+  # when niri never comes up.
+  niriSessionAwaitReady = pkgs.writeShellScript "halmasuit-niri-await-ready" ''
+    until [ -e "${niriSessionReadyMarker}" ]; do
+      ${pkgs.coreutils}/bin/sleep 0.1
+    done
+  '';
+
+  # The greeter's session command: niri-session's systemd flow around
+  # the nested halmasuit-niri unit.
+  niriSessionScript = pkgs.writeShellScriptBin "halmasuit-niri-session" ''
+    if [ -n "$SHELL" ] &&
+       grep -q "$SHELL" /etc/shells &&
+       ! (echo "$SHELL" | grep -q "false") &&
+       ! (echo "$SHELL" | grep -q "nologin"); then
+      if [ "$1" != '-l' ]; then
+        exec "$SHELL" -l -c "exec $0 -l $*"
+      else
+        shift
+      fi
+    fi
+
+    if systemctl --user -q is-active halmasuit-niri.service; then
+      echo 'A niri session is already running.'
+      exit 1
+    fi
+    systemctl --user reset-failed
+    # The leader env carries halmasuit's WAYLAND_DISPLAY; the unit
+    # inherits it from the user manager, which is how niri finds
+    # halmasuit.
+    dbus-update-activation-environment --systemd --all
+    systemctl --user --wait start halmasuit-niri.service
+    systemctl --user start --job-mode=replace-irreversibly niri-shutdown.target
+    systemctl --user unset-environment ${niriSessionVars}
+  '';
+
+  niriSessionPackage = pkgs.runCommand "halmasuit-niri-session" {
+    passthru.providedSessions = [ "halmasuit-niri" ];
+  } ''
+    mkdir -p $out/bin $out/share/wayland-sessions
+    ln -s ${niriSessionScript}/bin/halmasuit-niri-session $out/bin/halmasuit-niri-session
+    cat > $out/share/wayland-sessions/halmasuit-niri.desktop <<EOF
+    [Desktop Entry]
+    Name=Niri
+    Comment=niri, nested in halmasuit
+    Exec=$out/bin/halmasuit-niri-session
+    Type=Application
+    DesktopNames=niri
+    EOF
+  '';
+
   # Wallpaper config JSON — the file halmasuit's wallpaper engine
   # reads via HALMASUIT_WALLPAPER_CONFIG. Computed once here so both
   # the env attrs AND the initramfs storePaths can reference the
@@ -515,6 +588,35 @@ in
       '';
     };
 
+    niriSession = {
+      enable = lib.mkEnableOption ''
+        a niri session that runs nested in halmasuit. It adds a
+        `halmasuit-niri` wayland session (named "Niri") to
+        `services.displayManager.sessionPackages` and the
+        `halmasuit-niri` systemd user unit it starts. Upstream
+        `niri-session` cannot be used under halmasuit: `niri --session`
+        removes WAYLAND_DISPLAY and starts on the TTY, whose DRM device
+        halmasuit holds'';
+
+      package = lib.mkOption {
+        type        = lib.types.package;
+        default     = pkgs.niri;
+        defaultText = lib.literalExpression "pkgs.niri";
+        description = "The niri package the session runs.";
+      };
+
+      sessionPackage = lib.mkOption {
+        type        = lib.types.package;
+        readOnly    = true;
+        default     = niriSessionPackage;
+        description = ''
+          The session package (`share/wayland-sessions/halmasuit-niri.desktop`
+          and `bin/halmasuit-niri-session`), for a greeter whose session
+          list is built from explicit share dirs.
+        '';
+      };
+    };
+
     homeVt = lib.mkOption {
       type        = lib.types.nullOr (lib.types.ints.between 1 63);
       default     = null;
@@ -554,9 +656,11 @@ in
       default     = true;
       description = ''
         When true, this module declares
-        `security.pam.services.''${pamService} = {}`, giving you NixOS's
-        default unixAuth-backed PAM stack (pam_unix for password auth,
-        pam_env, pam_limits, pam_motd, etc.).
+        `security.pam.services.''${pamService}` with `startSession = true`,
+        giving you NixOS's default unixAuth-backed PAM stack (pam_unix
+        for password auth, pam_env, pam_limits, pam_motd, etc.) plus
+        pam_systemd, which registers each session with logind and starts
+        the user's systemd manager.
 
         Set to false when you want full control over the PAM stack —
         e.g. adding pam_u2f or pam_fprintd modules.
@@ -1329,7 +1433,7 @@ in
      # disable `installPamConfig` and declare
      # `security.pam.services.<name>` themselves.
      security.pam.services = lib.mkIf cfg.installPamConfig {
-       ${cfg.pamService} = {};
+       ${cfg.pamService}.startSession = true;
      };
 
      # Epic #47 R2.2: ship halmasuit (+ its transitive closure: Mesa,
@@ -2117,6 +2221,33 @@ in
          # non-interactive mode.
          XDG_RUNTIME_DIR   = "/run/halmasuit";
          WAYLAND_DISPLAY   = "wayland-0";
+       };
+     };
+   })
+   (lib.mkIf cfg.niriSession.enable {
+     services.displayManager.sessionPackages = [ niriSessionPackage ];
+     environment.systemPackages = [ niriSessionPackage ];
+
+     # niri.service with plain `niri` in place of `niri --session`. The
+     # unit finishes starting once the ready script niri spawns has
+     # imported niri's display, so graphical-session.target waits for
+     # the import.
+     systemd.user.services.halmasuit-niri = {
+       description = "niri, nested in halmasuit";
+       bindsTo     = [ "graphical-session.target" ];
+       before      = [ "graphical-session.target" "xdg-desktop-autostart.target" ];
+       wants       = [ "graphical-session-pre.target" "xdg-desktop-autostart.target" ];
+       after       = [ "graphical-session-pre.target" ];
+       environment = {
+         XDG_CURRENT_DESKTOP = "niri";
+         XDG_SESSION_TYPE    = "wayland";
+       };
+       serviceConfig = {
+         Slice         = "session.slice";
+         # %t is the user runtime dir, the scripts' $XDG_RUNTIME_DIR.
+         ExecStartPre  = "${pkgs.coreutils}/bin/rm -f %t/halmasuit-niri.ready";
+         ExecStart     = "${lib.getExe' cfg.niriSession.package "niri"} -- ${niriSessionReady}";
+         ExecStartPost = "${niriSessionAwaitReady}";
        };
      };
    })

@@ -145,9 +145,10 @@ pkgs.testers.runNixOSTest {
 
       # The authenticated session user (real pam_unix). Own gid-1001
       # group so the broker's ≥1000 UID/GID floor (Epic R8/R11) passes;
-      # test-local halmasuit-greeter membership lets niri reach
-      # halmasuit's 0660 wayland socket (production socket handover is
-      # a later concern). uid/gid 1001: test-user.nix takes 1000.
+      # halmasuit-greeter membership lets niri reach halmasuit's 0660
+      # wayland socket, as in a production config (the production
+      # niri-session path is halmasuit-session-handover). uid/gid 1001:
+      # test-user.nix takes 1000.
       users.users.alice = {
         isNormalUser = true;
         uid          = 1001;

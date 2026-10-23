@@ -45,6 +45,7 @@ mod input_hotplug;
 mod layer_focus;
 #[cfg(feature = "frame_audit")]
 mod offscreen;
+mod session_env;
 mod swap_gate;
 mod task_caps;
 mod vt_switch;
@@ -353,6 +354,9 @@ struct HalmasuitState {
     /// (`SOCK_SEQPACKET`). Each greeter episode `connect`s a fresh
     /// channel here and owns it for the whole episode (Amendment A6).
     broker_socket: PathBuf,
+    /// Absolute path of halmasuit's Wayland socket, handed to every
+    /// session it relays as `WAYLAND_DISPLAY` (see `session_env`).
+    wayland_socket: PathBuf,
     /// Authorised greeter UID; connections from any other uid are
     /// dropped by `handle_listener_ready`.
     greeter_uid: u32,
@@ -1190,6 +1194,15 @@ impl HalmasuitState {
     /// output and as the anchor for single-output-era call sites.
     fn primary_output(&self) -> &Output {
         &self.outputs[0]
+    }
+
+    /// The env halmasuit sets on a session it relays: its Wayland
+    /// socket, and seat0 on the VT it scans out over.
+    fn session_env(&self) -> Vec<String> {
+        session_env::entries(
+            &self.wayland_socket,
+            session_env::session_vt(home_vt_from_env()),
+        )
     }
 
     /// Plain-stop graceful close: ask the session client's toplevel to
@@ -2338,7 +2351,9 @@ fn handle_listener_ready(
                 // recoverable — drop this greeter connection (the
                 // greeter retries); never proceed without the broker.
                 let episode = match connect_broker(&state.broker_socket) {
-                    Ok(chan) => BrokerEpisode::new(chan, state.pam_service.clone()),
+                    Ok(chan) => {
+                        BrokerEpisode::new(chan, state.pam_service.clone(), state.session_env())
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, socket = ?state.broker_socket,
                             "connect to halmasuit-session broker failed; dropping greeter connection");
@@ -5246,11 +5261,11 @@ fn main() -> io::Result<()> {
     // `HALMASUIT_WAYLAND_GROUP_GID` so the same 0660 protections work
     // cross-deployment: the gid is baked into the module from the
     // greeter group's resolved gid in rootfs config.
+    let xdg_runtime_dir =
+        std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/run/halmasuit".into());
+    let abs_socket_path = PathBuf::from(xdg_runtime_dir).join(&socket_path);
     {
         use std::os::unix::fs::PermissionsExt;
-        let xdg_runtime_dir =
-            std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/run/halmasuit".into());
-        let abs_socket_path = PathBuf::from(xdg_runtime_dir).join(&socket_path);
         let perms = std::fs::Permissions::from_mode(0o660);
         std::fs::set_permissions(&abs_socket_path, perms).map_err(|e| {
             io::Error::other(format!("chmod 0660 {}: {e}", abs_socket_path.display()))
@@ -5674,6 +5689,7 @@ fn main() -> io::Result<()> {
         next_conn_id: 0,
         pam_service,
         broker_socket: broker_socket_path_from_env(),
+        wayland_socket: abs_socket_path,
         greeter_uid,
         // Epic #47 R2.1: in rootfs-only mode no boot-pivot kill spree
         // exists, so SIGTERM should drive graceful shutdown from the

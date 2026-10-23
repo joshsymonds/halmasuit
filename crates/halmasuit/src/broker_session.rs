@@ -27,7 +27,7 @@
 //! `halmasuit-session-ipc` codec is shared (the SEQPACKET syscall
 //! wrapper is reimplemented locally).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
@@ -80,6 +80,22 @@ const SYSTEM_PATH: &[&str] = &[
     "/usr/bin",
     "/bin",
 ];
+
+/// The `start_session` env relayed to the broker: the greeter's
+/// `KEY=VALUE` entries minus any whose key the compositor sets, then
+/// the compositor's entries.
+fn merge_session_env(greeter: &[String], compositor: &[String]) -> Vec<String> {
+    fn key(entry: &str) -> &str {
+        entry.split_once('=').map_or(entry, |(k, _)| k)
+    }
+    let owned: HashSet<&str> = compositor.iter().map(|e| key(e)).collect();
+    greeter
+        .iter()
+        .filter(|e| !owned.contains(key(e)))
+        .chain(compositor)
+        .cloned()
+        .collect()
+}
 
 /// Resolve `cmd[0]` against [`SYSTEM_PATH`] if it does not start
 /// with `/`. Returns the resolved command vector with `cmd[0]`
@@ -415,6 +431,10 @@ pub struct EpisodeOutcome {
 pub struct BrokerEpisode {
     chan: SeqpacketChannel,
     service: String,
+    /// `KEY=VALUE` entries the compositor adds to the greeter's
+    /// `start_session` env (see `session_env`), replacing greeter
+    /// entries with the same key.
+    session_env: Vec<String>,
     relay: Option<BrokerRelay>,
     conn: Connection,
     /// Amendment A5.6: the poll-only leader pidfd the broker attached
@@ -450,11 +470,14 @@ impl BrokerEpisode {
     /// `chan` — the broker channel (owned for the whole episode).
     /// `service` — the PAM service (`/etc/pam.d/<service>`); the
     /// `BeginAuth` hint's service field.
+    /// `session_env` — `KEY=VALUE` entries the compositor sets on the
+    /// session it relays (display and seat), overriding the greeter's.
     #[must_use]
-    pub fn new(chan: SeqpacketChannel, service: String) -> Self {
+    pub fn new(chan: SeqpacketChannel, service: String, session_env: Vec<String>) -> Self {
         Self {
             chan,
             service,
+            session_env,
             relay: None,
             conn: Connection::new(),
             leader_pidfd: None,
@@ -635,11 +658,12 @@ impl BrokerEpisode {
                     self.fail_closed(out);
                     return;
                 }
+                let env = merge_session_env(&spawn.env, &self.session_env);
                 let frame = self
                     .relay
                     .as_mut()
                     .unwrap()
-                    .start_session(spawn.cmd.clone(), &spawn.env);
+                    .start_session(spawn.cmd.clone(), &env);
                 match frame {
                     Ok(f) => {
                         if self.chan.send(&f).is_err() {
@@ -830,7 +854,10 @@ mod tests {
 
     fn episode() -> (BrokerEpisode, SeqpacketChannel) {
         let (comp, broker) = pair();
-        (BrokerEpisode::new(comp, "halmasuit".into()), broker)
+        (
+            BrokerEpisode::new(comp, "halmasuit".into(), Vec::new()),
+            broker,
+        )
     }
 
     fn create(username: &str) -> Vec<u8> {
@@ -856,6 +883,67 @@ mod tests {
                 username: "alice".into(),
             }
         );
+    }
+
+    #[test]
+    fn compositor_session_env_replaces_greeter_entries_with_the_same_key() {
+        let greeter = [
+            "XDG_SESSION_TYPE=x11".to_owned(),
+            "LANG=C".to_owned(),
+            "WAYLAND_DISPLAY=elsewhere".to_owned(),
+        ];
+        let compositor = [
+            "WAYLAND_DISPLAY=/run/halmasuit/wayland-0".to_owned(),
+            "XDG_SESSION_TYPE=wayland".to_owned(),
+        ];
+        assert_eq!(
+            merge_session_env(&greeter, &compositor),
+            [
+                "LANG=C",
+                "WAYLAND_DISPLAY=/run/halmasuit/wayland-0",
+                "XDG_SESSION_TYPE=wayland",
+            ]
+        );
+    }
+
+    #[test]
+    fn start_session_frame_carries_the_compositor_session_env() {
+        let (comp, broker) = pair();
+        let mut ep = BrokerEpisode::new(
+            comp,
+            "halmasuit".into(),
+            vec!["WAYLAND_DISPLAY=/run/halmasuit/wayland-0".into()],
+        );
+        ep.on_greeter_bytes(&create("alice"));
+        assert!(matches!(
+            broker_recv(&broker),
+            CompositorToBroker::BeginAuth { .. }
+        ));
+        broker_send(
+            &broker,
+            &BrokerToCompositor::Success {
+                username: "alice".into(),
+                uid: 1001,
+                gid: 1001,
+            },
+        );
+        ep.on_broker_readable();
+        let ss = greetd_encode(&Request::StartSession {
+            cmd: vec!["/usr/bin/niri".into()],
+            env: vec!["XDG_SESSION_TYPE=wayland".into()],
+        })
+        .unwrap();
+        ep.on_greeter_bytes(&ss);
+        match broker_recv(&broker) {
+            CompositorToBroker::StartSession { env, .. } => assert_eq!(
+                env,
+                vec![
+                    ("XDG_SESSION_TYPE".into(), "wayland".into()),
+                    ("WAYLAND_DISPLAY".into(), "/run/halmasuit/wayland-0".into()),
+                ]
+            ),
+            other => panic!("expected StartSession, got {other:?}"),
+        }
     }
 
     #[test]

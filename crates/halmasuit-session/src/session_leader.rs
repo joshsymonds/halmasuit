@@ -72,6 +72,15 @@ const ENV_ALLOWLIST: &[&str] = &[
     // LD_*) — safe to pass through unaltered.
     "XCURSOR_THEME",
     "XCURSOR_SIZE",
+    // The session's display and logind identity. The compositor sets
+    // WAYLAND_DISPLAY (its own socket) and XDG_SESSION_TYPE on the
+    // StartSession env; pam_systemd sets XDG_SESSION_ID. A session such
+    // as niri-session imports these into the systemd user manager, which
+    // is how its compositor service finds halmasuit. Plain path and
+    // identifier values with no library-loader or shell surface.
+    "WAYLAND_DISPLAY",
+    "XDG_SESSION_TYPE",
+    "XDG_SESSION_ID",
 ];
 
 /// Why a session spec / group merge was refused. Fail-closed on every
@@ -328,6 +337,9 @@ mod tests {
             ("HOME".into(), "/home/alice".into()),
             ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()),
             ("LC_ALL".into(), "C".into()),
+            ("WAYLAND_DISPLAY".into(), "/run/halmasuit/wayland-0".into()),
+            ("XDG_SESSION_TYPE".into(), "wayland".into()),
+            ("XDG_SESSION_ID".into(), "3".into()),
             ("HACKER_VAR".into(), "x".into()),
         ];
         let out = sanitize_env(raw);
@@ -341,7 +353,15 @@ mod tests {
         ] {
             assert!(!keys.contains(&bad), "must strip {bad}: {keys:?}");
         }
-        for good in ["PATH", "HOME", "XDG_RUNTIME_DIR", "LC_ALL"] {
+        for good in [
+            "PATH",
+            "HOME",
+            "XDG_RUNTIME_DIR",
+            "LC_ALL",
+            "WAYLAND_DISPLAY",
+            "XDG_SESSION_TYPE",
+            "XDG_SESSION_ID",
+        ] {
             assert!(keys.contains(&good), "must keep {good}: {keys:?}");
         }
     }
