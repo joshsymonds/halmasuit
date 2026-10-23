@@ -226,6 +226,14 @@ pkgs.testers.runNixOSTest {
     assert "greeter" in fg_events(), (
         f"expected greeter foreground; got {fg_events()}"
     )
+    # The greeter's first painted frame. Quickshell under llvmpipe can
+    # take seconds past its layer surface's first (bufferless) commit
+    # when the host is loaded; the R1 window check below reads the
+    # event stream up to this event.
+    machine.wait_until_succeeds(
+        "journalctl -u halmasuit -o cat | grep -F client_first_frame | grep -q overlay",
+        timeout=60,
+    )
 
     # ── Epic #35 R3: libEGL warnings absent ───────────────────────────
     # gen-400 logged three `libEGL warning: failed to get driver name
