@@ -431,7 +431,12 @@ in
     "phase-b-cryptsetup-test-luks-data" = {
       description = "Phase B side-volume LUKS unlock (driven by halmasuit-luks)";
       wantedBy = [ "initrd.target" ];
-      before = [ "initrd-switch-root.service" ];
+      # Before initrd.target, not only switch-root: reaching
+      # initrd.target starts initrd cleanup, which stops systemd-udevd,
+      # and device-mapper's activation waits on udev to confirm the new
+      # mapping. An attach still running then (a loaded host) never
+      # completes, and switch-root waits on it forever.
+      before = [ "initrd.target" "initrd-switch-root.service" ];
       requires = [ "halmasuit-luks.service" ];
       after = [ "halmasuit-luks.service" "systemd-udev-settle.service" "dev-vdb.device" ];
       wants = [ "dev-vdb.device" ];
