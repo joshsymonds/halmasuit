@@ -1580,7 +1580,7 @@
         halmasuit-session-handover = import ./tests/halmasuit-session-handover.nix {
           system = "x86_64-linux";
           niri-flake = niriFlake;
-          inherit nixpkgs;
+          inherit nixpkgs dms;
           halmasuit                         = self.packages.x86_64-linux.halmasuit-debug;
           halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;

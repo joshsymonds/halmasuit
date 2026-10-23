@@ -104,7 +104,8 @@ pub enum SpecError {
 }
 
 /// A validated, ready-to-launch session spec. Constructed ONLY via
-/// [`validate`]; `env` is already allowlist-sanitized.
+/// [`validate`]; `env` is already allowlist-sanitized and carries the
+/// PAM-resolved user's passwd identity (see [`with_passwd_identity`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSpec {
     pub username: String,
@@ -123,6 +124,29 @@ fn is_env_allowed(key: &str) -> bool {
 #[must_use]
 pub fn sanitize_env(env: Vec<(String, String)>) -> Vec<(String, String)> {
     env.into_iter().filter(|(k, _)| is_env_allowed(k)).collect()
+}
+
+/// Set `USER`, `LOGNAME`, `HOME` and `SHELL` from the PAM-resolved
+/// user's passwd entry, replacing any PAM-supplied value, as login(1)
+/// and greetd do. A session such as niri-session re-execs through the
+/// login `SHELL` to pick up the user's profile (their PATH) before it
+/// imports its env into the systemd user manager; without these the
+/// session's services cannot find the user's own programs.
+fn with_passwd_identity(
+    mut env: Vec<(String, String)>,
+    username: &str,
+    home: &str,
+    shell: &str,
+) -> Vec<(String, String)> {
+    const IDENTITY: [&str; 4] = ["USER", "LOGNAME", "HOME", "SHELL"];
+    env.retain(|(k, _)| !IDENTITY.contains(&k.as_str()));
+    env.extend([
+        ("USER".to_owned(), username.to_owned()),
+        ("LOGNAME".to_owned(), username.to_owned()),
+        ("HOME".to_owned(), home.to_owned()),
+        ("SHELL".to_owned(), shell.to_owned()),
+    ]);
+    env
 }
 
 fn lookup_user(username: &str) -> Result<User, SpecError> {
@@ -190,12 +214,18 @@ pub fn validate(
             user.gid.as_raw()
         )));
     }
+    let home = user.dir.to_str().ok_or_else(|| {
+        SpecError::PwentMismatch(format!("{username:?} has a non-UTF-8 home directory"))
+    })?;
+    let shell = user.shell.to_str().ok_or_else(|| {
+        SpecError::PwentMismatch(format!("{username:?} has a non-UTF-8 login shell"))
+    })?;
     Ok(SessionSpec {
         username: username.to_owned(),
         uid,
         gid,
         cmd,
-        env: sanitize_env(env),
+        env: with_passwd_identity(sanitize_env(env), username, home, shell),
     })
 }
 
@@ -311,6 +341,32 @@ mod tests {
             validate("root", 1000, 1000, ok_cmd(), vec![]),
             Err(SpecError::PwentMismatch(_))
         ));
+    }
+
+    #[test]
+    fn passwd_identity_replaces_pam_supplied_values() {
+        let env = vec![
+            ("PATH".to_owned(), "/run/current-system/sw/bin".to_owned()),
+            ("HOME".to_owned(), "/somewhere/else".to_owned()),
+            ("USER".to_owned(), "mallory".to_owned()),
+        ];
+        let out = with_passwd_identity(
+            env,
+            "alice",
+            "/home/alice",
+            "/run/current-system/sw/bin/zsh",
+        );
+        let get = |k: &str| {
+            out.iter()
+                .filter(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(get("USER"), ["alice"]);
+        assert_eq!(get("LOGNAME"), ["alice"]);
+        assert_eq!(get("HOME"), ["/home/alice"]);
+        assert_eq!(get("SHELL"), ["/run/current-system/sw/bin/zsh"]);
+        assert_eq!(get("PATH"), ["/run/current-system/sw/bin"]);
     }
 
     #[test]

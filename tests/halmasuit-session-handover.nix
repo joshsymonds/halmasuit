@@ -19,6 +19,9 @@
 #     active;
 #   - the user manager's WAYLAND_DISPLAY is niri's socket and
 #     graphical-session.target is active;
+#   - the user's shell (DMS, a user unit wanted by
+#     graphical-session.target, as home-manager installs it) starts
+#     and maps its layer surfaces in the nested niri;
 #   - no flash frame across the swap.
 #
 # The session user is in the greeter group, as a production config
@@ -29,6 +32,7 @@
   system,
   nixpkgs,
   niri-flake,
+  dms,
   halmasuit,
   halmasuit-session,
   halmasuit-layer-shell-test-client,
@@ -41,6 +45,7 @@ let
     config.allowUnfree = true;
   };
   niri = niri-flake.packages.${system}.niri-unstable;
+  dmsShell = dms.packages.${system}.dms-shell;
 
   # Minimal system niri config: no autostart, no animations.
   niriConfig = ''
@@ -102,6 +107,10 @@ pkgs.testers.runNixOSTest {
         group        = "alice";
         password     = "testpassword";
         extraGroups  = [ "halmasuit-greeter" ];
+        # DMS execs `qs` from PATH. On gnomon it is in the per-user
+        # profile, reached through the login PATH the session imports
+        # into the user manager; the same here.
+        packages     = [ pkgs.quickshell ];
       };
       users.groups.alice.gid = 1001;
 
@@ -118,6 +127,26 @@ pkgs.testers.runNixOSTest {
       };
 
       environment.systemPackages = [ halmasuit-vm-client ];
+
+      # The user's shell, as home-manager's DMS module installs it on
+      # gnomon: started by graphical-session.target, so it starts only
+      # once niri's display is in the user manager. Raw unit text, as
+      # home-manager writes it: a NixOS-declared service would carry a
+      # fixed Environment=PATH, while this one inherits the user
+      # manager's PATH, which the session imports from the login shell.
+      systemd.user.units."dms.service" = {
+        wantedBy = [ "graphical-session.target" ];
+        text = ''
+          [Unit]
+          PartOf=graphical-session.target
+          After=graphical-session.target
+
+          [Service]
+          Environment=QS_DISABLE_CRASH_HANDLER=1
+          Environment=QT_QUICK_BACKEND=software
+          ExecStart=${dmsShell}/bin/dms run --session
+        '';
+      };
 
       # VM substrate only: the headless virtio-gpu has no usable
       # EGL device, so niri renders through llvmpipe. The user manager
@@ -216,6 +245,22 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(
         "systemctl --user -M alice@ is-active graphical-session.target", timeout=60
     )
+
+    machine.wait_until_succeeds(
+        "systemctl --user -M alice@ is-active dms.service", timeout=60
+    )
+    niri_socket = next(
+        l.split("=", 1)[1] for l in user_env.splitlines() if l.startswith("NIRI_SOCKET=")
+    )
+    # DMS draws its bar and widgets as layer surfaces of the nested niri.
+    machine.wait_until_succeeds(
+        f"runuser -u alice -- env NIRI_SOCKET={niri_socket} niri msg layers "
+        "| grep -qi quickshell",
+        timeout=120,
+    )
+    print(machine.succeed(
+        f"runuser -u alice -- env NIRI_SOCKET={niri_socket} niri msg layers"
+    ))
 
     pid_now = machine.succeed(
         "systemctl show -p MainPID --value halmasuit.service"
