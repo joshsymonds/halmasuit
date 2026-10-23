@@ -1762,12 +1762,17 @@ in
      # called regardless of the initramfs/rootfs path (the seat is one
      # initialization site above the DRM branching), so xkbcommon needs
      # its data files reachable before any post-pivot Wayland client.
+     # libinput's device quirks (share/libinput) are data the same way:
+     # libinput reads them once, when halmasuit creates its context in
+     # the initramfs, so without them every device runs unquirked for
+     # the whole boot.
      boot.initrd.systemd.storePaths = [
        "${cfg.package}/bin/halmasuit"
        "${cfg.package}/bin/halmasuit-tty-graphics"
        "${cfg.luks.package}/bin/halmasuit-luks"
        "${pkgs.libglvnd}"
        "${pkgs.xkeyboard-config}"
+       "${pkgs.libinput.out}/share/libinput"
      ] ++ (if cfg.rendering.backend == "nvidia"
            then [
              "${cfg.rendering.nvidiaPackage}"

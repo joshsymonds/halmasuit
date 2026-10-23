@@ -448,5 +448,16 @@ pkgs.testers.runNixOSTest {
     # Steps 3b and 5 opened nodes after the drop with the fsgid set to
     # the input gid; every thread's fsgid must be back to compositor.
     assert_creds("after post-drop hotplug opens")
+
+    # ── 7. libinput loaded its device quirks ────────────────────────
+    # halmasuit creates its libinput context in the initramfs; the
+    # quirks data must be there, or every device runs without them
+    # for the whole boot.
+    quirks = machine.succeed(
+        "journalctl -b -u halmasuit -o cat | "
+        "grep -E 'failed to find data files|Failed to load the device quirks' || true"
+    ).strip()
+    assert not quirks, f"libinput could not load its quirks in the initramfs:\n{quirks}"
+    print("PASS: libinput loaded its device quirks")
   '';
 }
