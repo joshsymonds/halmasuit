@@ -42,6 +42,11 @@ once more. It passes only when the first greeter_spawned event's pid still exist
 /proc/PID`) and no greeter_died_pre_auth or greeter_terminated event follows that spawn;
 probe.json records the pid, its liveness and that death event. halmasuit-production holds the
 lab boot and never probes it.
+When the hold passes and a probe or an attended login follows, the runner first stops
+lab-crc.service. The sampler's vblank-waiting reads hold the NVIDIA modeset lock and stall
+halmasuit's commits; stopping it lets the probe or login run at the driver's own speed, while
+the samples from boot through the hold stay in the journal. A failed stop is noted in run.log
+and the run goes on.
 With `--attended` (accepted only when the experiments are exactly halmasuit), the halmasuit
 experiment runs no probe. After the hold it says the greeter is up and waits up to 1800 seconds
 for halmasuit.service's lab boot journal to hold both session_opened and
@@ -143,6 +148,7 @@ LISTEN_POLL_SECONDS = 0.2
 PAM_DIR = "/etc/pam.d/"
 GREETD_SERVICE = "greetd"
 PROBE_UNIT = "lab-probe.service"
+SAMPLER_UNIT = "lab-crc.service"
 PROBE_MAX_STARTS = 5
 PROBE_WAIT_SECONDS = 30
 PROBE_DEADLINE_SECONDS = 180
@@ -575,13 +581,16 @@ class Lab:
                     hold_reason = self._hold()
                     if hold_reason is not None:
                         run.say(f"hold expired: {hold_reason}; returning gnomon to {pre.default}")
-                    elif attended:
-                        signal = (run.directory / RETURN_FILE).resolve()
-                        attended_reason = self._attended_wait(run, signal)
-                        if attended_reason is not None:
-                            reason = f"no attended login: {attended_reason}"
-                            run.say(f"{reason}; returning gnomon to {pre.default}")
-                        signalled_after_login = attended_reason is None
+                    else:
+                        if attended or plan.probe_service is not None:
+                            self._stop_sampler(run)
+                        if attended:
+                            signal = (run.directory / RETURN_FILE).resolve()
+                            attended_reason = self._attended_wait(run, signal)
+                            if attended_reason is not None:
+                                reason = f"no attended login: {attended_reason}"
+                                run.say(f"{reason}; returning gnomon to {pre.default}")
+                            signalled_after_login = attended_reason is None
                 if plan.probe_service is not None and not attended:
                     probe, probe_problem = self._probe(run, plan.probe_service, plan.hold, hold_reason)
                     run.save("probe.json", probe)
@@ -985,6 +994,16 @@ class Lab:
                 f"{json.dumps(probe['greeter_death'])}"
             )
         raise LabError(f"probe did not pass: greeter pid {probe['greeter_pid']} is not running")
+
+    def _stop_sampler(self, run: RunLog) -> None:
+        """Stops the CRC sampler, whose vblank-waiting reads hold the NVIDIA modeset lock and
+        stall halmasuit's commits, so the probe or login that follows runs at the driver's own
+        speed. A failed stop is noted and the run goes on."""
+        result = self.layer.remote(["sudo", "-n", "systemctl", "stop", SAMPLER_UNIT])
+        if result.returncode == 0:
+            run.say(f"stopped {SAMPLER_UNIT} after the hold")
+        else:
+            run.say(f"could not stop {SAMPLER_UNIT}: rc {result.returncode}: {result.stderr.strip()}")
 
     def _hold(self) -> str | None:
         """Hold the lab boot until its greeter event is 30 s old in its journal.

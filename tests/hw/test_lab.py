@@ -140,6 +140,7 @@ HOLD_NEWEST = ("sudo", "-n", "journalctl", "-b", "0", "-n", "1", "-o", "json", "
 REBOOT = ("sudo", "-n", "systemctl", "reboot")
 HOLD_DEADLINE_SECONDS = 300
 PROBE_START = ("sudo", "-n", "systemctl", "start", PROBE_UNIT)
+SAMPLER_STOP = ("sudo", "-n", "systemctl", "stop", "lab-crc.service")
 GREETER_PID = 1459
 GREETER_SETTLE_SECONDS = 10
 # The greeter event lands at 10 s; the hold passes 30 s later at 40 s; the probe waits 10 s more for its greeter check.
@@ -423,7 +424,9 @@ class FakeGnomon:
         probe_query_fails: bool = False,
         return_file_at: float | None = None,
         journal_outage: tuple[float, float] | None = None,
+        sampler_stop_rc: int = 0,
     ) -> None:
+        self.sampler_stop_rc = sampler_stop_rc
         self.lab_mode = lab_mode
         self.sessions = list(sessions)
         self.esp_free = esp_free
@@ -686,6 +689,11 @@ class FakeGnomon:
             return self._read_journal(argv[4])
         if argv == ("sudo", "-n", "systemctl", "start", PROBE_UNIT):
             return self._start_probe()
+        if argv == SAMPLER_STOP:
+            self._event("sampler-stop")
+            if self.sampler_stop_rc:
+                return lab.Result(self.sampler_stop_rc, "", "Failed to stop lab-crc.service: Access denied")
+            return _ok()
         if argv == PROBE_JOURNAL:
             return _ok("".join(f"{line}\n" for line in self.authpriv.get(self.current_boot, [])))
         if argv in (HOLD_GREETER, HOLD_NEWEST):
@@ -1837,6 +1845,41 @@ class LabRunnerTest(unittest.TestCase):
         # The hold passes at 30 s past the greeter event (10 s), so the probe starts no earlier than 40 s.
         self.assertGreaterEqual(gnomon.probe_start_times[0] - gnomon.lab_started_at, 40)
 
+    def test_halmasuit_stops_the_sampler_after_the_hold_and_before_the_probe(self) -> None:
+        gnomon = greeter_fixture((12, SPAWNED))
+        code, _, err = self.run_queue(["halmasuit"], gnomon)
+        self.assertEqual(code, 0, err)
+        calls = gnomon.calls
+        stop = calls.index(("remote", SAMPLER_STOP))
+        self.assertEqual(calls.count(("remote", SAMPLER_STOP)), 1, calls)
+        last_hold = max(
+            index
+            for index, call in enumerate(calls)
+            if call in (("remote", HOLD_GREETER), ("remote", HOLD_NEWEST))
+            and index < calls.index(("remote", PROBE_START))
+        )
+        self.assertLess(last_hold, stop)
+        self.assertLess(stop, calls.index(("remote", PROBE_START)))
+        self.assertIn("stopped lab-crc.service after the hold", self.run_log("halmasuit"))
+
+    def test_a_failed_sampler_stop_is_noted_and_the_probe_still_runs(self) -> None:
+        gnomon = greeter_fixture((12, SPAWNED), sampler_stop_rc=1)
+        code, _, err = self.run_queue(["halmasuit"], gnomon)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(gnomon.probe_starts, [gnomon.lab_boot])
+        lines = [line for line in self.run_log("halmasuit") if line.startswith("could not stop lab-crc.service")]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("Access denied", lines[0])
+
+    def test_the_sampler_runs_on_when_the_hold_expires_or_no_probe_follows(self) -> None:
+        expired = greeter_fixture(lab_journal_ends_at=39.9)
+        self.run_queue(["halmasuit"], expired)
+        self.assertNotIn(("remote", SAMPLER_STOP), expired.calls)
+        production = FakeGnomon(greeter_event_at=10, lab_journal_ends_at=40)
+        code, _, err = self.run_queue(["halmasuit-production"], production)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(("remote", SAMPLER_STOP), production.calls)
+
     def test_halmasuit_probe_record_holds_the_greeter_fields(self) -> None:
         gnomon = greeter_fixture((12, SPAWNED))
         code, _, err = self.run_queue(["halmasuit"], gnomon)
@@ -2307,6 +2350,10 @@ class LabRunnerTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(gnomon.probe_starts, [])
         self.assertFalse(any(PROBE_UNIT in argv for _, argv in gnomon.calls))
+        self.assertEqual(gnomon.events.count("sampler-stop"), 1)
+        self.assertLess(
+            gnomon.trace.index("sampler-stop"), gnomon.trace.index("reboot", gnomon.trace.index("sampler-stop"))
+        )
         run_directory = self.single_run_dir("halmasuit")
         self.assertFalse((run_directory / "probe.json").exists())
         self.assertTrue((run_directory / "journal.json").exists())

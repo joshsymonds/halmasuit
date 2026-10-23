@@ -13,6 +13,11 @@
 //   * single layer role (Background)
 //   * single color (test fixture, not configurable)
 //   * exits on SIGTERM, not on close events
+//
+// HALMASUIT_TESTCLIENT_CONTINUOUS=1 repaints on every frame callback,
+// the way an animated greeter commits a new buffer each frame, and
+// HALMASUIT_TESTCLIENT_TAG names the instance in every log line so a
+// test can run two clients side by side.
 
 #![deny(unsafe_code)]
 // reason: sctk's idiomatic State struct uses `registry_state`,
@@ -24,6 +29,8 @@
 // are bounded to 1920x1080 (well below i32::MAX); no wrap is
 // achievable in practice.
 #![allow(clippy::cast_possible_wrap)]
+
+use std::io::Write as _;
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
@@ -68,6 +75,16 @@ fn parse_color(spec: &str) -> anyhow::Result<[u8; 4]> {
     Ok([blue, green, red, 0xFF])
 }
 
+/// Write `prefix: message` and its newline to stderr in one `write`, so
+/// lines from two clients sharing the greeter's stderr pipe never
+/// interleave (`eprintln!` writes each format piece separately).
+fn log_line(prefix: &str, message: std::fmt::Arguments<'_>) {
+    let line = format!("{prefix}: {message}\n");
+    std::io::stderr()
+        .write_all(line.as_bytes())
+        .expect("write log line to stderr");
+}
+
 /// Parse `WxH` into `(w, h)`.
 fn parse_size(spec: &str) -> anyhow::Result<(u32, u32)> {
     let (ws, hs) = spec
@@ -82,6 +99,8 @@ fn main() -> anyhow::Result<()> {
     //   HALMASUIT_TESTCLIENT_LAYER  background|bottom|top|overlay
     //   HALMASUIT_TESTCLIENT_COLOR  #RRGGBB
     //   HALMASUIT_TESTCLIENT_SIZE   WxH  (omitted ⇒ fullscreen, anchored)
+    //   HALMASUIT_TESTCLIENT_CONTINUOUS  set ⇒ repaint on every frame callback
+    //   HALMASUIT_TESTCLIENT_TAG    name logged as `layer-shell-test-client[TAG]`
     let layer = match std::env::var("HALMASUIT_TESTCLIENT_LAYER")
         .unwrap_or_default()
         .as_str()
@@ -101,6 +120,11 @@ fn main() -> anyhow::Result<()> {
         Err(_) => None,
     };
 
+    let continuous = std::env::var("HALMASUIT_TESTCLIENT_CONTINUOUS").is_ok();
+    let log_prefix = std::env::var("HALMASUIT_TESTCLIENT_TAG").map_or_else(
+        |_| "layer-shell-test-client".to_owned(),
+        |tag| format!("layer-shell-test-client[{tag}]"),
+    );
     let conn =
         Connection::connect_to_env().map_err(|e| anyhow::anyhow!("connect to wayland: {e}"))?;
     let (globals, mut event_queue) = registry_queue_init(&conn)?;
@@ -152,15 +176,20 @@ fn main() -> anyhow::Result<()> {
         shm,
         _compositor_state: compositor,
         _layer_shell: layer_shell,
-        _layer_surface: layer_surface,
+        layer_surface,
         pool,
         color,
+        continuous,
+        log_prefix,
         configured: false,
         width: 0,
         height: 0,
     };
 
-    eprintln!("layer-shell-test-client: bound, waiting for configure");
+    log_line(
+        &state.log_prefix,
+        format_args!("bound, waiting for configure"),
+    );
 
     // Roundtrip-then-dispatch loop until configured + painted.
     loop {
@@ -179,11 +208,15 @@ struct State {
     _compositor_state: CompositorState,
     _layer_shell: LayerShell,
     /// Held to keep the wayland proxy alive — sctk destroys the
-    /// surface when this is dropped. Not read; `configure` receives
-    /// its own `&LayerSurface`.
-    _layer_surface: LayerSurface,
+    /// surface when this is dropped. Continuous mode repaints it from
+    /// the frame callback.
+    layer_surface: LayerSurface,
     pool: SlotPool,
     color: [u8; 4],
+    /// Repaint on every frame callback.
+    continuous: bool,
+    /// `layer-shell-test-client`, or `layer-shell-test-client[TAG]`.
+    log_prefix: String,
     configured: bool,
     width: u32,
     height: u32,
@@ -199,7 +232,7 @@ impl LayerShellHandler for State {
     fn configure(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
@@ -217,13 +250,13 @@ impl LayerShellHandler for State {
         self.width = w;
         self.height = h;
         self.configured = true;
-        self.paint(layer);
-        eprintln!("layer-shell-test-client: painted {w}x{h}");
+        self.paint(qh, layer);
+        log_line(&self.log_prefix, format_args!("painted {w}x{h}"));
     }
 }
 
 impl State {
-    fn paint(&mut self, layer: &LayerSurface) {
+    fn paint(&mut self, qh: &QueueHandle<Self>, layer: &LayerSurface) {
         let stride = self.width as i32 * 4;
         let height = self.height as i32;
         let (buffer, canvas) = self
@@ -237,6 +270,9 @@ impl State {
             .wl_surface()
             .damage_buffer(0, 0, self.width as i32, height);
         buffer.attach_to(layer.wl_surface()).expect("attach_to");
+        if self.continuous {
+            layer.wl_surface().frame(qh, layer.wl_surface().clone());
+        }
         layer.commit();
     }
 }
@@ -263,10 +299,14 @@ impl CompositorHandler for State {
     fn frame(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
+        if self.continuous && self.configured {
+            let layer = self.layer_surface.clone();
+            self.paint(qh, &layer);
+        }
     }
 
     fn surface_enter(
@@ -341,10 +381,13 @@ impl SeatHandler for State {
         if capability == Capability::Keyboard && self.keyboard.is_none() {
             match self.seat_state.get_keyboard(qh, &seat, None) {
                 Ok(kb) => {
-                    eprintln!("layer-shell-test-client: keyboard capability acquired");
+                    log_line(
+                        &self.log_prefix,
+                        format_args!("keyboard capability acquired"),
+                    );
                     self.keyboard = Some(kb);
                 }
-                Err(e) => eprintln!("layer-shell-test-client: get_keyboard failed: {e}"),
+                Err(e) => log_line(&self.log_prefix, format_args!("get_keyboard failed: {e}")),
             }
         }
     }
@@ -375,7 +418,7 @@ impl KeyboardHandler for State {
         _: &[u32],
         _: &[Keysym],
     ) {
-        eprintln!("layer-shell-test-client: keyboard enter");
+        log_line(&self.log_prefix, format_args!("keyboard enter"));
     }
 
     fn leave(
@@ -398,9 +441,9 @@ impl KeyboardHandler for State {
     ) {
         // The single line the input VM test asserts on. raw() is the
         // xkb keysym (e.g. 0x61 for 'a').
-        eprintln!(
-            "layer-shell-test-client: key press keysym=0x{:x}",
-            event.keysym.raw()
+        log_line(
+            &self.log_prefix,
+            format_args!("key press keysym=0x{:x}", event.keysym.raw()),
         );
     }
 
@@ -422,9 +465,9 @@ impl KeyboardHandler for State {
         _: u32,
         event: KeyEvent,
     ) {
-        eprintln!(
-            "layer-shell-test-client: key repeat keysym=0x{:x}",
-            event.keysym.raw()
+        log_line(
+            &self.log_prefix,
+            format_args!("key repeat keysym=0x{:x}", event.keysym.raw()),
         );
     }
 

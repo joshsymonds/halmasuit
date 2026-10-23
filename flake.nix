@@ -1574,6 +1574,15 @@
           halmasuit-session                   = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
         };
+        # Keyboard focus stays on one greeter layer surface while
+        # several keyboard-interactive ones repaint.
+        halmasuit-greeter-focus = import ./tests/halmasuit-greeter-focus.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit                         = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session                 = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-layer-shell-test-client = self.packages.x86_64-linux.halmasuit-layer-shell-test-client;
+        };
       };
     };
 }

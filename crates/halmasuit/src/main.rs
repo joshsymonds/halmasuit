@@ -42,6 +42,7 @@ mod drm;
 #[cfg(feature = "frame_audit")]
 mod frame_audit;
 mod input_hotplug;
+mod layer_focus;
 #[cfg(feature = "frame_audit")]
 mod offscreen;
 mod swap_gate;
@@ -1318,9 +1319,9 @@ impl HalmasuitState {
     /// configure (the spec requires it in response to the client's
     /// first commit, which carries anchor/exclusive-zone/size — so
     /// `arrange` sees the committed anchor state), arrange the layer
-    /// map, then emit `ClientFirstFrame` and apply
-    /// focus-follows-foreground on the first buffered commit per
-    /// role.
+    /// map, emit `ClientFirstFrame` on the first buffered commit per
+    /// role, and apply focus-follows-foreground on every buffered
+    /// commit.
     fn handle_layer_shell_commit(&mut self, surface: &WlSurface) {
         // A layer surface is mapped on exactly one output; find it.
         let Some(output) = self
@@ -1421,12 +1422,39 @@ impl HalmasuitState {
         // layer client (the greeter) gets keyboard focus only while
         // the foreground is `Greeter`. After `start_session` the
         // foreground is `Session`, so a lingering/teardown greeter
-        // layer never steals focus from the session.
+        // layer never steals focus from the session. Among the
+        // greeter's layer surfaces, `layer_focus` keeps focus where it
+        // is, so repaints never move it between outputs.
         if self.foreground == halmasuit_introspect::Foreground::Greeter
             && layer.cached_state().keyboard_interactivity
                 != smithay::wayland::shell::wlr_layer::KeyboardInteractivity::None
         {
-            self.set_keyboard_focus(Some(surface.clone()));
+            let on_primary = self.outputs.first() == Some(&output);
+            if layer_focus::takes_focus(on_primary, self.keyboard_focus_holder()) {
+                self.set_keyboard_focus(Some(surface.clone()));
+            }
+        }
+    }
+
+    /// Classify the keyboard's current focus for `layer_focus`: a dead
+    /// or absent focus is `Nothing`, and a live layer surface ranks by
+    /// whether it sits on the primary (first) output.
+    fn keyboard_focus_holder(&self) -> layer_focus::FocusHolder {
+        let Some(focus) = self.seat.get_keyboard().and_then(|kb| kb.current_focus()) else {
+            return layer_focus::FocusHolder::Nothing;
+        };
+        if !focus.is_alive() {
+            return layer_focus::FocusHolder::Nothing;
+        }
+        let maps_focus = |output: &Output| {
+            layer_map_for_output(output)
+                .layer_for_surface(&focus, smithay::desktop::WindowSurfaceType::TOPLEVEL)
+                .is_some()
+        };
+        match self.outputs.iter().position(maps_focus) {
+            Some(0) => layer_focus::FocusHolder::PrimaryLayer,
+            Some(_) => layer_focus::FocusHolder::SecondaryLayer,
+            None => layer_focus::FocusHolder::NonLayer,
         }
     }
 
