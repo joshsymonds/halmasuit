@@ -17,7 +17,11 @@
 // HALMASUIT_TESTCLIENT_CONTINUOUS=1 repaints on every frame callback,
 // the way an animated greeter commits a new buffer each frame, and
 // HALMASUIT_TESTCLIENT_TAG names the instance in every log line so a
-// test can run two clients side by side.
+// test can run two clients side by side. HALMASUIT_TESTCLIENT_POPUP=1
+// opens one magenta xdg_popup on the layer surface after its first
+// paint, the way DMS's greeter opens a dropdown's list; pointer enter
+// and button presses are logged with the surface (layer or popup)
+// they land on.
 
 #![deny(unsafe_code)]
 // reason: sctk's idiomatic State struct uses `registry_state`,
@@ -34,27 +38,36 @@ use std::io::Write as _;
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::registry_handlers;
 use smithay_client_toolkit::seat::keyboard::{
     KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers,
 };
+use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
     LayerSurfaceConfigure,
 };
+use smithay_client_toolkit::shell::xdg::popup::{Popup, PopupConfigure, PopupHandler};
+use smithay_client_toolkit::shell::xdg::{XdgPositioner, XdgShell};
 use smithay_client_toolkit::shm::slot::SlotPool;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_registry,
-    delegate_seat, delegate_shm,
+    delegate_pointer, delegate_seat, delegate_shm, delegate_xdg_popup,
 };
+use smithay_client_toolkit::globals::GlobalData;
+use smithay_client_toolkit::reexports::client::{Dispatch, Proxy, delegate_dispatch};
+use smithay_client_toolkit::reexports::protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
+use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_wm_base;
 
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_keyboard;
 use smithay_client_toolkit::reexports::client::protocol::wl_output;
+use smithay_client_toolkit::reexports::client::protocol::wl_pointer;
 use smithay_client_toolkit::reexports::client::protocol::wl_seat;
 use smithay_client_toolkit::reexports::client::protocol::wl_shm::Format;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface;
@@ -64,6 +77,13 @@ use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
 /// from halmasuit's brand `#0a0014`. Stored ARGB8888 little-endian
 /// (sctk slot-pool default), bytes `[B, G, R, A]`.
 const DEFAULT_COLOR_BGRA: [u8; 4] = [0x4E, 0xC4, 0x16, 0xFF];
+
+/// Popup color: magenta `#FF00FF`, ARGB8888-LE `[B, G, R, A]`.
+const POPUP_COLOR_BGRA: [u8; 4] = [0xFF, 0x00, 0xFF, 0xFF];
+/// The popup asks for this size, anchored below-right of the parent
+/// point `POPUP_ANCHOR` (surface-local).
+const POPUP_SIZE: (i32, i32) = (200, 100);
+const POPUP_ANCHOR: (i32, i32) = (100, 100);
 
 /// Parse `#RRGGBB`/`RRGGBB` into ARGB8888-LE bytes `[B, G, R, 0xFF]`.
 fn parse_color(spec: &str) -> anyhow::Result<[u8; 4]> {
@@ -121,6 +141,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let continuous = std::env::var("HALMASUIT_TESTCLIENT_CONTINUOUS").is_ok();
+    let want_popup = std::env::var("HALMASUIT_TESTCLIENT_POPUP").is_ok();
     let log_prefix = std::env::var("HALMASUIT_TESTCLIENT_TAG").map_or_else(
         |_| "layer-shell-test-client".to_owned(),
         |tag| format!("layer-shell-test-client[{tag}]"),
@@ -132,6 +153,7 @@ fn main() -> anyhow::Result<()> {
 
     let compositor = CompositorState::bind(&globals, &qh)?;
     let layer_shell = LayerShell::bind(&globals, &qh)?;
+    let xdg_shell = XdgShell::bind(&globals, &qh)?;
     let shm = Shm::bind(&globals, &qh)?;
 
     let surface = compositor.create_surface(&qh);
@@ -173,14 +195,18 @@ fn main() -> anyhow::Result<()> {
         output_state: OutputState::new(&globals, &qh),
         seat_state: SeatState::new(&globals, &qh),
         keyboard: None,
+        pointer: None,
         shm,
-        _compositor_state: compositor,
+        compositor_state: compositor,
         _layer_shell: layer_shell,
         layer_surface,
         pool,
         color,
         continuous,
         log_prefix,
+        xdg_shell,
+        want_popup,
+        popup: None,
         configured: false,
         width: 0,
         height: 0,
@@ -202,10 +228,11 @@ struct State {
     output_state: OutputState,
     seat_state: SeatState,
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
     shm: Shm,
     /// Held for the surface's lifetime; the layer surface goes away if
     /// the LayerShell global is dropped.
-    _compositor_state: CompositorState,
+    compositor_state: CompositorState,
     _layer_shell: LayerShell,
     /// Held to keep the wayland proxy alive — sctk destroys the
     /// surface when this is dropped. Continuous mode repaints it from
@@ -217,6 +244,11 @@ struct State {
     continuous: bool,
     /// `layer-shell-test-client`, or `layer-shell-test-client[TAG]`.
     log_prefix: String,
+    xdg_shell: XdgShell,
+    /// Open one popup on the layer surface after the first paint.
+    want_popup: bool,
+    /// The popup, once opened; held so the proxy stays alive.
+    popup: Option<Popup>,
     configured: bool,
     width: u32,
     height: u32,
@@ -252,10 +284,29 @@ impl LayerShellHandler for State {
         self.configured = true;
         self.paint(qh, layer);
         log_line(&self.log_prefix, format_args!("painted {w}x{h}"));
+        if self.want_popup && self.popup.is_none() {
+            self.open_popup(qh, layer);
+        }
     }
 }
 
 impl State {
+    /// Open a popup parented to the layer surface, below-right of
+    /// `POPUP_ANCHOR`.
+    fn open_popup(&mut self, qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        let positioner = XdgPositioner::new(&self.xdg_shell).expect("xdg_positioner");
+        positioner.set_size(POPUP_SIZE.0, POPUP_SIZE.1);
+        positioner.set_anchor_rect(POPUP_ANCHOR.0, POPUP_ANCHOR.1, 1, 1);
+        positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
+        positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
+        let surface = self.compositor_state.create_surface(qh);
+        let popup = Popup::from_surface(None, &positioner, qh, surface, &self.xdg_shell)
+            .expect("xdg_popup");
+        layer.get_popup(popup.xdg_popup());
+        popup.wl_surface().commit();
+        self.popup = Some(popup);
+    }
+
     fn paint(&mut self, qh: &QueueHandle<Self>, layer: &LayerSurface) {
         let stride = self.width as i32 * 4;
         let height = self.height as i32;
@@ -378,6 +429,12 @@ impl SeatHandler for State {
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            match self.seat_state.get_pointer(qh, &seat) {
+                Ok(pointer) => self.pointer = Some(pointer),
+                Err(e) => log_line(&self.log_prefix, format_args!("get_pointer failed: {e}")),
+            }
+        }
         if capability == Capability::Keyboard && self.keyboard.is_none() {
             match self.seat_state.get_keyboard(qh, &seat, None) {
                 Ok(kb) => {
@@ -403,6 +460,11 @@ impl SeatHandler for State {
             && let Some(kb) = self.keyboard.take()
         {
             kb.release();
+        }
+        if capability == Capability::Pointer
+            && let Some(pointer) = self.pointer.take()
+        {
+            pointer.release();
         }
     }
 }
@@ -484,6 +546,74 @@ impl KeyboardHandler for State {
     }
 }
 
+impl PointerHandler for State {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            let target = if self
+                .popup
+                .as_ref()
+                .is_some_and(|p| p.wl_surface() == &event.surface)
+            {
+                "popup"
+            } else {
+                "layer"
+            };
+            let (x, y) = event.position;
+            match event.kind {
+                PointerEventKind::Enter { .. } => log_line(
+                    &self.log_prefix,
+                    format_args!("pointer enter {target} at {x:.0},{y:.0}"),
+                ),
+                PointerEventKind::Press { button, .. } => log_line(
+                    &self.log_prefix,
+                    format_args!("pointer press {target} button={button} at {x:.0},{y:.0}"),
+                ),
+                _ => {}
+            }
+        }
+    }
+}
+
+impl PopupHandler for State {
+    fn configure(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        popup: &Popup,
+        config: PopupConfigure,
+    ) {
+        let (w, h) = (config.width, config.height);
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(w, h, w * 4, Format::Argb8888)
+            .expect("create_buffer");
+        for pixel in canvas.as_chunks_mut::<4>().0 {
+            pixel.copy_from_slice(&POPUP_COLOR_BGRA);
+        }
+        popup.wl_surface().damage_buffer(0, 0, w, h);
+        buffer.attach_to(popup.wl_surface()).expect("attach_to");
+        popup.wl_surface().commit();
+        log_line(
+            &self.log_prefix,
+            format_args!(
+                "popup painted x={} y={} w={w} h={h}",
+                config.position.0, config.position.1
+            ),
+        );
+    }
+
+    fn done(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _popup: &Popup) {
+        log_line(&self.log_prefix, format_args!("popup done"));
+        self.popup = None;
+    }
+}
+
 impl ProvidesRegistryState for State {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -495,6 +625,25 @@ delegate_compositor!(State);
 delegate_output!(State);
 delegate_seat!(State);
 delegate_keyboard!(State);
+delegate_pointer!(State);
 delegate_shm!(State);
 delegate_layer!(State);
 delegate_registry!(State);
+// xdg_wm_base (ping/pong) goes to XdgShell. Not `delegate_xdg_shell!`,
+// whose toplevel-decoration arm needs a WindowHandler this window-less
+// client has no use for; the decoration manager XdgShell::bind binds
+// sends no events.
+delegate_dispatch!(State: [xdg_wm_base::XdgWmBase: GlobalData] => XdgShell);
+
+impl Dispatch<ZxdgDecorationManagerV1, GlobalData> for State {
+    fn event(
+        _: &mut Self,
+        _: &ZxdgDecorationManagerV1,
+        _: <ZxdgDecorationManagerV1 as Proxy>::Event,
+        _: &GlobalData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+delegate_xdg_popup!(State);

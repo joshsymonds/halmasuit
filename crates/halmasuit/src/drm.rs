@@ -1538,10 +1538,29 @@ impl DrmBackend {
         // end without an extra Vec move.
         let cursor_elements = self.cursor_elements();
         let mut elements: Vec<SceneElement> = Vec::new();
+        // A surface's popups (greeter dropdowns, menus) sit above it:
+        // render is front-to-back, so they go first, topmost popup
+        // first, each at the surface's origin plus its offset in the
+        // popup tree less its own window-geometry origin.
         let mut push_surface_at =
             |renderer: &mut GlesRenderer,
-             surface: &_,
+             surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
              loc: smithay::utils::Point<i32, smithay::utils::Physical>| {
+                let popups: Vec<_> =
+                    smithay::desktop::PopupManager::popups_for_surface(surface).collect();
+                for (popup, offset) in popups.into_iter().rev() {
+                    let popup_loc = loc + (offset - popup.geometry().loc).to_physical(1);
+                    let es: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                        render_elements_from_surface_tree(
+                            renderer,
+                            popup.wl_surface(),
+                            popup_loc,
+                            scale,
+                            1.0,
+                            Kind::Unspecified,
+                        );
+                    elements.extend(es.into_iter().map(SceneElement::Surface));
+                }
                 let es: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                     render_elements_from_surface_tree(
                         renderer,

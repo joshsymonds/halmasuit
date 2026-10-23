@@ -836,20 +836,35 @@ impl HalmasuitState {
         }
     }
 
-    /// Output-local pointer focus + coordinates for the foreground
-    /// surface. Returns `None` if no input-accepting surface exists.
-    /// halmasuit hosts one fullscreen surface, so the location is
-    /// always the output origin (0, 0).
+    /// Output-local pointer focus + surface origin for a pointer at
+    /// `location`. Returns `None` if no input-accepting surface exists.
+    /// The keyboard-focused surface sits at the output origin (0, 0);
+    /// a popup of it under the pointer (a greeter dropdown's list),
+    /// topmost first, takes the pointer at its own origin.
     fn pointer_focus(
         &self,
+        location: smithay::utils::Point<f64, smithay::utils::Logical>,
     ) -> Option<(
         WlSurface,
         smithay::utils::Point<f64, smithay::utils::Logical>,
     )> {
-        let keyboard = self.seat.get_keyboard()?;
-        keyboard
-            .current_focus()
-            .map(|s| (s, smithay::utils::Point::from((0.0_f64, 0.0_f64))))
+        let focus = self.seat.get_keyboard()?.current_focus()?;
+        let popups: Vec<_> = PopupManager::popups_for_surface(&focus).collect();
+        for (popup, offset) in popups.into_iter().rev() {
+            // Hit-test the popup's surface tree (its buffers and input
+            // regions), not its window geometry, which a client need
+            // not set.
+            let origin = offset - popup.geometry().loc;
+            if let Some((surface, at)) = smithay::desktop::utils::under_from_surface_tree(
+                popup.wl_surface(),
+                location,
+                origin,
+                smithay::desktop::WindowSurfaceType::ALL,
+            ) {
+                return Some((surface, at.to_f64()));
+            }
+        }
+        Some((focus, smithay::utils::Point::from((0.0_f64, 0.0_f64))))
     }
 
     /// Clamp absolute pointer coords to the output extents.
@@ -870,7 +885,7 @@ impl HalmasuitState {
         let delta = evt.delta();
         let mut location = pointer.current_location() + delta;
         location = self.clamp_pointer(location);
-        let focus = self.pointer_focus();
+        let focus = self.pointer_focus(location);
         pointer.motion(
             self,
             focus,
@@ -896,7 +911,7 @@ impl HalmasuitState {
         };
         let (w, h) = self.output_size;
         let location = evt.position_transformed((w, h).into());
-        let focus = self.pointer_focus();
+        let focus = self.pointer_focus(location);
         pointer.motion(
             self,
             focus,
@@ -1004,7 +1019,7 @@ impl HalmasuitState {
         };
         let (w, h) = self.output_size;
         let location = evt.position_transformed((w, h).into());
-        let focus = self.pointer_focus();
+        let focus = self.pointer_focus(location);
         touch.down(
             self,
             focus,
@@ -1043,7 +1058,7 @@ impl HalmasuitState {
         };
         let (w, h) = self.output_size;
         let location = evt.position_transformed((w, h).into());
-        let focus = self.pointer_focus();
+        let focus = self.pointer_focus(location);
         touch.motion(
             self,
             focus,
