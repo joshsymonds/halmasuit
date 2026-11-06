@@ -173,7 +173,7 @@ if CONFIG["journal"] is not None:
     sys.stdout.write(Path(CONFIG["journal"]).read_text())
 '''
 
-DEFAULT_FRAMES_DIR = "/var/lib/halmasuit-lab/frames"
+DEFAULT_FRAMES_DIR = "/run/halmasuit-lab/frames"
 
 
 class FakeClock:
@@ -696,7 +696,7 @@ class RunnerTest(unittest.TestCase):
         self.tools.set_frames(mode="escape")
         code, out = self.run_runner()
         self.assertEqual(code, 1, out)
-        self.assertIn("extract of /var/lib/halmasuit-lab/frames failed", self.run_log())
+        self.assertIn("extract of /run/halmasuit-lab/frames failed", self.run_log())
         self.assertFalse((self.run_dir() / "escape.txt").exists())
         self.assert_box_ended()
 

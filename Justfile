@@ -178,6 +178,8 @@ test-vm jobs="":
         lab-vkms-crc
         # Render-node split: GL on vgem render node, scan-out on vkms.
         halmasuit-render-node
+        # Diagnostic frame recorder: recordFrames wiring for rootfs and initrd units.
+        halmasuit-recorder
     )
     # Timing-bound gates run alone after the parallel batch: sharing the
     # host with other llvmpipe VMs slows the guest. Throughput gates
