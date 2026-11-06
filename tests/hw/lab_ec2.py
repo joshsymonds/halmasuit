@@ -4,8 +4,9 @@
 `ec2 up` builds the checkout's HEAD into a new box and prints `<name> ready` as its last stdout
 line. The runner holds the box's boot journal until halmasuit.service's greeter event is 30
 seconds old in it, copies the journal into the run directory as journal.json, copies the box's
-recorder directory into the run directory's frames/ over ssh, and checks the journal against the
-ec2-greeter profile in timeline.py. The frames copy is bounded by --copy-timeout seconds. The
+recorder index as of that read, cut back to its last complete line, and the PNG files its lines
+name into the run directory's frames/ over ssh, and checks the journal against the ec2-greeter
+profile in timeline.py. Each frames copy step is bounded by --copy-timeout seconds. The
 recorder's index is checked with timeline.recorder_failures against each output's video, which
 --ffmpeg encodes losslessly as `<output>.nut` at the frames' mono_us timing and --ffprobe counts.
 Each output's greeter frame is copied to `<output>-greeter.png`. Each run writes its record to a
@@ -370,39 +371,71 @@ class Ec2Run:
         (run.directory / timeline.JOURNAL_NAME).write_text(text, encoding="utf-8")
 
     def _collect_frames(self, run: lab.RunLog, name: str) -> None:
-        """Extracts the box's recorder directory into the run directory's frames/, or raises.
+        """Copies the recorder index snapshot and the PNGs its lines name into frames/, or raises.
+
+        The index is read first, and only its newline-terminated lines are kept. The recorder
+        writes each PNG completely before appending its index line and never rewrites a written
+        frame, so the PNGs the kept lines name are stable while tar reads them. The names go to tar
+        on stdin, since a run can name thousands of files and a remote command is one shell argument.
 
         The tar stream is binary, so it goes to an unnamed temporary file in the run directory,
-        which is gone once closed, even when the run is signalled mid-copy. subprocess.run kills
-        the ssh child on the timeout and on any exception escaping it.
+        which is gone once closed, even when the run is signalled mid-copy. Each ssh call is
+        bounded by copy_timeout, and subprocess.run kills the ssh child on the timeout and on any
+        exception escaping it. frames/ is created only once the archive has been copied.
         """
-        remote = ("sudo", "-n", "tar", "-C", self.frames_dir, "-cf", "-", ".")
-        run.say(f"frames copy: {shlex.join(remote)}")
+        snapshot = self._index_snapshot(run, name)
+        names = _frame_names(snapshot)
+        remote = ("sudo", "-n", "tar", "-C", self.frames_dir, "-cf", "-", "--null", "-T", "-")
+        listing = b"".join(f"{frame}\0".encode() for frame in names)
         with tempfile.TemporaryFile(dir=run.directory) as archive:
-            try:
-                done = subprocess.run(
-                    self._ssh_argv(name, remote),
-                    stdout=archive,
-                    stderr=subprocess.PIPE,
-                    timeout=self.copy_timeout,
-                    check=False,
-                )
-            except subprocess.TimeoutExpired as err:
-                raise LabError(f"copy of {self.frames_dir} timed out after {self.copy_timeout} seconds") from err
-            except OSError as err:
-                raise LabError(f"cannot start ssh for the frames copy: {err}") from err
-            stderr = done.stderr.decode("utf-8", errors="replace")
-            self._record(run, "frames copy", lab.Result(done.returncode, "", stderr))
-            if done.returncode != 0:
-                detail = stderr.strip() or "no output"
-                raise LabError(f"copy of {self.frames_dir} failed (rc {done.returncode}): {detail}")
+            self._copy_step(run, name, remote, stdout=archive, stdin=listing)
             archive.seek(0)
             try:
-                (run.directory / FRAMES_NAME).mkdir()
+                frames = run.directory / FRAMES_NAME
+                frames.mkdir()
                 with tarfile.open(fileobj=archive, mode="r:") as tar:
-                    tar.extractall(run.directory / FRAMES_NAME, filter="data")
+                    tar.extractall(frames, filter="data")
+                (frames / timeline.RECORDER_INDEX_NAME).write_bytes(snapshot)
             except (tarfile.TarError, OSError) as err:
                 raise LabError(f"extract of {self.frames_dir} failed: {err}") from err
+
+    def _index_snapshot(self, run: lab.RunLog, name: str) -> bytes:
+        """The box's recorder index as read, cut back to its last newline."""
+        remote = ("sudo", "-n", "cat", f"{self.frames_dir}/{timeline.RECORDER_INDEX_NAME}")
+        done = self._copy_step(run, name, remote, stdout=subprocess.PIPE, stdin=b"")
+        text = done.stdout
+        return text[: text.rfind(b"\n") + 1]
+
+    def _copy_step(
+        self,
+        run: lab.RunLog,
+        name: str,
+        remote: Sequence[str],
+        *,
+        stdout: IO[bytes] | int,
+        stdin: bytes,
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Runs one bounded copy step over ssh and returns it, or raises naming the step's failure."""
+        run.say(f"frames copy: {shlex.join(remote)}")
+        try:
+            done = subprocess.run(
+                self._ssh_argv(name, remote),
+                input=stdin,
+                stdout=stdout,
+                stderr=subprocess.PIPE,
+                timeout=self.copy_timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as err:
+            raise LabError(f"copy of {self.frames_dir} timed out after {self.copy_timeout} seconds") from err
+        except OSError as err:
+            raise LabError(f"cannot start ssh for the frames copy: {err}") from err
+        stderr = done.stderr.decode("utf-8", errors="replace")
+        self._record(run, "frames copy", lab.Result(done.returncode, "", stderr))
+        if done.returncode != 0:
+            detail = stderr.strip() or "no output"
+            raise LabError(f"copy of {self.frames_dir} failed (rc {done.returncode}): {detail}")
+        return done
 
     def _check(self, run: lab.RunLog) -> int:
         try:
@@ -444,9 +477,6 @@ class Ec2Run:
     def _write_video(self, run: lab.RunLog, output: str, lines: list[dict[str, Any]], video: Path) -> None:
         frames_dir = (run.directory / FRAMES_NAME).resolve()
         paths = [_frame_path(frames_dir, frame) for frame in lines]
-        for path in paths:
-            if not path.is_file():
-                raise LabError(f"frame file missing for {output}: {path}")
         with tempfile.TemporaryDirectory(dir=run.directory) as scratch:
             listing = Path(scratch) / "frames.ffconcat"
             listing.write_text(_concat_list(lines, paths), encoding="utf-8")
@@ -555,6 +585,22 @@ class Ec2Run:
 
 def _frame_path(frames_dir: Path, frame: dict[str, Any]) -> Path:
     return frames_dir / frame["output"] / f"{frame['seq']:08d}.png"
+
+
+def _frame_names(snapshot: bytes) -> list[str]:
+    """The frames/-relative PNG names the snapshot's index lines name, each once, in index order."""
+    try:
+        text = snapshot.decode("utf-8")
+    except UnicodeDecodeError as err:
+        raise LabError(f"recorder index unreadable: {err}") from err
+    names: dict[str, None] = {}
+    for number, line in enumerate(text.split("\n")[:-1], start=1):
+        try:
+            frame = timeline.recorder_frame(line, number)
+        except ValueError as err:
+            raise LabError(f"recorder index unreadable: {err}") from err
+        names[f"{frame['output']}/{frame['seq']:08d}.png"] = None
+    return list(names)
 
 
 def _ffconcat_quote(path: str) -> str:

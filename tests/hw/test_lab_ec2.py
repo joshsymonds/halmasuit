@@ -43,6 +43,8 @@ FRAME_SIZE = 4
 FIRST_MONO_US = 1_599_000
 FRAME_STEP_US = 500_000
 GREETER_FRAME = FRAME_COUNT - 1
+PARTIAL_LINE_BYTES = 25
+DURING_COPY_FRAMES = 80
 
 EC2_FAKE = r'''
 import json
@@ -142,15 +144,92 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CONFIG = json.loads((HERE / "config.json").read_text())["ssh"]
+CHUNK = 1024
 with (HERE / "ssh-calls.jsonl").open("a") as calls:
     calls.write(json.dumps(sys.argv[1:]) + "\n")
 if CONFIG["fails"]:
     print("ssh: connect refused", file=sys.stderr)
     sys.exit(255)
+
+
+class Recorder:
+    """The live recorder on the box: lands one scripted step inside each member's read.
+
+    A step writes its PNG, then appends its index bytes. The first step completes the index's
+    partial last line, so the box is mid-write when the copy starts.
+    """
+
+    def __init__(self, source, append):
+        self.source = source
+        self.append = append
+        self.next = 0
+
+    def land(self):
+        if self.append is None or self.next >= len(self.append["steps"]):
+            return
+        step = self.append["steps"][self.next]
+        self.next += 1
+        target = self.source / step["png"]
+        target.parent.mkdir(exist_ok=True)
+        target.write_bytes((Path(self.append["pending"]) / step["png"]).read_bytes())
+        with (self.source / "index.jsonl").open("ab") as index:
+            index.write(step["index"].encode())
+
+
+def stamp(path):
+    status = path.stat()
+    return (status.st_size, status.st_mtime_ns)
+
+
+def read_member(path, recorder):
+    with path.open("rb") as handle:
+        head = handle.read(CHUNK)
+        recorder.land()
+        return head + handle.read()
+
+
+def archive_members(source, names, recorder, mode):
+    """Writes the members to stdout as GNU tar would: exit 2 for a name it cannot stat, else 1 for a change."""
+    status = 0
+    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as archive:
+        for name in names:
+            path = source / name
+            try:
+                before = stamp(path)
+            except FileNotFoundError:
+                print(f"tar: {name}: Cannot stat: No such file or directory", file=sys.stderr)
+                status = 2
+                continue
+            data = read_member(path, recorder)
+            if stamp(path) != before:
+                print(f"tar: {name}: file changed as we read it", file=sys.stderr)
+                status = status or 1
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+        if mode == "escape":
+            payload = b"outside the frames directory"
+            member = tarfile.TarInfo("../escape.txt")
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+    return status
+
+
 remote = sys.argv[-1]
+words = shlex.split(remote)
+if remote.startswith("sudo -n cat "):
+    frames = CONFIG["frames"]
+    index = Path(frames["source"]) / "index.jsonl"
+    if words[3] != f"{frames['dir']}/index.jsonl":
+        print(f"cat: {words[3]}: Cannot open: No such file or directory", file=sys.stderr)
+        sys.exit(2)
+    if not index.exists():
+        print(f"cat: {words[3]}: No such file or directory", file=sys.stderr)
+        sys.exit(1)
+    sys.stdout.buffer.write(index.read_bytes())
+    sys.exit(0)
 if remote.startswith("sudo -n tar "):
     frames = CONFIG["frames"]
-    words = shlex.split(remote)
     if words[4] != frames["dir"]:
         print(f"tar: {words[4]}: Cannot open: No such file or directory", file=sys.stderr)
         sys.exit(2)
@@ -161,14 +240,9 @@ if remote.startswith("sudo -n tar "):
         (HERE / "ssh-copy.pid").write_text(str(os.getpid()))
         while True:
             time.sleep(60)
-    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as archive:
-        archive.add(frames["source"], arcname=".")
-        if frames["mode"] == "escape":
-            payload = b"outside the frames directory"
-            member = tarfile.TarInfo("../escape.txt")
-            member.size = len(payload)
-            archive.addfile(member, io.BytesIO(payload))
-    sys.exit(0)
+    source = Path(frames["source"])
+    names = [raw.decode() for raw in sys.stdin.buffer.read().split(b"\0") if raw]
+    sys.exit(archive_members(source, names, Recorder(source, frames["append"]), frames["mode"]))
 if CONFIG["journal"] is not None:
     sys.stdout.write(Path(CONFIG["journal"]).read_text())
 '''
@@ -251,7 +325,11 @@ def tree(root: Path) -> dict[str, bytes]:
 
 
 def tar_command(frames_dir: str) -> str:
-    return f"sudo -n tar -C {frames_dir} -cf - ."
+    return f"sudo -n tar -C {frames_dir} -cf - --null -T -"
+
+
+def index_command(frames_dir: str) -> str:
+    return f"sudo -n cat {frames_dir}/index.jsonl"
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -367,7 +445,7 @@ class FakeTools:
         self.ssh_config = {
             "fails": False,
             "journal": str(FIXTURE),
-            "frames": {"dir": DEFAULT_FRAMES_DIR, "source": str(served), "mode": "serve"},
+            "frames": {"dir": DEFAULT_FRAMES_DIR, "source": str(served), "mode": "serve", "append": None},
         }
         install(self.ec2, EC2_FAKE)
         install(self.ssh, SSH_FAKE)
@@ -511,7 +589,10 @@ class RunnerTest(unittest.TestCase):
         self.assertTrue(self.tools.ssh_calls())
         for call in self.tools.ssh_calls():
             self.assertEqual(call[-2], f"joshsymonds@{BOX}")
-            self.assertIn(call[-1], (REMOTE_COMMAND, tar_command(DEFAULT_FRAMES_DIR)))
+            self.assertIn(
+                call[-1],
+                (REMOTE_COMMAND, index_command(DEFAULT_FRAMES_DIR), tar_command(DEFAULT_FRAMES_DIR)),
+            )
             self.assertIn("StrictHostKeyChecking=accept-new", call)
         self.assertEqual({number: signal.getsignal(number) for number in SIGNALS}, before)
 
@@ -641,14 +722,52 @@ class RunnerTest(unittest.TestCase):
         (self.tools.frames_source / "index.jsonl").unlink()
         code, out = self.run_runner()
         self.assertEqual(code, 1, out)
-        self.assertIn("FAIL ec2-greeter: recorder index unreadable: [Errno 2] No such file or directory", self.run_log())
+        self.assertIn(
+            f"FAIL ec2-greeter: copy of {DEFAULT_FRAMES_DIR} failed (rc 1): "
+            f"cat: {DEFAULT_FRAMES_DIR}/index.jsonl: No such file or directory",
+            self.run_log(),
+        )
+        self.assertFalse((self.run_dir() / "frames").exists())
         self.assert_box_ended()
 
     def test_missing_frame_file_fails_the_run(self) -> None:
         (self.tools.frames_source / OUTPUT / f"{5:08d}.png").unlink()
         code, out = self.run_runner()
         self.assertEqual(code, 1, out)
-        self.assertIn(f"FAIL ec2-greeter: frame file missing for {OUTPUT}", self.run_log())
+        self.assertIn(
+            f"FAIL ec2-greeter: copy of {DEFAULT_FRAMES_DIR} failed (rc 2): "
+            f"tar: {OUTPUT}/{5:08d}.png: Cannot stat: No such file or directory",
+            self.run_log(),
+        )
+        self.assertFalse((self.run_dir() / "frames").exists())
+        self.assert_box_ended()
+
+    def test_frames_recorded_during_the_copy_stay_out_of_the_run(self) -> None:
+        served = self.tools.frames_source / "index.jsonl"
+        complete = json.dumps(index_line(FRAME_COUNT))
+        with served.open("ab") as index:
+            index.write(complete[:PARTIAL_LINE_BYTES].encode())
+        pending = self.tools.root / "pending"
+        steps = []
+        for seq in range(FRAME_COUNT, FRAME_COUNT + DURING_COPY_FRAMES):
+            png = f"{OUTPUT}/{seq:08d}.png"
+            (pending / png).parent.mkdir(parents=True, exist_ok=True)
+            (pending / png).write_bytes(frame_png(seq))
+            line = json.dumps(index_line(seq)) + "\n"
+            if seq == FRAME_COUNT:
+                line = complete[PARTIAL_LINE_BYTES:] + "\n"
+            steps.append({"png": png, "index": line})
+        self.tools.set_frames(append={"pending": str(pending), "steps": steps})
+
+        code, out = self.run_runner()
+
+        self.assertEqual(code, 0, out)
+        snapshot = "".join(json.dumps(index_line(seq)) + "\n" for seq in range(FRAME_COUNT)).encode()
+        expected = {f"{OUTPUT}/{seq:08d}.png": frame_png(seq) for seq in range(FRAME_COUNT)}
+        expected["index.jsonl"] = snapshot
+        self.assertEqual(tree(self.run_dir() / "frames"), expected)
+        self.assertGreater(served.read_bytes().count(b"\n"), FRAME_COUNT)
+        self.assertEqual([call[-1] for call in self.frames_calls()], [tar_command(DEFAULT_FRAMES_DIR)])
         self.assert_box_ended()
 
     def test_failing_ffmpeg_fails_the_run(self) -> None:
