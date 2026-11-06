@@ -89,6 +89,82 @@ pub fn rgba_to_xrgb8888(
     Ok(())
 }
 
+/// The inverse of [`rgba_to_xrgb8888`] for a flipped buffer: reads a
+/// pitched XRGB8888 image of `width` x `height` pixels, `pitch` bytes per
+/// row, and returns it as tightly packed top-down `[R, G, B, 0xFF]` pixels.
+/// The row padding is ignored.
+///
+/// # Errors
+///
+/// Returns an error if the size is zero, if `pitch` cannot hold a row, or
+/// if `src` is shorter than `pitch * height`.
+#[cfg(feature = "frame_audit")]
+pub fn xrgb8888_to_rgba(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    pitch: usize,
+) -> io::Result<Vec<u8>> {
+    let row_bytes = width
+        .checked_mul(4)
+        .filter(|&n| n > 0 && height > 0)
+        .ok_or_else(|| io::Error::other("scan-out copy: zero-sized frame"))?;
+    if pitch < row_bytes {
+        return Err(io::Error::other(
+            "scan-out copy: pitch is shorter than one pixel row",
+        ));
+    }
+    let src_len = pitch
+        .checked_mul(height)
+        .ok_or_else(|| io::Error::other("scan-out copy: pitch * height overflows"))?;
+    if src.len() < src_len {
+        return Err(io::Error::other(
+            "scan-out copy: buffer is shorter than pitch * height",
+        ));
+    }
+    let mut rgba = Vec::with_capacity(row_bytes * height);
+    for src_row in src.chunks_exact(pitch).take(height) {
+        let (pixels, _padding) = src_row.split_at(row_bytes);
+        for px in pixels.as_chunks::<4>().0 {
+            rgba.extend_from_slice(&[px[2], px[1], px[0], 0xFF]);
+        }
+    }
+    Ok(rgba)
+}
+
+/// The seq a presentation carries, for frame_audit's recorder. A flip
+/// presents the texture as it stands, so the frame that reaches the
+/// screen carries the seq of the latest damaged render whose content it
+/// holds: its own seq when presented at once, or the latest deferred
+/// render's seq when presented at the completion of the flip in flight.
+#[cfg(feature = "frame_audit")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SeqBook {
+    deferred: Option<u64>,
+}
+
+#[cfg(feature = "frame_audit")]
+impl SeqBook {
+    /// A render with `seq` was given `action`. Returns the seq of the frame
+    /// presented now, if any. A deferred render replaces any earlier one.
+    pub const fn frame_rendered(&mut self, action: FrameAction, seq: u64) -> Option<u64> {
+        match action {
+            FrameAction::Nothing => None,
+            FrameAction::Present => Some(seq),
+            FrameAction::Defer => {
+                self.deferred = Some(seq);
+                None
+            }
+        }
+    }
+
+    /// The flip in flight completed. Returns the seq of the deferred frame
+    /// it presents, if one was waiting.
+    pub const fn flip_completed(&mut self) -> Option<u64> {
+        self.deferred.take()
+    }
+}
+
 /// What a rendered frame asks the scan-out path to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameAction {
@@ -198,6 +274,22 @@ impl DumbFramebuffer {
     }
 }
 
+#[cfg(feature = "frame_audit")]
+impl DumbFramebuffer {
+    /// The buffer's pixels as packed top-down `[R, G, B, 0xFF]`.
+    fn read_rgba(&mut self) -> io::Result<Vec<u8>> {
+        let (w, h) = (usize::from(self.size.0), usize::from(self.size.1));
+        let pitch = usize::try_from(self.pitch)
+            .map_err(|_| io::Error::other("scan-out copy: pitch overflows usize"))?;
+        let buffer = self
+            .buffer
+            .as_mut()
+            .ok_or_else(|| io::Error::other("scan-out copy: dumb buffer already released"))?;
+        let mapping = self.fd.map_dumb_buffer(buffer)?;
+        xrgb8888_to_rgba(&mapping, w, h, pitch)
+    }
+}
+
 impl Drop for DumbFramebuffer {
     fn drop(&mut self) {
         let _ = self.fd.destroy_framebuffer(self.fb);
@@ -228,6 +320,30 @@ pub struct CopyScanout {
     /// buffer at this index is never the one on screen or in flight.
     back: usize,
     scheduler: FlipScheduler,
+    /// The flip accepted since the last [`Self::take_presented`]. Only
+    /// exists in `halmasuit-debug`, for the frame recorder.
+    #[cfg(feature = "frame_audit")]
+    flipped: Option<Flipped>,
+}
+
+/// A flip the scan-out device accepted: the buffer it scans out and the
+/// monotonic time it was accepted.
+#[cfg(feature = "frame_audit")]
+struct Flipped {
+    index: usize,
+    mono_us: u64,
+}
+
+/// A frame the scan-out device accepted, as the frame recorder takes it.
+#[cfg(feature = "frame_audit")]
+pub struct Presented {
+    /// `CLOCK_MONOTONIC` when the flip was accepted.
+    pub mono_us: u64,
+    pub width: u32,
+    pub height: u32,
+    /// The scanned-out pixels as packed `[R, G, B, 0xFF]`, or why they could
+    /// not be read back.
+    pub rgba: io::Result<Vec<u8>>,
 }
 
 impl CopyScanout {
@@ -261,6 +377,8 @@ impl CopyScanout {
             buffers,
             back: 0,
             scheduler: FlipScheduler::default(),
+            #[cfg(feature = "frame_audit")]
+            flipped: None,
         })
     }
 
@@ -318,6 +436,21 @@ impl CopyScanout {
         }
     }
 
+    /// The flip accepted since the last call, with its pixels read back from
+    /// the buffer it scanned out. Only the frame recorder calls this, so
+    /// without a recorder nothing is read back.
+    #[cfg(feature = "frame_audit")]
+    pub fn take_presented(&mut self) -> Option<Presented> {
+        let flipped = self.flipped.take()?;
+        let (w, h) = self.size;
+        Some(Presented {
+            mono_us: flipped.mono_us,
+            width: u32::from(w),
+            height: u32::from(h),
+            rgba: self.buffers[flipped.index].read_rgba(),
+        })
+    }
+
     /// Present the texture on the scan-out device. A failed submission
     /// clears the scheduler so the next damaged frame presents again.
     fn submit(&mut self, renderer: &mut GlesRenderer) -> io::Result<()> {
@@ -354,6 +487,13 @@ impl CopyScanout {
             self.surface.page_flip([plane], true)
         };
         flip.map_err(|e| io::Error::other(format!("scan-out copy flip: {e}")))?;
+        #[cfg(feature = "frame_audit")]
+        {
+            self.flipped = Some(Flipped {
+                index,
+                mono_us: crate::recorder::monotonic_us(),
+            });
+        }
         self.back = 1 - index;
         Ok(())
     }
@@ -486,5 +626,69 @@ mod tests {
         sched.flip_failed();
         assert_eq!(sched.flip_completed(), FlipCompletion::Idle);
         assert_eq!(sched.frame_rendered(true), FrameAction::Present);
+    }
+
+    #[cfg(feature = "frame_audit")]
+    #[test]
+    fn pitched_xrgb_reads_back_as_packed_rgba_ignoring_row_padding() {
+        // The inverse of `converts_rgba_rows_to_bgrx_and_keeps_row_padding`'s
+        // image: pitch 16, 8 padding bytes per row, alpha forced to 0xFF.
+        #[rustfmt::skip]
+        let xrgb = [
+            0x14, 0x00, 0x0A, 0x00,  0x00, 0x00, 0xFF, 0x00, // row 0
+            0xEE, 0xEE, 0xEE, 0xEE,  0xEE, 0xEE, 0xEE, 0xEE, // row 0 padding
+            0x00, 0xFF, 0x00, 0x00,  0xFF, 0x00, 0x00, 0x00, // row 1
+            0xEE, 0xEE, 0xEE, 0xEE,  0xEE, 0xEE, 0xEE, 0xEE, // row 1 padding
+        ];
+        let rgba = xrgb8888_to_rgba(&xrgb, 2, 2, 16).expect("valid geometry");
+        #[rustfmt::skip]
+        let expected = [
+            0x0A, 0x00, 0x14, 0xFF,  0xFF, 0x00, 0x00, 0xFF, // row 0: #0a0014, red
+            0x00, 0xFF, 0x00, 0xFF,  0x00, 0x00, 0xFF, 0xFF, // row 1: green, blue
+        ];
+        assert_eq!(rgba, expected);
+    }
+
+    #[cfg(feature = "frame_audit")]
+    #[test]
+    fn pitched_xrgb_readback_rejects_geometry_that_does_not_fit() {
+        assert!(
+            xrgb8888_to_rgba(&[0; 15], 2, 2, 8).is_err(),
+            "source shorter than pitch * height"
+        );
+        assert!(
+            xrgb8888_to_rgba(&[0; 8], 2, 1, 4).is_err(),
+            "pitch below one pixel row"
+        );
+        assert!(xrgb8888_to_rgba(&[], 0, 0, 0).is_err(), "zero-sized frame");
+    }
+
+    #[cfg(feature = "frame_audit")]
+    #[test]
+    fn presented_now_carries_its_own_seq() {
+        let mut book = SeqBook::default();
+        assert_eq!(book.frame_rendered(FrameAction::Present, 7), Some(7));
+        assert_eq!(book.flip_completed(), None);
+    }
+
+    #[cfg(feature = "frame_audit")]
+    #[test]
+    fn deferred_frame_superseded_before_completion_presents_once_with_later_seq() {
+        let mut book = SeqBook::default();
+        assert_eq!(book.frame_rendered(FrameAction::Present, 1), Some(1));
+        assert_eq!(book.frame_rendered(FrameAction::Defer, 2), None);
+        assert_eq!(book.frame_rendered(FrameAction::Defer, 3), None);
+        assert_eq!(book.flip_completed(), Some(3));
+        assert_eq!(book.flip_completed(), None, "presented once");
+    }
+
+    #[cfg(feature = "frame_audit")]
+    #[test]
+    fn undamaged_render_changes_nothing() {
+        let mut book = SeqBook::default();
+        assert_eq!(book.frame_rendered(FrameAction::Present, 1), Some(1));
+        assert_eq!(book.frame_rendered(FrameAction::Defer, 2), None);
+        assert_eq!(book.frame_rendered(FrameAction::Nothing, 9), None);
+        assert_eq!(book.flip_completed(), Some(2), "seq 2 still pending");
     }
 }

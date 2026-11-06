@@ -604,6 +604,10 @@ struct OutputSurface {
     crtc: crtc::Handle,
     /// How this output's frames reach the CRTC.
     scanout: Scanout,
+    /// frame_audit only: the seq the render-node split's deferred frame
+    /// carries when its flip completes.
+    #[cfg(feature = "frame_audit")]
+    seqs: scanout_copy::SeqBook,
 }
 
 /// The presentation path of one output. `Compositor` is the GBM path,
@@ -1296,6 +1300,8 @@ where
             output,
             crtc: crtc_handle,
             scanout,
+            #[cfg(feature = "frame_audit")]
+            seqs: scanout_copy::SeqBook::default(),
         });
         x_offset += i32::from(w);
     }
@@ -2042,8 +2048,7 @@ impl DrmBackend {
     /// frame_audit only: submit the frame just queued on output `i` to the
     /// recorder. Call after `render_one_output` returned `true` and before
     /// the frame counter advances, so `seq` is this logical frame's id.
-    /// Only `Scanout::Compositor` outputs are recorded; the readback
-    /// failing skips the frame and never fails the render.
+    /// The readback failing skips the frame and never fails the render.
     #[cfg(feature = "frame_audit")]
     fn record_queued(
         &mut self,
@@ -2052,12 +2057,16 @@ impl DrmBackend {
         elements: &[SceneElement],
         clear_color: [u8; 4],
     ) {
-        if self.recorder.is_none() || !matches!(self.outputs[i].scanout, Scanout::Compositor(_)) {
+        if self.recorder.is_none() {
             return;
         }
         let seq = self
             .frame_counter
             .load(std::sync::atomic::Ordering::Relaxed);
+        if matches!(self.outputs[i].scanout, Scanout::CpuCopy(_)) {
+            self.record_split_queued(i, seq);
+            return;
+        }
         let mono_us = crate::recorder::monotonic_us();
         let name = output.name();
         let captured = self
@@ -2080,6 +2089,49 @@ impl DrmBackend {
         match captured {
             Ok(frame) => recorder.submit(frame),
             Err(e) => recorder.skip(&name, seq, &e),
+        }
+    }
+
+    /// frame_audit only: a render-node split frame was queued on output `i`.
+    /// It is presented now when its render's flip was accepted; otherwise
+    /// it waits behind the flip in flight and is recorded at completion.
+    #[cfg(feature = "frame_audit")]
+    fn record_split_queued(&mut self, i: usize, seq: u64) {
+        let Some(recorder) = self.recorder.as_mut() else {
+            return;
+        };
+        let surface = &mut self.outputs[i];
+        let Scanout::CpuCopy(copy) = &mut surface.scanout else {
+            return;
+        };
+        let presented = copy.take_presented();
+        let action = if presented.is_some() {
+            scanout_copy::FrameAction::Present
+        } else {
+            scanout_copy::FrameAction::Defer
+        };
+        let carried = surface.seqs.frame_rendered(action, seq);
+        if let (Some(presented), Some(carried)) = (presented, carried) {
+            submit_presented(recorder, &surface.output.name(), presented, carried);
+        }
+    }
+
+    /// frame_audit only: the flip in flight on output `i` completed. The
+    /// deferred frame it presents, if any, is recorded with the seq it
+    /// carries.
+    #[cfg(feature = "frame_audit")]
+    fn record_split_completed(&mut self, i: usize) {
+        let Some(recorder) = self.recorder.as_mut() else {
+            return;
+        };
+        let surface = &mut self.outputs[i];
+        let Scanout::CpuCopy(copy) = &mut surface.scanout else {
+            return;
+        };
+        let carried = surface.seqs.flip_completed();
+        let presented = copy.take_presented();
+        if let (Some(presented), Some(carried)) = (presented, carried) {
+            submit_presented(recorder, &surface.output.name(), presented, carried);
         }
     }
 
@@ -2236,10 +2288,10 @@ impl DrmBackend {
     /// Returns an error if smithay's `frame_submitted` reports an
     /// underlying DRM failure.
     pub fn frame_submitted(&mut self, crtc: crtc::Handle) -> io::Result<Option<Output>> {
-        let Some(surface) = self.outputs.iter_mut().find(|o| o.crtc == crtc) else {
+        let Some(i) = self.outputs.iter().position(|o| o.crtc == crtc) else {
             return Ok(None);
         };
-        match &mut surface.scanout {
+        match &mut self.outputs[i].scanout {
             Scanout::Compositor(compositor) => {
                 compositor
                     .frame_submitted()
@@ -2247,7 +2299,31 @@ impl DrmBackend {
             }
             Scanout::CpuCopy(copy) => copy.frame_submitted(&mut self.renderer)?,
         }
-        Ok(Some(surface.output.clone()))
+        #[cfg(feature = "frame_audit")]
+        self.record_split_completed(i);
+        Ok(Some(self.outputs[i].output.clone()))
+    }
+}
+
+/// frame_audit only: submit one presented render-node split frame as
+/// `seq`, or skip it when its pixels could not be read back.
+#[cfg(feature = "frame_audit")]
+fn submit_presented(
+    recorder: &mut crate::recorder::Recorder,
+    output: &str,
+    presented: scanout_copy::Presented,
+    seq: u64,
+) {
+    match presented.rgba {
+        Ok(rgba) => recorder.submit(crate::recorder::Frame {
+            output: output.to_owned(),
+            seq,
+            mono_us: presented.mono_us,
+            width: presented.width,
+            height: presented.height,
+            rgba,
+        }),
+        Err(e) => recorder.skip(output, seq, &e),
     }
 }
 
