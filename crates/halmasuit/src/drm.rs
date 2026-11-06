@@ -59,6 +59,8 @@ use crate::wallpaper::{
     wallpaper_slot,
 };
 
+mod scanout_copy;
+
 /// The transient GL clear color, as the RGB bytes of an `#0a0014`
 /// pixel: `red=0x0A, green=0x00, blue=0x14`. Under epic amendment
 /// G1/R6 there is no observable pre-client solid phase — the
@@ -581,7 +583,7 @@ struct CachedNamed {
 /// One physical output: its smithay `Output` (logical — owns the
 /// per-output `LayerMap`, the current mode, and the position in the
 /// global compositor space), the CRTC scanning it out (the vblank
-/// routing key), and the `DrmCompositor` driving that CRTC's surface.
+/// routing key), and the `Scanout` presenting frames on that CRTC.
 ///
 /// NVIDIA's open kernel module exposes one CRTC ("head") per connector
 /// and never sets `possible_clones`, so binding two connectors to one
@@ -600,19 +602,45 @@ struct OutputSurface {
     /// The CRTC this output scans out on. `DrmEvent::VBlank(crtc)` is
     /// routed back to this surface by matching this handle.
     crtc: crtc::Handle,
+    /// How this output's frames reach the CRTC.
+    scanout: Scanout,
+}
+
+/// The presentation path of one output. `Compositor` is the GBM path,
+/// where GLES renders into scan-out buffers. `CpuCopy` is the render-node
+/// split, where GLES renders on the render node and the frame is copied
+/// to dumb buffers on the scan-out device.
+enum Scanout {
     /// The smithay `DrmCompositor` driving this CRTC's surface. Owns the
     /// `DrmSurface`, a per-output GBM allocator + framebuffer exporter,
     /// and its own swapchain. Dropping it releases the surface (and thus
     /// the CRTC).
-    compositor: DrmCompositor<
-        GbmAllocator<DrmDeviceFd>,
-        GbmFramebufferExporter<DrmDeviceFd>,
-        (),
-        DrmDeviceFd,
-    >,
+    Compositor(
+        Box<
+            DrmCompositor<
+                GbmAllocator<DrmDeviceFd>,
+                GbmFramebufferExporter<DrmDeviceFd>,
+                (),
+                DrmDeviceFd,
+            >,
+        >,
+    ),
+    /// The render-node split presenter for this CRTC.
+    CpuCopy(Box<scanout_copy::CopyScanout>),
 }
 
-/// The full GLES + GBM stack plus one `DrmCompositor` per connected
+impl Scanout {
+    /// The DRM device this output's CRTC lives on. DRM master is per
+    /// device, so `pause` and `resume` act through this fd.
+    fn device_fd(&self) -> &DrmDeviceFd {
+        match self {
+            Self::Compositor(compositor) => compositor.surface().device_fd(),
+            Self::CpuCopy(copy) => copy.device_fd(),
+        }
+    }
+}
+
+/// The full GLES + GBM stack plus one `Scanout` per connected
 /// connector (each on its own dedicated CRTC). Pinned for the process
 /// lifetime in `HalmasuitState`. Dropping this value releases master,
 /// tears down EGL, and lets the kernel reset every CRTC.
@@ -620,12 +648,12 @@ pub struct DrmBackend {
     /// One per connected connector — extended multi-output. The first
     /// entry is the primary (leftmost, at x=0; honors
     /// `services.halmasuit.rendering.primaryOutput`). All share the
-    /// `renderer` below and the same GBM device (each holds its own
-    /// allocator/exporter clone of it). Always non-empty (`setup`
+    /// `renderer` below; on the single-device path each also holds its
+    /// own allocator/exporter clone of the GBM device. Always non-empty (`setup`
     /// errors if zero outputs initialize).
     outputs: Vec<OutputSurface>,
-    /// GLES renderer bound to the GBM device's EGL display, SHARED
-    /// across every output's compositor. Used by `render_frame` to
+    /// GLES renderer bound to the GBM device's EGL display (the render
+    /// node when one is configured), SHARED across every output. Used to
     /// clear + composite each output's scene every vblank.
     pub renderer: GlesRenderer,
     /// `dev_t` of the render node that `zwp_linux_dmabuf_v1` default
@@ -874,8 +902,10 @@ fn connector_short_name(info: &connector::Info) -> String {
 /// originating output.
 ///
 /// `render_node`, when set, is the resolved `/dev/dri/renderD<N>` path
-/// named by `HALMASUIT_RENDER_NODE`. It supplies the `zwp_linux_dmabuf_v1`
-/// default-feedback main device; `None` derives it from `path`.
+/// named by `HALMASUIT_RENDER_NODE`. GBM, EGL and GLES then run on it, it
+/// is the `zwp_linux_dmabuf_v1` default-feedback main device, and `path`
+/// only scans out, through CPU-copied dumb buffers
+/// (`scanout_copy::CopyScanout`). `None` renders and scans out on `path`.
 ///
 /// # Errors
 ///
@@ -897,11 +927,24 @@ where
     S: 'static,
     F: FnMut(DrmEvent, &mut Option<smithay::backend::drm::DrmEventMetadata>, &mut S) + 'static,
 {
+    let render_node_dev = render_node.map(render_node_dev_id).transpose()?;
+    let device_fd = open_drm_device(path)?;
+    let render_fd = render_node.map(open_drm_device).transpose()?;
+    build_drm_pipeline(
+        device_fd,
+        render_fd,
+        loop_handle,
+        drm_event_handler,
+        wallpaper_config,
+        render_node_dev,
+    )
+}
+
+/// Open a DRM device node `O_RDWR | O_NONBLOCK`. `O_CLOEXEC` is set by
+/// std's `OpenOptions` by default since Rust 1.20.
+fn open_drm_device(path: &Path) -> io::Result<DrmDeviceFd> {
     use std::os::fd::OwnedFd;
     use std::os::unix::fs::OpenOptionsExt;
-    let render_node_dev = render_node.map(render_node_dev_id).transpose()?;
-    // O_RDWR | O_NONBLOCK. O_CLOEXEC is set by std's OpenOptions by
-    // default since Rust 1.20.
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -909,14 +952,7 @@ where
         .open(path)
         .map_err(|e| io::Error::other(format!("open {}: {e}", path.display())))?;
     let owned_fd: OwnedFd = file.into();
-    let device_fd = DrmDeviceFd::new(DeviceFd::from(owned_fd));
-    build_drm_pipeline(
-        device_fd,
-        loop_handle,
-        drm_event_handler,
-        wallpaper_config,
-        render_node_dev,
-    )
+    Ok(DrmDeviceFd::new(DeviceFd::from(owned_fd)))
 }
 
 /// The `zwp_linux_dmabuf_v1` default-feedback main device: the `dev_t`
@@ -990,6 +1026,7 @@ fn resolve_dmabuf_main_device(device_fd: &DrmDeviceFd) -> Option<libc::dev_t> {
 )]
 fn build_drm_pipeline<S, F>(
     device_fd: DrmDeviceFd,
+    render_fd: Option<DrmDeviceFd>,
     loop_handle: &smithay::reexports::calloop::LoopHandle<'static, S>,
     drm_event_handler: F,
     wallpaper_config: Option<WallpaperConfig>,
@@ -1076,13 +1113,18 @@ where
         return Err(io::Error::other("no connected DRM connector"));
     }
 
-    // GBM device on the same fd, SHARED by every output's allocator,
-    // exporter, and compositor (each takes its own clone — GbmDevice is
-    // ref-counted). Allocators pull SCANOUT-capable buffers from this
-    // device; the framebuffer exporters wrap the resulting BOs as DRM
-    // framebuffer handles.
-    let gbm =
-        GbmDevice::new(device_fd).map_err(|e| io::Error::other(format!("GbmDevice::new: {e}")))?;
+    // With a render node, GBM and GLES run on the render node and every
+    // output is presented through the CPU-copy path. Without one, GBM
+    // sits on the scan-out fd and each output scans out GLES-rendered
+    // GBM buffers through its own `DrmCompositor`.
+    let copy_scanout = render_fd.is_some();
+    // GBM device on the render or scan-out fd, SHARED by every output's
+    // allocator, exporter, and compositor (each takes its own clone —
+    // GbmDevice is ref-counted). Allocators pull SCANOUT-capable buffers
+    // from this device; the framebuffer exporters wrap the resulting BOs
+    // as DRM framebuffer handles.
+    let gbm = GbmDevice::new(render_fd.unwrap_or(device_fd))
+        .map_err(|e| io::Error::other(format!("GbmDevice::new: {e}")))?;
 
     // EGL display + context + GLES renderer, SHARED across all outputs.
     // The two `unsafe`s are smithay's API contracts: EGLDisplay::new
@@ -1188,40 +1230,50 @@ where
         output.change_current_state(Some(output_mode), None, None, Some((x_offset, 0).into()));
         output.set_preferred(output_mode);
 
-        // Per-output allocator + framebuffer exporter, each wrapping a
-        // clone of the shared GBM device. `NodeFilter::None` = "use this
-        // GBM device for all framebuffer exports" (single-GPU).
-        let allocator = GbmAllocator::new(
-            gbm.clone(),
-            GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-        );
-        let exporter = GbmFramebufferExporter::new(
-            gbm.clone(),
-            smithay::backend::drm::exporter::gbm::NodeFilter::None,
-        );
+        let scanout = if copy_scanout {
+            Scanout::CpuCopy(Box::new(scanout_copy::CopyScanout::new(
+                &mut renderer,
+                surface,
+                &output,
+                (w, h),
+            )?))
+        } else {
+            // Per-output allocator + framebuffer exporter, each wrapping a
+            // clone of the shared GBM device. `NodeFilter::None` = "use this
+            // GBM device for all framebuffer exports" (single-GPU).
+            let allocator = GbmAllocator::new(
+                gbm.clone(),
+                GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+            );
+            let exporter = GbmFramebufferExporter::new(
+                gbm.clone(),
+                smithay::backend::drm::exporter::gbm::NodeFilter::None,
+            );
 
-        // DrmCompositor: drives this CRTC's surface + swapchain.
-        // `OutputModeSource::Auto(output.downgrade())` ties its working
-        // size/scale to this output. `DrmCompositor::new` issues a TEST
-        // atomic commit — the layer the prior kernel-clone approach was
-        // rejected at; per-CRTC it passes.
-        let compositor = DrmCompositor::<
-            GbmAllocator<DrmDeviceFd>,
-            GbmFramebufferExporter<DrmDeviceFd>,
-            (),
-            DrmDeviceFd,
-        >::new(
-            OutputModeSource::Auto(output.downgrade()),
-            surface,
-            None,
-            allocator,
-            exporter,
-            SUPPORTED_COLOR_FORMATS.iter().copied(),
-            render_formats.clone(),
-            cursor_size,
-            Some(gbm.clone()),
-        )
-        .map_err(|e| io::Error::other(format!("DrmCompositor::new ({name}): {e}")))?;
+            // DrmCompositor: drives this CRTC's surface + swapchain.
+            // `OutputModeSource::Auto(output.downgrade())` ties its working
+            // size/scale to this output. `DrmCompositor::new` issues a TEST
+            // atomic commit — the layer the prior kernel-clone approach was
+            // rejected at; per-CRTC it passes.
+            let compositor = DrmCompositor::<
+                GbmAllocator<DrmDeviceFd>,
+                GbmFramebufferExporter<DrmDeviceFd>,
+                (),
+                DrmDeviceFd,
+            >::new(
+                OutputModeSource::Auto(output.downgrade()),
+                surface,
+                None,
+                allocator,
+                exporter,
+                SUPPORTED_COLOR_FORMATS.iter().copied(),
+                render_formats.clone(),
+                cursor_size,
+                Some(gbm.clone()),
+            )
+            .map_err(|e| io::Error::other(format!("DrmCompositor::new ({name}): {e}")))?;
+            Scanout::Compositor(Box::new(compositor))
+        };
 
         tracing::info!(
             target: "halmasuit",
@@ -1231,6 +1283,7 @@ where
             mode_w = w,
             mode_h = h,
             mode_hz = mode.vrefresh(),
+            copy_scanout,
             "DRM output: connector bound to dedicated CRTC"
         );
 
@@ -1238,7 +1291,7 @@ where
         output_surfaces.push(OutputSurface {
             output,
             crtc: crtc_handle,
-            compositor,
+            scanout,
         });
         x_offset += i32::from(w);
     }
@@ -1361,8 +1414,7 @@ impl DrmBackend {
             return Ok(());
         };
         first
-            .compositor
-            .surface()
+            .scanout
             .device_fd()
             .release_master_lock()
             .map_err(|e| io::Error::other(format!("DRM DROP_MASTER: {e}")))?;
@@ -1385,8 +1437,7 @@ impl DrmBackend {
             return Ok(());
         };
         first
-            .compositor
-            .surface()
+            .scanout
             .device_fd()
             .acquire_master_lock()
             .map_err(|e| io::Error::other(format!("DRM SET_MASTER: {e}")))?;
@@ -1837,11 +1888,11 @@ impl DrmBackend {
         for i in 0..self.outputs.len() {
             let output = self.outputs[i].output.clone();
             let elements = self.scene_elements(&output, foreground)?;
-            // Split borrow: `self.outputs[i].compositor` and
+            // Split borrow: `self.outputs[i].scanout` and
             // `self.renderer` are disjoint fields.
             let queued = {
-                let comp = &mut self.outputs[i].compositor;
-                render_one_output(comp, &mut self.renderer, &elements, clear_color)?
+                let scanout = &mut self.outputs[i].scanout;
+                render_one_output(scanout, &mut self.renderer, &elements, clear_color)?
             };
             any |= queued;
             #[cfg(feature = "frame_audit")]
@@ -1900,10 +1951,10 @@ impl DrmBackend {
         let output = self.outputs[i].output.clone();
         let elements = self.scene_elements(&output, foreground)?;
         let queued = {
-            // Split borrow: `self.outputs[i].compositor` and
+            // Split borrow: `self.outputs[i].scanout` and
             // `self.renderer` are disjoint fields (mirrors render_all).
-            let comp = &mut self.outputs[i].compositor;
-            render_one_output(comp, &mut self.renderer, &elements, clear_color)?
+            let scanout = &mut self.outputs[i].scanout;
+            render_one_output(scanout, &mut self.renderer, &elements, clear_color)?
         };
         if queued {
             self.frame_counter
@@ -2124,45 +2175,48 @@ impl DrmBackend {
         let Some(surface) = self.outputs.iter_mut().find(|o| o.crtc == crtc) else {
             return Ok(None);
         };
-        surface
-            .compositor
-            .frame_submitted()
-            .map_err(|e| io::Error::other(format!("frame_submitted: {e}")))?;
+        match &mut surface.scanout {
+            Scanout::Compositor(compositor) => {
+                compositor
+                    .frame_submitted()
+                    .map_err(|e| io::Error::other(format!("frame_submitted: {e}")))?;
+            }
+            Scanout::CpuCopy(copy) => copy.frame_submitted(&mut self.renderer)?,
+        }
         Ok(Some(surface.output.clone()))
     }
 }
 
-/// Composite `elements` over `clear_color` onto one output's
-/// `DrmCompositor` and queue the resulting frame for scanout. Free
-/// function (not a method) so the caller can pass disjoint `&mut`
-/// borrows of `self.outputs[i].compositor` and `self.renderer`.
-/// Returns `Ok(true)` if a frame was queued, `Ok(false)` if the
-/// composition had no damage (`render_frame` reported empty).
+/// Composite `elements` over `clear_color` and queue the resulting frame
+/// for scanout on one output. Free function (not a method) so the caller
+/// can pass disjoint `&mut` borrows of `self.outputs[i].scanout` and
+/// `self.renderer`. Returns `Ok(true)` if a frame was rendered with
+/// damage, `Ok(false)` if the composition had no damage.
 fn render_one_output(
-    compositor: &mut DrmCompositor<
-        GbmAllocator<DrmDeviceFd>,
-        GbmFramebufferExporter<DrmDeviceFd>,
-        (),
-        DrmDeviceFd,
-    >,
+    scanout: &mut Scanout,
     renderer: &mut GlesRenderer,
     elements: &[SceneElement],
     clear_color: [u8; 4],
 ) -> io::Result<bool> {
     let color = xrgb_le_to_color32f(clear_color);
-    let render_res = compositor
-        .render_frame::<_, SceneElement>(renderer, elements, color, FrameFlags::DEFAULT)
-        .map_err(|e| io::Error::other(format!("render_frame: {e}")))?;
+    match scanout {
+        Scanout::Compositor(compositor) => {
+            let render_res = compositor
+                .render_frame::<_, SceneElement>(renderer, elements, color, FrameFlags::DEFAULT)
+                .map_err(|e| io::Error::other(format!("render_frame: {e}")))?;
 
-    if render_res.is_empty {
-        return Ok(false);
+            if render_res.is_empty {
+                return Ok(false);
+            }
+
+            compositor
+                .queue_frame(())
+                .map_err(|e| io::Error::other(format!("queue_frame: {e}")))?;
+
+            Ok(true)
+        }
+        Scanout::CpuCopy(copy) => copy.render(renderer, elements, color),
     }
-
-    compositor
-        .queue_frame(())
-        .map_err(|e| io::Error::other(format!("queue_frame: {e}")))?;
-
-    Ok(true)
 }
 
 #[cfg(test)]

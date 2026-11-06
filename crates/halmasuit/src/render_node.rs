@@ -1,5 +1,6 @@
 // halmasuit/src/render_node.rs — `HALMASUIT_RENDER_NODE`: the render node
-// that names the `zwp_linux_dmabuf_v1` default-feedback main device.
+// halmasuit renders on and names as the `zwp_linux_dmabuf_v1`
+// default-feedback main device, while the DRM device only scans out.
 //
 // Unset or empty means no render node; the single-device path runs as it
 // always has. Otherwise the value is a literal `/dev/dri/renderD<N>` or a
