@@ -1314,6 +1314,13 @@
           halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
           ssimulacra2-cli = self.packages.x86_64-linux.ssimulacra2-cli;
         };
+        halmasuit-render-node = import ./tests/halmasuit-render-node.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit         = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session = self.packages.x86_64-linux.halmasuit-session;
+          ssimulacra2-cli   = self.packages.x86_64-linux.ssimulacra2-cli;
+        };
         visual-halmasuit-layer = import ./tests/visual-halmasuit-layer.nix {
           system = "x86_64-linux";
           inherit nixpkgs;
