@@ -196,6 +196,14 @@ let
     then {}
     else { HALMASUIT_DRM_DEVICE = cfg.drmDevice; };
 
+  # `renderNodeEnv` — attrset exporting `HALMASUIT_RENDER_NODE` to both
+  # units. Empty when `rendering.renderNode` is null, so the unit envs
+  # stay byte-identical to the single-device path.
+  renderNodeEnv =
+    if cfg.rendering.renderNode == null
+    then {}
+    else { HALMASUIT_RENDER_NODE = cfg.rendering.renderNode; };
+
   # `systemd-udev-settle.service` is documented upstream as "not
   # recommended" (systemd-udev-settle.service(8): "There can be no
   # guarantee that hardware is fully discovered at any specific
@@ -867,6 +875,25 @@ in
           option is advisory, not load-bearing.
         '';
       };
+
+      renderNode = lib.mkOption {
+        type    = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/dev/dri/renderD128";
+        description = ''
+          Render node halmasuit opens for GPU rendering, exported to
+          both the initramfs and rootfs units as
+          `HALMASUIT_RENDER_NODE`. Accepted shapes:
+
+          - `/dev/dri/renderDN` — a render node path, e.g.
+            `/dev/dri/renderD128`.
+          - `pci:DDDD:BB:DD.F` — a PCI address; halmasuit resolves it
+            to the render node bound to that device.
+
+          When null (default), no variable is exported and halmasuit
+          keeps the single-device path.
+        '';
+      };
     };
 
     drmDevice = lib.mkOption {
@@ -1302,7 +1329,7 @@ in
         # Epic #71 R-honest.7: the VT halmasuit owns as VT_PROCESS
         # controller for cooperative switching. See `homeVt`.
         HALMASUIT_HOME_VT = toString cfg.homeVt;
-      } // wallpaperEnv // drmDeviceEnv;
+      } // wallpaperEnv // drmDeviceEnv // renderNodeEnv;
 
     };
    })
@@ -2147,7 +2174,7 @@ in
          # Mirrors the rootfs unit (see comment there). The Rust
          # resolver runs in initramfs too, so the env must travel.
          HALMASUIT_PRIMARY_OUTPUT = cfg.rendering.primaryOutput;
-       } // wallpaperEnv // drmDeviceEnv;
+       } // wallpaperEnv // drmDeviceEnv // renderNodeEnv;
      };
 
      # halmasuit-luks: the systemd password-agent Wayland client.

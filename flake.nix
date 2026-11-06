@@ -894,6 +894,16 @@
           halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-luks       = self.packages.x86_64-linux.halmasuit-luks;
         };
+        # `services.halmasuit.rendering.renderNode` exports
+        # HALMASUIT_RENDER_NODE to both units when set and leaves both
+        # envs byte-identical when null.
+        halmasuit-render-node-eval = import ./tests/halmasuit-render-node-eval.nix {
+          system    = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit            = self.packages.x86_64-linux.halmasuit;
+          halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-luks       = self.packages.x86_64-linux.halmasuit-luks;
+        };
         # Epic #45 rung 1: bare VFIO-passthrough smoke. RUNNER-ONLY —
         # runs via `.driver` on stygianlibrary (GPU on vfio-pci), NEVER
         # via `nix build` (the sandbox has no /dev/vfio). Deliberately
