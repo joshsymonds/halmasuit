@@ -45,6 +45,8 @@ mod input_hotplug;
 mod layer_focus;
 #[cfg(feature = "frame_audit")]
 mod offscreen;
+#[cfg(feature = "frame_audit")]
+mod recorder;
 mod render_node;
 mod session_env;
 mod swap_gate;
@@ -5794,6 +5796,10 @@ fn main() -> io::Result<()> {
         // Center the foreground toplevel (LUKS prompt) over the
         // wallpaper in the initramfs; fullscreen it in the rootfs.
         backend.set_in_initramfs(state.in_initramfs);
+        // frame_audit only: start the lossless frame recorder before the
+        // initial render, so frame 0 is recorded.
+        #[cfg(feature = "frame_audit")]
+        backend.set_recorder(recorder::Recorder::from_env());
     }
 
     // The wallpaper plane is composited from frame 0 (epic G1/R3/R6):
