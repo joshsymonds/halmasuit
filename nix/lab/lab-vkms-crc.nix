@@ -1,4 +1,4 @@
-{ stdenv, libdrm, pkg-config }:
+{ stdenv }:
 
 stdenv.mkDerivation {
   pname = "lab-vkms-crc";
@@ -9,12 +9,9 @@ stdenv.mkDerivation {
   dontUnpack = true;
   dontConfigure = true;
 
-  nativeBuildInputs = [ pkg-config ];
-  buildInputs = [ libdrm ];
-
   buildPhase = ''
     runHook preBuild
-    $CC -Wall -Wextra -Werror -O2 $src $(pkg-config --cflags --libs libdrm) -o lab-vkms-crc
+    $CC -Wall -Wextra -Werror -O2 $src -o lab-vkms-crc
     runHook postBuild
   '';
 
