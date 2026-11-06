@@ -737,6 +737,10 @@ pub struct DrmBackend {
     /// xdg-toplevel overlay. Only exists in `halmasuit-debug`.
     #[cfg(feature = "frame_audit")]
     wallpaper_only_buf: crate::dbus::SnapshotBuffer,
+    /// Lossless per-frame recorder (`HALMASUIT_RECORD_FRAMES`). `None`
+    /// unless `main` started one. Only exists in `halmasuit-debug`.
+    #[cfg(feature = "frame_audit")]
+    recorder: Option<crate::recorder::Recorder>,
 }
 
 /// Top-left origin that centers a `surface`-sized window on an
@@ -1379,6 +1383,8 @@ where
             snapshot_buf: crate::dbus::new_buffer(),
             #[cfg(feature = "frame_audit")]
             wallpaper_only_buf: crate::dbus::new_buffer(),
+            #[cfg(feature = "frame_audit")]
+            recorder: None,
         },
         registration_token,
         outputs,
@@ -1896,6 +1902,10 @@ impl DrmBackend {
             };
             any |= queued;
             #[cfg(feature = "frame_audit")]
+            if queued {
+                self.record_queued(i, &output, &elements, clear_color);
+            }
+            #[cfg(feature = "frame_audit")]
             if i == 0 && queued {
                 primary_audit = Some((output, elements));
             }
@@ -1957,6 +1967,8 @@ impl DrmBackend {
             render_one_output(scanout, &mut self.renderer, &elements, clear_color)?
         };
         if queued {
+            #[cfg(feature = "frame_audit")]
+            self.record_queued(i, &output, &elements, clear_color);
             self.frame_counter
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Frame-audit runs on the PRIMARY output only (matches
@@ -2017,6 +2029,58 @@ impl DrmBackend {
     /// incremented (no frames lost, no second copy).
     pub fn set_frame_counter(&mut self, shared: std::sync::Arc<std::sync::atomic::AtomicU64>) {
         self.frame_counter = shared;
+    }
+
+    /// frame_audit only: install the frame recorder `main` started from
+    /// `HALMASUIT_RECORD_FRAMES`. Called before the initial render so the
+    /// first presented frame is recorded.
+    #[cfg(feature = "frame_audit")]
+    pub fn set_recorder(&mut self, recorder: Option<crate::recorder::Recorder>) {
+        self.recorder = recorder;
+    }
+
+    /// frame_audit only: submit the frame just queued on output `i` to the
+    /// recorder. Call after `render_one_output` returned `true` and before
+    /// the frame counter advances, so `seq` is this logical frame's id.
+    /// Only `Scanout::Compositor` outputs are recorded; the readback
+    /// failing skips the frame and never fails the render.
+    #[cfg(feature = "frame_audit")]
+    fn record_queued(
+        &mut self,
+        i: usize,
+        output: &Output,
+        elements: &[SceneElement],
+        clear_color: [u8; 4],
+    ) {
+        if self.recorder.is_none() || !matches!(self.outputs[i].scanout, Scanout::Compositor(_)) {
+            return;
+        }
+        let seq = self
+            .frame_counter
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mono_us = crate::recorder::monotonic_us();
+        let name = output.name();
+        let captured = self
+            .read_frame_rgba(output, elements, clear_color)
+            .and_then(|(rgba, w, h)| {
+                Ok(crate::recorder::Frame {
+                    output: name.clone(),
+                    seq,
+                    mono_us,
+                    width: u32::try_from(w)
+                        .map_err(|_| io::Error::other("recorder: width exceeds u32"))?,
+                    height: u32::try_from(h)
+                        .map_err(|_| io::Error::other("recorder: height exceeds u32"))?,
+                    rgba,
+                })
+            });
+        let Some(recorder) = self.recorder.as_mut() else {
+            return;
+        };
+        match captured {
+            Ok(frame) => recorder.submit(frame),
+            Err(e) => recorder.skip(&name, seq, &e),
+        }
     }
 
     /// Record whether halmasuit is running in the Phase-B initramfs.
