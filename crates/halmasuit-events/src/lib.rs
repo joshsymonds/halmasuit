@@ -55,6 +55,7 @@ pub const fn canonical_name(event: &Event) -> Option<&'static str> {
         // WallpaperUniformApplied is the observability marker the wallpaper
         // itself emits — giving it a name would let it re-trigger a write.
         Event::FrameRendered { .. }
+        | Event::FrameSuperseded { .. }
         | Event::Fatal { .. }
         | Event::GreeterKillFailed { .. }
         | Event::GreeterDiedPreAuth { .. }
@@ -171,6 +172,7 @@ mod tests {
                 None,
             ),
             (Event::GreeterDiedPreAuth { pid: 2 }, None),
+            (Event::FrameSuperseded { frame_id: 1 }, None),
             (
                 Event::FrameRendered {
                     frame_id: 1,

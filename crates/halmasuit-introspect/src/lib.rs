@@ -177,6 +177,14 @@ pub enum Event {
         /// gross content shifts without pixel-exact comparison.
         phash: u64,
     },
+    /// A deferred render-node split frame was replaced before the flip in
+    /// flight completed: the newer frame is presented in its place, so
+    /// `frame_id` is never presented or recorded. Emitted only by
+    /// halmasuit's `frame_audit` recording path, like `FrameRendered`.
+    FrameSuperseded {
+        /// The `frame_id` of the deferred render that was replaced.
+        frame_id: u64,
+    },
     /// First composite of a given layer role. For `Wallpaper` this
     /// is halmasuit's INTERNAL wallpaper plane (epic amendment
     /// G1/R3) — emitted once, before the first composited frame,
@@ -773,6 +781,13 @@ mod tests {
     }
 
     #[test]
+    fn event_frame_superseded_carries_replaced_frame_id() {
+        let v = round_trip(&Event::FrameSuperseded { frame_id: 226 });
+        assert_eq!(v["event"], "frame_superseded");
+        assert_eq!(v["frame_id"], 226);
+    }
+
+    #[test]
     fn event_greeter_died_pre_auth_carries_pid() {
         let v = round_trip(&Event::GreeterDiedPreAuth { pid: 4242 });
         assert_eq!(v["event"], "greeter_died_pre_auth");
@@ -891,6 +906,7 @@ mod tests {
                 error: "No such process (os error 3)".to_owned(),
             },
             Event::GreeterDiedPreAuth { pid: 2 },
+            Event::FrameSuperseded { frame_id: 1 },
             Event::FrameRendered {
                 frame_id: 1,
                 pixel_count: 4,
