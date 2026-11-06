@@ -13,13 +13,17 @@ import io
 import json
 import os
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import zlib
 from collections.abc import Callable
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import lab
@@ -33,6 +37,12 @@ BOX = "halmasuit-lab-k3x"
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 REMOTE_COMMAND = "sudo -n journalctl -b 0 -o json --all --no-pager"
 WAIT_SECONDS = 30
+OUTPUT = "DP-1"
+FRAME_COUNT = 64
+FRAME_SIZE = 4
+FIRST_MONO_US = 1_599_000
+FRAME_STEP_US = 500_000
+GREETER_FRAME = FRAME_COUNT - 1
 
 EC2_FAKE = r'''
 import json
@@ -244,6 +254,98 @@ def tar_command(frames_dir: str) -> str:
     return f"sudo -n tar -C {frames_dir} -cf - ."
 
 
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def frame_pixels(seq: int) -> bytes:
+    """The rgb8 pixels of one frame; each seq has its own colour."""
+    red, green, blue = (seq * 4) % 256, 255 - (seq * 4) % 256, (seq * 7) % 256
+    return bytes((red, green, blue)) * (FRAME_SIZE * FRAME_SIZE)
+
+
+def png_chunk(kind: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+
+def frame_png(seq: int) -> bytes:
+    """One frame as an 8-bit RGB PNG, encoded with zlib and struct alone."""
+    row = FRAME_SIZE * 3
+    pixels = frame_pixels(seq)
+    raw = b"".join(b"\x00" + pixels[y * row : (y + 1) * row] for y in range(FRAME_SIZE))
+    header = struct.pack(">IIBBBBB", FRAME_SIZE, FRAME_SIZE, 8, 2, 0, 0, 0)
+    return (
+        PNG_SIGNATURE
+        + png_chunk(b"IHDR", header)
+        + png_chunk(b"IDAT", zlib.compress(raw))
+        + png_chunk(b"IEND", b"")
+    )
+
+
+def png_pixels(data: bytes) -> bytes:
+    """The rgb8 pixels of a PNG as frame_png writes it: one IHDR, one IDAT, filter 0 on each row."""
+    assert data.startswith(PNG_SIGNATURE), "not a PNG"
+    chunks: dict[bytes, bytes] = {}
+    offset = len(PNG_SIGNATURE)
+    while offset < len(data):
+        (length,) = struct.unpack(">I", data[offset : offset + 4])
+        chunks[data[offset + 4 : offset + 8]] = data[offset + 8 : offset + 8 + length]
+        offset += 12 + length
+    width, height, depth, color = struct.unpack(">IIBB", chunks[b"IHDR"][:10])
+    assert (width, height, depth, color) == (FRAME_SIZE, FRAME_SIZE, 8, 2), (width, height, depth, color)
+    raw = zlib.decompress(chunks[b"IDAT"])
+    stride = 1 + width * 3
+    rows = []
+    for y in range(height):
+        assert raw[y * stride] == 0, f"row {y} filter {raw[y * stride]}"
+        rows.append(raw[y * stride + 1 : (y + 1) * stride])
+    return b"".join(rows)
+
+
+def index_line(seq: int, *, mono_us: int | None = None, dropped: int = 0) -> dict[str, Any]:
+    if mono_us is None:
+        mono_us = FIRST_MONO_US + FRAME_STEP_US * seq
+    return {
+        "seq": seq,
+        "output": OUTPUT,
+        "mono_us": mono_us,
+        "width": FRAME_SIZE,
+        "height": FRAME_SIZE,
+        "format": "rgb8",
+        "dropped": dropped,
+    }
+
+
+def write_index(path: Path, lines: list[dict[str, Any]]) -> None:
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+
+def write_recorder(directory: Path) -> None:
+    """A recorder directory as the box holds it: one output, a PNG and an index line per seq."""
+    (directory / OUTPUT).mkdir(parents=True)
+    for seq in range(FRAME_COUNT):
+        (directory / OUTPUT / f"{seq:08d}.png").write_bytes(frame_png(seq))
+    write_index(directory / "index.jsonl", [index_line(seq) for seq in range(FRAME_COUNT)])
+
+
+def decode_video(path: Path) -> bytes:
+    done = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        capture_output=True,
+        check=True,
+    )
+    return done.stdout
+
+
+def video_times_us(path: Path) -> list[Decimal]:
+    done = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries", "frame=pts_time", "-of", "csv=p=0", str(path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [Decimal(text) * 1_000_000 for text in done.stdout.split()]
+
+
 class FakeTools:
     """The fake ec2 and ssh executables in one temp directory, configured per test."""
 
@@ -260,9 +362,7 @@ class FakeTools:
             "ls_garbled_after_down": False,
         }
         served = root / "served-frames"
-        (served / "DP-1").mkdir(parents=True)
-        (served / "index.jsonl").write_text('{"frame": 0}\n{"frame": 1}\n')
-        (served / "DP-1" / "00000000.png").write_bytes(bytes(range(256)))
+        write_recorder(served)
         self.frames_source = served
         self.ssh_config = {
             "fails": False,
@@ -366,6 +466,9 @@ class RunnerTest(unittest.TestCase):
     def assert_frames_copied(self, frames_dir: str) -> None:
         self.assertEqual([call[-1] for call in self.frames_calls()], [tar_command(frames_dir)])
         self.assertEqual(tree(self.run_dir() / "frames"), tree(self.tools.frames_source))
+
+    def set_served_index(self, lines: list[dict[str, Any]]) -> None:
+        write_index(self.tools.frames_source / "index.jsonl", lines)
 
     def run_dir(self) -> Path:
         """The one run directory under state_root; a subprocess run stamps it from the real clock."""
@@ -484,7 +587,90 @@ class RunnerTest(unittest.TestCase):
         self.assert_frames_copied(DEFAULT_FRAMES_DIR)
         self.assertEqual(
             sorted(path.name for path in self.run_dir().iterdir()),
-            ["frames", "journal.json", "run.log", "timeline.json"],
+            ["DP-1-greeter.png", "DP-1.nut", "frames", "journal.json", "run.log", "timeline.json"],
+        )
+        self.assert_box_ended()
+
+    def test_pass_writes_each_video_and_the_greeter_png(self) -> None:
+        code, out = self.run_runner()
+        self.assertEqual(code, 0, out)
+        run_dir = self.run_dir()
+        video = run_dir / f"{OUTPUT}.nut"
+        self.assertEqual(decode_video(video), b"".join(png_pixels(frame_png(seq)) for seq in range(FRAME_COUNT)))
+        self.assertEqual(video_times_us(video), [Decimal(FRAME_STEP_US * seq) for seq in range(FRAME_COUNT)])
+        self.assertEqual((run_dir / f"{OUTPUT}-greeter.png").read_bytes(), frame_png(GREETER_FRAME))
+        self.assert_box_ended()
+
+    def test_index_starting_after_the_first_frame_fails_the_run(self) -> None:
+        self.set_served_index([index_line(seq) for seq in range(1, FRAME_COUNT)])
+        code, out = self.run_runner()
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            "FAIL ec2-greeter: recorder index starts at 2099000 us, after the first frame_rendered from pid 1184",
+            self.run_log(),
+        )
+        self.assert_box_ended()
+
+    def test_seq_gap_in_the_index_fails_the_run(self) -> None:
+        self.set_served_index([index_line(seq) for seq in range(FRAME_COUNT) if seq != 10])
+        code, out = self.run_runner()
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL ec2-greeter: boot-to-greeter frames: seq 10 missing", self.run_log())
+        self.assert_box_ended()
+
+    def test_dropped_frame_in_the_index_fails_the_run(self) -> None:
+        self.set_served_index([index_line(seq, dropped=1 if seq == 20 else 0) for seq in range(FRAME_COUNT)])
+        code, out = self.run_runner()
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            "FAIL ec2-greeter: dropped frames in boot-to-greeter window: DP-1 (1 line(s))",
+            self.run_log(),
+        )
+        self.assert_box_ended()
+
+    def test_malformed_index_fails_the_run_naming_the_line(self) -> None:
+        lines = [json.dumps(index_line(seq)) for seq in range(FRAME_COUNT)]
+        lines[2] = "not json"
+        (self.tools.frames_source / "index.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        code, out = self.run_runner()
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL ec2-greeter: recorder index unreadable: index.jsonl line 3: not JSON", self.run_log())
+        self.assert_box_ended()
+
+    def test_missing_index_fails_the_run(self) -> None:
+        (self.tools.frames_source / "index.jsonl").unlink()
+        code, out = self.run_runner()
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL ec2-greeter: recorder index unreadable: [Errno 2] No such file or directory", self.run_log())
+        self.assert_box_ended()
+
+    def test_missing_frame_file_fails_the_run(self) -> None:
+        (self.tools.frames_source / OUTPUT / f"{5:08d}.png").unlink()
+        code, out = self.run_runner()
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"FAIL ec2-greeter: frame file missing for {OUTPUT}", self.run_log())
+        self.assert_box_ended()
+
+    def test_failing_ffmpeg_fails_the_run(self) -> None:
+        code, out = self.run_runner("--ffmpeg", "false")
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"FAIL ec2-greeter: encode {OUTPUT} failed (rc 1)", self.run_log())
+        self.assert_box_ended()
+
+    def test_missing_ffmpeg_fails_the_run(self) -> None:
+        code, out = self.run_runner("--ffmpeg", str(self.tools.root / "no-such-ffmpeg"))
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"FAIL ec2-greeter: encode {OUTPUT} failed (rc 127)", self.run_log())
+        self.assert_box_ended()
+
+    def test_ffprobe_count_different_from_the_index_fails_the_run(self) -> None:
+        install(self.tools.root / "ffprobe-63", "print(63)\n")
+        code, out = self.run_runner("--ffprobe", str(self.tools.root / "ffprobe-63"))
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            f"FAIL ec2-greeter: video frame count differs from index: {OUTPUT} has 63 video frame(s) "
+            f"for {FRAME_COUNT} index line(s)",
+            self.run_log(),
         )
         self.assert_box_ended()
 
