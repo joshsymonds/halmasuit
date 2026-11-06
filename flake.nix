@@ -911,9 +911,9 @@
           halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-luks       = self.packages.x86_64-linux.halmasuit-luks;
         };
-        # `services.halmasuit.diagnostic.recordFrames` exports
-        # HALMASUIT_RECORD_FRAMES, creates the directory, and requires a
-        # frame_audit build; null leaves both units unchanged.
+        # `services.halmasuit.diagnostic.recordFrames`: eval checks (export,
+        # directory, frame_audit requirement, null unchanged) plus a VM test
+        # of the recorder on the render-node split and the DrmCompositor path.
         halmasuit-recorder = import ./tests/halmasuit-recorder.nix {
           system    = "x86_64-linux";
           inherit nixpkgs;

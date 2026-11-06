@@ -1260,11 +1260,10 @@ in
         # below); overriding `greeterGroup` is honored here too.
         Group = cfg.greeterGroup;
       } // lib.optionalAttrs (cfg.diagnostic.recordFrames != null) {
-        # Frame recording (`diagnostic.recordFrames`): the directory is
-        # created before the compositor drops privileges and stays
-        # writable under ProtectSystem=strict. The `+` prefix runs the
-        # command as root outside the unit's sandbox.
-        ExecStartPre  = "+${pkgs.coreutils}/bin/install -d -m 0700 -o ${toString cfg.compositorUid} ${cfg.diagnostic.recordFrames}";
+        # Frame recording (`diagnostic.recordFrames`): writable under
+        # ProtectSystem=strict. The directory must exist when the unit's
+        # mount namespace is set up; the tmpfiles rule below creates it
+        # before sysinit.target, which this unit is ordered after.
         ReadWritePaths = [ cfg.diagnostic.recordFrames ];
       };
 
@@ -1449,6 +1448,15 @@ in
        description  = lib.mkDefault "halmasuit greeter peer (SO_PEERCRED-authorized greetd client)";
      };
      users.groups.${cfg.greeterGroup}.gid = lib.mkDefault cfg.greeterUid;
+   })
+
+   # Frame recording directory for the rootfs unit: mode 0700, owned by
+   # the compositor uid it drops to.
+   (lib.mkIf (cfg.enable && cfg.diagnostic.recordFrames != null) {
+     systemd.tmpfiles.settings.halmasuit-record-frames.${cfg.diagnostic.recordFrames}.d = {
+       user = toString cfg.compositorUid;
+       mode = "0700";
+     };
    })
 
    # Frame recording needs the `frame_audit` build: the recorder is
