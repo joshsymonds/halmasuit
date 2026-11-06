@@ -136,7 +136,8 @@
         "event": "started",
         "pid": 1184,
         "version": "0.1.0"
-      }
+      },
+      "pid": 1184
     },
     {
       "t_us": 4673541,
@@ -147,7 +148,8 @@
       "payload": {
         "event": "phase_entered",
         "phase": "initramfs_init"
-      }
+      },
+      "pid": 1184
     },
     {
       "t_us": 4823541,
@@ -158,7 +160,8 @@
       "payload": {
         "event": "phase_entered",
         "phase": "drm_master_acquired"
-      }
+      },
+      "pid": 1184
     },
     {
       "t_us": 4833541,
@@ -169,7 +172,8 @@
       "payload": {
         "event": "phase_entered",
         "phase": "init"
-      }
+      },
+      "pid": 1184
     },
     {
       "t_us": 4835541,
@@ -180,7 +184,8 @@
       "payload": {
         "event": "phase_entered",
         "phase": "wayland_ready"
-      }
+      },
+      "pid": 1184
     },
     {
       "t_us": 4845541,
@@ -191,7 +196,8 @@
       "payload": {
         "event": "client_first_frame",
         "role": "wallpaper"
-      }
+      },
+      "pid": 1184
     },
     {
       "t_us": 4858541,
@@ -202,7 +208,8 @@
       "payload": {
         "event": "phase_entered",
         "phase": "scanout_active"
-      }
+      },
+      "pid": 1184
     },
     {
       "t_us": 4884741,
@@ -248,7 +255,8 @@
       "payload": {
         "event": "phase_entered",
         "phase": "rootfs_ready"
-      }
+      },
+      "pid": 1184
     },
     {
       "t_us": 5573541,
@@ -259,7 +267,8 @@
       "payload": {
         "event": "phase_entered",
         "phase": "greetd_ready"
-      }
+      },
+      "pid": 1184
     },
     {
       "t_us": 5578541,
@@ -270,7 +279,8 @@
       "payload": {
         "event": "greeter_spawned",
         "pid": 1459
-      }
+      },
+      "pid": 1184
     },
     {
       "t_us": 5579541,
@@ -281,7 +291,8 @@
       "payload": {
         "event": "foreground_changed",
         "to": "greeter"
-      }
+      },
+      "pid": 1184
     },
     {
       "t_us": 5581541,
@@ -292,7 +303,8 @@
       "payload": {
         "event": "phase_entered",
         "phase": "deprivileged"
-      }
+      },
+      "pid": 1184
     },
     {
       "t_us": 5593541,
@@ -303,7 +315,8 @@
       "payload": {
         "event": "client_first_frame",
         "role": "overlay"
-      }
+      },
+      "pid": 1184
     },
     {
       "t_us": 5884741,

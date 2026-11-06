@@ -1,0 +1,1959 @@
+{
+  "run": "synthetic-ec2-greeter",
+  "boot_id": "b007b007b007b007b007b007b007b007",
+  "clock": {
+    "zero": "cpu-reset",
+    "kernel_zero_us": null,
+    "kernel_zero_source": null
+  },
+  "firmware": {
+    "info": null,
+    "loader_init_us": null,
+    "loader_exec_us": null,
+    "fpdt": null
+  },
+  "firmware_mode": null,
+  "logo": null,
+  "events": [
+    {
+      "t_us": null,
+      "mono_us": 1000000,
+      "kind": "vkms-sampler-start",
+      "source": "lab-vkms-crc-initrd.service",
+      "detail": "start t=1000000"
+    },
+    {
+      "t_us": null,
+      "mono_us": 1010000,
+      "kind": "driver-display",
+      "source": "kernel",
+      "detail": "NVRM: loading NVIDIA UNIX Open Kernel Module for x86_64  615.78.08  Release Build  (nixbld@)  "
+    },
+    {
+      "t_us": null,
+      "mono_us": 1020000,
+      "kind": "driver-display",
+      "source": "kernel",
+      "detail": "[drm] Initialized nvidia-drm 0.0.0 for 0000:00:1e.0 on minor 2"
+    },
+    {
+      "t_us": null,
+      "mono_us": 1100000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc-initrd.service",
+      "detail": "sample card=card1 crtc=72 t=1100000 crc=00000000 active=0",
+      "head": "card1/crtc72",
+      "crc": "00000000",
+      "active": false
+    },
+    {
+      "t_us": null,
+      "mono_us": 1180000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "started",
+      "payload": {
+        "event": "started",
+        "pid": 1184,
+        "version": "0.1.0"
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 1190000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "phase_entered",
+      "payload": {
+        "event": "phase_entered",
+        "phase": "initramfs_init"
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 1200000,
+      "kind": "gl",
+      "source": "halmasuit.service",
+      "detail": "GL Version: \"OpenGL ES 3.2 NVIDIA 615.78.08\"",
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 1200010,
+      "kind": "gl",
+      "source": "halmasuit.service",
+      "detail": "GL Vendor: \"NVIDIA Corporation\"",
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 1200020,
+      "kind": "gl",
+      "source": "halmasuit.service",
+      "detail": "GL Renderer: \"Tesla T4/PCIe/SSE2\"",
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 1250000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc-initrd.service",
+      "detail": "sample card=card1 crtc=72 t=1250000 crc=00000000 active=0",
+      "head": "card1/crtc72",
+      "crc": "00000000",
+      "active": false
+    },
+    {
+      "t_us": null,
+      "mono_us": 1400000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc-initrd.service",
+      "detail": "sample card=card1 crtc=72 t=1400000 crc=00000000 active=0",
+      "head": "card1/crtc72",
+      "crc": "00000000",
+      "active": false
+    },
+    {
+      "t_us": null,
+      "mono_us": 1500000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "phase_entered",
+      "payload": {
+        "event": "phase_entered",
+        "phase": "drm_master_acquired"
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 1520000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "phase_entered",
+      "payload": {
+        "event": "phase_entered",
+        "phase": "init"
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 1530000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "phase_entered",
+      "payload": {
+        "event": "phase_entered",
+        "phase": "wayland_ready"
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 1540000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "client_first_frame",
+      "payload": {
+        "event": "client_first_frame",
+        "role": "wallpaper"
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 1600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 0,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 19088743
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 2100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 1,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 11400714819342287228
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 2600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 2,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 4354685564955934097
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 2900000,
+      "kind": "vkms-sampler-start",
+      "source": "lab-vkms-crc.service",
+      "detail": "start t=2900000"
+    },
+    {
+      "t_us": null,
+      "mono_us": 2950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=2950000 crc=00001000 active=1",
+      "head": "card1/crtc72",
+      "crc": "00001000",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 2985000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "phase_entered",
+      "payload": {
+        "event": "phase_entered",
+        "phase": "rootfs_ready"
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 2990000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "phase_entered",
+      "payload": {
+        "event": "phase_entered",
+        "phase": "greetd_ready"
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 2995000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "greeter_spawned",
+      "payload": {
+        "event": "greeter_spawned",
+        "pid": 1459
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 2996000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "foreground_changed",
+      "payload": {
+        "event": "foreground_changed",
+        "to": "greeter"
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 2998000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "phase_entered",
+      "payload": {
+        "event": "phase_entered",
+        "phase": "deprivileged"
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 3010000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "client_first_frame",
+      "payload": {
+        "event": "client_first_frame",
+        "role": "overlay"
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 3100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 3,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 15755400384279132582
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 3450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=3450000 crc=9e3789b1 active=1",
+      "head": "card1/crtc72",
+      "crc": "9e3789b1",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 3600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 4,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 8709371129892779451
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 3950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=3950000 crc=3c6f0362 active=1",
+      "head": "card1/crtc72",
+      "crc": "3c6f0362",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 4100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 5,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 1663341875506426320
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 4450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=4450000 crc=d0a67d13 active=1",
+      "head": "card1/crtc72",
+      "crc": "d0a67d13",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 4600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 6,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 13064056694829624805
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 4950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=4950000 crc=78ddf6c4 active=1",
+      "head": "card1/crtc72",
+      "crc": "78ddf6c4",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 5100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 7,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 6018027440443271674
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 5450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=5450000 crc=17157075 active=1",
+      "head": "card1/crtc72",
+      "crc": "17157075",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 5600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 8,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 17418742259766470159
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 5950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=5950000 crc=b54cea26 active=1",
+      "head": "card1/crtc72",
+      "crc": "b54cea26",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 6100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 9,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 10372713005380117028
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 6450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=6450000 crc=538463d7 active=1",
+      "head": "card1/crtc72",
+      "crc": "538463d7",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 6600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 10,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 3326683750993763897
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 6950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=6950000 crc=f1bbdd88 active=1",
+      "head": "card1/crtc72",
+      "crc": "f1bbdd88",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 7100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 11,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 14727398570316962382
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 7450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=7450000 crc=8ff35739 active=1",
+      "head": "card1/crtc72",
+      "crc": "8ff35739",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 7600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 12,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 7681369315930609251
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 7950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=7950000 crc=2e2ad0ea active=1",
+      "head": "card1/crtc72",
+      "crc": "2e2ad0ea",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 8100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 13,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 635340061544256120
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 8450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=8450000 crc=cc624a9b active=1",
+      "head": "card1/crtc72",
+      "crc": "cc624a9b",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 8600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 14,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 12036054880867454605
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 8950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=8950000 crc=6a99c44c active=1",
+      "head": "card1/crtc72",
+      "crc": "6a99c44c",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 9100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 15,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 4990025626481101474
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 9450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=9450000 crc=08d13dfd active=1",
+      "head": "card1/crtc72",
+      "crc": "08d13dfd",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 9600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 16,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 16390740445804299959
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 9950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=9950000 crc=a708b7ae active=1",
+      "head": "card1/crtc72",
+      "crc": "a708b7ae",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 10100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 17,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 9344711191417946828
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 10450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=10450000 crc=4540315f active=1",
+      "head": "card1/crtc72",
+      "crc": "4540315f",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 10600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 18,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 2298681937031593697
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 10950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=10950000 crc=e377ab10 active=1",
+      "head": "card1/crtc72",
+      "crc": "e377ab10",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 11100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 19,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 13699396756354792182
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 11450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=11450000 crc=81af24c1 active=1",
+      "head": "card1/crtc72",
+      "crc": "81af24c1",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 11600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 20,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 6653367501968439051
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 11950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=11950000 crc=1fe69e72 active=1",
+      "head": "card1/crtc72",
+      "crc": "1fe69e72",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 12100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 21,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 18054082321291637536
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 12450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=12450000 crc=be1e1823 active=1",
+      "head": "card1/crtc72",
+      "crc": "be1e1823",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 12600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 22,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 11008053066905284405
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 12950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=12950000 crc=5c5591d4 active=1",
+      "head": "card1/crtc72",
+      "crc": "5c5591d4",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 13100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 23,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 3962023812518931274
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 13450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=13450000 crc=fa8d0b85 active=1",
+      "head": "card1/crtc72",
+      "crc": "fa8d0b85",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 13600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 24,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 15362738631842129759
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 13950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=13950000 crc=98c48536 active=1",
+      "head": "card1/crtc72",
+      "crc": "98c48536",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 14100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 25,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 8316709377455776628
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 14450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=14450000 crc=36fbfee7 active=1",
+      "head": "card1/crtc72",
+      "crc": "36fbfee7",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 14600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 26,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 1270680123069423497
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 14950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=14950000 crc=d5337898 active=1",
+      "head": "card1/crtc72",
+      "crc": "d5337898",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 15100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 27,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 12671394942392621982
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 15450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=15450000 crc=736af249 active=1",
+      "head": "card1/crtc72",
+      "crc": "736af249",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 15600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 28,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 5625365688006268851
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 15950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=15950000 crc=11a26bfa active=1",
+      "head": "card1/crtc72",
+      "crc": "11a26bfa",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 16100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 29,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 17026080507329467336
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 16450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=16450000 crc=afd9e5ab active=1",
+      "head": "card1/crtc72",
+      "crc": "afd9e5ab",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 16600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 30,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 9980051252943114205
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 16950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=16950000 crc=4e115f5c active=1",
+      "head": "card1/crtc72",
+      "crc": "4e115f5c",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 17100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 31,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 2934021998556761074
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 17450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=17450000 crc=ec48d90d active=1",
+      "head": "card1/crtc72",
+      "crc": "ec48d90d",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 17600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 32,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 14334736817879959559
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 17950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=17950000 crc=8a8052be active=1",
+      "head": "card1/crtc72",
+      "crc": "8a8052be",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 18100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 33,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 7288707563493606428
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 18450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=18450000 crc=28b7cc6f active=1",
+      "head": "card1/crtc72",
+      "crc": "28b7cc6f",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 18600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 34,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 242678309107253297
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 18950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=18950000 crc=c6ef4620 active=1",
+      "head": "card1/crtc72",
+      "crc": "c6ef4620",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 19100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 35,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 11643393128430451782
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 19450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=19450000 crc=6526bfd1 active=1",
+      "head": "card1/crtc72",
+      "crc": "6526bfd1",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 19600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 36,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 4597363874044098651
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 19950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=19950000 crc=035e3982 active=1",
+      "head": "card1/crtc72",
+      "crc": "035e3982",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 20100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 37,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 15998078693367297136
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 20450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=20450000 crc=a195b333 active=1",
+      "head": "card1/crtc72",
+      "crc": "a195b333",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 20600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 38,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 8952049438980944005
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 20950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=20950000 crc=3fcd2ce4 active=1",
+      "head": "card1/crtc72",
+      "crc": "3fcd2ce4",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 21100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 39,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 1906020184594590874
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 21450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=21450000 crc=de04a695 active=1",
+      "head": "card1/crtc72",
+      "crc": "de04a695",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 21600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 40,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 13306735003917789359
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 21950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=21950000 crc=7c3c2046 active=1",
+      "head": "card1/crtc72",
+      "crc": "7c3c2046",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 22100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 41,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 6260705749531436228
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 22450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=22450000 crc=1a7399f7 active=1",
+      "head": "card1/crtc72",
+      "crc": "1a7399f7",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 22600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 42,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 17661420568854634713
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 22950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=22950000 crc=b8ab13a8 active=1",
+      "head": "card1/crtc72",
+      "crc": "b8ab13a8",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 23100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 43,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 10615391314468281582
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 23450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=23450000 crc=56e28d59 active=1",
+      "head": "card1/crtc72",
+      "crc": "56e28d59",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 23600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 44,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 3569362060081928451
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 23950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=23950000 crc=f51a070a active=1",
+      "head": "card1/crtc72",
+      "crc": "f51a070a",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 24100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 45,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 14970076879405126936
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 24450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=24450000 crc=935180bb active=1",
+      "head": "card1/crtc72",
+      "crc": "935180bb",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 24600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 46,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 7924047625018773805
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 24950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=24950000 crc=3188fa6c active=1",
+      "head": "card1/crtc72",
+      "crc": "3188fa6c",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 25100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 47,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 878018370632420674
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 25450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=25450000 crc=cfc0741d active=1",
+      "head": "card1/crtc72",
+      "crc": "cfc0741d",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 25600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 48,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 12278733189955619159
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 25950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=25950000 crc=6df7edce active=1",
+      "head": "card1/crtc72",
+      "crc": "6df7edce",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 26100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 49,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 5232703935569266028
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 26450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=26450000 crc=0c2f677f active=1",
+      "head": "card1/crtc72",
+      "crc": "0c2f677f",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 26600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 50,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 16633418754892464513
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 26950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=26950000 crc=aa66e130 active=1",
+      "head": "card1/crtc72",
+      "crc": "aa66e130",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 27100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 51,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 9587389500506111382
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 27450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=27450000 crc=489e5ae1 active=1",
+      "head": "card1/crtc72",
+      "crc": "489e5ae1",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 27600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 52,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 2541360246119758251
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 27950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=27950000 crc=e6d5d492 active=1",
+      "head": "card1/crtc72",
+      "crc": "e6d5d492",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 28100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 53,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 13942075065442956736
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 28450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=28450000 crc=850d4e43 active=1",
+      "head": "card1/crtc72",
+      "crc": "850d4e43",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 28600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 54,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 6896045811056603605
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 28950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=28950000 crc=2344c7f4 active=1",
+      "head": "card1/crtc72",
+      "crc": "2344c7f4",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 29100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 55,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 18296760630379802090
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 29450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=29450000 crc=c17c41a5 active=1",
+      "head": "card1/crtc72",
+      "crc": "c17c41a5",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 29600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 56,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 11250731375993448959
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 29950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=29950000 crc=5fb3bb56 active=1",
+      "head": "card1/crtc72",
+      "crc": "5fb3bb56",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 30100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 57,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 4204702121607095828
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 30450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=30450000 crc=fdeb3507 active=1",
+      "head": "card1/crtc72",
+      "crc": "fdeb3507",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 30600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 58,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 15605416940930294313
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 30950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=30950000 crc=9c22aeb8 active=1",
+      "head": "card1/crtc72",
+      "crc": "9c22aeb8",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 31100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 59,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 8559387686543941182
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 31450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=31450000 crc=3a5a2869 active=1",
+      "head": "card1/crtc72",
+      "crc": "3a5a2869",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 31600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 60,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 1513358432157588051
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 31950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=31950000 crc=d891a21a active=1",
+      "head": "card1/crtc72",
+      "crc": "d891a21a",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 32100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 61,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 12914073251480786536
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 32450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=32450000 crc=76c91bcb active=1",
+      "head": "card1/crtc72",
+      "crc": "76c91bcb",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 32600000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 62,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 5868043997094433405
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 32950000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=32950000 crc=1500957c active=1",
+      "head": "card1/crtc72",
+      "crc": "1500957c",
+      "active": true
+    },
+    {
+      "t_us": null,
+      "mono_us": 33100000,
+      "kind": "halmasuit",
+      "source": "halmasuit.service",
+      "detail": "frame_rendered",
+      "payload": {
+        "event": "frame_rendered",
+        "frame_id": 63,
+        "pixel_count": 3686400,
+        "clear_pixel_count": 0,
+        "black_pixel_count": 0,
+        "degenerate": false,
+        "phash": 17268758816417631890
+      },
+      "pid": 1184
+    },
+    {
+      "t_us": null,
+      "mono_us": 33450000,
+      "kind": "vkms-crc",
+      "source": "lab-vkms-crc.service",
+      "detail": "sample card=card1 crtc=72 t=33450000 crc=b3380f2d active=1",
+      "head": "card1/crtc72",
+      "crc": "b3380f2d",
+      "active": true
+    }
+  ],
+  "heads": {},
+  "sampler_starts": [],
+  "greetd_started": null,
+  "greeter_first_appearance": {},
+  "probe": []
+}

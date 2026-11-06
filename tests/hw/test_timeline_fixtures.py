@@ -7,8 +7,10 @@ Runs are read in place: build_timeline never writes into the fixture. The
 synthetic-baseline, gnomon-baseline, synthetic-bios-shader-greeter,
 synthetic-production, and synthetic-attended-login runs also assert their story
 facts by hand, so a golden file regenerated from a broken timeline still fails.
+The synthetic-ec2-greeter run does the same for the ec2-greeter profile.
 """
 
+import copy
 import errno
 import itertools
 import json
@@ -28,6 +30,28 @@ GNOMON_RUN = FIXTURE_ROOT / "gnomon-baseline"
 BIOS_RUN = FIXTURE_ROOT / "synthetic-bios-shader-greeter"
 PRODUCTION_RUN = FIXTURE_ROOT / "synthetic-production"
 ATTENDED_RUN = FIXTURE_ROOT / "synthetic-attended-login"
+EC2_RUN = FIXTURE_ROOT / "synthetic-ec2-greeter"
+EC2_HALMASUIT_PID = 1184
+EC2_OTHER_PID = 1185
+EC2_GREETER_PID = 1459
+EC2_HEAD = "card1/crtc72"
+EC2_INITRD_VKMS = "lab-vkms-crc-initrd.service"
+EC2_ROOTFS_VKMS = "lab-vkms-crc.service"
+EC2_GL_LINES = (
+    'GL Version: "OpenGL ES 3.2 NVIDIA 615.78.08"',
+    'GL Vendor: "NVIDIA Corporation"',
+    'GL Renderer: "Tesla T4/PCIe/SSE2"',
+)
+EC2_GL_MONOS = (1_200_000, 1_200_010, 1_200_020)
+EC2_STAGE1_SAMPLE_MONOS = (1_100_000, 1_250_000, 1_400_000)
+EC2_DRM_MASTER_MONO = 1_500_000
+EC2_EARLY_SAMPLE_MONO = 1_550_000
+EC2_FIRST_FRAME_MONO = 1_600_000
+EC2_FRAME_INTERVAL_US = 500_000
+EC2_FRAME_COUNT = 64
+EC2_ROOTFS_FIRST_SAMPLE_MONO = 2_950_000
+EC2_ROOTFS_SAMPLE_COUNT = 62
+EC2_GREETER_MONO = 2_996_000
 # exitbootservice_end_ns is 2_583_541_217, which floors to 2_583_541 us.
 KERNEL_ZERO_US = 2_583_541
 # Recorded gnomon boot: exitbootservice_end_ns floors to 19_664_764 us.
@@ -160,6 +184,9 @@ class FixtureReplayTest(unittest.TestCase):
 
     def test_attended_fixture_is_committed(self):
         self.assertIn(ATTENDED_RUN, fixture_runs())
+
+    def test_ec2_fixture_is_committed(self):
+        self.assertIn(EC2_RUN, fixture_runs())
 
     def test_every_fixture_matches_expected_timeline(self):
         for run in fixture_runs():
@@ -387,6 +414,7 @@ class BiosShaderGreeterStoryTest(unittest.TestCase):
                     "source": HALMASUIT_UNIT,
                     "detail": "foreground_changed",
                     "payload": greeter_payload,
+                    "pid": 1184,
                 }
             ],
         )
@@ -592,6 +620,7 @@ class ProductionStoryTest(unittest.TestCase):
                     "source": HALMASUIT_UNIT,
                     "detail": "foreground_changed",
                     "payload": greeter_payload,
+                    "pid": 1184,
                 }
             ],
         )
@@ -924,6 +953,278 @@ class AttendedLoginShapeTest(unittest.TestCase):
         for message in messages:
             with self.subTest(message=message):
                 self.assertRegex(message, SAMPLE_LINE)
+
+
+def ec2_events(timed_events, kind):
+    return [event for event in timed_events if event["kind"] == kind]
+
+
+def ec2_payloads(timeline_doc, name):
+    return [
+        event
+        for event in ec2_events(timeline_doc["events"], "halmasuit")
+        if event["payload"].get("event") == name
+    ]
+
+
+def ec2_stage_one_samples(timeline_doc):
+    return [
+        event
+        for event in ec2_events(timeline_doc["events"], "vkms-crc")
+        if "active" in event and event["source"] == EC2_INITRD_VKMS
+    ]
+
+
+def ec2_frames(timeline_doc):
+    return ec2_payloads(timeline_doc, "frame_rendered")
+
+
+class Ec2GreeterStoryTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.timeline = replay(EC2_RUN)
+
+    def test_run_is_journal_only_so_no_time_is_anchored(self):
+        self.assertFalse((EC2_RUN / "firmware").exists())
+        self.assertIsNone(self.timeline["clock"]["kernel_zero_us"])
+        self.assertTrue(self.timeline["events"])
+        self.assertTrue(all(event["t_us"] is None for event in self.timeline["events"]))
+
+    def test_halmasuit_starts_once_under_one_pid_in_the_initrd(self):
+        started = ec2_payloads(self.timeline, "started")
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0]["mono_us"], 1_180_000)
+        self.assertEqual(started[0]["payload"], {"event": "started", "pid": EC2_HALMASUIT_PID, "version": "0.1.0"})
+        halmasuit = ec2_events(self.timeline["events"], "halmasuit")
+        self.assertEqual({event["pid"] for event in halmasuit}, {EC2_HALMASUIT_PID})
+
+    def test_gl_lines_name_nvidia_from_the_halmasuit_pid(self):
+        gl = ec2_events(self.timeline["events"], "gl")
+        self.assertEqual(
+            [(event["mono_us"], event["detail"], event["pid"]) for event in gl],
+            [(mono, line, EC2_HALMASUIT_PID) for mono, line in zip(EC2_GL_MONOS, EC2_GL_LINES)],
+        )
+
+    def test_drm_master_is_acquired_once_at_its_time(self):
+        phases = ec2_payloads(self.timeline, "phase_entered")
+        master = [event["mono_us"] for event in phases if event["payload"]["phase"] == "drm_master_acquired"]
+        self.assertEqual(master, [EC2_DRM_MASTER_MONO])
+
+    def test_stage_one_samples_are_inactive_and_precede_drm_master(self):
+        samples = ec2_stage_one_samples(self.timeline)
+        self.assertEqual(
+            [(event["mono_us"], event["active"], event["head"]) for event in samples],
+            [(mono, False, EC2_HEAD) for mono in EC2_STAGE1_SAMPLE_MONOS],
+        )
+        self.assertTrue(all(event["mono_us"] < EC2_DRM_MASTER_MONO for event in samples))
+
+    def test_sampler_starts_are_initrd_then_rootfs_and_no_lab_crc_start(self):
+        starts = ec2_events(self.timeline["events"], "vkms-sampler-start")
+        self.assertEqual(
+            [(event["source"], event["mono_us"]) for event in starts],
+            [(EC2_INITRD_VKMS, 1_000_000), (EC2_ROOTFS_VKMS, 2_900_000)],
+        )
+        self.assertEqual(self.timeline["sampler_starts"], [])
+
+    def test_rootfs_samples_are_active_every_half_second_past_the_hold(self):
+        rootfs = [
+            event
+            for event in ec2_events(self.timeline["events"], "vkms-crc")
+            if event["source"] == EC2_ROOTFS_VKMS
+        ]
+        self.assertEqual(
+            [event["mono_us"] for event in rootfs],
+            [EC2_ROOTFS_FIRST_SAMPLE_MONO + EC2_FRAME_INTERVAL_US * k for k in range(EC2_ROOTFS_SAMPLE_COUNT)],
+        )
+        self.assertTrue(all(event["active"] and event["head"] == EC2_HEAD for event in rootfs))
+
+    def test_frames_run_every_half_second_from_the_first_frame(self):
+        frames = ec2_frames(self.timeline)
+        self.assertEqual(
+            [event["mono_us"] for event in frames],
+            [EC2_FIRST_FRAME_MONO + EC2_FRAME_INTERVAL_US * i for i in range(EC2_FRAME_COUNT)],
+        )
+        self.assertEqual([event["payload"]["frame_id"] for event in frames], list(range(EC2_FRAME_COUNT)))
+        self.assertEqual({event["pid"] for event in frames}, {EC2_HALMASUIT_PID})
+        self.assertTrue(all(event["payload"]["degenerate"] is False for event in frames))
+
+    def test_first_active_sample_follows_the_first_frame(self):
+        first_frame = min(event["mono_us"] for event in ec2_frames(self.timeline))
+        active = [
+            event
+            for event in ec2_events(self.timeline["events"], "vkms-crc")
+            if event["active"] and event["mono_us"] > first_frame
+        ]
+        self.assertEqual(active[0]["mono_us"], EC2_ROOTFS_FIRST_SAMPLE_MONO)
+
+    def test_greeter_is_spawned_and_foreground_then_overlay_draws(self):
+        spawned = ec2_payloads(self.timeline, "greeter_spawned")
+        self.assertEqual(
+            [(event["mono_us"], event["payload"]) for event in spawned],
+            [(2_995_000, {"event": "greeter_spawned", "pid": EC2_GREETER_PID})],
+        )
+        foreground = [
+            event["mono_us"]
+            for event in ec2_payloads(self.timeline, "foreground_changed")
+            if event["payload"]["to"] == "greeter"
+        ]
+        self.assertEqual(foreground, [EC2_GREETER_MONO])
+        overlay = [
+            event["mono_us"]
+            for event in ec2_payloads(self.timeline, "client_first_frame")
+            if event["payload"]["role"] == "overlay"
+        ]
+        self.assertEqual(overlay, [3_010_000])
+
+    def test_journal_runs_thirty_seconds_past_the_greeter(self):
+        last = max(event["mono_us"] for event in self.timeline["events"] if event["mono_us"] is not None)
+        self.assertGreaterEqual(last - EC2_GREETER_MONO, 30_000_000)
+
+    def test_ec2_greeter_profile_passes(self):
+        self.assertEqual(timeline.PROFILES["ec2-greeter"](self.timeline), [])
+
+
+class Ec2GreeterChecksTest(unittest.TestCase):
+    """Each check fails alone, with its message, on a copy of the EC2 timeline altered to break it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.timeline = replay(EC2_RUN)
+
+    def failures_after(self, transform):
+        altered = {**self.timeline, "events": transform(copy.deepcopy(self.timeline["events"]))}
+        return timeline.PROFILES["ec2-greeter"](altered)
+
+    def test_unaltered_run_has_no_failures(self):
+        self.assertEqual(self.failures_after(lambda events: events), [])
+
+    def test_started_must_be_exactly_one(self):
+        def duplicate(events):
+            return events + [event for event in events if is_started(event)]
+
+        self.assertEqual(
+            self.failures_after(duplicate),
+            ["2 halmasuit started events; expected exactly one"],
+        )
+
+    def test_started_must_carry_a_pid(self):
+        def unpid(events):
+            return [
+                {**event, "payload": {key: value for key, value in event["payload"].items() if key != "pid"}}
+                if is_started(event)
+                else event
+                for event in events
+            ]
+
+        self.assertEqual(self.failures_after(unpid), ["started event carries no pid"])
+
+    def test_greeter_foreground_is_required(self):
+        def drop(events):
+            return [event for event in events if not is_payload(event, "foreground_changed", to="greeter")]
+
+        self.assertEqual(self.failures_after(drop), ["no foreground_changed{to: greeter}"])
+
+    def test_frame_from_the_started_pid_is_required(self):
+        def reparent(events):
+            return [{**event, "pid": EC2_OTHER_PID} if is_frame(event) else event for event in events]
+
+        self.assertEqual(self.failures_after(reparent), [f"no frame_rendered from pid {EC2_HALMASUIT_PID}"])
+
+    def test_gl_vendor_from_the_started_pid_is_required(self):
+        def reparent(events):
+            return [{**event, "pid": EC2_OTHER_PID} if is_gl_vendor(event) else event for event in events]
+
+        self.assertEqual(self.failures_after(reparent), [f"no GL Vendor line from pid {EC2_HALMASUIT_PID}"])
+
+    def test_every_gl_vendor_must_name_nvidia(self):
+        def add_mesa_vendor(events):
+            vendor = next(event for event in events if is_gl_vendor(event))
+            return events + [{**vendor, "detail": 'GL Vendor: "Mesa"'}]
+
+        self.assertEqual(
+            self.failures_after(add_mesa_vendor),
+            ['GL Vendor is not NVIDIA: GL Vendor: "Mesa"'],
+        )
+
+    def test_drm_master_is_required(self):
+        def drop(events):
+            return [event for event in events if not is_payload(event, "phase_entered", phase="drm_master_acquired")]
+
+        self.assertEqual(self.failures_after(drop), ["drm_master_acquired missing"])
+
+    def test_initrd_sampler_start_is_required(self):
+        def drop(events):
+            return [
+                event
+                for event in events
+                if not (event["kind"] == "vkms-sampler-start" and event["source"] == EC2_INITRD_VKMS)
+            ]
+
+        self.assertEqual(
+            self.failures_after(drop),
+            [f"no lab-vkms-crc start from {EC2_INITRD_VKMS}"],
+        )
+
+    def test_vkms_sample_before_drm_master_is_required(self):
+        def drop(events):
+            return [event for event in events if not (is_vkms_sample(event) and before_master(event))]
+
+        self.assertEqual(self.failures_after(drop), ["no vkms sample before drm_master_acquired"])
+
+    def test_no_vkms_sample_before_drm_master_is_active(self):
+        def activate_first_pre_master(events):
+            first = min(
+                (event for event in events if is_vkms_sample(event) and before_master(event)),
+                key=lambda event: event["mono_us"],
+            )
+            return [{**event, "active": True} if event is first else event for event in events]
+
+        self.assertEqual(
+            self.failures_after(activate_first_pre_master),
+            ["vkms sample active before drm_master_acquired on: card1/crtc72"],
+        )
+
+    def test_active_vkms_sample_after_the_first_frame_is_required(self):
+        def move_activity_before_first_frame(events):
+            template = next(event for event in events if is_vkms_sample(event) and event["active"])
+            kept = [
+                {**event, "active": False}
+                if is_vkms_sample(event) and event["active"] and event["mono_us"] > EC2_FIRST_FRAME_MONO
+                else event
+                for event in events
+            ]
+            return kept + [{**template, "mono_us": EC2_EARLY_SAMPLE_MONO}]
+
+        self.assertEqual(
+            self.failures_after(move_activity_before_first_frame),
+            [f"no active vkms sample after the first frame_rendered from pid {EC2_HALMASUIT_PID}"],
+        )
+
+
+def is_payload(event, name, **fields):
+    return event["kind"] == "halmasuit" and event["payload"].get("event") == name and all(
+        event["payload"].get(key) == value for key, value in fields.items()
+    )
+
+
+def is_started(event):
+    return is_payload(event, "started")
+
+
+def is_frame(event):
+    return is_payload(event, "frame_rendered")
+
+
+def is_gl_vendor(event):
+    return event["kind"] == "gl" and event["detail"].startswith("GL Vendor: ")
+
+
+def is_vkms_sample(event):
+    return event["kind"] == "vkms-crc" and "active" in event
+
+
+def before_master(event):
+    return event["mono_us"] < EC2_DRM_MASTER_MONO
 
 
 if __name__ == "__main__":

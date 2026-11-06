@@ -29,6 +29,9 @@ JOURNAL = "journal.json"
 INITRD_UNIT = "lab-crc-initrd.service"
 ROOTFS_UNIT = "lab-crc.service"
 HALMASUIT_UNIT = "halmasuit.service"
+VKMS_IDENTIFIER = "lab-vkms-crc"
+VKMS_INITRD_UNIT = "lab-vkms-crc-initrd.service"
+GL_TARGET = "smithay::backend::renderer::gles"
 FATAL_ERRNO = "lab-crc: nvidia card fd lost: No such device"
 FATAL_BARE = "lab-crc: nvidia card fd lost"
 TIMELINE_KEYS = {
@@ -65,6 +68,7 @@ def journal_line(
     started_unit="",
     message_id="",
     as_bytes=False,
+    pid=None,
 ):
     fields = {
         "MESSAGE": list(message.encode()) if as_bytes else message,
@@ -78,6 +82,8 @@ def journal_line(
         fields["_SOURCE_MONOTONIC_TIMESTAMP"] = str(source)
     if unit:
         fields["_SYSTEMD_UNIT"] = unit
+    if pid is not None:
+        fields["_PID"] = str(pid)
     if started_unit:
         fields["UNIT"] = started_unit
     if message_id:
@@ -227,7 +233,7 @@ def tracing_line(json_field, *, target="halmasuit::event", level="INFO"):
     )
 
 
-def halmasuit_line(event, *, mono, unit=HALMASUIT_UNIT, as_bytes=False):
+def halmasuit_line(event, *, mono, unit=HALMASUIT_UNIT, as_bytes=False, pid=None):
     return journal_line(
         tracing_line(json.dumps(event)),
         identifier="halmasuit",
@@ -235,7 +241,31 @@ def halmasuit_line(event, *, mono, unit=HALMASUIT_UNIT, as_bytes=False):
         unit=unit,
         mono=mono,
         as_bytes=as_bytes,
+        pid=pid,
     )
+
+
+def gl_line(message, *, mono, pid=None, target=GL_TARGET):
+    line = json.dumps(
+        {
+            "timestamp": "2026-10-22T00:00:00.000000Z",
+            "level": "INFO",
+            "fields": {"message": message},
+            "target": target,
+        }
+    )
+    return journal_line(
+        line, identifier="halmasuit", transport="stdout", unit=HALMASUIT_UNIT, mono=mono, pid=pid
+    )
+
+
+def vkms_sample(card, crtc, t_us, active, *, crc="1a2b3c4d", unit=VKMS_INITRD_UNIT):
+    message = f"sample card={card} crtc={crtc} t={t_us} crc={crc} active={active}"
+    return journal_line(message, identifier=VKMS_IDENTIFIER, unit=unit)
+
+
+def vkms_line(message, *, unit=VKMS_INITRD_UNIT):
+    return journal_line(message, identifier=VKMS_IDENTIFIER, unit=unit)
 
 
 def frame_payload(frame_id, *, phash=18364758544493064720):
@@ -633,6 +663,13 @@ class EventTest(unittest.TestCase):
 
 
 class HalmasuitEventTest(unittest.TestCase):
+    def test_event_carries_the_journal_pid_as_an_int(self):
+        files = with_journal(
+            complete_files(),
+            journal_of(complete_files()) + [halmasuit_line(STARTED_PAYLOAD, mono=1_300_000, pid=1184)],
+        )
+        self.assertEqual(one_event(build(files), "started")["pid"], 1184)
+
     def test_each_event_carries_its_detail_and_exact_payload(self):
         cases = [
             (PHASE_PAYLOAD, 1_300_000),
@@ -656,6 +693,7 @@ class HalmasuitEventTest(unittest.TestCase):
                         "source": HALMASUIT_UNIT,
                         "detail": payload["event"],
                         "payload": payload,
+                        "pid": None,
                     },
                 )
 
@@ -735,6 +773,142 @@ class HalmasuitEventTest(unittest.TestCase):
         doc = build(with_journal(complete_files(), journal_of(complete_files()) + lines))
         self.assertEqual([event["mono_us"] for event in halmasuit_events(doc)], [1_700_400])
         self.assertEqual(one_event(doc, "client_first_frame")["payload"], CLIENT_PAYLOAD)
+
+
+class GlLineTest(unittest.TestCase):
+    def test_gl_lines_are_gl_events_with_detail_and_pid(self):
+        version = 'GL Version: "OpenGL ES 3.2 NVIDIA 615.78.08"'
+        vendor = 'GL Vendor: "NVIDIA Corporation"'
+        renderer = 'GL Renderer: "Tesla T4/PCIe/SSE2"'
+        lines = [
+            gl_line(version, mono=1_200_000, pid=1184),
+            gl_line(vendor, mono=1_200_001, pid=1184),
+            gl_line(renderer, mono=1_200_002),
+        ]
+        doc = build(with_journal(complete_files(), journal_of(complete_files()) + lines))
+        self.assertEqual(
+            [event for event in doc["events"] if event["kind"] == "gl"],
+            [
+                {
+                    "t_us": KERNEL_ZERO_FPDT_US + 1_200_000,
+                    "mono_us": 1_200_000,
+                    "kind": "gl",
+                    "source": HALMASUIT_UNIT,
+                    "detail": version,
+                    "pid": 1184,
+                },
+                {
+                    "t_us": KERNEL_ZERO_FPDT_US + 1_200_001,
+                    "mono_us": 1_200_001,
+                    "kind": "gl",
+                    "source": HALMASUIT_UNIT,
+                    "detail": vendor,
+                    "pid": 1184,
+                },
+                {
+                    "t_us": KERNEL_ZERO_FPDT_US + 1_200_002,
+                    "mono_us": 1_200_002,
+                    "kind": "gl",
+                    "source": HALMASUIT_UNIT,
+                    "detail": renderer,
+                    "pid": None,
+                },
+            ],
+        )
+
+    def test_other_gl_messages_targets_and_plain_text_are_not_gl_events(self):
+        lines = [
+            gl_line('GL Extensions: ["GL_KHR_debug"]', mono=1_200_000, pid=1184),
+            gl_line('GL Vendor: "NVIDIA Corporation"', mono=1_200_001, pid=1184, target="smithay::backend::egl::display"),
+            journal_line(
+                'GL Vendor: "NVIDIA Corporation"',
+                identifier="halmasuit",
+                transport="stdout",
+                unit=HALMASUIT_UNIT,
+                mono=1_200_002,
+            ),
+        ]
+        doc = build(with_journal(complete_files(), journal_of(complete_files()) + lines))
+        self.assertFalse([event for event in doc["events"] if event["kind"] == "gl"])
+
+
+class VkmsCrcTest(unittest.TestCase):
+    def test_start_is_a_vkms_sampler_start_event(self):
+        message = "start t=1600000"
+        doc = build(with_journal(complete_files(), journal_of(complete_files()) + [vkms_line(message)]))
+        self.assertEqual(
+            one_event(doc, message),
+            {
+                "t_us": KERNEL_ZERO_FPDT_US + 1_600_000,
+                "mono_us": 1_600_000,
+                "kind": "vkms-sampler-start",
+                "source": VKMS_INITRD_UNIT,
+                "detail": message,
+            },
+        )
+
+    def test_sample_carries_head_crc_and_active_flag(self):
+        for digit, active in (("0", False), ("1", True)):
+            message = f"sample card=card1 crtc=72 t=1700000 crc=1a2b3c4d active={digit}"
+            with self.subTest(active=digit):
+                doc = build(with_journal(complete_files(), journal_of(complete_files()) + [vkms_line(message)]))
+                self.assertEqual(
+                    one_event(doc, message),
+                    {
+                        "t_us": KERNEL_ZERO_FPDT_US + 1_700_000,
+                        "mono_us": 1_700_000,
+                        "kind": "vkms-crc",
+                        "source": VKMS_INITRD_UNIT,
+                        "detail": message,
+                        "head": "card1/crtc72",
+                        "crc": "1a2b3c4d",
+                        "active": active,
+                    },
+                )
+
+    def test_error_carries_head_and_errno(self):
+        message = "error card=card1 crtc=72 t=1750000 errno=19"
+        doc = build(with_journal(complete_files(), journal_of(complete_files()) + [vkms_line(message)]))
+        self.assertEqual(
+            one_event(doc, message),
+            {
+                "t_us": KERNEL_ZERO_FPDT_US + 1_750_000,
+                "mono_us": 1_750_000,
+                "kind": "vkms-crc",
+                "source": VKMS_INITRD_UNIT,
+                "detail": message,
+                "head": "card1/crtc72",
+                "errno": 19,
+            },
+        )
+
+    def test_failure_line_is_a_vkms_crc_event_with_no_head(self):
+        message = "lab-vkms-crc: card1 vanished: No such device"
+        line = journal_line(message, identifier=VKMS_IDENTIFIER, unit=VKMS_INITRD_UNIT, mono=1_800_000)
+        doc = build(with_journal(complete_files(), journal_of(complete_files()) + [line]))
+        self.assertEqual(
+            one_event(doc, message),
+            {
+                "t_us": KERNEL_ZERO_FPDT_US + 1_800_000,
+                "mono_us": 1_800_000,
+                "kind": "vkms-crc",
+                "source": VKMS_INITRD_UNIT,
+                "detail": message,
+            },
+        )
+
+    def test_vkms_lines_leave_heads_and_lab_crc_starts_unchanged(self):
+        base = build()
+        lines = [
+            vkms_line("start t=1600000"),
+            vkms_sample("card1", "72", 1_700_000, 1),
+            vkms_line("error card=card1 crtc=72 t=1750000 errno=19"),
+            vkms_line("lab-vkms-crc: card1 vanished"),
+        ]
+        doc = build(with_journal(complete_files(), journal_of(complete_files()) + lines))
+        self.assertEqual(doc["heads"], base["heads"])
+        self.assertEqual(doc["sampler_starts"], base["sampler_starts"])
+        self.assertEqual(doc["greeter_first_appearance"], base["greeter_first_appearance"])
 
 
 class NullMessageTest(unittest.TestCase):
@@ -1347,6 +1521,22 @@ class CliTest(unittest.TestCase):
             with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
                 run = write_run(Path(tmp), replacing_lines(complete_files(), "t=1200000", line))
                 code, _, err = run_cli([str(run)])
+                self.assertEqual(code, 2)
+                self.assertIn("malformed run", err)
+
+    def test_malformed_vkms_line_exits_two(self):
+        cases = {
+            "sample active not 0 or 1": "sample card=card1 crtc=72 t=1700000 crc=1a2b3c4d active=2",
+            "sample crc not eight hex digits": "sample card=card1 crtc=72 t=1700000 crc=zz active=1",
+            "sample without active": "sample card=card1 crtc=72 t=1700000 crc=1a2b3c4d",
+            "sample without t": "sample card=card1 crtc=72 crc=1a2b3c4d active=1",
+            "start with non-numeric t": "start t=soon",
+            "error without errno": "error card=card1 crtc=72 t=1750000",
+        }
+        for label, message in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                files = with_journal(complete_files(), journal_of(complete_files()) + [vkms_line(message)])
+                code, _, err = run_cli([str(write_run(Path(tmp), files))])
                 self.assertEqual(code, 2)
                 self.assertIn("malformed run", err)
 
