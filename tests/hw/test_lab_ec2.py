@@ -682,6 +682,14 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual((run_dir / f"{OUTPUT}-greeter.png").read_bytes(), frame_png(GREETER_FRAME))
         self.assert_box_ended()
 
+    def test_journal_is_read_after_the_index_snapshot(self) -> None:
+        code, out = self.run_runner()
+        self.assertEqual(code, 0, out)
+        commands = [call[-1] for call in self.tools.ssh_calls()]
+        snapshot = commands.index(index_command(DEFAULT_FRAMES_DIR))
+        journal = len(commands) - 1 - commands[::-1].index(REMOTE_COMMAND)
+        self.assertGreater(journal, snapshot, commands)
+
     def test_index_starting_after_the_first_frame_fails_the_run(self) -> None:
         self.set_served_index([index_line(seq) for seq in range(1, FRAME_COUNT)])
         code, out = self.run_runner()

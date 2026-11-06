@@ -3,9 +3,11 @@
 
 `ec2 up` builds the checkout's HEAD into a new box and prints `<name> ready` as its last stdout
 line. The runner holds the box's boot journal until halmasuit.service's greeter event is 30
-seconds old in it, copies the journal into the run directory as journal.json, copies the box's
-recorder index as of that read, cut back to its last complete line, and the PNG files its lines
-name into the run directory's frames/ over ssh, and checks the journal against the ec2-greeter
+seconds old in it, then copies the box's recorder index, cut back to its last complete line, and
+the PNG files its lines name into the run directory's frames/ over ssh, and only then copies the
+journal into the run directory as journal.json. halmasuit logs `frame_rendered` before the
+recorder writes that frame's index line, so the journal read after the index snapshot holds the
+`frame_rendered` for every indexed seq. The runner checks the journal against the ec2-greeter
 profile in timeline.py. Each frames copy step is bounded by --copy-timeout seconds. The
 recorder's index is checked with timeline.recorder_failures against each output's video, which
 --ffmpeg encodes losslessly as `<output>.nut` at the frames' mono_us timing and --ffprobe counts.
@@ -200,17 +202,17 @@ class Ec2Run:
         name = self._up(run, launch, head)
         reason = self._hold(name)
         try:
-            self._collect_journal(run, name)
-        except LabError as err:
-            if reason is None:
-                raise
-            run.say(f"journal: {err}; journal.json not written")
-        try:
             self._collect_frames(run, name)
         except LabError as err:
             if reason is None:
                 raise
             run.say(f"frames: {err}; frames not copied")
+        try:
+            self._collect_journal(run, name)
+        except LabError as err:
+            if reason is None:
+                raise
+            run.say(f"journal: {err}; journal.json not written")
         if reason is not None:
             raise LabError(reason)
         return self._check(run)
