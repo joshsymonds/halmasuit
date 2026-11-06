@@ -45,6 +45,7 @@ mod input_hotplug;
 mod layer_focus;
 #[cfg(feature = "frame_audit")]
 mod offscreen;
+mod render_node;
 mod session_env;
 mod swap_gate;
 mod task_caps;
@@ -3535,6 +3536,21 @@ fn drm_device_path_from_env() -> io::Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
+/// Read `HALMASUIT_RENDER_NODE` (see [`render_node::RenderNodeSpec`]).
+/// Unset or empty yields `None`, leaving the single-device path unchanged.
+/// A non-UTF-8 value fails startup, as does any value that does not parse.
+/// The error text does not echo the value.
+fn render_node_spec_from_env() -> io::Result<Option<render_node::RenderNodeSpec>> {
+    let raw = match std::env::var_os("HALMASUIT_RENDER_NODE") {
+        None => String::new(),
+        Some(v) => v
+            .into_string()
+            .map_err(|_| io::Error::other("HALMASUIT_RENDER_NODE is not valid UTF-8"))?,
+    };
+    render_node::RenderNodeSpec::from_env_value(&raw)
+        .map_err(|e| io::Error::other(format!("HALMASUIT_RENDER_NODE rejected: {e}")))
+}
+
 /// How long [`drm::resolve_drm_device`] retries on `NotFound`-class
 /// errors before giving up. 10 s is comfortably above the observed
 /// gnomon race (nvidia_drm module insertion → udev node creation
@@ -4930,6 +4946,9 @@ fn main() -> io::Result<()> {
     // built — `setup_drm_backend` needs `loop_handle` to wire the
     // page-flip event source.
     let drm_device_path = drm_device_path_from_env()?;
+    // Parsed here so a malformed value fails startup even when the DRM
+    // device is the dev/test SKIP path; resolved only with a DRM device.
+    let render_node_spec = render_node_spec_from_env()?;
     // The wallpaper plane (epic G1/R3/R6). Constructed once inside
     // `setup_drm_backend`; `is_some()` here also gates the frame-0
     // wallpaper anchor emitted below.
@@ -5019,8 +5038,20 @@ fn main() -> io::Result<()> {
     // 2. `None`: the dev/test SKIP path — synthesized 1920x1080
     //    placeholder so wl_clients can still discover an output global.
     let (drm_backend, drm_token, outputs, libinput) = if let Some(path) = &drm_device_path {
-        let (backend, token, real_outputs) =
-            drm::setup_drm_direct(path, &loop_handle, handle_drm_event, wallpaper_config)?;
+        let render_node_path = render_node_spec
+            .as_ref()
+            .map(|spec| render_node::resolve(spec, DRM_RESOLVE_DEADLINE))
+            .transpose()?;
+        if let Some(render_node_path) = &render_node_path {
+            tracing::info!(?render_node_path, "render node resolved");
+        }
+        let (backend, token, real_outputs) = drm::setup_drm_direct(
+            path,
+            &loop_handle,
+            handle_drm_event,
+            wallpaper_config,
+            render_node_path.as_deref(),
+        )?;
         // One wl_output global per connector (extended multi-output).
         for output in &real_outputs {
             output.create_global::<HalmasuitState>(&display_handle);

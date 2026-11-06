@@ -292,6 +292,9 @@ pub struct PathShapeError;
 /// How often the retry loop polls when the device isn't there yet.
 const RESOLVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// The sysfs class directory the BDF walks read.
+pub const SYS_CLASS_DRM: &str = "/sys/class/drm";
+
 /// Resolve a [`DrmDeviceSpec`] to a concrete `/dev/dri/cardN` path,
 /// retrying on `NotFound`-class errors until either resolution
 /// succeeds or `deadline` elapses (polls every
@@ -311,10 +314,26 @@ const RESOLVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// without resolution; propagates any other I/O error from the first
 /// failing call.
 pub fn resolve_drm_device(spec: &DrmDeviceSpec, deadline: Duration) -> io::Result<PathBuf> {
+    poll_until_present(&format!("DRM device {spec:?}"), deadline, || {
+        try_resolve_once(spec)
+    })
+}
+
+/// Run `probe` until it yields a path or `deadline` elapses. The first
+/// probe is unconditional, so an already-present node resolves with no
+/// sleep. `Ok(None)` from the probe means "not yet — retry"; an `Err`
+/// propagates immediately.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::NotFound`] naming `what` if the deadline
+/// elapses; propagates any other error from `probe`.
+pub fn poll_until_present<F>(what: &str, deadline: Duration, mut probe: F) -> io::Result<PathBuf>
+where
+    F: FnMut() -> io::Result<Option<PathBuf>>,
+{
     let start = Instant::now();
-    // First probe is unconditional — when the device is already there
-    // (the common case), avoid any sleep before resolution.
-    if let Some(p) = try_resolve_once(spec)? {
+    if let Some(p) = probe()? {
         return Ok(p);
     }
     // Subsequent probes: sleep, then check deadline BEFORE probing.
@@ -325,10 +344,10 @@ pub fn resolve_drm_device(spec: &DrmDeviceSpec, deadline: Duration) -> io::Resul
         if start.elapsed() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("no DRM device satisfies {spec:?} within {deadline:?}"),
+                format!("{what} not present within {deadline:?}"),
             ));
         }
-        if let Some(p) = try_resolve_once(spec)? {
+        if let Some(p) = probe()? {
             return Ok(p);
         }
     }
@@ -339,20 +358,22 @@ pub fn resolve_drm_device(spec: &DrmDeviceSpec, deadline: Duration) -> io::Resul
 fn try_resolve_once(spec: &DrmDeviceSpec) -> io::Result<Option<PathBuf>> {
     match spec {
         DrmDeviceSpec::Auto => find_auto(),
-        DrmDeviceSpec::Path(p) => {
-            // `symlink_metadata` (vs. `Path::exists` → `metadata`)
-            // does not traverse symlinks. We're addressing a literal
-            // DRM device node; a symlink in `/dev/dri/` (whatever its
-            // target) is rejected. Defense-in-depth against a future
-            // wiring that might let a less-trusted source set the env.
-            match std::fs::symlink_metadata(p) {
-                Ok(md) if md.file_type().is_symlink() => Ok(None),
-                Ok(_) => Ok(Some(p.clone())),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(e),
-            }
-        }
-        DrmDeviceSpec::Pci(bdf) => find_by_bdf(bdf),
+        DrmDeviceSpec::Path(p) => probe_device_path(p),
+        DrmDeviceSpec::Pci(bdf) => find_dri_node_by_bdf(Path::new(SYS_CLASS_DRM), "card", bdf),
+    }
+}
+
+/// Probe a literal DRM node path. `symlink_metadata` (vs.
+/// `Path::exists` → `metadata`) does not traverse symlinks. We're
+/// addressing a literal DRM device node; a symlink in `/dev/dri/`
+/// (whatever its target) is rejected. Defense-in-depth against a future
+/// wiring that might let a less-trusted source set the env.
+pub fn probe_device_path(p: &Path) -> io::Result<Option<PathBuf>> {
+    match std::fs::symlink_metadata(p) {
+        Ok(md) if md.file_type().is_symlink() => Ok(None),
+        Ok(_) => Ok(Some(p.to_path_buf())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -366,7 +387,7 @@ fn find_auto() -> io::Result<Option<PathBuf>> {
     // retries"; any other error (EACCES, EIO, EMFILE…) propagates so
     // the operator sees the real failure instead of a misleading
     // deadline-exhausted NotFound at the end of the 10s wait. Matches
-    // `find_by_bdf`'s shape below.
+    // `find_dri_node_by_bdf`'s shape below.
     let read_dir = match std::fs::read_dir("/dev/dri") {
         Ok(d) => d,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -442,14 +463,18 @@ fn card_has_connected_connector(path: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
-/// Walk `/sys/class/drm/card*/device` and return the `/dev/dri/cardN`
-/// whose symlink target's basename matches `bdf`. `Ok(None)` means
-/// "no match yet" (caller retries — udev may not have populated the
-/// sysfs link yet).
-fn find_by_bdf(bdf: &PciBdf) -> io::Result<Option<PathBuf>> {
-    let read_dir = match std::fs::read_dir("/sys/class/drm") {
+/// Walk `sys_class_drm` for the `<prefix>N` node (`card` or `renderD`)
+/// whose `device` symlink target's basename matches `bdf`, and return its
+/// `/dev/dri` path. `Ok(None)` means "no match yet" (caller retries —
+/// udev may not have populated the sysfs link yet).
+pub fn find_dri_node_by_bdf(
+    sys_class_drm: &Path,
+    prefix: &str,
+    bdf: &PciBdf,
+) -> io::Result<Option<PathBuf>> {
+    let read_dir = match std::fs::read_dir(sys_class_drm) {
         Ok(d) => d,
-        // /sys/class/drm hasn't been populated yet — caller retries.
+        // The class directory hasn't been populated yet — caller retries.
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
@@ -464,12 +489,15 @@ fn find_by_bdf(bdf: &PciBdf) -> io::Result<Option<PathBuf>> {
         let Some(name) = name_os.to_str() else {
             continue;
         };
-        if !name.starts_with("card") || name[4..].parse::<u32>().is_err() {
+        let Some(digits) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        if digits.parse::<u32>().is_err() {
             continue;
         }
 
         // The `device` symlink may legitimately be absent on partial
-        // udev population — treat NotFound as "skip this card, try the
+        // udev population — treat NotFound as "skip this node, try the
         // next" and propagate other errors.
         let device_symlink = entry.path().join("device");
         let target = match std::fs::read_link(&device_symlink) {
@@ -845,15 +873,21 @@ fn connector_short_name(info: &connector::Info) -> String {
 /// when `DrmEvent::VBlank(crtc)` fires; `crtc` routes back to the
 /// originating output.
 ///
+/// `render_node`, when set, is the resolved `/dev/dri/renderD<N>` path
+/// named by `HALMASUIT_RENDER_NODE`. It supplies the `zwp_linux_dmabuf_v1`
+/// default-feedback main device; `None` derives it from `path`.
+///
 /// # Errors
 ///
 /// Bubbles any open / SET_MASTER ioctl / DRM / GBM / EGL / GLES /
-/// calloop failure with context. Errors if zero outputs initialize.
+/// calloop failure with context. Errors if zero outputs initialize, and
+/// if `render_node` is not a DRM node.
 pub fn setup_drm_direct<S, F>(
     path: &Path,
     loop_handle: &smithay::reexports::calloop::LoopHandle<'static, S>,
     drm_event_handler: F,
     wallpaper_config: Option<WallpaperConfig>,
+    render_node: Option<&Path>,
 ) -> io::Result<(
     DrmBackend,
     smithay::reexports::calloop::RegistrationToken,
@@ -865,6 +899,7 @@ where
 {
     use std::os::fd::OwnedFd;
     use std::os::unix::fs::OpenOptionsExt;
+    let render_node_dev = render_node.map(render_node_dev_id).transpose()?;
     // O_RDWR | O_NONBLOCK. O_CLOEXEC is set by std's OpenOptions by
     // default since Rust 1.20.
     let file = std::fs::OpenOptions::new()
@@ -875,7 +910,13 @@ where
         .map_err(|e| io::Error::other(format!("open {}: {e}", path.display())))?;
     let owned_fd: OwnedFd = file.into();
     let device_fd = DrmDeviceFd::new(DeviceFd::from(owned_fd));
-    build_drm_pipeline(device_fd, loop_handle, drm_event_handler, wallpaper_config)
+    build_drm_pipeline(
+        device_fd,
+        loop_handle,
+        drm_event_handler,
+        wallpaper_config,
+        render_node_dev,
+    )
 }
 
 /// The `zwp_linux_dmabuf_v1` default-feedback main device: the `dev_t`
@@ -891,6 +932,23 @@ fn dmabuf_feedback_main_device<E>(
         return Some(opened_dev);
     }
     render.ok().flatten()
+}
+
+/// The `zwp_linux_dmabuf_v1` default-feedback main device. A configured
+/// render node names it; otherwise `derive` supplies it from the scan-out
+/// device.
+fn select_dmabuf_main_device(
+    configured: Option<libc::dev_t>,
+    derive: impl FnOnce() -> Option<libc::dev_t>,
+) -> Option<libc::dev_t> {
+    configured.or_else(derive)
+}
+
+/// `dev_t` of the render node at `path`.
+fn render_node_dev_id(path: &Path) -> io::Result<libc::dev_t> {
+    DrmNode::from_path(path)
+        .map(|node| node.dev_id())
+        .map_err(|e| io::Error::other(format!("render node {}: {e}", path.display())))
 }
 
 /// Looks up the dmabuf feedback main device for the DRM device behind
@@ -935,6 +993,7 @@ fn build_drm_pipeline<S, F>(
     loop_handle: &smithay::reexports::calloop::LoopHandle<'static, S>,
     drm_event_handler: F,
     wallpaper_config: Option<WallpaperConfig>,
+    render_node_dev: Option<libc::dev_t>,
 ) -> io::Result<(
     DrmBackend,
     smithay::reexports::calloop::RegistrationToken,
@@ -945,7 +1004,8 @@ where
     F: FnMut(DrmEvent, &mut Option<smithay::backend::drm::DrmEventMetadata>, &mut S) + 'static,
 {
     // Resolved before `device_fd` moves into the GBM device below.
-    let dmabuf_main_device = resolve_dmabuf_main_device(&device_fd);
+    let dmabuf_main_device =
+        select_dmabuf_main_device(render_node_dev, || resolve_dmabuf_main_device(&device_fd));
     // DrmDevice + its event notifier. `drm` must be `mut` so we can
     // call `create_surface` on it below.
     let (mut drm, notifier) = DrmDevice::new(device_fd.clone(), true)
@@ -2133,6 +2193,23 @@ mod tests {
         assert_eq!(
             dmabuf_feedback_main_device(render, NodeType::Render, Ok::<_, io::Error>(None)),
             Some(render)
+        );
+    }
+
+    #[test]
+    fn dmabuf_main_device_is_the_configured_render_node() {
+        let render = drm_dev(129);
+        assert_eq!(
+            select_dmabuf_main_device(Some(render), || Some(drm_dev(128))),
+            Some(render)
+        );
+    }
+
+    #[test]
+    fn dmabuf_main_device_is_derived_when_no_render_node_is_configured() {
+        assert_eq!(
+            select_dmabuf_main_device(None, || Some(drm_dev(128))),
+            Some(drm_dev(128))
         );
     }
 
