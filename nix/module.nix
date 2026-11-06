@@ -204,6 +204,14 @@ let
     then {}
     else { HALMASUIT_RENDER_NODE = cfg.rendering.renderNode; };
 
+  # `recordFramesEnv` — attrset exporting `HALMASUIT_RECORD_FRAMES` to
+  # both units. Empty when `diagnostic.recordFrames` is null, so the unit
+  # envs stay byte-identical to the default path.
+  recordFramesEnv =
+    if cfg.diagnostic.recordFrames == null
+    then {}
+    else { HALMASUIT_RECORD_FRAMES = cfg.diagnostic.recordFrames; };
+
   # `systemd-udev-settle.service` is documented upstream as "not
   # recommended" (systemd-udev-settle.service(8): "There can be no
   # guarantee that hardware is fully discovered at any specific
@@ -709,6 +717,19 @@ in
           Disable once the relevant frames are captured — the
           captured journal is the analysis artifact, not a thing to
           keep producing.
+        '';
+      };
+
+      recordFrames = lib.mkOption {
+        type        = lib.types.nullOr lib.types.str;
+        default     = null;
+        description = ''
+          Directory the compositor records presented frames into. When
+          set, `HALMASUIT_RECORD_FRAMES` is exported to both units and
+          the directory is created mode 0700 owned by `compositorUid`
+          before the compositor starts. Requires `services.halmasuit.package`
+          built with the `frame_audit` feature; evaluation fails
+          otherwise. Null (the default) records nothing.
         '';
       };
     };
@@ -1238,6 +1259,13 @@ in
         # (see the shared `cfg.enable || cfg.fromInitrd.enable` block
         # below); overriding `greeterGroup` is honored here too.
         Group = cfg.greeterGroup;
+      } // lib.optionalAttrs (cfg.diagnostic.recordFrames != null) {
+        # Frame recording (`diagnostic.recordFrames`): the directory is
+        # created before the compositor drops privileges and stays
+        # writable under ProtectSystem=strict. The `+` prefix runs the
+        # command as root outside the unit's sandbox.
+        ExecStartPre  = "+${pkgs.coreutils}/bin/install -d -m 0700 -o ${toString cfg.compositorUid} ${cfg.diagnostic.recordFrames}";
+        ReadWritePaths = [ cfg.diagnostic.recordFrames ];
       };
 
       environment = {
@@ -1329,7 +1357,7 @@ in
         # Epic #71 R-honest.7: the VT halmasuit owns as VT_PROCESS
         # controller for cooperative switching. See `homeVt`.
         HALMASUIT_HOME_VT = toString cfg.homeVt;
-      } // wallpaperEnv // drmDeviceEnv // renderNodeEnv;
+      } // wallpaperEnv // drmDeviceEnv // renderNodeEnv // recordFramesEnv;
 
     };
    })
@@ -1421,6 +1449,22 @@ in
        description  = lib.mkDefault "halmasuit greeter peer (SO_PEERCRED-authorized greetd client)";
      };
      users.groups.${cfg.greeterGroup}.gid = lib.mkDefault cfg.greeterUid;
+   })
+
+   # Frame recording needs the `frame_audit` build: the recorder is
+   # compiled out of the default package.
+   (lib.mkIf (cfg.diagnostic.recordFrames != null) {
+     assertions = [
+       {
+         assertion = lib.elem "frame_audit" (cfg.package.cargoBuildFlags or [ ]);
+         message   = ''
+           services.halmasuit.diagnostic.recordFrames requires
+           services.halmasuit.package to be built with the frame_audit
+           feature (for example halmasuit-debug). The default package
+           does not record frames.
+         '';
+       }
+     ];
    })
 
    # Rendering-backend assertion: the nvidia variant requires a
@@ -1978,6 +2022,10 @@ in
            # lands inside the initramfs filesystem (NixOS does NOT
            # follow unit-text references into the closure).
            "${nvidiaDevnodesScript}"
+         ] ++ lib.optionals (cfg.diagnostic.recordFrames != null) [
+           # Frame recording (`diagnostic.recordFrames`): mode 0700,
+           # owned by the compositor uid it drops to.
+           "${pkgs.coreutils}/bin/install -d -m 0700 -o ${toString cfg.compositorUid} ${cfg.diagnostic.recordFrames}"
          ];
          # ExecStart: normally just the binary. When
          # `rendering.debugStrace` is set, wrap in strace -f -y
@@ -2174,7 +2222,7 @@ in
          # Mirrors the rootfs unit (see comment there). The Rust
          # resolver runs in initramfs too, so the env must travel.
          HALMASUIT_PRIMARY_OUTPUT = cfg.rendering.primaryOutput;
-       } // wallpaperEnv // drmDeviceEnv // renderNodeEnv;
+       } // wallpaperEnv // drmDeviceEnv // renderNodeEnv // recordFramesEnv;
      };
 
      # halmasuit-luks: the systemd password-agent Wayland client.

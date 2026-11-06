@@ -911,6 +911,17 @@
           halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
           halmasuit-luks       = self.packages.x86_64-linux.halmasuit-luks;
         };
+        # `services.halmasuit.diagnostic.recordFrames` exports
+        # HALMASUIT_RECORD_FRAMES, creates the directory, and requires a
+        # frame_audit build; null leaves both units unchanged.
+        halmasuit-recorder = import ./tests/halmasuit-recorder.nix {
+          system    = "x86_64-linux";
+          inherit nixpkgs;
+          halmasuit            = self.packages.x86_64-linux.halmasuit;
+          halmasuit-debug      = self.packages.x86_64-linux.halmasuit-debug;
+          halmasuit-session    = self.packages.x86_64-linux.halmasuit-session;
+          halmasuit-luks       = self.packages.x86_64-linux.halmasuit-luks;
+        };
         # Epic #45 rung 1: bare VFIO-passthrough smoke. RUNNER-ONLY —
         # runs via `.driver` on stygianlibrary (GPU on vfio-pci), NEVER
         # via `nix build` (the sandbox has no /dev/vfio). Deliberately
