@@ -18,13 +18,18 @@
 # Implementation: synthetic nixosSystem evaluations of the module in its
 # rootfs (enable) and boot-from-initrd (fromInitrd.enable) shapes.
 #
-# VM test (`halmasuit-recorder`), halmasuit-debug on two nodes:
+# VM test (`halmasuit-recorder`), halmasuit-debug on three nodes:
 # - `split`: render-node split, GL on vgem renderD128, scan-out on vkms,
 #   no VGA device. Also asserts the last recorded PNG equals the vkms
 #   scan-out byte for byte (RGB).
 # - `direct`: single-device DrmCompositor path on virtio-gpu-pci. Also
 #   asserts the last recorded PNG equals `Snapshot()` byte for byte (RGB).
-# Both nodes: the diagnostic overlay is opened and closed (QEMU keyboard)
+# - `initrd`: `fromInitrd.enable` on virtio-gpu-pci, recording into
+#   /run/halmasuit-lab/frames (a tmpfs that survives switch-root). Frames
+#   recorded in stage 1 stay in the index after the pivot: one unbroken
+#   seq run from 0, frames on both sides of rootfs_ready, every PNG at its
+#   indexed size, dropped 0, the same halmasuit PID across both phases.
+# Rootfs nodes: the diagnostic overlay is opened and closed (QEMU keyboard)
 # so at least three frames are recorded, and the checks run once the
 # recorder has caught up. Index starts at seq 0; the first frame_rendered
 # is frame_id 0 and precedes scanout_active; seqs increase, each has one frame_rendered
@@ -45,6 +50,9 @@ let
   lib = pkgs.lib;
 
   recordDir = "/var/lib/halmasuit/frames";
+  # /run is moved across switch-root, so frames recorded in stage 1 stay
+  # at this path after the pivot.
+  labRecordDir = "/run/halmasuit-lab/frames";
   compositorUid = 998;
 
   evalWith = { shape, package, diagnostic }: nixpkgs.lib.nixosSystem {
@@ -379,39 +387,40 @@ let
   # Exits 0 once the recorder has caught up with the render loop: at least
   # three frames are indexed and the last index seq is the newest
   # frame_rendered frame_id. Taken after the scene stops changing, so the
-  # last recorded frame is the one on screen.
+  # last recorded frame is the one on screen. Argument: the record dir.
   recorderSettled = pkgs.writeShellScript "halmasuit-recorder-settled" ''
     set -eu
-    index=${recordDir}/index.jsonl
+    index=$1/index.jsonl
     [ "$(${pkgs.coreutils}/bin/wc -l < "$index")" -ge 3 ]
     last=$(${pkgs.coreutils}/bin/tail -n 1 "$index" | ${pkgs.jq}/bin/jq -r .seq)
-    newest=$(journalctl -b -u halmasuit -o cat --no-pager \
+    newest=$(journalctl -b -o cat --no-pager \
       | ${pkgs.jq}/bin/jq -Rr 'fromjson? | .fields.json // empty | fromjson? | select(.event == "frame_rendered") | .frame_id' \
       | ${pkgs.coreutils}/bin/sort -n | ${pkgs.coreutils}/bin/tail -n 1)
     [ -n "$newest" ] && [ "$last" = "$newest" ]
   '';
 
-  # Shared by both nodes. Snapshot() runs after halmasuit's privilege drop
+  # No greeter activity: the checks read the compositor's own output.
+  greeterScript = pkgs.writeShellScript "halmasuit-recorder-test-greeter" ''
+    exec ${pkgs.coreutils}/bin/sleep infinity
+  '';
+
+  # Shared by all nodes. Snapshot() runs after halmasuit's privilege drop
   # under ProtectSystem=strict, so /run/hsnap is the writable scratch dir.
   recorderBase = {
     imports = [ ../nix/module.nix ];
 
     services.halmasuit = {
-      enable            = true;
       package           = halmasuit-debug; # frame_audit build
       session.package   = halmasuit-session;
+      luks.package      = halmasuit-luks;
       greeterUid        = 999;
       greeterGroup      = "halmasuit-greeter";
       compositorUid     = compositorUid;
-      diagnostic.recordFrames = recordDir;
       wallpaper = {
         type   = "image";
         source = ./fixtures/wallpaper.png;
       };
-      # No greeter activity: this check reads the compositor's own output.
-      greeterCommand = "${pkgs.writeShellScript "halmasuit-recorder-test-greeter" ''
-        exec ${pkgs.coreutils}/bin/sleep infinity
-      ''}";
+      greeterCommand = "${greeterScript}";
     };
 
     systemd.tmpfiles.rules = [ "d /run/hsnap 0777 root root -" ];
@@ -450,7 +459,11 @@ let
       # vkms the scan-out card. No VGA or virtio-gpu device exists.
       split = {
         imports = [ recorderBase ];
-        services.halmasuit.rendering.renderNode = "/dev/dri/renderD128";
+        services.halmasuit = {
+          enable = true;
+          diagnostic.recordFrames = recordDir;
+          rendering.renderNode = "/dev/dri/renderD128";
+        };
         boot.kernelModules = [ "vkms" "vgem" ];
         # The virtio keyboard drives the diagnostic-overlay chord.
         virtualisation.qemu.options = [ "-vga none" "-device virtio-keyboard-pci" ];
@@ -458,6 +471,27 @@ let
       # Single-device DrmCompositor path.
       direct = {
         imports = [ recorderBase ];
+        services.halmasuit = {
+          enable = true;
+          diagnostic.recordFrames = recordDir;
+        };
+        virtualisation.qemu.options = [
+          "-vga none"
+          "-device virtio-gpu-pci"
+          "-device virtio-keyboard-pci"
+        ];
+      };
+      # Boot-from-initrd: halmasuit starts in stage 1 and records into a
+      # /run directory that survives switch-root.
+      initrd = {
+        imports = [ recorderBase ];
+        services.halmasuit = {
+          fromInitrd.enable = true;
+          diagnostic.recordFrames = labRecordDir;
+        };
+        # The greeter is spawned post-pivot from the rootfs closure, so
+        # the script must be pinned there (as tests/initrd-survival.nix does).
+        system.extraDependencies = [ greeterScript ];
         virtualisation.qemu.options = [
           "-vga none"
           "-device virtio-gpu-pci"
@@ -467,23 +501,29 @@ let
     };
 
     testScript = ''
+      import base64
       import json
+      import struct
       import sys
 
       sys.path.insert(0, "${./lib}")
       import visual
 
       RECORD_DIR = "${recordDir}"
+      LAB_RECORD_DIR = "${labRecordDir}"
       COMPOSITOR_UID = ${toString compositorUid}
       SNAP_DIR = "/run/hsnap"
       MAX_SKEW_US = 1_000_000
       RGB_COMPARE = "${rgbCompare}/bin/halmasuit-rgb-compare"
       VKMS_CAPTURE = "${vkmsScanoutCapture}/bin/vkms-scanout-capture"
+      RECORDER_SETTLED = "${recorderSettled}"
 
 
       def journal_events(node):
-          """(CLOCK_MONOTONIC usec, event dict) for every halmasuit event."""
-          raw = node.succeed("journalctl -b -u halmasuit -o json --no-pager")
+          """(CLOCK_MONOTONIC usec, _PID, event dict) for every halmasuit
+          event, from the whole boot: the initramfs unit's journal entries
+          are not reachable by unit name after switch-root."""
+          raw = node.succeed("journalctl -b -o json --no-pager")
           events = []
           for line in raw.splitlines():
               entry = json.loads(line)
@@ -502,30 +542,104 @@ let
               except ValueError:
                   continue
               if isinstance(ev, dict) and "event" in ev:
-                  events.append((int(entry["__MONOTONIC_TIMESTAMP"]), ev))
+                  events.append((
+                      int(entry["__MONOTONIC_TIMESTAMP"]),
+                      int(entry["_PID"]),
+                      ev,
+                  ))
           return events
 
 
-      def change_scene(node):
+      def png_size(node, path):
+          """(width, height) from the IHDR chunk of the PNG at `path`."""
+          head = base64.b64decode(node.succeed(f"head -c 24 {path} | base64 -w0"))
+          assert head[:8] == b"\x89PNG\r\n\x1a\n", f"{path} is not a PNG"
+          return struct.unpack(">II", head[16:24])
+
+
+      def change_scene(node, record_dir):
           """Open and close the diagnostic overlay: two damaged frames after
           frame 0, then a static scene the recorder must catch up with."""
           node.send_key("ctrl-alt-shift-esc")
           node.wait_until_succeeds(
-              "journalctl -u halmasuit | grep -qF "
+              "journalctl -b -o cat | grep -qF "
               "'OVERLAY_OPEN: diagnostic content composed'",
               timeout=30,
           )
           node.send_key("esc")
           node.wait_until_succeeds(
-              "journalctl -u halmasuit | grep -qF "
+              "journalctl -b -o cat | grep -qF "
               "'OVERLAY_CLOSE: diagnostic overlay hidden'",
               timeout=30,
           )
-          node.wait_until_succeeds("${recorderSettled}", timeout=60)
+          node.wait_until_succeeds(f"{RECORDER_SETTLED} {record_dir}", timeout=60)
+
+
+      def check_initrd_recording(node):
+          """Frames recorded in stage 1 survive switch-root: one unbroken
+          index from seq 0, frames on both sides of rootfs_ready, every
+          PNG at its indexed size, all logged by the same halmasuit PID."""
+          change_scene(node, LAB_RECORD_DIR)
+          index = [
+              json.loads(line)
+              for line in node.succeed(
+                  f"cat {LAB_RECORD_DIR}/index.jsonl"
+              ).splitlines()
+          ]
+          assert len(index) >= 3, (
+              f"index.jsonl has {len(index)} lines, expected at least 3"
+          )
+
+          events = journal_events(node)
+          started = [ev["pid"] for _, _, ev in events if ev.get("event") == "started"]
+          assert len(started) == 1, f"started events: {started}"
+          phases = {}
+          for ts, pid, ev in events:
+              if ev.get("event") == "phase_entered" and ev.get("phase") in (
+                  "initramfs_init",
+                  "rootfs_ready",
+              ):
+                  phases.setdefault(ev["phase"], []).append((ts, pid))
+          for phase in ("initramfs_init", "rootfs_ready"):
+              assert len(phases.get(phase, [])) == 1, (
+                  f"phase {phase} entries: {phases.get(phase)}"
+              )
+          init_ts, init_pid = phases["initramfs_init"][0]
+          ready_ts, ready_pid = phases["rootfs_ready"][0]
+          assert init_ts < ready_ts, (
+              f"initramfs_init at {init_ts} us is not before rootfs_ready at "
+              f"{ready_ts} us"
+          )
+          pid = started[0]
+          assert init_pid == pid and ready_pid == pid, (
+              f"phases logged by pids {init_pid} and {ready_pid}, "
+              f"started pid {pid}"
+          )
+          node.succeed(f"kill -0 {pid}")
+
+          seqs = [line["seq"] for line in index]
+          assert seqs == list(range(len(seqs))), (
+              f"index seqs are not contiguous from 0: {seqs}"
+          )
+          assert all(line["dropped"] == 0 for line in index), (
+              f"frames dropped: {[l for l in index if l['dropped']]}"
+          )
+          before = [line for line in index if line["mono_us"] < ready_ts]
+          after = [line for line in index if line["mono_us"] > ready_ts]
+          assert before, f"no frame recorded before rootfs_ready at {ready_ts} us"
+          assert after, f"no frame recorded after rootfs_ready at {ready_ts} us"
+
+          for line in index:
+              path = f"{LAB_RECORD_DIR}/{line['output']}/{line['seq']:08d}.png"
+              size = png_size(node, path)
+              assert size == (line["width"], line["height"]), (
+                  f"{path} is {size}, index says "
+                  f"{line['width']}x{line['height']}"
+              )
 
 
       def check_recording(node, is_split):
-          change_scene(node)
+          change_scene(node, RECORD_DIR)
           index = [
               json.loads(line)
               for line in node.succeed(
@@ -573,13 +687,13 @@ let
           # first recorded frame precedes scanout_active.
           events = journal_events(node)
           scanout = [
-              ts for ts, ev in events
+              ts for ts, _, ev in events
               if ev.get("event") == "phase_entered"
               and ev.get("phase") == "scanout_active"
           ]
           assert scanout, "no scanout_active phase_entered event"
           rendered = [
-              (ts, ev["frame_id"]) for ts, ev in events
+              (ts, ev["frame_id"]) for ts, _, ev in events
               if ev.get("event") == "frame_rendered"
           ]
           assert rendered, "no frame_rendered events"
@@ -658,8 +772,18 @@ let
               "busctl --system status org.halmasuit", timeout=30
           )
 
+      initrd.wait_for_unit("multi-user.target")
+      initrd.wait_until_succeeds(
+          "journalctl -b -o cat | grep -qF 'scanout_active'",
+          timeout=30,
+      )
+      initrd.wait_until_succeeds(
+          "busctl --system status org.halmasuit", timeout=30
+      )
+
       check_recording(split, is_split=True)
       check_recording(direct, is_split=False)
+      check_initrd_recording(initrd)
 
       print("halmasuit-recorder: ALL ASSERTIONS PASSED")
     '';
