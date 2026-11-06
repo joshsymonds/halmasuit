@@ -174,6 +174,10 @@ test-vm jobs="":
         # Epic #12: real halmasuit-decoder sandbox + crash-recovery +
         # budget-exhaustion + login-flash continuity under video wallpaper.
         visual-wallpaper-video
+        # Lab vkms CRC sampler: stage 1 and after switch-root, no mocks.
+        lab-vkms-crc
+        # Render-node split: GL on vgem render node, scan-out on vkms.
+        halmasuit-render-node
     )
     # Timing-bound gates run alone after the parallel batch: sharing the
     # host with other llvmpipe VMs slows the guest. Throughput gates

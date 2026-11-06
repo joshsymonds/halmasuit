@@ -3,10 +3,14 @@
 
 `ec2 up` builds the checkout's HEAD into a new box and prints `<name> ready` as its last stdout
 line. The runner holds the box's boot journal until halmasuit.service's greeter event is 30
-seconds old in it, copies the journal into the run directory as journal.json, and checks it
-against the ec2-greeter profile in timeline.py. Each run writes its record to a directory under
---state-root named `<stamp>-ec2-greeter`: run.log holds the ec2 calls with their results, the
-`ec2 up` output, and PASS or each `FAIL ec2-greeter: <message>` line.
+seconds old in it, copies the journal into the run directory as journal.json, copies the box's
+recorder directory into the run directory's frames/ over ssh, and checks the journal against the
+ec2-greeter profile in timeline.py. The frames copy is bounded by --copy-timeout seconds. The
+recorder's index is checked with timeline.recorder_failures against each output's video, which
+--ffmpeg encodes losslessly as `<output>.nut` at the frames' mono_us timing and --ffprobe counts.
+Each output's greeter frame is copied to `<output>-greeter.png`. Each run writes its record to a
+directory under --state-root named `<stamp>-ec2-greeter`: run.log holds the ec2 calls with their
+results, the `ec2 up` output, and PASS or each `FAIL ec2-greeter: <message>` line.
 
 A run refuses, launching nothing, while a halmasuit-lab box is already listed. Every box a run
 launches is ended before the run returns, on pass, fail, an exception, or SIGINT, SIGTERM, or
@@ -27,13 +31,15 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 import lab
 import timeline
@@ -46,6 +52,13 @@ READY = re.compile(r"(halmasuit-lab-\S+) ready")
 BOX_USER = "joshsymonds"
 CONNECT_TIMEOUT_SECONDS = 10
 JOURNAL_COMMAND = ("sudo", "-n", "journalctl", "-b", "0", "-o", "json", "--all", "--no-pager")
+DEFAULT_FRAMES_DIR = "/var/lib/halmasuit-lab/frames"
+FRAMES_NAME = "frames"
+COPY_TIMEOUT_SECONDS = 600
+VIDEO_TIMEOUT_SECONDS = 600
+VIDEO_SUFFIX = ".nut"
+GREETER_SUFFIX = "-greeter.png"
+CONCAT_FRAMERATE = 1_000_000
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
@@ -128,6 +141,10 @@ class Ec2Run:
         nix_config: Path,
         state_root: Path,
         known_hosts: Path,
+        frames_dir: str,
+        copy_timeout: int,
+        ffmpeg: str,
+        ffprobe: str,
         interrupts: _Interrupts,
     ) -> None:
         self.ec2 = ec2
@@ -137,6 +154,10 @@ class Ec2Run:
         self.nix_config = nix_config
         self.state_root = state_root
         self.known_hosts = known_hosts
+        self.frames_dir = frames_dir
+        self.copy_timeout = copy_timeout
+        self.ffmpeg = ffmpeg
+        self.ffprobe = ffprobe
         self.interrupts = interrupts
 
     def run(self) -> int:
@@ -183,6 +204,12 @@ class Ec2Run:
             if reason is None:
                 raise
             run.say(f"journal: {err}; journal.json not written")
+        try:
+            self._collect_frames(run, name)
+        except LabError as err:
+            if reason is None:
+                raise
+            run.say(f"frames: {err}; frames not copied")
         if reason is not None:
             raise LabError(reason)
         return self._check(run)
@@ -278,8 +305,8 @@ class Ec2Run:
             process.terminate()
         self._reap_up(run, launch)
 
-    def _ssh(self, name: str, remote: Sequence[str]) -> lab.Result:
-        argv = [
+    def _ssh_argv(self, name: str, remote: Sequence[str]) -> list[str]:
+        return [
             self.ssh,
             "-o",
             "BatchMode=yes",
@@ -296,7 +323,9 @@ class Ec2Run:
             f"{BOX_USER}@{name}",
             shlex.join(remote),
         ]
-        return _program(argv, lab.REMOTE_TIMEOUT_SECONDS)
+
+    def _ssh(self, name: str, remote: Sequence[str]) -> lab.Result:
+        return _program(self._ssh_argv(name, remote), lab.REMOTE_TIMEOUT_SECONDS)
 
     def _journal(self, name: str, what: str) -> str:
         return lab._ok(self._ssh(name, JOURNAL_COMMAND), what)
@@ -340,19 +369,144 @@ class Ec2Run:
         text = self._journal(name, "collect the boot journal")
         (run.directory / timeline.JOURNAL_NAME).write_text(text, encoding="utf-8")
 
+    def _collect_frames(self, run: lab.RunLog, name: str) -> None:
+        """Extracts the box's recorder directory into the run directory's frames/, or raises.
+
+        The tar stream is binary, so it goes to an unnamed temporary file in the run directory,
+        which is gone once closed, even when the run is signalled mid-copy. subprocess.run kills
+        the ssh child on the timeout and on any exception escaping it.
+        """
+        remote = ("sudo", "-n", "tar", "-C", self.frames_dir, "-cf", "-", ".")
+        run.say(f"frames copy: {shlex.join(remote)}")
+        with tempfile.TemporaryFile(dir=run.directory) as archive:
+            try:
+                done = subprocess.run(
+                    self._ssh_argv(name, remote),
+                    stdout=archive,
+                    stderr=subprocess.PIPE,
+                    timeout=self.copy_timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as err:
+                raise LabError(f"copy of {self.frames_dir} timed out after {self.copy_timeout} seconds") from err
+            except OSError as err:
+                raise LabError(f"cannot start ssh for the frames copy: {err}") from err
+            stderr = done.stderr.decode("utf-8", errors="replace")
+            self._record(run, "frames copy", lab.Result(done.returncode, "", stderr))
+            if done.returncode != 0:
+                detail = stderr.strip() or "no output"
+                raise LabError(f"copy of {self.frames_dir} failed (rc {done.returncode}): {detail}")
+            archive.seek(0)
+            try:
+                (run.directory / FRAMES_NAME).mkdir()
+                with tarfile.open(fileobj=archive, mode="r:") as tar:
+                    tar.extractall(run.directory / FRAMES_NAME, filter="data")
+            except (tarfile.TarError, OSError) as err:
+                raise LabError(f"extract of {self.frames_dir} failed: {err}") from err
+
     def _check(self, run: lab.RunLog) -> int:
         try:
             document = timeline.build_timeline(run.directory)
         except (KeyError, OSError, ValueError) as exc:
             raise LabError(f"malformed run: {exc!r}") from exc
+        frames = self._recorder_index(run)
+        video_frames = self._encode(run, frames)
+        self._greeter_pngs(run, document, frames)
         (run.directory / timeline.TIMELINE_NAME).write_text(json.dumps(document, indent=2) + "\n")
-        failures = timeline.PROFILES[PROFILE](document)
+        failures = timeline.recorder_failures(document, frames, video_frames)
+        failures += timeline.PROFILES[PROFILE](document)
         for failure in failures:
             run.say(f"FAIL {PROFILE}: {failure}")
         if failures:
             return 1
         run.say(f"PASS {PROFILE}")
         return 0
+
+    def _recorder_index(self, run: lab.RunLog) -> list[dict[str, Any]]:
+        try:
+            return timeline.read_recorder_index(run.directory / FRAMES_NAME)
+        except (OSError, ValueError) as err:
+            raise LabError(f"recorder index unreadable: {err}") from err
+
+    def _encode(self, run: lab.RunLog, frames: list[dict[str, Any]]) -> dict[str, int]:
+        """Writes one lossless video per output; returns each video's frame count as ffprobe reads it."""
+        outputs: dict[str, list[dict[str, Any]]] = {}
+        for frame in frames:
+            outputs.setdefault(frame["output"], []).append(frame)
+        counts: dict[str, int] = {}
+        for output, lines in sorted(outputs.items()):
+            lines.sort(key=lambda frame: frame["mono_us"])
+            video = run.directory / f"{output}{VIDEO_SUFFIX}"
+            self._write_video(run, output, lines, video)
+            counts[output] = self._count_frames(run, video)
+        return counts
+
+    def _write_video(self, run: lab.RunLog, output: str, lines: list[dict[str, Any]], video: Path) -> None:
+        frames_dir = (run.directory / FRAMES_NAME).resolve()
+        paths = [_frame_path(frames_dir, frame) for frame in lines]
+        for path in paths:
+            if not path.is_file():
+                raise LabError(f"frame file missing for {output}: {path}")
+        with tempfile.TemporaryDirectory(dir=run.directory) as scratch:
+            listing = Path(scratch) / "frames.ffconcat"
+            listing.write_text(_concat_list(lines, paths), encoding="utf-8")
+            result = _program(
+                [
+                    self.ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-n",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(listing),
+                    "-fps_mode",
+                    "passthrough",
+                    "-c:v",
+                    "ffv1",
+                    str(video),
+                ],
+                VIDEO_TIMEOUT_SECONDS,
+            )
+        self._record(run, f"encode {output}", result)
+        lab._ok(result, f"encode {output}")
+
+    def _count_frames(self, run: lab.RunLog, video: Path) -> int:
+        result = _program(
+            [
+                self.ffprobe,
+                "-v",
+                "error",
+                "-count_frames",
+                "-select_streams",
+                "v",
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "default=nw=1:nk=1",
+                str(video),
+            ],
+            VIDEO_TIMEOUT_SECONDS,
+        )
+        self._record(run, f"count {video.name}", result)
+        text = lab._ok(result, f"count frames of {video.name}").strip()
+        try:
+            return int(text)
+        except ValueError as err:
+            raise LabError(f"count frames of {video.name} printed {text!r}, not a number") from err
+
+    def _greeter_pngs(self, run: lab.RunLog, document: timeline.Timeline, frames: list[dict[str, Any]]) -> None:
+        frames_dir = (run.directory / FRAMES_NAME).resolve()
+        for output, frame in sorted(timeline.greeter_frames(document, frames).items()):
+            target = run.directory / f"{output}{GREETER_SUFFIX}"
+            try:
+                shutil.copyfile(_frame_path(frames_dir, frame), target)
+            except OSError as err:
+                raise LabError(f"copy greeter frame of {output} failed: {err}") from err
 
     def _end(self, run: lab.RunLog, launch: _Launch) -> list[str]:
         """Ends the boxes this run launched; returns one problem per box or check that failed.
@@ -399,6 +553,25 @@ class Ec2Run:
         return f"could not terminate {name} (rc {result.returncode}): {detail}; terminate it by hand"
 
 
+def _frame_path(frames_dir: Path, frame: dict[str, Any]) -> Path:
+    return frames_dir / frame["output"] / f"{frame['seq']:08d}.png"
+
+
+def _ffconcat_quote(path: str) -> str:
+    return "'" + path.replace("'", "'\\''") + "'"
+
+
+def _concat_list(lines: list[dict[str, Any]], paths: list[Path]) -> str:
+    """An ffconcat list that shows each frame for the microseconds until the next frame's mono_us."""
+    text = ["ffconcat version 1.0"]
+    for index, (frame, path) in enumerate(zip(lines, paths, strict=True)):
+        text.append(f"file {_ffconcat_quote(str(path))}")
+        text.append(f"option framerate {CONCAT_FRAMERATE}")
+        if index + 1 < len(lines):
+            text.append(f"duration {lines[index + 1]['mono_us'] - frame['mono_us']}us")
+    return "\n".join(text) + "\n"
+
+
 def _known_hosts() -> Path:
     state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
     return Path(state) / "ec2-fleet" / "known_hosts"
@@ -426,6 +599,19 @@ def main(argv: Sequence[str] | None = None, *, clock: lab.Clock | None = None) -
         default=Path.home() / ".local" / "state" / "halmasuit-lab" / "runs",
         help="directory for per-run logs",
     )
+    parser.add_argument(
+        "--frames-dir",
+        default=DEFAULT_FRAMES_DIR,
+        help="recorder directory on the box",
+    )
+    parser.add_argument(
+        "--copy-timeout",
+        type=int,
+        default=COPY_TIMEOUT_SECONDS,
+        help="seconds the frames copy from the box may take",
+    )
+    parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg to encode each output's video")
+    parser.add_argument("--ffprobe", default="ffprobe", help="ffprobe to count each video's frames")
     options = parser.parse_args(argv)
     interrupts = _Interrupts()
     runner = Ec2Run(
@@ -436,6 +622,10 @@ def main(argv: Sequence[str] | None = None, *, clock: lab.Clock | None = None) -
         nix_config=options.nix_config,
         state_root=options.state_root,
         known_hosts=_known_hosts(),
+        frames_dir=options.frames_dir,
+        copy_timeout=options.copy_timeout,
+        ffmpeg=options.ffmpeg,
+        ffprobe=options.ffprobe,
         interrupts=interrupts,
     )
     previous: dict[int, object] = {}

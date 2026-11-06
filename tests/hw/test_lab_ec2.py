@@ -13,13 +13,17 @@ import io
 import json
 import os
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import zlib
 from collections.abc import Callable
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import lab
@@ -33,6 +37,12 @@ BOX = "halmasuit-lab-k3x"
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 REMOTE_COMMAND = "sudo -n journalctl -b 0 -o json --all --no-pager"
 WAIT_SECONDS = 30
+OUTPUT = "DP-1"
+FRAME_COUNT = 64
+FRAME_SIZE = 4
+FIRST_MONO_US = 1_599_000
+FRAME_STEP_US = 500_000
+GREETER_FRAME = FRAME_COUNT - 1
 
 EC2_FAKE = r'''
 import json
@@ -121,8 +131,13 @@ sys.exit(2)
 '''
 
 SSH_FAKE = r'''
+import io
 import json
+import os
+import shlex
 import sys
+import tarfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -132,9 +147,33 @@ with (HERE / "ssh-calls.jsonl").open("a") as calls:
 if CONFIG["fails"]:
     print("ssh: connect refused", file=sys.stderr)
     sys.exit(255)
+remote = sys.argv[-1]
+if remote.startswith("sudo -n tar "):
+    frames = CONFIG["frames"]
+    words = shlex.split(remote)
+    if words[4] != frames["dir"]:
+        print(f"tar: {words[4]}: Cannot open: No such file or directory", file=sys.stderr)
+        sys.exit(2)
+    if frames["mode"] == "fail":
+        print("ssh: connection reset during frames copy", file=sys.stderr)
+        sys.exit(255)
+    if frames["mode"] == "hang":
+        (HERE / "ssh-copy.pid").write_text(str(os.getpid()))
+        while True:
+            time.sleep(60)
+    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as archive:
+        archive.add(frames["source"], arcname=".")
+        if frames["mode"] == "escape":
+            payload = b"outside the frames directory"
+            member = tarfile.TarInfo("../escape.txt")
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+    sys.exit(0)
 if CONFIG["journal"] is not None:
     sys.stdout.write(Path(CONFIG["journal"]).read_text())
 '''
+
+DEFAULT_FRAMES_DIR = "/var/lib/halmasuit-lab/frames"
 
 
 class FakeClock:
@@ -206,6 +245,107 @@ def process_alive(pid: int) -> bool:
     return True
 
 
+def tree(root: Path) -> dict[str, bytes]:
+    """Every regular file under root, keyed by its path relative to root."""
+    return {str(path.relative_to(root)): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+def tar_command(frames_dir: str) -> str:
+    return f"sudo -n tar -C {frames_dir} -cf - ."
+
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def frame_pixels(seq: int) -> bytes:
+    """The rgb8 pixels of one frame; each seq has its own colour."""
+    red, green, blue = (seq * 4) % 256, 255 - (seq * 4) % 256, (seq * 7) % 256
+    return bytes((red, green, blue)) * (FRAME_SIZE * FRAME_SIZE)
+
+
+def png_chunk(kind: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+
+def frame_png(seq: int) -> bytes:
+    """One frame as an 8-bit RGB PNG, encoded with zlib and struct alone."""
+    row = FRAME_SIZE * 3
+    pixels = frame_pixels(seq)
+    raw = b"".join(b"\x00" + pixels[y * row : (y + 1) * row] for y in range(FRAME_SIZE))
+    header = struct.pack(">IIBBBBB", FRAME_SIZE, FRAME_SIZE, 8, 2, 0, 0, 0)
+    return (
+        PNG_SIGNATURE
+        + png_chunk(b"IHDR", header)
+        + png_chunk(b"IDAT", zlib.compress(raw))
+        + png_chunk(b"IEND", b"")
+    )
+
+
+def png_pixels(data: bytes) -> bytes:
+    """The rgb8 pixels of a PNG as frame_png writes it: one IHDR, one IDAT, filter 0 on each row."""
+    assert data.startswith(PNG_SIGNATURE), "not a PNG"
+    chunks: dict[bytes, bytes] = {}
+    offset = len(PNG_SIGNATURE)
+    while offset < len(data):
+        (length,) = struct.unpack(">I", data[offset : offset + 4])
+        chunks[data[offset + 4 : offset + 8]] = data[offset + 8 : offset + 8 + length]
+        offset += 12 + length
+    width, height, depth, color = struct.unpack(">IIBB", chunks[b"IHDR"][:10])
+    assert (width, height, depth, color) == (FRAME_SIZE, FRAME_SIZE, 8, 2), (width, height, depth, color)
+    raw = zlib.decompress(chunks[b"IDAT"])
+    stride = 1 + width * 3
+    rows = []
+    for y in range(height):
+        assert raw[y * stride] == 0, f"row {y} filter {raw[y * stride]}"
+        rows.append(raw[y * stride + 1 : (y + 1) * stride])
+    return b"".join(rows)
+
+
+def index_line(seq: int, *, mono_us: int | None = None, dropped: int = 0) -> dict[str, Any]:
+    if mono_us is None:
+        mono_us = FIRST_MONO_US + FRAME_STEP_US * seq
+    return {
+        "seq": seq,
+        "output": OUTPUT,
+        "mono_us": mono_us,
+        "width": FRAME_SIZE,
+        "height": FRAME_SIZE,
+        "format": "rgb8",
+        "dropped": dropped,
+    }
+
+
+def write_index(path: Path, lines: list[dict[str, Any]]) -> None:
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+
+def write_recorder(directory: Path) -> None:
+    """A recorder directory as the box holds it: one output, a PNG and an index line per seq."""
+    (directory / OUTPUT).mkdir(parents=True)
+    for seq in range(FRAME_COUNT):
+        (directory / OUTPUT / f"{seq:08d}.png").write_bytes(frame_png(seq))
+    write_index(directory / "index.jsonl", [index_line(seq) for seq in range(FRAME_COUNT)])
+
+
+def decode_video(path: Path) -> bytes:
+    done = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        capture_output=True,
+        check=True,
+    )
+    return done.stdout
+
+
+def video_times_us(path: Path) -> list[Decimal]:
+    done = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries", "frame=pts_time", "-of", "csv=p=0", str(path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [Decimal(text) * 1_000_000 for text in done.stdout.split()]
+
+
 class FakeTools:
     """The fake ec2 and ssh executables in one temp directory, configured per test."""
 
@@ -221,7 +361,14 @@ class FakeTools:
             "down_sleep": 0,
             "ls_garbled_after_down": False,
         }
-        self.ssh_config = {"fails": False, "journal": str(FIXTURE)}
+        served = root / "served-frames"
+        write_recorder(served)
+        self.frames_source = served
+        self.ssh_config = {
+            "fails": False,
+            "journal": str(FIXTURE),
+            "frames": {"dir": DEFAULT_FRAMES_DIR, "source": str(served), "mode": "serve"},
+        }
         install(self.ec2, EC2_FAKE)
         install(self.ssh, SSH_FAKE)
         self.save()
@@ -236,6 +383,10 @@ class FakeTools:
 
     def set_ssh(self, **changes: object) -> None:
         self.ssh_config.update(changes)
+        self.save()
+
+    def set_frames(self, **changes: object) -> None:
+        self.ssh_config["frames"].update(changes)
         self.save()
 
     def serve_journal(self, data: bytes | None) -> None:
@@ -256,9 +407,15 @@ class FakeTools:
     def ssh_calls(self) -> list[list[str]]:
         return read_jsonl(self.root / "ssh-calls.jsonl")
 
-    def up_pid(self) -> int | None:
-        pid_file = self.root / "ec2-up.pid"
+    def pid_of(self, name: str) -> int | None:
+        pid_file = self.root / name
         return int(pid_file.read_text()) if pid_file.exists() else None
+
+    def up_pid(self) -> int | None:
+        return self.pid_of("ec2-up.pid")
+
+    def copy_pid(self) -> int | None:
+        return self.pid_of("ssh-copy.pid")
 
     def listed(self) -> list[str]:
         done = subprocess.run([str(self.ec2), "ls"], capture_output=True, text=True, check=True)
@@ -271,17 +428,17 @@ class RunnerTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         self.tools = FakeTools(root / "tools")
-        self.addCleanup(self.kill_hung_up)
+        self.addCleanup(self.kill_hung_children)
         self.repo_root = root / "halmasuit"
         self.sha = make_repo(self.repo_root)
         self.state_root = root / "runs"
         self.nix_config = root / "nix-config"
         self.clock = FakeClock()
 
-    def kill_hung_up(self) -> None:
-        pid = self.tools.up_pid()
-        if pid is not None and process_alive(pid):
-            os.kill(pid, signal.SIGKILL)
+    def kill_hung_children(self) -> None:
+        for pid in (self.tools.up_pid(), self.tools.copy_pid()):
+            if pid is not None and process_alive(pid):
+                os.kill(pid, signal.SIGKILL)
 
     def args(self) -> list[str]:
         return [
@@ -297,11 +454,21 @@ class RunnerTest(unittest.TestCase):
             str(self.state_root),
         ]
 
-    def run_runner(self) -> tuple[int, str]:
+    def run_runner(self, *options: str) -> tuple[int, str]:
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            code = lab_ec2.main(self.args(), clock=self.clock)
+            code = lab_ec2.main([*self.args(), *options], clock=self.clock)
         return code, out.getvalue()
+
+    def frames_calls(self) -> list[list[str]]:
+        return [call for call in self.tools.ssh_calls() if call[-1].startswith("sudo -n tar ")]
+
+    def assert_frames_copied(self, frames_dir: str) -> None:
+        self.assertEqual([call[-1] for call in self.frames_calls()], [tar_command(frames_dir)])
+        self.assertEqual(tree(self.run_dir() / "frames"), tree(self.tools.frames_source))
+
+    def set_served_index(self, lines: list[dict[str, Any]]) -> None:
+        write_index(self.tools.frames_source / "index.jsonl", lines)
 
     def run_dir(self) -> Path:
         """The one run directory under state_root; a subprocess run stamps it from the real clock."""
@@ -344,7 +511,7 @@ class RunnerTest(unittest.TestCase):
         self.assertTrue(self.tools.ssh_calls())
         for call in self.tools.ssh_calls():
             self.assertEqual(call[-2], f"joshsymonds@{BOX}")
-            self.assertEqual(call[-1], REMOTE_COMMAND)
+            self.assertIn(call[-1], (REMOTE_COMMAND, tar_command(DEFAULT_FRAMES_DIR)))
             self.assertIn("StrictHostKeyChecking=accept-new", call)
         self.assertEqual({number: signal.getsignal(number) for number in SIGNALS}, before)
 
@@ -413,6 +580,165 @@ class RunnerTest(unittest.TestCase):
         self.assertIn(f"could not terminate {BOX}", self.run_log())
         self.assertIn(BOX, out)
         self.assertEqual(self.tools.listed(), [BOX])
+
+    def test_pass_copies_the_default_frames_dir_into_the_run(self) -> None:
+        code, out = self.run_runner()
+        self.assertEqual(code, 0, out)
+        self.assert_frames_copied(DEFAULT_FRAMES_DIR)
+        self.assertEqual(
+            sorted(path.name for path in self.run_dir().iterdir()),
+            ["DP-1-greeter.png", "DP-1.nut", "frames", "journal.json", "run.log", "timeline.json"],
+        )
+        self.assert_box_ended()
+
+    def test_pass_writes_each_video_and_the_greeter_png(self) -> None:
+        code, out = self.run_runner()
+        self.assertEqual(code, 0, out)
+        run_dir = self.run_dir()
+        video = run_dir / f"{OUTPUT}.nut"
+        self.assertEqual(decode_video(video), b"".join(png_pixels(frame_png(seq)) for seq in range(FRAME_COUNT)))
+        self.assertEqual(video_times_us(video), [Decimal(FRAME_STEP_US * seq) for seq in range(FRAME_COUNT)])
+        self.assertEqual((run_dir / f"{OUTPUT}-greeter.png").read_bytes(), frame_png(GREETER_FRAME))
+        self.assert_box_ended()
+
+    def test_index_starting_after_the_first_frame_fails_the_run(self) -> None:
+        self.set_served_index([index_line(seq) for seq in range(1, FRAME_COUNT)])
+        code, out = self.run_runner()
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            "FAIL ec2-greeter: recorder index starts at 2099000 us, after the first frame_rendered from pid 1184",
+            self.run_log(),
+        )
+        self.assert_box_ended()
+
+    def test_seq_gap_in_the_index_fails_the_run(self) -> None:
+        self.set_served_index([index_line(seq) for seq in range(FRAME_COUNT) if seq != 10])
+        code, out = self.run_runner()
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL ec2-greeter: boot-to-greeter frames: seq 10 missing", self.run_log())
+        self.assert_box_ended()
+
+    def test_dropped_frame_in_the_index_fails_the_run(self) -> None:
+        self.set_served_index([index_line(seq, dropped=1 if seq == 20 else 0) for seq in range(FRAME_COUNT)])
+        code, out = self.run_runner()
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            "FAIL ec2-greeter: dropped frames in boot-to-greeter window: DP-1 (1 line(s))",
+            self.run_log(),
+        )
+        self.assert_box_ended()
+
+    def test_malformed_index_fails_the_run_naming_the_line(self) -> None:
+        lines = [json.dumps(index_line(seq)) for seq in range(FRAME_COUNT)]
+        lines[2] = "not json"
+        (self.tools.frames_source / "index.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        code, out = self.run_runner()
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL ec2-greeter: recorder index unreadable: index.jsonl line 3: not JSON", self.run_log())
+        self.assert_box_ended()
+
+    def test_missing_index_fails_the_run(self) -> None:
+        (self.tools.frames_source / "index.jsonl").unlink()
+        code, out = self.run_runner()
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL ec2-greeter: recorder index unreadable: [Errno 2] No such file or directory", self.run_log())
+        self.assert_box_ended()
+
+    def test_missing_frame_file_fails_the_run(self) -> None:
+        (self.tools.frames_source / OUTPUT / f"{5:08d}.png").unlink()
+        code, out = self.run_runner()
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"FAIL ec2-greeter: frame file missing for {OUTPUT}", self.run_log())
+        self.assert_box_ended()
+
+    def test_failing_ffmpeg_fails_the_run(self) -> None:
+        code, out = self.run_runner("--ffmpeg", "false")
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"FAIL ec2-greeter: encode {OUTPUT} failed (rc 1)", self.run_log())
+        self.assert_box_ended()
+
+    def test_missing_ffmpeg_fails_the_run(self) -> None:
+        code, out = self.run_runner("--ffmpeg", str(self.tools.root / "no-such-ffmpeg"))
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"FAIL ec2-greeter: encode {OUTPUT} failed (rc 127)", self.run_log())
+        self.assert_box_ended()
+
+    def test_ffprobe_count_different_from_the_index_fails_the_run(self) -> None:
+        install(self.tools.root / "ffprobe-63", "print(63)\n")
+        code, out = self.run_runner("--ffprobe", str(self.tools.root / "ffprobe-63"))
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            f"FAIL ec2-greeter: video frame count differs from index: {OUTPUT} has 63 video frame(s) "
+            f"for {FRAME_COUNT} index line(s)",
+            self.run_log(),
+        )
+        self.assert_box_ended()
+
+    def test_frames_dir_option_names_the_copied_directory(self) -> None:
+        self.tools.set_frames(dir="/srv/recorder/frames")
+        code, out = self.run_runner("--frames-dir", "/srv/recorder/frames")
+        self.assertEqual(code, 0, out)
+        self.assert_frames_copied("/srv/recorder/frames")
+        self.assert_box_ended()
+
+    def test_failing_frames_copy_fails_the_run_and_ends_the_box(self) -> None:
+        self.tools.set_frames(mode="fail")
+        code, out = self.run_runner()
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            f"copy of {DEFAULT_FRAMES_DIR} failed (rc 255): ssh: connection reset during frames copy",
+            self.run_log(),
+        )
+        self.assertFalse((self.run_dir() / "frames").exists())
+        self.assert_box_ended()
+
+    def test_frames_member_outside_the_directory_fails_the_run(self) -> None:
+        self.tools.set_frames(mode="escape")
+        code, out = self.run_runner()
+        self.assertEqual(code, 1, out)
+        self.assertIn("extract of /var/lib/halmasuit-lab/frames failed", self.run_log())
+        self.assertFalse((self.run_dir() / "escape.txt").exists())
+        self.assert_box_ended()
+
+    def test_frames_copy_outlasting_the_timeout_fails_and_ends_the_box(self) -> None:
+        self.tools.set_frames(mode="hang")
+        code, out = self.run_runner("--copy-timeout", "2")
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"copy of {DEFAULT_FRAMES_DIR} timed out after 2 seconds", self.run_log())
+        pid = self.tools.copy_pid()
+        self.assertIsNotNone(pid)
+        self.assertFalse(process_alive(pid))
+        self.assert_box_ended()
+
+    def test_failing_frames_copy_after_a_hold_timeout_keeps_the_hold_reason(self) -> None:
+        self.tools.serve_journal(None)
+        self.tools.set_frames(mode="fail")
+        code, out = self.run_runner()
+        self.assertEqual(code, 1, out)
+        log = self.run_log()
+        self.assertIn("FAIL ec2-greeter: no halmasuit.service foreground_changed to greeter event", log)
+        self.assertIn("frames not copied", log)
+        self.assert_box_ended()
+
+    def test_sigterm_during_the_frames_copy_ends_the_box(self) -> None:
+        self.tools.set_frames(mode="hang")
+        runner = subprocess.Popen(
+            [sys.executable, "-B", str(RUNNER), *self.args()],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            pid = wait_for(self.tools.copy_pid, "the hung frames copy to start")
+            runner.send_signal(signal.SIGTERM)
+            out, err = runner.communicate(timeout=60)
+        finally:
+            if runner.poll() is None:
+                runner.kill()
+                runner.communicate()
+        self.assertEqual(runner.returncode, 128 + signal.SIGTERM, out + err)
+        self.assertFalse(process_alive(pid))
+        self.assert_box_ended()
 
     def assert_killed_while_hung(self, signum: int, up: str = "hang") -> None:
         self.tools.set_ec2(up=up)
