@@ -3,10 +3,12 @@
 
 `ec2 up` builds the checkout's HEAD into a new box and prints `<name> ready` as its last stdout
 line. The runner holds the box's boot journal until halmasuit.service's greeter event is 30
-seconds old in it, copies the journal into the run directory as journal.json, and checks it
-against the ec2-greeter profile in timeline.py. Each run writes its record to a directory under
---state-root named `<stamp>-ec2-greeter`: run.log holds the ec2 calls with their results, the
-`ec2 up` output, and PASS or each `FAIL ec2-greeter: <message>` line.
+seconds old in it, copies the journal into the run directory as journal.json, copies the box's
+recorder directory into the run directory's frames/ over ssh, and checks the journal against the
+ec2-greeter profile in timeline.py. The frames copy is bounded by --copy-timeout seconds. Each run
+writes its record to a directory under --state-root named `<stamp>-ec2-greeter`: run.log holds the
+ec2 calls with their results, the `ec2 up` output, and PASS or each `FAIL ec2-greeter: <message>`
+line.
 
 A run refuses, launching nothing, while a halmasuit-lab box is already listed. Every box a run
 launches is ended before the run returns, on pass, fail, an exception, or SIGINT, SIGTERM, or
@@ -30,6 +32,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
@@ -46,6 +49,9 @@ READY = re.compile(r"(halmasuit-lab-\S+) ready")
 BOX_USER = "joshsymonds"
 CONNECT_TIMEOUT_SECONDS = 10
 JOURNAL_COMMAND = ("sudo", "-n", "journalctl", "-b", "0", "-o", "json", "--all", "--no-pager")
+DEFAULT_FRAMES_DIR = "/var/lib/halmasuit-lab/frames"
+FRAMES_NAME = "frames"
+COPY_TIMEOUT_SECONDS = 600
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
@@ -128,6 +134,8 @@ class Ec2Run:
         nix_config: Path,
         state_root: Path,
         known_hosts: Path,
+        frames_dir: str,
+        copy_timeout: int,
         interrupts: _Interrupts,
     ) -> None:
         self.ec2 = ec2
@@ -137,6 +145,8 @@ class Ec2Run:
         self.nix_config = nix_config
         self.state_root = state_root
         self.known_hosts = known_hosts
+        self.frames_dir = frames_dir
+        self.copy_timeout = copy_timeout
         self.interrupts = interrupts
 
     def run(self) -> int:
@@ -183,6 +193,12 @@ class Ec2Run:
             if reason is None:
                 raise
             run.say(f"journal: {err}; journal.json not written")
+        try:
+            self._collect_frames(run, name)
+        except LabError as err:
+            if reason is None:
+                raise
+            run.say(f"frames: {err}; frames not copied")
         if reason is not None:
             raise LabError(reason)
         return self._check(run)
@@ -278,8 +294,8 @@ class Ec2Run:
             process.terminate()
         self._reap_up(run, launch)
 
-    def _ssh(self, name: str, remote: Sequence[str]) -> lab.Result:
-        argv = [
+    def _ssh_argv(self, name: str, remote: Sequence[str]) -> list[str]:
+        return [
             self.ssh,
             "-o",
             "BatchMode=yes",
@@ -296,7 +312,9 @@ class Ec2Run:
             f"{BOX_USER}@{name}",
             shlex.join(remote),
         ]
-        return _program(argv, lab.REMOTE_TIMEOUT_SECONDS)
+
+    def _ssh(self, name: str, remote: Sequence[str]) -> lab.Result:
+        return _program(self._ssh_argv(name, remote), lab.REMOTE_TIMEOUT_SECONDS)
 
     def _journal(self, name: str, what: str) -> str:
         return lab._ok(self._ssh(name, JOURNAL_COMMAND), what)
@@ -339,6 +357,41 @@ class Ec2Run:
     def _collect_journal(self, run: lab.RunLog, name: str) -> None:
         text = self._journal(name, "collect the boot journal")
         (run.directory / timeline.JOURNAL_NAME).write_text(text, encoding="utf-8")
+
+    def _collect_frames(self, run: lab.RunLog, name: str) -> None:
+        """Extracts the box's recorder directory into the run directory's frames/, or raises.
+
+        The tar stream is binary, so it goes to an unnamed temporary file in the run directory,
+        which is gone once closed, even when the run is signalled mid-copy. subprocess.run kills
+        the ssh child on the timeout and on any exception escaping it.
+        """
+        remote = ("sudo", "-n", "tar", "-C", self.frames_dir, "-cf", "-", ".")
+        run.say(f"frames copy: {shlex.join(remote)}")
+        with tempfile.TemporaryFile(dir=run.directory) as archive:
+            try:
+                done = subprocess.run(
+                    self._ssh_argv(name, remote),
+                    stdout=archive,
+                    stderr=subprocess.PIPE,
+                    timeout=self.copy_timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as err:
+                raise LabError(f"copy of {self.frames_dir} timed out after {self.copy_timeout} seconds") from err
+            except OSError as err:
+                raise LabError(f"cannot start ssh for the frames copy: {err}") from err
+            stderr = done.stderr.decode("utf-8", errors="replace")
+            self._record(run, "frames copy", lab.Result(done.returncode, "", stderr))
+            if done.returncode != 0:
+                detail = stderr.strip() or "no output"
+                raise LabError(f"copy of {self.frames_dir} failed (rc {done.returncode}): {detail}")
+            archive.seek(0)
+            try:
+                (run.directory / FRAMES_NAME).mkdir()
+                with tarfile.open(fileobj=archive, mode="r:") as tar:
+                    tar.extractall(run.directory / FRAMES_NAME, filter="data")
+            except (tarfile.TarError, OSError) as err:
+                raise LabError(f"extract of {self.frames_dir} failed: {err}") from err
 
     def _check(self, run: lab.RunLog) -> int:
         try:
@@ -426,6 +479,17 @@ def main(argv: Sequence[str] | None = None, *, clock: lab.Clock | None = None) -
         default=Path.home() / ".local" / "state" / "halmasuit-lab" / "runs",
         help="directory for per-run logs",
     )
+    parser.add_argument(
+        "--frames-dir",
+        default=DEFAULT_FRAMES_DIR,
+        help="recorder directory on the box",
+    )
+    parser.add_argument(
+        "--copy-timeout",
+        type=int,
+        default=COPY_TIMEOUT_SECONDS,
+        help="seconds the frames copy from the box may take",
+    )
     options = parser.parse_args(argv)
     interrupts = _Interrupts()
     runner = Ec2Run(
@@ -436,6 +500,8 @@ def main(argv: Sequence[str] | None = None, *, clock: lab.Clock | None = None) -
         nix_config=options.nix_config,
         state_root=options.state_root,
         known_hosts=_known_hosts(),
+        frames_dir=options.frames_dir,
+        copy_timeout=options.copy_timeout,
         interrupts=interrupts,
     )
     previous: dict[int, object] = {}
