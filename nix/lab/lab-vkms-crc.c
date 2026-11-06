@@ -1,15 +1,18 @@
 /*
  * lab-vkms-crc: vkms scanout CRC sampler for the lab VM gate.
  *
- * Opens the first /dev/dri card whose DRM driver name is "vkms", drops DRM
- * master right after opening, and samples the CRC of every CRTC through
- * debugfs (/sys/kernel/debug/dri/<minor>/crtc-<index>/crc). A CRTC is active
- * when KMS reports a valid mode and its data file opens; an inactive CRTC is
- * logged with active=0 and crc=00000000. Prints the frozen lab-vkms-crc
- * journal lines on stdout and failures on stderr.
+ * Finds the vkms device through debugfs: the dri/<N> entry whose name file
+ * reads "vkms" is the device. Its CRTC ids, their order, and their atomic
+ * active state come from dri/<N>/state. The sampler opens no /dev/dri node, so
+ * it never takes or blocks DRM master.
  *
- * The debugfs crtc-<index> directory is named by the CRTC's position in the
- * KMS CRTC list, which drmModeGetResources reports in order.
+ * A CRTC is sampled through dri/<N>/crtc-<index>/crc. An inactive CRTC is
+ * logged with active=0 and crc=00000000. Prints the frozen lab-vkms-crc journal
+ * lines on stdout and failures on stderr.
+ *
+ * The primary minor <N> is /dev/dri/card<N>, so the card name is card<N>. The
+ * debugfs crtc-<index> directory is named by the CRTC's position in the KMS
+ * CRTC list, which the state file prints in order.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -22,14 +25,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/sysmacros.h>
 #include <time.h>
 #include <unistd.h>
 
-#include <xf86drm.h>
-#include <xf86drmMode.h>
-
+#define DEBUGFS_DRI "/sys/kernel/debug/dri"
 #define NS_PER_SEC 1000000000L
 #define CARD_SCAN_PERIOD_NS (100L * 1000000L)
 #define PACING_NS (2L * 1000000L)
@@ -40,16 +39,21 @@
  */
 #define DEBUGFS_DIR_LEN 64
 #define DEBUGFS_PATH_LEN 256
+#define DEBUGFS_NAME_LEN 256
+#define STATE_LEN 65536
 
 struct crtc {
 	uint32_t id;
 	uint32_t index;
 	int data_fd;
 	bool has_sample;
+	bool kms_active;
 	bool active;
 	bool error_reported;
 	uint32_t crc;
 };
+
+static char state_text[STATE_LEN];
 
 static _Noreturn void fatal(const char *what, int err)
 {
@@ -95,107 +99,192 @@ static void sleep_until(struct timespec deadline)
 		fatal("clock_nanosleep", rc);
 }
 
-static bool is_card_name(const char *name)
+static bool is_minor_name(const char *name)
 {
-	const char *digits = name + strlen("card");
-
-	if (strncmp(name, "card", strlen("card")) != 0 || *digits == '\0')
+	if (*name == '\0')
 		return false;
-	for (; *digits != '\0'; digits++) {
-		if (*digits < '0' || *digits > '9')
+	for (; *name != '\0'; name++) {
+		if (*name < '0' || *name > '9')
 			return false;
 	}
 	return true;
 }
 
-static bool is_vkms_fd(int fd)
+/*
+ * Reads the whole file into buf and NUL-terminates it. Returns the length, or
+ * -1 with errno set; EFBIG means the contents do not fit in len - 1 bytes.
+ */
+static ssize_t read_file(const char *path, char *buf, size_t len)
 {
-	drmVersionPtr version = drmGetVersion(fd);
-	bool match;
+	size_t total = 0;
+	int fd, err = 0;
 
-	if (version == NULL)
-		return false;
-	match = strcmp(version->name, "vkms") == 0;
-	drmFreeVersion(version);
-	return match;
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	for (;;) {
+		ssize_t n;
+
+		if (total == len - 1) {
+			err = EFBIG;
+			break;
+		}
+		n = read(fd, buf + total, len - 1 - total);
+		if (n < 0) {
+			err = errno;
+			break;
+		}
+		if (n == 0)
+			break;
+		total += (size_t)n;
+	}
+	close(fd);
+	if (err != 0) {
+		errno = err;
+		return -1;
+	}
+	buf[total] = '\0';
+	return (ssize_t)total;
+}
+
+static bool is_vkms_name(const char *name)
+{
+	size_t len = strlen("vkms");
+
+	return strncmp(name, "vkms", len) == 0 &&
+	       (name[len] == '\0' || name[len] == ' ' || name[len] == '\n');
 }
 
 /*
- * Returns the fd of the first vkms card, with its name copied into card, or
- * -1 when no vkms card is present yet. Other cards are closed unchanged.
+ * Sets minor to the dri/<N> entry whose name file reads "vkms" and returns
+ * true, or returns false when no vkms device is registered yet.
  */
-static int open_vkms_card(char *card, size_t card_len)
+static bool find_vkms_minor(unsigned *minor)
 {
 	DIR *dir;
 	struct dirent *ent;
-	int fd = -1;
+	bool found = false;
 
-	dir = opendir("/dev/dri");
+	dir = opendir(DEBUGFS_DRI);
 	if (dir == NULL)
-		return -1;
-	while ((ent = readdir(dir)) != NULL) {
-		char path[sizeof "/dev/dri/" + NAME_MAX];
+		return false;
+	while (!found && (ent = readdir(dir)) != NULL) {
+		char path[sizeof DEBUGFS_DRI + NAME_MAX + sizeof "/name"];
+		char name[DEBUGFS_NAME_LEN];
+		unsigned long value;
+		ssize_t n;
 
-		if (!is_card_name(ent->d_name))
+		if (!is_minor_name(ent->d_name))
 			continue;
-		snprintf(path, sizeof path, "/dev/dri/%s", ent->d_name);
-		fd = open(path, O_RDWR | O_CLOEXEC);
-		if (fd < 0)
+		value = strtoul(ent->d_name, NULL, 10);
+		if (value > UINT_MAX)
 			continue;
-		if (is_vkms_fd(fd)) {
-			snprintf(card, card_len, "%s", ent->d_name);
-			break;
+		snprintf(path, sizeof path, "%s/%s/name", DEBUGFS_DRI, ent->d_name);
+		n = read_file(path, name, sizeof name);
+		if (n < 0) {
+			if (errno != ENOENT)
+				fatal("read name", errno);
+			continue;
 		}
-		close(fd);
-		fd = -1;
+		if (is_vkms_name(name)) {
+			*minor = (unsigned)value;
+			found = true;
+		}
 	}
 	closedir(dir);
-	return fd;
+	return found;
 }
 
-static int wait_for_vkms_card(char *card, size_t card_len)
+static unsigned wait_for_vkms_minor(void)
 {
-	int fd;
+	unsigned minor = 0;
 
-	while ((fd = open_vkms_card(card, card_len)) < 0)
+	while (!find_vkms_minor(&minor))
 		sleep_until(add_ns(now_mono(), CARD_SCAN_PERIOD_NS));
-	return fd;
+	return minor;
 }
 
-static struct crtc *read_crtcs(int fd, size_t *count)
+/* Reads dri/<N>/state into state_text. Returns 0, or the errno of the read. */
+static int read_state(unsigned minor)
 {
-	drmModeResPtr res;
+	char path[DEBUGFS_PATH_LEN];
+
+	snprintf(path, sizeof path, "%s/%u/state", DEBUGFS_DRI, minor);
+	if (read_file(path, state_text, sizeof state_text) < 0)
+		return errno;
+	return 0;
+}
+
+/*
+ * Walks the state dump. A "crtc[<id>]:" line starts a CRTC block; its
+ * "\tactive=" line gives the atomic state. Any other line that does not start
+ * with a tab (planes, connectors, private objects) ends the block. Returns the
+ * number of CRTC blocks. With crtcs non-NULL it also fills each block's id,
+ * index, and kms_active, and fails unless there are exactly count blocks, each
+ * with one active line.
+ */
+static size_t parse_state(const char *text, struct crtc *crtcs, size_t count)
+{
+	const char *line = text;
+	size_t blocks = 0, actives = 0;
+	bool in_block = false;
+
+	while (*line != '\0') {
+		const char *next = strchr(line, '\n');
+		uint32_t id;
+		int value;
+
+		if (sscanf(line, "crtc[%" SCNu32 "]", &id) == 1) {
+			if (crtcs != NULL) {
+				if (blocks >= count)
+					fatal("state has more CRTCs than were loaded", 0);
+				crtcs[blocks].id = id;
+				crtcs[blocks].index = (uint32_t)blocks;
+			}
+			blocks++;
+			in_block = true;
+		} else if (line[0] != '\t') {
+			in_block = false;
+		} else if (in_block &&
+			   sscanf(line, "\tactive=%d", &value) == 1 &&
+			   (value == 0 || value == 1)) {
+			actives++;
+			if (crtcs != NULL)
+				crtcs[blocks - 1].kms_active = value == 1;
+		}
+
+		if (next == NULL)
+			break;
+		line = next + 1;
+	}
+
+	if (crtcs != NULL && (blocks != count || actives != count))
+		fatal("unparsable CRTC state", 0);
+	return blocks;
+}
+
+static struct crtc *read_crtcs(unsigned dev_minor, size_t *count)
+{
 	struct crtc *crtcs;
+	size_t n;
+	int err;
 
-	res = drmModeGetResources(fd);
-	if (res == NULL)
-		fatal("drmModeGetResources", errno);
-	if (res->count_crtcs <= 0)
+	while ((err = read_state(dev_minor)) == ENOENT)
+		sleep_until(add_ns(now_mono(), CARD_SCAN_PERIOD_NS));
+	if (err != 0)
+		fatal("read state", err);
+
+	n = parse_state(state_text, NULL, 0);
+	if (n == 0)
 		fatal("vkms card reports no CRTCs", 0);
-
-	*count = (size_t)res->count_crtcs;
-	crtcs = calloc(*count, sizeof *crtcs);
+	crtcs = calloc(n, sizeof *crtcs);
 	if (crtcs == NULL)
 		fatal("calloc", errno);
-	for (size_t i = 0; i < *count; i++) {
-		crtcs[i].id = res->crtcs[i];
-		crtcs[i].index = (uint32_t)i;
+	for (size_t i = 0; i < n; i++)
 		crtcs[i].data_fd = -1;
-	}
-	drmModeFreeResources(res);
+	parse_state(state_text, crtcs, n);
+	*count = n;
 	return crtcs;
-}
-
-static bool crtc_kms_active(int fd, uint32_t id)
-{
-	drmModeCrtcPtr crtc = drmModeGetCrtc(fd, id);
-	bool active;
-
-	if (crtc == NULL)
-		fatal("drmModeGetCrtc", errno);
-	active = crtc->mode_valid != 0;
-	drmModeFreeCrtc(crtc);
-	return active;
 }
 
 /*
@@ -264,8 +353,7 @@ static void report_error(const char *card, struct crtc *c, int err)
 	c->error_reported = true;
 }
 
-static void sample_crtc(int card_fd, const char *card, unsigned dev_minor,
-			struct crtc *c)
+static void sample_crtc(const char *card, unsigned dev_minor, struct crtc *c)
 {
 	char dir[DEBUGFS_DIR_LEN];
 	char line[CRC_LINE_LEN];
@@ -273,14 +361,14 @@ static void sample_crtc(int card_fd, const char *card, unsigned dev_minor,
 	ssize_t n;
 	int err;
 
-	if (!crtc_kms_active(card_fd, c->id)) {
+	if (!c->kms_active) {
 		close_data(c);
 		observe(card, c, false, 0, monotonic_us());
 		return;
 	}
 
-	snprintf(dir, sizeof dir, "/sys/kernel/debug/dri/%u/crtc-%" PRIu32,
-		 dev_minor, c->index);
+	snprintf(dir, sizeof dir, "%s/%u/crtc-%" PRIu32, DEBUGFS_DRI, dev_minor,
+		 c->index);
 	if (c->data_fd < 0) {
 		err = open_crc_data(dir, &c->data_fd);
 		if (err == EIO) {
@@ -309,13 +397,17 @@ static void sample_crtc(int card_fd, const char *card, unsigned dev_minor,
 	observe(card, c, true, crc, monotonic_us());
 }
 
-static _Noreturn void sample_forever(int card_fd, const char *card,
-				     unsigned dev_minor, struct crtc *crtcs,
-				     size_t count)
+static _Noreturn void sample_forever(const char *card, unsigned dev_minor,
+				     struct crtc *crtcs, size_t count)
 {
 	for (;;) {
+		int err = read_state(dev_minor);
+
+		if (err != 0)
+			fatal("read state", err);
+		parse_state(state_text, crtcs, count);
 		for (size_t i = 0; i < count; i++)
-			sample_crtc(card_fd, card, dev_minor, &crtcs[i]);
+			sample_crtc(card, dev_minor, &crtcs[i]);
 		if (ferror(stdout))
 			fatal("stdout write", errno);
 		sleep_until(add_ns(now_mono(), PACING_NS));
@@ -324,22 +416,17 @@ static _Noreturn void sample_forever(int card_fd, const char *card,
 
 int main(void)
 {
-	char card[NAME_MAX + 1];
-	struct stat st;
+	char card[sizeof "card" + sizeof "4294967295"];
 	struct crtc *crtcs;
+	unsigned dev_minor;
 	size_t count;
-	int card_fd;
 
 	if (setvbuf(stdout, NULL, _IOLBF, 0) != 0)
 		fatal("setvbuf", errno);
 	printf("start t=%" PRIu64 "\n", monotonic_us());
 
-	card_fd = wait_for_vkms_card(card, sizeof card);
-	if (drmIsMaster(card_fd) && drmDropMaster(card_fd) != 0)
-		fatal("drmDropMaster", errno);
-	if (fstat(card_fd, &st) != 0)
-		fatal("fstat", errno);
-
-	crtcs = read_crtcs(card_fd, &count);
-	sample_forever(card_fd, card, minor(st.st_rdev), crtcs, count);
+	dev_minor = wait_for_vkms_minor();
+	snprintf(card, sizeof card, "card%u", dev_minor);
+	crtcs = read_crtcs(dev_minor, &count);
+	sample_forever(card, dev_minor, crtcs, count);
 }

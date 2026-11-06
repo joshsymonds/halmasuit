@@ -204,6 +204,32 @@ pkgs.testers.runNixOSTest {
             f"journalctl -b -o cat _SYSTEMD_UNIT={unit} SYSLOG_IDENTIFIER=lab-vkms-crc"
         )
 
+    # The sampler must run without any /dev/dri fd: it reads KMS state through
+    # debugfs only, so it cannot take or block DRM master.
+    def sampler_pids():
+        return machine.succeed("pgrep -x lab-vkms-crc || true").split()
+
+    def assert_sampler_without_dri_fd(label):
+        pids = sampler_pids()
+        if not pids:
+            raise AssertionError(f"{label}: no lab-vkms-crc process is running")
+        for pid in pids:
+            held = machine.succeed(
+                f"find /proc/{pid}/fd -mindepth 1 -maxdepth 1 -lname '/dev/dri/*' -print"
+            ).strip()
+            if held:
+                raise AssertionError(
+                    f"{label}: lab-vkms-crc pid {pid} holds DRM fds:\n{held}"
+                )
+
+    # debugfs clients lists one row per DRM file; the column after tgid and dev
+    # is master, 'y' for the current master.
+    def assert_scanout_is_master():
+        machine.succeed(
+            "awk '$1 == \"vkms-scanout\" && $4 == \"y\"' /sys/kernel/debug/dri/0/clients"
+            " | grep -q ."
+        )
+
     machine.start()
     machine.wait_for_unit("multi-user.target")
 
@@ -221,12 +247,15 @@ pkgs.testers.runNixOSTest {
         timeout=300,
     )
 
-    # Mode set with a black frame, then a lit frame on SIGUSR1.
+    # Mode set with a black frame, then a lit frame on SIGUSR1. The sampler is
+    # running and holds no DRM fd when the mode-setter takes master.
+    assert_sampler_without_dri_fd("before the mode set")
     machine.succeed("systemd-run --unit=vkms-scanout ${vkmsScanout}/bin/vkms-scanout")
     machine.wait_until_succeeds(
         "journalctl -b -o cat _SYSTEMD_UNIT=vkms-scanout.service | grep -q '^mode-set t='",
         timeout=300,
     )
+    assert_scanout_is_master()
     machine.wait_until_succeeds(
         f"journalctl -b -o cat SYSLOG_IDENTIFIER=lab-vkms-crc | grep -q 'crc={BLACK:08x} active=1$'",
         timeout=300,
@@ -242,6 +271,7 @@ pkgs.testers.runNixOSTest {
         f" | grep -E '^sample .* active=1$' | grep -v 'crc={BLACK:08x}' | grep -q .",
         timeout=300,
     )
+    assert_sampler_without_dri_fd("after the lit frame")
 
     scanout = machine.succeed("journalctl -b -o cat _SYSTEMD_UNIT=vkms-scanout.service")
     mode_set_t = field(r"^mode-set t=(\d+)$", scanout)
