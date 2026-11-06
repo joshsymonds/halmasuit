@@ -109,16 +109,20 @@ against an ec2-greeter timeline; it is not a profile, and its messages are retur
 the way a profile returns its own. The first frame is the earliest frame_rendered from
 P, and the index must start no later than it. The boot-to-greeter window is the index
 lines before the session foreground, or every line when there is none. In that window
-the seqs are contiguous, no (output, seq) pair repeats, and every line has `dropped`
-0. Each output's video frame count equals its index lines, and each output has a frame
+every line's seq is the frame_id of a frame_rendered from P, the seqs strictly increase
+per output in file order, no (output, seq) pair repeats, and every line has `dropped`
+0. A seq absent between the window's lowest and highest seq is accepted only when the
+timeline holds a frame_rendered and a frame_superseded with that frame_id, each from P.
+Each output's video frame count equals its index lines, and each output has a frame
 in the greeter-foreground window. `greeter_frames` picks, per output, the latest index
 line in that window; that is the greeter PNG a run names. Seqs are shared by every
-output, so contiguity is over seqs, not per output.
+output, so the absent-seq rule is over seqs, not per output.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import importlib
 import json
 import re
@@ -721,20 +725,75 @@ def greeter_frames(timeline: Timeline, frames: list[dict[str, Any]]) -> dict[str
     return picked
 
 
-def recorder_boot_failures(boot: list[dict[str, Any]]) -> list[str]:
+def frame_ids(timed: list[dict[str, Any]], name: str, pid: int | None) -> set[int]:
+    ids: set[int] = set()
+    for event in timed:
+        frame_id = event["payload"].get("frame_id")
+        if from_pid(event, pid) and payload_matches(event["payload"], name) and type(frame_id) is int:
+            ids.add(frame_id)
+    return ids
+
+
+def unexcused_gaps(seqs: list[int], excused: list[int]) -> list[tuple[int, int]]:
+    """The inclusive runs of absent seqs between consecutive seqs, leaving out excused seqs.
+
+    `seqs` and `excused` are sorted, and `seqs` holds no duplicates.
+    """
+    runs: list[tuple[int, int]] = []
+    for low, high in zip(seqs, seqs[1:]):
+        cursor = low + 1
+        for seq in excused[bisect.bisect_right(excused, low) : bisect.bisect_left(excused, high)]:
+            if seq > cursor:
+                runs.append((cursor, seq - 1))
+            cursor = seq + 1
+        if cursor < high:
+            runs.append((cursor, high - 1))
+    return runs
+
+
+def out_of_order(boot: list[dict[str, Any]], repeats: set[tuple[str, int]]) -> list[tuple[str, int, int]]:
+    """Lines whose seq does not exceed the previous seq of their output; a repeated pair is left to its own check."""
+    last: dict[str, int] = {}
+    stepped: list[tuple[str, int, int]] = []
+    for frame in boot:
+        output, seq = frame["output"], frame["seq"]
+        previous = last.get(output)
+        if previous is not None and seq <= previous and (output, seq) not in repeats:
+            stepped.append((output, seq, previous))
+        last[output] = seq
+    return stepped
+
+
+def recorder_boot_failures(boot: list[dict[str, Any]], timed: list[dict[str, Any]], pid: int | None) -> list[str]:
     failures: list[str] = []
     seqs = sorted({frame["seq"] for frame in boot})
-    gaps = [(low, high) for low, high in zip(seqs, seqs[1:]) if high != low + 1]
+    rendered = frame_ids(timed, "frame_rendered", pid)
+    superseded = frame_ids(timed, "frame_superseded", pid)
+    gaps = unexcused_gaps(seqs, sorted(rendered & superseded))
     pairs = Counter((frame["output"], frame["seq"]) for frame in boot)
-    repeats = sorted(pair for pair, count in pairs.items() if count > 1)
+    repeated = sorted(pair for pair, count in pairs.items() if count > 1)
+    unrendered = [frame for frame in boot if frame["seq"] not in rendered]
+    stepped = out_of_order(boot, set(repeated))
     parts: list[str] = []
     if gaps:
         low, high = gaps[0]
-        missing = f"seq {low + 1}" if high - low == 2 else f"seqs {low + 1}..{high - 1}"
-        parts.append(f"{missing} missing")
-    if repeats:
-        output, seq = repeats[0]
-        parts.append(f"{len(repeats)} (output, seq) pair(s) repeated, first {output} seq {seq}")
+        missing = f"seq {low} missing" if low == high else f"seqs {low}..{high} missing"
+        parts.append(missing)
+    if unrendered:
+        first = unrendered[0]
+        parts.append(
+            f"{len(unrendered)} line(s) with no frame_rendered from the started pid, "
+            f"first {first['output']} seq {first['seq']}"
+        )
+    if stepped:
+        output, seq, previous = stepped[0]
+        parts.append(
+            f"{len(stepped)} line(s) with seq not increasing per output, "
+            f"first {output} seq {seq} after seq {previous}"
+        )
+    if repeated:
+        output, seq = repeated[0]
+        parts.append(f"{len(repeated)} (output, seq) pair(s) repeated, first {output} seq {seq}")
     if parts:
         failures.append("boot-to-greeter frames: " + "; ".join(parts))
     dropped = Counter(frame["output"] for frame in boot if frame["dropped"] != 0)
@@ -777,7 +836,7 @@ def recorder_failures(
         )
     start, end = foreground_window(timed)
     boot = [frame for frame in frames if end is None or frame["mono_us"] < end]
-    failures += recorder_boot_failures(boot)
+    failures += recorder_boot_failures(boot, timed, pid)
     failures += recorder_count_failures(frames, video_frames)
     if start is not None:
         seen = greeter_frames(timeline, frames)

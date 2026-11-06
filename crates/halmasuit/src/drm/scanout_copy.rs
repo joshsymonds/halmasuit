@@ -143,17 +143,38 @@ pub struct SeqBook {
     deferred: Option<u64>,
 }
 
+/// What one render did to a [`SeqBook`].
+#[cfg(feature = "frame_audit")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Rendered {
+    /// The seq of the frame presented now, if any.
+    pub presented: Option<u64>,
+    /// The seq of the earlier deferred render this one replaced, if any.
+    /// That frame is never presented.
+    pub superseded: Option<u64>,
+}
+
 #[cfg(feature = "frame_audit")]
 impl SeqBook {
-    /// A render with `seq` was given `action`. Returns the seq of the frame
-    /// presented now, if any. A deferred render replaces any earlier one.
-    pub const fn frame_rendered(&mut self, action: FrameAction, seq: u64) -> Option<u64> {
+    /// A render with `seq` was given `action`. A deferred render replaces
+    /// any earlier one, which is reported as superseded.
+    pub const fn frame_rendered(&mut self, action: FrameAction, seq: u64) -> Rendered {
         match action {
-            FrameAction::Nothing => None,
-            FrameAction::Present => Some(seq),
+            FrameAction::Nothing => Rendered {
+                presented: None,
+                superseded: None,
+            },
+            FrameAction::Present => Rendered {
+                presented: Some(seq),
+                superseded: None,
+            },
             FrameAction::Defer => {
+                let superseded = self.deferred.take();
                 self.deferred = Some(seq);
-                None
+                Rendered {
+                    presented: None,
+                    superseded,
+                }
             }
         }
     }
@@ -667,7 +688,9 @@ mod tests {
     #[test]
     fn presented_now_carries_its_own_seq() {
         let mut book = SeqBook::default();
-        assert_eq!(book.frame_rendered(FrameAction::Present, 7), Some(7));
+        let rendered = book.frame_rendered(FrameAction::Present, 7);
+        assert_eq!(rendered.presented, Some(7));
+        assert_eq!(rendered.superseded, None);
         assert_eq!(book.flip_completed(), None);
     }
 
@@ -675,20 +698,56 @@ mod tests {
     #[test]
     fn deferred_frame_superseded_before_completion_presents_once_with_later_seq() {
         let mut book = SeqBook::default();
-        assert_eq!(book.frame_rendered(FrameAction::Present, 1), Some(1));
-        assert_eq!(book.frame_rendered(FrameAction::Defer, 2), None);
-        assert_eq!(book.frame_rendered(FrameAction::Defer, 3), None);
+        assert_eq!(
+            book.frame_rendered(FrameAction::Present, 1).presented,
+            Some(1)
+        );
+        assert_eq!(book.frame_rendered(FrameAction::Defer, 2).presented, None);
+        assert_eq!(book.frame_rendered(FrameAction::Defer, 3).presented, None);
         assert_eq!(book.flip_completed(), Some(3));
         assert_eq!(book.flip_completed(), None, "presented once");
     }
 
     #[cfg(feature = "frame_audit")]
     #[test]
+    fn deferred_render_replaced_before_completion_reports_replaced_seq() {
+        let mut book = SeqBook::default();
+        assert_eq!(
+            book.frame_rendered(FrameAction::Defer, 2),
+            Rendered {
+                presented: None,
+                superseded: None,
+            },
+            "defer with nothing waiting supersedes nothing"
+        );
+        assert_eq!(
+            book.frame_rendered(FrameAction::Defer, 3),
+            Rendered {
+                presented: None,
+                superseded: Some(2),
+            },
+            "the newer defer reports the seq it replaces"
+        );
+        assert_eq!(
+            book.flip_completed(),
+            Some(3),
+            "only the newest is presented"
+        );
+    }
+
+    #[cfg(feature = "frame_audit")]
+    #[test]
     fn undamaged_render_changes_nothing() {
         let mut book = SeqBook::default();
-        assert_eq!(book.frame_rendered(FrameAction::Present, 1), Some(1));
-        assert_eq!(book.frame_rendered(FrameAction::Defer, 2), None);
-        assert_eq!(book.frame_rendered(FrameAction::Nothing, 9), None);
+        assert_eq!(
+            book.frame_rendered(FrameAction::Present, 1).presented,
+            Some(1)
+        );
+        assert_eq!(book.frame_rendered(FrameAction::Defer, 2).presented, None);
+        assert_eq!(
+            book.frame_rendered(FrameAction::Nothing, 9),
+            Rendered::default()
+        );
         assert_eq!(book.flip_completed(), Some(2), "seq 2 still pending");
     }
 }

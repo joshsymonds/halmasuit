@@ -1608,6 +1608,19 @@ def with_session_foreground(doc, mono):
     return doc
 
 
+def with_superseded(doc, frame_id, pid=1184):
+    doc["events"].append(
+        {
+            "kind": "halmasuit",
+            "mono_us": EC2_FIRST_FRAME_MONO_US,
+            "pid": pid,
+            "detail": "frame_superseded",
+            "payload": {"event": "frame_superseded", "frame_id": frame_id},
+        }
+    )
+    return doc
+
+
 def without_key(mapping, key):
     return {name: value for name, value in mapping.items() if name != key}
 
@@ -1699,12 +1712,73 @@ class RecorderFailuresTest(unittest.TestCase):
         failures = timeline.recorder_failures(
             doc, ec2_lines(range(1, EC2_FRAME_COUNT)), {RECORDER_OUTPUT: EC2_FRAME_COUNT - 1}
         )
-        self.assertEqual(failures, [])
+        self.assertEqual(
+            failures,
+            ["boot-to-greeter frames: 63 line(s) with no frame_rendered from the started pid, first DP-1 seq 1"],
+        )
 
     def test_seq_gap_in_boot_window_fails(self):
         frames = ec2_lines(seq for seq in range(EC2_FRAME_COUNT) if seq != 10)
         failures = timeline.recorder_failures(ec2_timeline(), frames, {RECORDER_OUTPUT: EC2_FRAME_COUNT - 1})
         self.assertEqual(failures, ["boot-to-greeter frames: seq 10 missing"])
+
+    def test_seq_gap_with_superseded_and_rendered_from_started_pid_passes(self):
+        doc = with_superseded(ec2_timeline(), 10)
+        frames = ec2_lines(seq for seq in range(EC2_FRAME_COUNT) if seq != 10)
+        failures = timeline.recorder_failures(doc, frames, {RECORDER_OUTPUT: EC2_FRAME_COUNT - 1})
+        self.assertEqual(failures, [])
+
+    def test_superseded_gap_run_passes_when_every_seq_is_superseded(self):
+        doc = with_superseded(with_superseded(ec2_timeline(), 10), 11)
+        frames = ec2_lines(seq for seq in range(EC2_FRAME_COUNT) if seq not in (10, 11))
+        failures = timeline.recorder_failures(doc, frames, {RECORDER_OUTPUT: EC2_FRAME_COUNT - 2})
+        self.assertEqual(failures, [])
+
+    def test_gap_run_fails_on_the_seq_without_superseded(self):
+        doc = with_superseded(with_superseded(ec2_timeline(), 10), 12)
+        frames = ec2_lines(seq for seq in range(EC2_FRAME_COUNT) if seq not in (10, 11, 12))
+        failures = timeline.recorder_failures(doc, frames, {RECORDER_OUTPUT: EC2_FRAME_COUNT - 3})
+        self.assertEqual(failures, ["boot-to-greeter frames: seq 11 missing"])
+
+    def test_superseded_gap_from_another_pid_fails(self):
+        doc = with_superseded(ec2_timeline(), 10, pid=2000)
+        frames = ec2_lines(seq for seq in range(EC2_FRAME_COUNT) if seq != 10)
+        failures = timeline.recorder_failures(doc, frames, {RECORDER_OUTPUT: EC2_FRAME_COUNT - 1})
+        self.assertEqual(failures, ["boot-to-greeter frames: seq 10 missing"])
+
+    def test_superseded_gap_without_frame_rendered_fails(self):
+        doc = drop_events(
+            with_superseded(ec2_timeline(), 10),
+            lambda event: is_frame_rendered(event) and event["payload"].get("frame_id") == 10,
+        )
+        frames = ec2_lines(seq for seq in range(EC2_FRAME_COUNT) if seq != 10)
+        failures = timeline.recorder_failures(doc, frames, {RECORDER_OUTPUT: EC2_FRAME_COUNT - 1})
+        self.assertEqual(failures, ["boot-to-greeter frames: seq 10 missing"])
+
+    def test_superseded_gap_with_dropped_line_fails_only_on_dropped(self):
+        doc = with_superseded(ec2_timeline(), 10)
+        frames = [recorder_line(seq, dropped=1 if seq == 5 else 0) for seq in range(EC2_FRAME_COUNT) if seq != 10]
+        failures = timeline.recorder_failures(doc, frames, {RECORDER_OUTPUT: EC2_FRAME_COUNT - 1})
+        self.assertEqual(failures, ["dropped frames in boot-to-greeter window: DP-1 (1 line(s))"])
+
+    def test_index_seq_without_frame_rendered_fails(self):
+        doc = drop_events(
+            ec2_timeline(),
+            lambda event: is_frame_rendered(event) and event["payload"].get("frame_id") == 5,
+        )
+        failures = timeline.recorder_failures(doc, ec2_lines(), {RECORDER_OUTPUT: EC2_FRAME_COUNT})
+        self.assertEqual(
+            failures,
+            ["boot-to-greeter frames: 1 line(s) with no frame_rendered from the started pid, first DP-1 seq 5"],
+        )
+
+    def test_non_increasing_seq_within_output_fails(self):
+        order = [0, 1, 2, 3, 4, 6, 5, *range(7, EC2_FRAME_COUNT)]
+        failures = timeline.recorder_failures(ec2_timeline(), ec2_lines(order), {RECORDER_OUTPUT: EC2_FRAME_COUNT})
+        self.assertEqual(
+            failures,
+            ["boot-to-greeter frames: 1 line(s) with seq not increasing per output, first DP-1 seq 5 after seq 6"],
+        )
 
     def test_repeated_output_seq_pair_in_boot_window_fails(self):
         frames = ec2_lines() + [recorder_line(10)]

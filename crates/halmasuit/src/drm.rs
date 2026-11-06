@@ -2110,8 +2110,13 @@ impl DrmBackend {
         } else {
             scanout_copy::FrameAction::Defer
         };
-        let carried = surface.seqs.frame_rendered(action, seq);
-        if let (Some(presented), Some(carried)) = (presented, carried) {
+        let rendered = surface.seqs.frame_rendered(action, seq);
+        if let Some(superseded) = rendered.superseded {
+            halmasuit_introspect::emit(&halmasuit_introspect::Event::FrameSuperseded {
+                frame_id: superseded,
+            });
+        }
+        if let (Some(presented), Some(carried)) = (presented, rendered.presented) {
             submit_presented(recorder, &surface.output.name(), presented, carried);
         }
     }
