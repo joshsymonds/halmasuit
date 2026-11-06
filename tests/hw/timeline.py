@@ -25,13 +25,24 @@ a `sample` or `error` is a `crc` event. Any other lab-crc line is the sampler's
 own failure output (`lab-crc: <what>`, optionally `: <strerror>`), kept as a
 `crc` event whose source is its unit and which is attributed to no head. A
 `start`, `sample`, or `error` line whose fields do not parse is a malformed run.
+A lab-vkms-crc `start` is a `vkms-sampler-start` event. A `sample` is a `vkms-crc`
+event carrying `head` (`<card>/crtc<id>`), `crc` (eight hex digits), and `active`
+(a bool from 0 or 1). An `error` is a `vkms-crc` event carrying `head` and `errno`.
+Any other lab-vkms-crc line is the sampler's failure output, a `vkms-crc` event
+with no `head`. Each of these takes its monotonic time from `t=`, as lab-crc does.
+A lab-vkms-crc `start`, `sample`, or `error` whose fields do not parse is a malformed run.
 A lab-probe line is a `probe` event.
 A `halmasuit.service` line whose MESSAGE is a tracing JSON line carrying a
 halmasuit Event is a `halmasuit` event: its detail is the Event's `event` tag,
 its payload is the whole Event object, and its time is the line's monotonic
 time on the kernel clock. Every such line is kept, repeats included. Any other
 line from that unit is ignored, and lines from other units produce no
-`halmasuit` event.
+`halmasuit` or `gl` event.
+Every `halmasuit` event carries `pid`: the line's journal `_PID` as an int, or
+null when the line has none. A `halmasuit.service` line whose MESSAGE is a tracing
+JSON line from target `smithay::backend::renderer::gles`, with `fields.message`
+beginning `GL Vendor: `, `GL Renderer: `, or `GL Version: `, is a `gl` event: its
+detail is that message and it carries `pid` likewise.
 greetd's start is the first entry whose MESSAGE_ID is the unit-started ID and
 whose `UNIT` is `greetd.service`; it is a `unit` event. That start is read from
 MESSAGE_ID and UNIT and does not depend on MESSAGE. A journal entry whose MESSAGE
@@ -77,6 +88,18 @@ exactly one `started` exists; when it does and a `session_opened` exists, that
 one; and `assert_no_flash_stream` passes over every halmasuit payload in timeline
 order. A halmasuit restart across the swap is caught by the `started` count and
 order checks.
+
+Profile `ec2-greeter` checks an EC2 lab boot. Its run is journal-only, so every
+time is null and events are ordered by monotonic time. P is the payload `pid` of
+the one `started` event, and M is the first `drm_master_acquired` phase with a
+monotonic time. The checks, one message each when they fail: exactly one
+`started` exists and carries a pid; a `foreground_changed` to greeter exists; a
+`frame_rendered` from P exists; a `GL Vendor` line from P exists; every `GL
+Vendor` line names NVIDIA; M exists; a `lab-vkms-crc-initrd.service` start
+exists; at least one vkms sample is earlier than M; no vkms sample earlier than M
+is active; at least one active vkms sample follows the first `frame_rendered` from
+P. A check that needs P, M, or that first frame is not evaluated when that anchor
+is missing: the check that defines the anchor reports it.
 """
 
 from __future__ import annotations
@@ -117,6 +140,12 @@ GREETD_UNIT = "greetd.service"
 HALMASUIT_UNIT = "halmasuit.service"
 INITRD_SAMPLER_UNIT = "lab-crc-initrd.service"
 CRC_VERBS = ("start", "sample", "error")
+VKMS_IDENTIFIER = "lab-vkms-crc"
+INITRD_VKMS_UNIT = "lab-vkms-crc-initrd.service"
+HEX_CRC = re.compile(r"[0-9a-f]{8}")
+GL_TARGET = "smithay::backend::renderer::gles"
+GL_PREFIXES = ("GL Vendor: ", "GL Renderer: ", "GL Version: ")
+GL_VENDOR_PREFIX = "GL Vendor: "
 DISPLAY_PATTERN = re.compile(
     r"efifb|simpledrm|simple-framebuffer|fbcon|Console: switching|\[drm\]|nvidia-drm|nvidia-modeset|NVRM"
 )
@@ -135,6 +164,7 @@ class JournalEntry:
     message_id: str
     boot_id: str
     mono_us: int | None
+    pid: int | None
 
 
 @dataclass(frozen=True)
@@ -156,6 +186,11 @@ def monotonic_us(fields: dict[str, str]) -> int | None:
     return int(raw) if raw else None
 
 
+def journal_pid(fields: dict[str, str]) -> int | None:
+    raw = fields.get("_PID")
+    return int(raw) if raw else None
+
+
 def read_journal(path: Path) -> list[JournalEntry]:
     if not path.is_file():
         return []
@@ -174,6 +209,7 @@ def read_journal(path: Path) -> list[JournalEntry]:
                 message_id=fields.get("MESSAGE_ID", ""),
                 boot_id=fields.get("_BOOT_ID", ""),
                 mono_us=monotonic_us(fields),
+                pid=journal_pid(fields),
             )
         )
     return entries
@@ -263,6 +299,24 @@ def crc_fields(message: str) -> tuple[str, dict[str, str]]:
     return verb, dict(token.split("=", 1) for token in tokens)
 
 
+def gl_detail(message: str) -> str | None:
+    try:
+        outer = json.loads(message)
+    except ValueError:
+        return None
+    if not isinstance(outer, dict) or outer.get("target") != GL_TARGET:
+        return None
+    fields = outer.get("fields")
+    text = fields.get("message") if isinstance(fields, dict) else None
+    return text if isinstance(text, str) and text.startswith(GL_PREFIXES) else None
+
+
+def vkms_crc(value: str) -> str:
+    if not HEX_CRC.fullmatch(value):
+        raise ValueError(f"expected eight hex digits, got {value!r}")
+    return value
+
+
 def halmasuit_payload(message: str) -> dict[str, Any] | None:
     try:
         outer = json.loads(message)
@@ -326,7 +380,12 @@ def build_timeline(run: Path) -> Timeline:
                 event = make_event(
                     platform_us(zero, mono), mono, "halmasuit", HALMASUIT_UNIT, payload["event"]
                 )
-                events.append({**event, "payload": payload})
+                events.append({**event, "payload": payload, "pid": entry.pid})
+            else:
+                detail = gl_detail(entry.message)
+                if detail is not None:
+                    gl = make_event(platform_us(zero, mono), mono, "gl", HALMASUIT_UNIT, detail)
+                    events.append({**gl, "pid": entry.pid})
         if entry.transport == "kernel" and DISPLAY_PATTERN.search(entry.message):
             kind = "driver-display" if DRIVER_PATTERN.search(entry.message) else "kernel-display"
             events.append(make_event(platform_us(zero, mono), mono, kind, "kernel", entry.message))
@@ -364,6 +423,25 @@ def build_timeline(run: Path) -> Timeline:
                 events.append(make_event(t, mono, "crc", entry.unit, entry.message))
         elif entry.identifier == "lab-crc":
             events.append(make_event(platform_us(zero, mono), mono, "crc", entry.unit, entry.message))
+        elif entry.identifier == VKMS_IDENTIFIER and crc_verb(entry.message) in CRC_VERBS:
+            verb, fields = crc_fields(entry.message)
+            mono = int(fields["t"])
+            t = platform_us(zero, mono)
+            if verb == "start":
+                events.append(make_event(t, mono, "vkms-sampler-start", entry.unit, entry.message))
+            else:
+                head = f"{fields['card']}/crtc{fields['crtc']}"
+                if verb == "sample":
+                    extra = {
+                        "head": head,
+                        "crc": vkms_crc(fields["crc"]),
+                        "active": flag(fields["active"]),
+                    }
+                else:
+                    extra = {"head": head, "errno": int(fields["errno"])}
+                events.append({**make_event(t, mono, "vkms-crc", entry.unit, entry.message), **extra})
+        elif entry.identifier == VKMS_IDENTIFIER:
+            events.append(make_event(platform_us(zero, mono), mono, "vkms-crc", entry.unit, entry.message))
         elif entry.identifier == "lab-probe":
             t = platform_us(zero, mono)
             probe.append({"t_us": t, "mono_us": mono, "line": entry.message})
@@ -518,6 +596,63 @@ def client_and_foreground_failures(payloads: list[dict[str, Any]]) -> list[str]:
     return failures
 
 
+def from_pid(event: dict[str, Any], pid: int | None) -> bool:
+    return pid is not None and event["pid"] == pid
+
+
+def ec2_started(halmasuit: list[dict[str, Any]]) -> tuple[list[str], int | None]:
+    started = [event for event in halmasuit if payload_matches(event["payload"], "started")]
+    if len(started) != 1:
+        return [f"{len(started)} halmasuit started events; expected exactly one"], None
+    pid = started[0]["payload"].get("pid")
+    if type(pid) is not int:
+        return ["started event carries no pid"], None
+    return [], pid
+
+
+def ec2_greeter(timeline: Timeline) -> list[str]:
+    events = timeline["events"]
+    halmasuit = [event for event in events if event["kind"] == "halmasuit"]
+    timed = [event for event in halmasuit if event["mono_us"] is not None]
+    payloads = [event["payload"] for event in halmasuit]
+    vkms = [event for event in events if event["kind"] == "vkms-crc" and "active" in event]
+
+    failures, pid = ec2_started(halmasuit)
+    if not any(payload_matches(payload, "foreground_changed", to="greeter") for payload in payloads):
+        failures.append("no foreground_changed{to: greeter}")
+
+    frames = [
+        event for event in timed if payload_matches(event["payload"], "frame_rendered") and from_pid(event, pid)
+    ]
+    first_frame = min(frames, key=lambda event: event["mono_us"]) if frames else None
+    if pid is not None and first_frame is None:
+        failures.append(f"no frame_rendered from pid {pid}")
+
+    gl_vendor = [event for event in events if event["kind"] == "gl" and event["detail"].startswith(GL_VENDOR_PREFIX)]
+    if pid is not None and not any(from_pid(event, pid) for event in gl_vendor):
+        failures.append(f"no GL Vendor line from pid {pid}")
+    not_nvidia = [event["detail"] for event in gl_vendor if "NVIDIA" not in event["detail"]]
+    if not_nvidia:
+        failures.append(f"GL Vendor is not NVIDIA: {'; '.join(not_nvidia)}")
+
+    master_failures, m = drm_master_check(timed)
+    failures += master_failures
+    if not any(event["kind"] == "vkms-sampler-start" and event["source"] == INITRD_VKMS_UNIT for event in events):
+        failures.append(f"no lab-vkms-crc start from {INITRD_VKMS_UNIT}")
+    if m is not None:
+        before = [event for event in vkms if event["mono_us"] < m]
+        if not before:
+            failures.append("no vkms sample before drm_master_acquired")
+        active = sorted({event["head"] for event in before if event["active"]})
+        if active:
+            failures.append(f"vkms sample active before drm_master_acquired on: {', '.join(active)}")
+    if first_frame is not None and not any(
+        event["active"] and event["mono_us"] > first_frame["mono_us"] for event in vkms
+    ):
+        failures.append(f"no active vkms sample after the first frame_rendered from pid {pid}")
+    return failures
+
+
 def bios_shader_greeter(timeline: Timeline) -> list[str]:
     events = timeline["events"]
     halmasuit = [event for event in events if event["kind"] == "halmasuit"]
@@ -617,6 +752,7 @@ PROFILES: dict[str, Profile] = {
     "attended-login": attended_login,
     "baseline-greetd": baseline_greetd,
     "bios-shader-greeter": bios_shader_greeter,
+    "ec2-greeter": ec2_greeter,
     "production": production,
 }
 
