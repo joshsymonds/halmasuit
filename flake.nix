@@ -880,6 +880,13 @@
           labExperiments = self.lib.labExperiments;
           labPatches = self.lib.labPatches;
         };
+        # Lab vkms CRC sampler (halmasuit.lab.vkmsCrc, interface I2): real vkms,
+        # stage 1 and rootfs units, black and lit frame CRCs.
+        lab-vkms-crc = import ./tests/lab-vkms-crc.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          labModule = self.nixosModules.gnomon-lab;
+        };
         # NVIDIA-EGL env shape regression gate. Cannot replicate the
         # actual NVIDIA failure in CI (no single-GPU passthrough on
         # consumer Blackwell); asserts the UNIT shape — that
