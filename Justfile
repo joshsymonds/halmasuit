@@ -62,6 +62,12 @@ vis-selftest:
 lab-run +experiments:
     python3 -B tests/hw/lab.py {{experiments}}
 
+# Launches one halmasuit-lab EC2 box from this checkout's HEAD, checks its greeter boot against
+# the ec2-greeter profile, and ends the box on every exit path. Refuses while a halmasuit-lab box
+# is already listed. Pass --help for the ec2, ssh, and state-root options.
+lab-ec2-run *args:
+    python3 -B tests/hw/lab_ec2.py {{args}}
+
 # Builds timeline.json on the power-on clock for one lab run directory and
 # checks it against a profile (default baseline-greetd; pass --expect PROFILE).
 lab-timeline-check run *args:
