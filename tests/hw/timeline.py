@@ -100,6 +100,20 @@ exists; at least one vkms sample is earlier than M; no vkms sample earlier than 
 is active; at least one active vkms sample follows the first `frame_rendered` from
 P. A check that needs P, M, or that first frame is not evaluated when that anchor
 is missing: the check that defines the anchor reports it.
+
+Recorder index. `index.jsonl` is the frame recorder's index, one JSON object per
+presented frame and output, with `seq`, `output`, `mono_us`, `width`, `height`,
+`format`, and `dropped`. `read_recorder_index` returns its lines in file order and
+rejects a malformed line by its line number. `recorder_failures` checks an index
+against an ec2-greeter timeline; it is not a profile, and its messages are returned
+the way a profile returns its own. The first frame is the earliest frame_rendered from
+P, and the index must start no later than it. The boot-to-greeter window is the index
+lines before the session foreground, or every line when there is none. In that window
+the seqs are contiguous, no (output, seq) pair repeats, and every line has `dropped`
+0. Each output's video frame count equals its index lines, and each output has a frame
+in the greeter-foreground window. `greeter_frames` picks, per output, the latest index
+line in that window; that is the greeter PNG a run names. Seqs are shared by every
+output, so contiguity is over seqs, not per output.
 """
 
 from __future__ import annotations
@@ -110,7 +124,8 @@ import json
 import re
 import struct
 import sys
-from collections.abc import Callable, Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -152,6 +167,8 @@ DISPLAY_PATTERN = re.compile(
 DRIVER_PATTERN = re.compile(r"nvidia-drm|nvidia-modeset|NVRM")
 JOURNAL_NAME = "journal.json"
 TIMELINE_NAME = "timeline.json"
+RECORDER_INDEX_NAME = "index.jsonl"
+RECORDER_INT_FIELDS = ("seq", "mono_us", "width", "height", "dropped")
 
 
 @dataclass(frozen=True)
@@ -610,6 +627,11 @@ def ec2_started(halmasuit: list[dict[str, Any]]) -> tuple[list[str], int | None]
     return [], pid
 
 
+def ec2_first_frame(timed: list[dict[str, Any]], pid: int | None) -> dict[str, Any] | None:
+    frames = [event for event in timed if payload_matches(event["payload"], "frame_rendered") and from_pid(event, pid)]
+    return min(frames, key=lambda event: event["mono_us"]) if frames else None
+
+
 def ec2_greeter(timeline: Timeline) -> list[str]:
     events = timeline["events"]
     halmasuit = [event for event in events if event["kind"] == "halmasuit"]
@@ -621,10 +643,7 @@ def ec2_greeter(timeline: Timeline) -> list[str]:
     if not any(payload_matches(payload, "foreground_changed", to="greeter") for payload in payloads):
         failures.append("no foreground_changed{to: greeter}")
 
-    frames = [
-        event for event in timed if payload_matches(event["payload"], "frame_rendered") and from_pid(event, pid)
-    ]
-    first_frame = min(frames, key=lambda event: event["mono_us"]) if frames else None
+    first_frame = ec2_first_frame(timed, pid)
     if pid is not None and first_frame is None:
         failures.append(f"no frame_rendered from pid {pid}")
 
@@ -650,6 +669,121 @@ def ec2_greeter(timeline: Timeline) -> list[str]:
         event["active"] and event["mono_us"] > first_frame["mono_us"] for event in vkms
     ):
         failures.append(f"no active vkms sample after the first frame_rendered from pid {pid}")
+    return failures
+
+
+def recorder_frame(text: str, number: int) -> dict[str, Any]:
+    where = f"{RECORDER_INDEX_NAME} line {number}"
+    try:
+        frame = json.loads(text)
+    except ValueError as exc:
+        raise ValueError(f"{where}: not JSON: {exc}") from exc
+    if not isinstance(frame, dict):
+        raise ValueError(f"{where}: not a JSON object")
+    for field in RECORDER_INT_FIELDS:
+        value = frame.get(field)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{where}: {field} is not a non-negative int")
+    if not isinstance(frame.get("format"), str):
+        raise ValueError(f"{where}: format is not a string")
+    output = frame.get("output")
+    if not isinstance(output, str) or output in ("", ".", "..") or "/" in output or "\0" in output:
+        raise ValueError(f"{where}: output is not one path component")
+    return frame
+
+
+def read_recorder_index(directory: Path) -> list[dict[str, Any]]:
+    with (directory / RECORDER_INDEX_NAME).open(encoding="utf-8") as handle:
+        return [recorder_frame(text, number) for number, text in enumerate(handle, start=1)]
+
+
+def timed_halmasuit(timeline: Timeline) -> list[dict[str, Any]]:
+    return [event for event in timeline["events"] if event["kind"] == "halmasuit" and event["mono_us"] is not None]
+
+
+def greeter_frames(timeline: Timeline, frames: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Each output's index line with the greatest mono_us in the greeter-foreground window.
+
+    The window starts at the greeter's foreground time, inclusive, and ends at the
+    session foreground time, exclusive. The result is empty without a greeter foreground.
+    """
+    start, end = foreground_window(timed_halmasuit(timeline))
+    if start is None:
+        return {}
+    picked: dict[str, dict[str, Any]] = {}
+    for frame in frames:
+        mono = frame["mono_us"]
+        if mono < start or (end is not None and mono >= end):
+            continue
+        held = picked.get(frame["output"])
+        if held is None or mono >= held["mono_us"]:
+            picked[frame["output"]] = frame
+    return picked
+
+
+def recorder_boot_failures(boot: list[dict[str, Any]]) -> list[str]:
+    failures: list[str] = []
+    seqs = sorted({frame["seq"] for frame in boot})
+    gaps = [(low, high) for low, high in zip(seqs, seqs[1:]) if high != low + 1]
+    pairs = Counter((frame["output"], frame["seq"]) for frame in boot)
+    repeats = sorted(pair for pair, count in pairs.items() if count > 1)
+    parts: list[str] = []
+    if gaps:
+        low, high = gaps[0]
+        missing = f"seq {low + 1}" if high - low == 2 else f"seqs {low + 1}..{high - 1}"
+        parts.append(f"{missing} missing")
+    if repeats:
+        output, seq = repeats[0]
+        parts.append(f"{len(repeats)} (output, seq) pair(s) repeated, first {output} seq {seq}")
+    if parts:
+        failures.append("boot-to-greeter frames: " + "; ".join(parts))
+    dropped = Counter(frame["output"] for frame in boot if frame["dropped"] != 0)
+    if dropped:
+        listed = ", ".join(f"{output} ({count} line(s))" for output, count in sorted(dropped.items()))
+        failures.append(f"dropped frames in boot-to-greeter window: {listed}")
+    return failures
+
+
+def recorder_count_failures(frames: list[dict[str, Any]], video_frames: Mapping[str, int]) -> list[str]:
+    counts = Counter(frame["output"] for frame in frames)
+    mismatched: list[str] = []
+    for output in sorted(counts):
+        lines = counts[output]
+        if output not in video_frames:
+            mismatched.append(f"{output} has no video frame count for {lines} index line(s)")
+        elif video_frames[output] != lines:
+            mismatched.append(f"{output} has {video_frames[output]} video frame(s) for {lines} index line(s)")
+    if not mismatched:
+        return []
+    return [f"video frame count differs from index: {'; '.join(mismatched)}"]
+
+
+def recorder_failures(
+    timeline: Timeline, frames: list[dict[str, Any]], video_frames: Mapping[str, int]
+) -> list[str]:
+    if not frames:
+        return ["recorder index holds no frames"]
+    halmasuit = [event for event in timeline["events"] if event["kind"] == "halmasuit"]
+    timed = timed_halmasuit(timeline)
+    _, pid = ec2_started(halmasuit)
+    first = ec2_first_frame(timed, pid)
+    failures: list[str] = []
+
+    earliest = min(frame["mono_us"] for frame in frames)
+    if first is not None and earliest > first["mono_us"]:
+        failures.append(
+            f"recorder index starts at {earliest} us, after the first frame_rendered "
+            f"from pid {pid} at {first['mono_us']} us"
+        )
+    start, end = foreground_window(timed)
+    boot = [frame for frame in frames if end is None or frame["mono_us"] < end]
+    failures += recorder_boot_failures(boot)
+    failures += recorder_count_failures(frames, video_frames)
+    if start is not None:
+        seen = greeter_frames(timeline, frames)
+        missing = sorted({frame["output"] for frame in frames} - seen.keys())
+        if missing:
+            failures.append(f"no frame in the greeter foreground window for output(s): {', '.join(missing)}")
     return failures
 
 

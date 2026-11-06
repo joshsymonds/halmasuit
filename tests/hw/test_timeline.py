@@ -1553,5 +1553,207 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 2)
 
 
+EC2_RUN = Path(__file__).resolve().parent / "fixtures" / "synthetic-ec2-greeter"
+EC2_FRAME_COUNT = 64
+EC2_FIRST_FRAME_MONO_US = 1_600_000
+EC2_FRAME_STEP_US = 500_000
+EC2_GREETER_MONO_US = 2_996_000
+EC2_SESSION_MONO_US = 10_100_000
+RECORDER_OUTPUT = "DP-1"
+SECOND_OUTPUT = "DP-2"
+THIRD_OUTPUT = "DP-3"
+RECORDER_FIELDS = ("seq", "output", "mono_us", "width", "height", "format", "dropped")
+RECORDER_INT_FIELDS = ("seq", "mono_us", "width", "height", "dropped")
+
+
+def recorder_line(seq, *, output=RECORDER_OUTPUT, mono=None, dropped=0):
+    if mono is None:
+        mono = EC2_FIRST_FRAME_MONO_US + EC2_FRAME_STEP_US * seq
+    return {
+        "seq": seq,
+        "output": output,
+        "mono_us": mono,
+        "width": 1920,
+        "height": 1080,
+        "format": "rgb8",
+        "dropped": dropped,
+    }
+
+
+def ec2_lines(seqs=range(EC2_FRAME_COUNT), output=RECORDER_OUTPUT):
+    return [recorder_line(seq, output=output) for seq in seqs]
+
+
+def ec2_timeline():
+    return timeline.build_timeline(EC2_RUN)
+
+
+def drop_events(doc, predicate):
+    doc["events"] = [event for event in doc["events"] if not predicate(event)]
+    return doc
+
+
+def is_frame_rendered(event):
+    return event["kind"] == "halmasuit" and event["payload"].get("event") == "frame_rendered"
+
+
+def is_greeter_foreground(event):
+    return event["kind"] == "halmasuit" and event["payload"] == FOREGROUND_PAYLOAD
+
+
+def with_session_foreground(doc, mono):
+    doc["events"].append(
+        {"kind": "halmasuit", "mono_us": mono, "pid": 1184, "detail": "session", "payload": SESSION_PAYLOAD}
+    )
+    return doc
+
+
+def without_key(mapping, key):
+    return {name: value for name, value in mapping.items() if name != key}
+
+
+def malformed_recorder_lines():
+    yield "not JSON", "{"
+    yield "not an object", "[]"
+    for field in RECORDER_INT_FIELDS:
+        for value in (-1, True, 1.0, "1", None):
+            yield f"{field}={value!r}", json.dumps(recorder_line(1) | {field: value})
+    for value in (1, None):
+        yield f"format={value!r}", json.dumps(recorder_line(1) | {"format": value})
+    for value in ("", ".", "..", "a/b", "a\x00b", 7, None):
+        yield f"output={value!r}", json.dumps(recorder_line(1) | {"output": value})
+    for field in RECORDER_FIELDS:
+        yield f"{field} missing", json.dumps(without_key(recorder_line(1), field))
+
+
+class RecorderIndexReadTest(unittest.TestCase):
+    def write_index(self, root, text):
+        (root / timeline.RECORDER_INDEX_NAME).write_text(text, encoding="utf-8")
+
+    def test_returns_lines_in_file_order(self):
+        lines = [recorder_line(0), recorder_line(1, output=SECOND_OUTPUT)]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_index(root, "".join(json.dumps(line) + "\n" for line in lines))
+            self.assertEqual(timeline.read_recorder_index(root), lines)
+
+    def test_missing_index_raises_oserror(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(OSError):
+                timeline.read_recorder_index(Path(tmp))
+
+    def test_malformed_line_is_rejected_by_line_number(self):
+        valid = json.dumps(recorder_line(0))
+        for label, bad in malformed_recorder_lines():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.write_index(root, f"{valid}\n{bad}\n")
+                with self.assertRaisesRegex(ValueError, "line 2"):
+                    timeline.read_recorder_index(root)
+
+
+class RecorderGreeterFramesTest(unittest.TestCase):
+    def test_last_in_window_frame_per_output(self):
+        doc = with_session_foreground(ec2_timeline(), EC2_SESSION_MONO_US)
+        frames = ec2_lines() + ec2_lines(output=SECOND_OUTPUT)
+        picked = timeline.greeter_frames(doc, frames)
+        self.assertEqual(
+            picked,
+            {
+                RECORDER_OUTPUT: recorder_line(16),
+                SECOND_OUTPUT: recorder_line(16, output=SECOND_OUTPUT),
+            },
+        )
+
+    def test_greeter_start_is_inclusive(self):
+        doc = with_session_foreground(ec2_timeline(), EC2_SESSION_MONO_US)
+        at_start = recorder_line(99, output=THIRD_OUTPUT, mono=EC2_GREETER_MONO_US)
+        picked = timeline.greeter_frames(doc, ec2_lines() + [at_start])
+        self.assertEqual(picked[THIRD_OUTPUT], at_start)
+
+    def test_empty_without_greeter_foreground(self):
+        doc = drop_events(ec2_timeline(), is_greeter_foreground)
+        self.assertEqual(timeline.greeter_frames(doc, ec2_lines()), {})
+
+
+class RecorderFailuresTest(unittest.TestCase):
+    def test_matching_index_passes(self):
+        failures = timeline.recorder_failures(ec2_timeline(), ec2_lines(), {RECORDER_OUTPUT: EC2_FRAME_COUNT})
+        self.assertEqual(failures, [])
+
+    def test_empty_index_reports_only_itself(self):
+        failures = timeline.recorder_failures(ec2_timeline(), [], {})
+        self.assertEqual(failures, ["recorder index holds no frames"])
+
+    def test_first_frame_later_than_index_start_fails(self):
+        failures = timeline.recorder_failures(
+            ec2_timeline(), ec2_lines(range(1, EC2_FRAME_COUNT)), {RECORDER_OUTPUT: EC2_FRAME_COUNT - 1}
+        )
+        self.assertEqual(
+            failures,
+            ["recorder index starts at 2100000 us, after the first frame_rendered from pid 1184 at 1600000 us"],
+        )
+
+    def test_first_frame_check_needs_a_frame_from_the_started_pid(self):
+        doc = drop_events(ec2_timeline(), is_frame_rendered)
+        failures = timeline.recorder_failures(
+            doc, ec2_lines(range(1, EC2_FRAME_COUNT)), {RECORDER_OUTPUT: EC2_FRAME_COUNT - 1}
+        )
+        self.assertEqual(failures, [])
+
+    def test_seq_gap_in_boot_window_fails(self):
+        frames = ec2_lines(seq for seq in range(EC2_FRAME_COUNT) if seq != 10)
+        failures = timeline.recorder_failures(ec2_timeline(), frames, {RECORDER_OUTPUT: EC2_FRAME_COUNT - 1})
+        self.assertEqual(failures, ["boot-to-greeter frames: seq 10 missing"])
+
+    def test_repeated_output_seq_pair_in_boot_window_fails(self):
+        frames = ec2_lines() + [recorder_line(10)]
+        failures = timeline.recorder_failures(ec2_timeline(), frames, {RECORDER_OUTPUT: EC2_FRAME_COUNT + 1})
+        self.assertEqual(
+            failures,
+            ["boot-to-greeter frames: 1 (output, seq) pair(s) repeated, first DP-1 seq 10"],
+        )
+
+    def test_dropped_line_in_boot_window_fails(self):
+        frames = [recorder_line(seq, dropped=1 if seq == 5 else 0) for seq in range(EC2_FRAME_COUNT)]
+        failures = timeline.recorder_failures(ec2_timeline(), frames, {RECORDER_OUTPUT: EC2_FRAME_COUNT})
+        self.assertEqual(failures, ["dropped frames in boot-to-greeter window: DP-1 (1 line(s))"])
+
+    def test_lines_after_session_foreground_are_outside_the_boot_window(self):
+        doc = with_session_foreground(ec2_timeline(), EC2_SESSION_MONO_US)
+        frames = [
+            recorder_line(seq, dropped=1 if seq == 20 else 0) for seq in range(EC2_FRAME_COUNT) if seq != 40
+        ]
+        failures = timeline.recorder_failures(doc, frames, {RECORDER_OUTPUT: EC2_FRAME_COUNT - 1})
+        self.assertEqual(failures, [])
+
+    def test_video_count_mismatch_fails(self):
+        failures = timeline.recorder_failures(ec2_timeline(), ec2_lines(), {RECORDER_OUTPUT: EC2_FRAME_COUNT - 1})
+        self.assertEqual(
+            failures,
+            ["video frame count differs from index: DP-1 has 63 video frame(s) for 64 index line(s)"],
+        )
+
+    def test_missing_video_count_fails(self):
+        failures = timeline.recorder_failures(ec2_timeline(), ec2_lines(), {})
+        self.assertEqual(
+            failures,
+            ["video frame count differs from index: DP-1 has no video frame count for 64 index line(s)"],
+        )
+
+    def test_output_without_greeter_frame_fails(self):
+        frames = ec2_lines() + ec2_lines(range(3), output=SECOND_OUTPUT)
+        failures = timeline.recorder_failures(
+            ec2_timeline(), frames, {RECORDER_OUTPUT: EC2_FRAME_COUNT, SECOND_OUTPUT: 3}
+        )
+        self.assertEqual(failures, ["no frame in the greeter foreground window for output(s): DP-2"])
+
+    def test_greeter_check_not_evaluated_without_greeter_foreground(self):
+        doc = drop_events(ec2_timeline(), is_greeter_foreground)
+        frames = ec2_lines() + ec2_lines(range(3), output=SECOND_OUTPUT)
+        failures = timeline.recorder_failures(doc, frames, {RECORDER_OUTPUT: EC2_FRAME_COUNT, SECOND_OUTPUT: 3})
+        self.assertEqual(failures, [])
+
+
 if __name__ == "__main__":
     unittest.main()
