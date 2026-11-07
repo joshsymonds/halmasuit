@@ -889,6 +889,12 @@
         };
         # lab-probe-type relay (J2): its checkPhase runs the fake-holder harness.
         lab-probe-type = nixpkgs.legacyPackages.x86_64-linux.callPackage ./nix/lab/lab-probe-type.nix { };
+        # lab-probe-kbd typing (J1 + J2): real holder from stage 1, evdev sink, no password leak.
+        lab-probe-kbd = import ./tests/lab-probe-kbd.nix {
+          system = "x86_64-linux";
+          inherit nixpkgs;
+          labModule = self.nixosModules.gnomon-lab;
+        };
         # NVIDIA-EGL env shape regression gate. Cannot replicate the
         # actual NVIDIA failure in CI (no single-GPU passthrough on
         # consumer Blackwell); asserts the UNIT shape — that
