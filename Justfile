@@ -177,6 +177,8 @@ test-vm jobs="":
         visual-wallpaper-video
         # Lab vkms CRC sampler: stage 1 and after switch-root, no mocks.
         lab-vkms-crc
+        # Lab probe keyboard: stage-1 holder types a requested password; no leak.
+        lab-probe-kbd
         # Render-node split: GL on vgem render node, scan-out on vkms.
         halmasuit-render-node
         # Diagnostic frame recorder: recordFrames wiring for rootfs and initrd units.
