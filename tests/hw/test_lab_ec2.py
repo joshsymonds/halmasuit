@@ -93,6 +93,10 @@ if verb == "up":
         sys.exit(1)
     name = f"halmasuit-lab-{CONFIG['suffix']}"
     launch(name)
+    if CONFIG["break_run_log"]:
+        broken = Path(CONFIG["break_run_log"])
+        broken.unlink()
+        broken.mkdir()
     if mode == "fail-after-launch":
         print("ec2: boot failed", file=sys.stderr)
         sys.exit(1)
@@ -103,11 +107,12 @@ if verb == "up":
     if mode == "ready-missing":
         sys.exit(0)
     if mode in ("hang", "hang-bad-stderr"):
+        # The pid is written before the flush that makes the first line visible to the reader.
+        (HERE / "ec2-up.pid").write_text(str(os.getpid()))
         if mode == "hang-bad-stderr":
             sys.stderr.buffer.write(b"bad \xff\n")
             sys.stderr.flush()
         sys.stdout.flush()
-        (HERE / "ec2-up.pid").write_text(str(os.getpid()))
         while True:
             time.sleep(60)
     sys.exit(2)
@@ -438,6 +443,7 @@ class FakeTools:
             "down_fails": False,
             "down_sleep": 0,
             "ls_garbled_after_down": False,
+            "break_run_log": None,
         }
         served = root / "served-frames"
         write_recorder(served)
@@ -498,6 +504,22 @@ class FakeTools:
     def listed(self) -> list[str]:
         done = subprocess.run([str(self.ec2), "ls"], capture_output=True, text=True, check=True)
         return [line.split()[0] for line in done.stdout.splitlines()[1:] if line.split()]
+
+
+class BrokenStdout(io.StringIO):
+    """Stdout whose reader closes at the first write starting with `closes_at`: every later write raises BrokenPipeError."""
+
+    def __init__(self, closes_at: str) -> None:
+        super().__init__()
+        self.closes_at = closes_at
+        self.reader_gone = False
+
+    def write(self, text: str) -> int:
+        if text.startswith(self.closes_at):
+            self.reader_gone = True
+        if self.reader_gone:
+            raise BrokenPipeError("stdout reader closed")
+        return super().write(text)
 
 
 class RunnerTest(unittest.TestCase):
@@ -959,6 +981,48 @@ class RunnerTest(unittest.TestCase):
         with mock.patch.object(lab_ec2._Interrupts, "begin_cleanup", signal_before_cleaning_is_set):
             code, out = self.run_runner()
         self.assertEqual(code, 128 + signal.SIGTERM, out)
+        self.assert_box_ended()
+
+    def assert_up_ended(self) -> None:
+        pid = self.tools.up_pid()
+        self.assertIsNotNone(pid, "ec2 up never started")
+        self.assertFalse(process_alive(pid))
+
+    def test_stdout_failing_at_the_first_up_line_still_ends_the_box(self) -> None:
+        self.tools.set_ec2(up="hang")
+        with contextlib.redirect_stdout(BrokenStdout("ec2 up:")), self.assertRaises(BrokenPipeError):
+            lab_ec2.main(self.args(), clock=self.clock)
+        self.assert_up_ended()
+        self.assert_box_ended()
+
+    def test_run_log_failing_at_the_first_up_line_still_ends_the_box(self) -> None:
+        run_log = self.state_root / f"{STAMP}-ec2-greeter" / "run.log"
+        self.tools.set_ec2(up="hang", break_run_log=str(run_log))
+        with self.assertRaises(IsADirectoryError):
+            self.run_runner()
+        self.assert_up_ended()
+        self.assert_box_ended()
+
+    def test_stdout_failing_before_the_launch_launches_nothing(self) -> None:
+        self.tools.set_ec2(up="hang")
+        with contextlib.redirect_stdout(BrokenStdout("ec2-greeter run from halmasuit")), self.assertRaises(BrokenPipeError):
+            lab_ec2.main(self.args(), clock=self.clock)
+        self.assertEqual(self.tools.ec2_calls("up"), [])
+
+    def test_stdout_failing_after_the_launch_stops_the_run_and_ends_the_box(self) -> None:
+        with contextlib.redirect_stdout(BrokenStdout("frames copy:")), self.assertRaises(BrokenPipeError):
+            lab_ec2.main(self.args(), clock=self.clock)
+        self.assertEqual(self.frames_calls(), [])
+        self.assert_box_ended()
+
+    def test_stdout_failing_during_the_cleanup_still_ends_the_box_and_fails_the_run(self) -> None:
+        stdout = BrokenStdout(f"ec2 down {BOX}:")
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = lab_ec2.main(self.args(), clock=self.clock)
+        self.assertEqual(code, 1, stdout.getvalue())
+        self.assertIn("PASS ec2-greeter", self.run_log())
+        self.assertIn("run log write failed: stdout reader closed", stderr.getvalue())
         self.assert_box_ended()
 
     def test_undecodable_final_listing_is_recorded_and_the_run_fails(self) -> None:
