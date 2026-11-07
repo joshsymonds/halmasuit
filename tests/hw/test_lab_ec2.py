@@ -12,6 +12,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import signal
 import struct
 import subprocess
@@ -20,7 +21,7 @@ import tempfile
 import time
 import unittest
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,16 @@ FRAME_STEP_US = 500_000
 GREETER_FRAME = FRAME_COUNT - 1
 PARTIAL_LINE_BYTES = 25
 DURING_COPY_FRAMES = 80
+GREETER_PID = 1459
+PROBE_USER = "labuser"
+PAM_US = 33_200_000
+DEATH_US = 33_300_000
+SESSION_FOREGROUND_US = 33_500_000
+SESSION_OPENED_US = 34_000_000
+SESSION_FIRST_FRAME_US = 34_050_000
+SESSION_FRAMES = ((64, 33_600_000), (65, 34_100_000), (66, 34_600_000), (67, 35_100_000))
+JOURNAL_BOOT_ID = "b007b007b007b007b007b007b007b007"
+REALTIME_OFFSET_US = 1_792_640_291_000_000
 
 EC2_FAKE = r'''
 import json
@@ -220,8 +231,59 @@ def archive_members(source, names, recorder, mode):
     return status
 
 
+def stdin_log(command):
+    """The stdins the fake received for one remote command, in order."""
+    path = HERE / "stdin.jsonl"
+    if not path.exists():
+        return []
+    return [call["stdin"] for call in map(json.loads, path.read_text().splitlines()) if call["command"] == command]
+
+
+def record_stdin(command, text):
+    with (HERE / "stdin.jsonl").open("a") as calls:
+        calls.write(json.dumps({"command": command, "stdin": text}) + "\n")
+
+
+def set_password():
+    """The password of the last chpasswd line the fake received, or None."""
+    sets = stdin_log("chpasswd")
+    return sets[-1].split(":", 1)[1].rstrip("\n") if sets else None
+
+
 remote = sys.argv[-1]
 words = shlex.split(remote)
+if remote == "sudo -n chpasswd":
+    record_stdin("chpasswd", sys.stdin.read())
+    if CONFIG["login"]["chpasswd"] == "fail":
+        print("chpasswd: permission denied", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+if remote == "sudo -n lab-probe-type":
+    request = sys.stdin.read()
+    record_stdin("lab-probe-type", request)
+    holder = CONFIG["login"]["holder"]
+    if holder == "hang":
+        (HERE / "ssh-probe.pid").write_text(str(os.getpid()))
+        while True:
+            time.sleep(60)
+    if holder == "exit-1":
+        print("lab-probe-type: holder unavailable", file=sys.stderr)
+        sys.exit(1)
+    if holder == "bad-reply":
+        print("holder busy")
+        sys.exit(0)
+    _, typed = request.rstrip("\n").split(" ", 1)
+    lines = CONFIG["login"]["right"] if typed == set_password() else CONFIG["login"]["wrong"]
+    with (HERE / "login-journal.jsonl").open("a") as journal:
+        journal.writelines(line + "\n" for line in lines)
+    print(f"ok {len(stdin_log('lab-probe-type'))}")
+    sys.exit(0)
+if words[:2] == ["test", "-d"]:
+    probe = CONFIG["login"]["greeter_probe"]
+    if probe == "error":
+        print("ssh: test failed", file=sys.stderr)
+        sys.exit(255)
+    sys.exit(0 if probe == "alive" else 1)
 if remote.startswith("sudo -n cat "):
     frames = CONFIG["frames"]
     index = Path(frames["source"]) / "index.jsonl"
@@ -250,6 +312,9 @@ if remote.startswith("sudo -n tar "):
     sys.exit(archive_members(source, names, Recorder(source, frames["append"]), frames["mode"]))
 if CONFIG["journal"] is not None:
     sys.stdout.write(Path(CONFIG["journal"]).read_text())
+    login = HERE / "login-journal.jsonl"
+    if login.exists():
+        sys.stdout.write(login.read_text())
 '''
 
 DEFAULT_FRAMES_DIR = "/run/halmasuit-lab/frames"
@@ -410,6 +475,53 @@ def write_recorder(directory: Path) -> None:
     write_index(directory / "index.jsonl", [index_line(seq) for seq in range(FRAME_COUNT)])
 
 
+def journal_entry(mono_us: int, message: str, **fields: str) -> str:
+    """One `journalctl -o json` line for a boot journal entry at mono_us."""
+    record = {
+        "__REALTIME_TIMESTAMP": str(REALTIME_OFFSET_US + mono_us),
+        "__MONOTONIC_TIMESTAMP": str(mono_us),
+        "_BOOT_ID": JOURNAL_BOOT_ID,
+        "MESSAGE": message,
+        **fields,
+    }
+    return json.dumps(record)
+
+
+def halmasuit_entry(mono_us: int, event: dict[str, Any]) -> str:
+    """A halmasuit.service entry carrying one Event in its tracing-JSON line."""
+    tracing = {
+        "timestamp": "2026-10-22T03:38:44.000000Z",
+        "level": "INFO",
+        "fields": {"json": json.dumps(event)},
+        "target": "halmasuit::event",
+    }
+    return journal_entry(
+        mono_us,
+        json.dumps(tracing),
+        _SYSTEMD_UNIT="halmasuit.service",
+        SYSLOG_IDENTIFIER="halmasuit",
+        _PID="1184",
+        _TRANSPORT="stdout",
+        PRIORITY="6",
+    )
+
+
+def pam_entry(mono_us: int) -> str:
+    """The authpriv line pam_unix writes for a wrong password typed for PROBE_USER at the greeter."""
+    message = (
+        f"pam_unix(halmasuit:auth): authentication failure; logname= uid=0 euid=0 tty= ruser= rhost=  "
+        f"user={PROBE_USER}"
+    )
+    return journal_entry(mono_us, message, SYSLOG_FACILITY="10", SYSLOG_IDENTIFIER="halmasuit-session", PRIORITY="3")
+
+
+SESSION_LINES = [
+    halmasuit_entry(SESSION_FOREGROUND_US, {"event": "foreground_changed", "to": "session"}),
+    halmasuit_entry(SESSION_OPENED_US, {"event": "session_opened"}),
+    halmasuit_entry(SESSION_FIRST_FRAME_US, {"event": "session_client_first_frame"}),
+]
+
+
 def decode_video(path: Path) -> bytes:
     done = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
@@ -452,6 +564,7 @@ class FakeTools:
             "fails": False,
             "journal": str(FIXTURE),
             "frames": {"dir": DEFAULT_FRAMES_DIR, "source": str(served), "mode": "serve", "append": None},
+            "login": {"chpasswd": "ok", "holder": "ok", "greeter_probe": "alive", "wrong": [], "right": []},
         }
         install(self.ec2, EC2_FAKE)
         install(self.ssh, SSH_FAKE)
@@ -471,6 +584,10 @@ class FakeTools:
 
     def set_frames(self, **changes: object) -> None:
         self.ssh_config["frames"].update(changes)
+        self.save()
+
+    def set_login(self, **changes: object) -> None:
+        self.ssh_config["login"].update(changes)
         self.save()
 
     def serve_journal(self, data: bytes | None) -> None:
@@ -500,6 +617,15 @@ class FakeTools:
 
     def copy_pid(self) -> int | None:
         return self.pid_of("ssh-copy.pid")
+
+    def probe_pid(self) -> int | None:
+        return self.pid_of("ssh-probe.pid")
+
+    def stdin_calls(self) -> list[dict]:
+        return read_jsonl(self.root / "stdin.jsonl")
+
+    def stdins(self, command: str) -> list[str]:
+        return [call["stdin"] for call in self.stdin_calls() if call["command"] == command]
 
     def listed(self) -> list[str]:
         done = subprocess.run([str(self.ec2), "ls"], capture_output=True, text=True, check=True)
@@ -536,7 +662,7 @@ class RunnerTest(unittest.TestCase):
         self.clock = FakeClock()
 
     def kill_hung_children(self) -> None:
-        for pid in (self.tools.up_pid(), self.tools.copy_pid()):
+        for pid in (self.tools.up_pid(), self.tools.copy_pid(), self.tools.probe_pid()):
             if pid is not None and process_alive(pid):
                 os.kill(pid, signal.SIGKILL)
 
@@ -570,14 +696,28 @@ class RunnerTest(unittest.TestCase):
     def set_served_index(self, lines: list[dict[str, Any]]) -> None:
         write_index(self.tools.frames_source / "index.jsonl", lines)
 
-    def run_dir(self) -> Path:
+    def serve_session_frames(self, frames: Sequence[tuple[int, int]] = SESSION_FRAMES) -> None:
+        """Appends the session's frames to the served recorder: a PNG and an index line per (seq, mono_us)."""
+        with (self.tools.frames_source / "index.jsonl").open("a", encoding="utf-8") as index:
+            for seq, mono_us in frames:
+                (self.tools.frames_source / OUTPUT / f"{seq:08d}.png").write_bytes(frame_png(seq))
+                index.write(json.dumps(index_line(seq, mono_us=mono_us)) + "\n")
+
+    def serve_login(self, **changes: object) -> None:
+        """Configures a login run: the lines a wrong and a right typing append, and the session's frames."""
+        settings: dict[str, object] = {"wrong": [pam_entry(PAM_US)], "right": SESSION_LINES}
+        settings.update(changes)
+        self.tools.set_login(**settings)
+        self.serve_session_frames()
+
+    def run_dir(self, profile: str = "ec2-greeter") -> Path:
         """The one run directory under state_root; a subprocess run stamps it from the real clock."""
-        found = sorted(self.state_root.glob("*-ec2-greeter"))
+        found = sorted(self.state_root.glob(f"*-{profile}"))
         self.assertEqual(len(found), 1, found)
         return found[0]
 
-    def run_log(self) -> str:
-        return (self.run_dir() / "run.log").read_text()
+    def run_log(self, profile: str = "ec2-greeter") -> str:
+        return (self.run_dir(profile) / "run.log").read_text()
 
     def assert_box_ended(self) -> None:
         self.assertEqual([call["argv"] for call in self.tools.ec2_calls("down")], [["down", BOX]])
@@ -1031,6 +1171,186 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn("could not list boxes after ending the run", self.run_log())
         self.assertEqual([call["argv"] for call in self.tools.ec2_calls("down")], [["down", BOX]])
+
+    def test_login_sets_the_password_then_types_the_wrong_one_then_the_right_one(self) -> None:
+        self.serve_login()
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(
+            [call["command"] for call in self.tools.stdin_calls()],
+            ["chpasswd", "lab-probe-type", "lab-probe-type"],
+        )
+        (set_line,) = self.tools.stdins("chpasswd")
+        wrong_line, right_line = self.tools.stdins("lab-probe-type")
+        self.assertRegex(set_line, rf"\A{PROBE_USER}:[a-z]{{32}}\n\Z")
+        self.assertRegex(wrong_line, rf"\A{PROBE_USER} [a-z]{{32}}\n\Z")
+        right = set_line[len(PROBE_USER) + 1 : -1]
+        wrong = wrong_line[len(PROBE_USER) + 1 : -1]
+        self.assertNotEqual(wrong, right)
+        self.assertEqual(right_line, f"{PROBE_USER} {right}\n")
+        remotes = [call[-1] for call in self.tools.ssh_calls()]
+        self.assertIn("sudo -n chpasswd", remotes)
+        self.assertEqual(remotes.count("sudo -n lab-probe-type"), 2)
+        self.assert_box_ended()
+
+    def test_login_passes_and_ends_the_box(self) -> None:
+        self.serve_login()
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 0, out)
+        log = self.run_log("ec2-login")
+        self.assertIn("R1 matched: pam_unix(halmasuit:auth): authentication failure", log)
+        self.assertIn(f"R1 greeter pid {GREETER_PID}: alive", log)
+        self.assertIn("PASS ec2-login", log)
+        self.assertTrue((self.run_dir("ec2-login") / "journal.json").is_file())
+        self.assert_box_ended()
+
+    def test_r1_fails_after_one_typing_when_no_pam_line_appears(self) -> None:
+        self.serve_login(wrong=[])
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            "FAIL ec2-login: R1: no line holding 'pam_unix(halmasuit:auth): authentication failure'",
+            self.run_log("ec2-login"),
+        )
+        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 1)
+        self.assert_box_ended()
+
+    def test_r1_fails_after_one_typing_when_the_greeter_is_dead(self) -> None:
+        self.serve_login(greeter_probe="dead")
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"FAIL ec2-login: R1: greeter pid {GREETER_PID} is dead", self.run_log("ec2-login"))
+        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 1)
+        self.assert_box_ended()
+
+    def test_r1_fails_when_the_greeter_liveness_check_errors(self) -> None:
+        self.serve_login(greeter_probe="error")
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            f"FAIL ec2-login: R1: could not check greeter pid {GREETER_PID} (test -d rc 255)",
+            self.run_log("ec2-login"),
+        )
+        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 1)
+        self.assert_box_ended()
+
+    def test_r1_fails_when_the_greeter_died_after_it_spawned(self) -> None:
+        death = halmasuit_entry(DEATH_US, {"event": "greeter_terminated"})
+        self.tools.serve_journal(FIXTURE.read_bytes().rstrip(b"\n") + b"\n" + death.encode() + b"\n")
+        self.serve_login()
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            f"FAIL ec2-login: R1: greeter_terminated follows greeter_spawned pid {GREETER_PID}",
+            self.run_log("ec2-login"),
+        )
+        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 1)
+        self.assert_box_ended()
+
+    def test_no_login_within_the_wait_fails_the_run(self) -> None:
+        self.serve_login(right=[])
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL ec2-login: no login within 120 seconds", self.run_log("ec2-login"))
+        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 2)
+        self.assertGreaterEqual(self.clock.now, lab_ec2.LOGIN_WAIT_SECONDS)
+        self.assert_box_ended()
+
+    def test_hold_failure_in_login_mode_types_nothing(self) -> None:
+        self.tools.serve_journal(None)
+        self.serve_login()
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            "FAIL ec2-login: no halmasuit.service foreground_changed to greeter event",
+            self.run_log("ec2-login"),
+        )
+        self.assertEqual(self.tools.stdin_calls(), [])
+        self.assertTrue((self.run_dir("ec2-login") / "journal.json").is_file())
+        self.assert_box_ended()
+
+    def test_failing_chpasswd_fails_before_any_typing(self) -> None:
+        self.serve_login(chpasswd="fail")
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            "FAIL ec2-login: set the labuser password failed (rc 1): chpasswd: permission denied",
+            self.run_log("ec2-login"),
+        )
+        self.assertEqual(self.tools.stdins("lab-probe-type"), [])
+        self.assert_box_ended()
+
+    def test_holder_failing_fails_the_run_at_the_wrong_typing(self) -> None:
+        self.serve_login(holder="exit-1")
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            "FAIL ec2-login: type the wrong password failed (rc 1): lab-probe-type: holder unavailable",
+            self.run_log("ec2-login"),
+        )
+        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 1)
+        self.assert_box_ended()
+
+    def test_holder_reply_without_ok_fails_the_run_at_the_wrong_typing(self) -> None:
+        self.serve_login(holder="bad-reply")
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            "FAIL ec2-login: type the wrong password: the holder did not reply `ok <n>`",
+            self.run_log("ec2-login"),
+        )
+        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 1)
+        self.assert_box_ended()
+
+    def test_login_index_must_span_session_opened(self) -> None:
+        self.serve_login()
+        self.set_served_index([index_line(seq) for seq in range(FRAME_COUNT)] + [index_line(64, mono_us=33_600_000)])
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            f"FAIL ec2-login: recorder index does not span session_opened at {SESSION_OPENED_US} us on output(s): "
+            f"{OUTPUT}",
+            self.run_log("ec2-login"),
+        )
+        self.assert_box_ended()
+
+    def test_passwords_stay_out_of_argv_stdout_and_the_run_directory(self) -> None:
+        self.serve_login()
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 0, out)
+        sent = self.tools.stdins("chpasswd") + self.tools.stdins("lab-probe-type")
+        passwords = {word for text in sent for word in re.findall(r"[a-z]{32}", text)}
+        self.assertEqual(len(passwords), 2)
+        ec2_argv = json.dumps(read_jsonl(self.tools.root / "ec2-calls.jsonl"))
+        ssh_argv = json.dumps(self.tools.ssh_calls())
+        run_files = tree(self.run_dir("ec2-login"))
+        for password in passwords:
+            self.assertNotIn(password, ec2_argv)
+            self.assertNotIn(password, ssh_argv)
+            self.assertNotIn(password, out)
+            for name, data in run_files.items():
+                self.assertNotIn(password.encode(), data, name)
+        self.assert_box_ended()
+
+    def test_sigterm_while_lab_probe_type_hangs_ends_the_box(self) -> None:
+        self.serve_login(holder="hang")
+        runner = subprocess.Popen(
+            [sys.executable, "-B", str(RUNNER), *self.args(), "--login"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            pid = wait_for(self.tools.probe_pid, "the hung lab-probe-type to start")
+            runner.send_signal(signal.SIGTERM)
+            out, err = runner.communicate(timeout=60)
+        finally:
+            if runner.poll() is None:
+                runner.kill()
+                runner.communicate()
+        self.assertEqual(runner.returncode, 128 + signal.SIGTERM, out + err)
+        self.assertFalse(process_alive(pid))
+        self.assert_box_ended()
 
 
 if __name__ == "__main__":

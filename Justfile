@@ -63,8 +63,9 @@ lab-run +experiments:
     python3 -B tests/hw/lab.py {{experiments}}
 
 # Launches one halmasuit-lab EC2 box from this checkout's HEAD, checks its greeter boot against
-# the ec2-greeter profile, and ends the box on every exit path. Refuses while a halmasuit-lab box
-# is already listed. Pass --help for the ec2, ssh, and state-root options.
+# the ec2-greeter profile, and ends the box on every exit path. Pass --login to also log labuser
+# in at the greeter and check the ec2-login profile. Refuses while a halmasuit-lab box is already
+# listed. Pass --help for the ec2, ssh, and state-root options.
 lab-ec2-run *args:
     python3 -B tests/hw/lab_ec2.py {{args}}
 
