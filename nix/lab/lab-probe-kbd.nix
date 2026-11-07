@@ -85,6 +85,7 @@ let
     }
 
     static int req_w = -1, req_r = -1, rep_r = -1, rep_w = -1, up_r = -1, up_w = -1;
+    static struct request probe_req;
 
     static void open_pipes(void)
     {
@@ -102,7 +103,7 @@ let
     }
 
     struct events {
-            struct input_event ev[512];
+            struct input_event ev[1024];
             size_t n;
     };
 
@@ -129,16 +130,28 @@ let
                     out->n++;
     }
 
+    /* Serves one request, then checks that the request buffers hold no request bytes. */
+    static void serve(void)
+    {
+            const unsigned char *p = (const unsigned char *)&probe_req;
+            bool wiped = true;
+
+            serve_one(req_r, rep_w, up_w, &probe_req);
+            for (size_t i = 0; i < sizeof probe_req; i++)
+                    wiped = wiped && p[i] == 0;
+            CHECK(wiped);
+    }
+
     static void exchange(const char *line, size_t len, char *reply, size_t cap,
                          struct events *ev)
     {
             send_request(line, len);
-            serve_one(req_r, rep_w, up_w);
+            serve();
             read_reply(reply, cap);
             drain_events(ev);
     }
 
-    static size_t expected_presses(const char *username, int *out)
+    static size_t expected_presses(const char *username, const char *password, int *out)
     {
             size_t n = 0;
             const char *p;
@@ -150,17 +163,17 @@ let
                             out[n++] = literal_codes[*p - 'a'];
                     out[n++] = LITERAL_ENTER;
             }
-            for (p = "wrongprobe"; *p != '\0'; p++)
+            for (p = password; *p != '\0'; p++)
                     out[n++] = literal_codes[*p - 'a'];
             out[n++] = LITERAL_ENTER;
             return n;
     }
 
     /* Each press is press, SYN, release, SYN, in order, with no extra events. */
-    static void check_typed(const struct events *ev, const char *username)
+    static void check_typed(const struct events *ev, const char *username, const char *password)
     {
-            int want[128];
-            size_t nwant = expected_presses(username, want);
+            int want[256];
+            size_t nwant = expected_presses(username, password, want);
 
             CHECK(ev->n == nwant * 4);
             for (size_t i = 0; i < nwant && i * 4 + 3 < ev->n; i++) {
@@ -226,16 +239,31 @@ let
 
     static void test_accepted(void)
     {
+            static const char pw64[] =
+                    "abcdefghijklmnopqrstuvwxyz"
+                    "abcdefghijklmnopqrstuvwxyz"
+                    "abcdefghijkl";
             static const struct {
                     const char *line;
                     const char *user;
+                    const char *password;
                     const char *reply;
             } cases[] = {
-                    { "\n", "", "ok 43\n" },
-                    { "probeuser\n", "probeuser", "ok 53\n" },
-                    { "a\n", "a", "ok 45\n" },
+                    { "\n", "", "wrongprobe", "ok 43\n" },
+                    { "probeuser\n", "probeuser", "wrongprobe", "ok 53\n" },
+                    { "a\n", "a", "wrongprobe", "ok 45\n" },
                     { "abcdefghijklmnopqrstuvwxyzabcdef\n",
-                      "abcdefghijklmnopqrstuvwxyzabcdef", "ok 76\n" },
+                      "abcdefghijklmnopqrstuvwxyzabcdef", "wrongprobe", "ok 76\n" },
+                    { "probeuser pw\n", "probeuser", "pw", "ok 45\n" },
+                    { "pro be\n", "pro", "be", "ok 39\n" },
+                    { " a\n", "", "a", "ok 34\n" },
+                    { " abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl\n",
+                      "", pw64, "ok 97\n" },
+                    { "probeuser abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl\n",
+                      "probeuser", pw64, "ok 107\n" },
+                    { "abcdefghijklmnopqrstuvwxyzabcdef "
+                      "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl\n",
+                      "abcdefghijklmnopqrstuvwxyzabcdef", pw64, "ok 130\n" },
             };
 
             for (size_t i = 0; i < COUNT(cases); i++) {
@@ -244,23 +272,50 @@ let
 
                     exchange(cases[i].line, strlen(cases[i].line), reply, sizeof reply, &ev);
                     CHECK(strcmp(reply, cases[i].reply) == 0);
-                    check_typed(&ev, cases[i].user);
+                    check_typed(&ev, cases[i].user, cases[i].password);
             }
+    }
+
+    /* The next request after a rejected line is served fresh: the bare fixed probe. */
+    static void expect_fresh(void)
+    {
+            char reply[64];
+            struct events ev;
+
+            exchange("\n", 1, reply, sizeof reply, &ev);
+            CHECK(strcmp(reply, "ok 43\n") == 0);
+            check_typed(&ev, "", "wrongprobe");
     }
 
     static void test_rejected(void)
     {
-            static const char *const bad_lines[] = {
-                    "PROBE\n", "probe1\n", "pro/be\n", "pro be\n",
+            static const struct {
+                    const char *line;
+                    const char *reply;
+            } cases[] = {
+                    { "PROBE\n", "error bad username\n" },
+                    { "probe1\n", "error bad username\n" },
+                    { "pro/be\n", "error bad username\n" },
+                    { "pro/be pw\n", "error bad username\n" },
+                    { "probe \n", "error missing password\n" },
+                    { " \n", "error missing password\n" },
+                    { "probe  pw\n", "error too many fields\n" },
+                    { "probe pw \n", "error too many fields\n" },
+                    { "probe pw pw\n", "error too many fields\n" },
+                    { "probe  \n", "error too many fields\n" },
+                    { "probe pa1s\n", "error bad password\n" },
+                    { "probe PASS\n", "error bad password\n" },
+                    { "probe pa/s\n", "error bad password\n" },
             };
-            char longline[128];
+            char longline[160];
             char reply[64];
             struct events ev;
 
-            for (size_t i = 0; i < COUNT(bad_lines); i++) {
-                    exchange(bad_lines[i], strlen(bad_lines[i]), reply, sizeof reply, &ev);
-                    CHECK(strcmp(reply, "error bad username\n") == 0);
+            for (size_t i = 0; i < COUNT(cases); i++) {
+                    exchange(cases[i].line, strlen(cases[i].line), reply, sizeof reply, &ev);
+                    CHECK(strcmp(reply, cases[i].reply) == 0);
                     CHECK(ev.n == 0);
+                    expect_fresh();
             }
 
             memset(longline, 'a', 33);
@@ -268,36 +323,66 @@ let
             exchange(longline, 34, reply, sizeof reply, &ev);
             CHECK(strcmp(reply, "error username too long\n") == 0);
             CHECK(ev.n == 0);
+            expect_fresh();
 
             memset(longline, 'a', 100);
             longline[100] = '\n';
             exchange(longline, 101, reply, sizeof reply, &ev);
             CHECK(strcmp(reply, "error username too long\n") == 0);
             CHECK(ev.n == 0);
+            expect_fresh();
+
+            /* An over-long user is reported ahead of a bad password byte. */
+            memset(longline, 'a', 33);
+            longline[33] = ' ';
+            longline[34] = '1';
+            longline[35] = '\n';
+            exchange(longline, 36, reply, sizeof reply, &ev);
+            CHECK(strcmp(reply, "error username too long\n") == 0);
+            CHECK(ev.n == 0);
+            expect_fresh();
+
+            /* A 65-byte password is one byte over the limit. */
+            memcpy(longline, "probe ", 6);
+            memset(longline + 6, 'a', 65);
+            longline[71] = '\n';
+            exchange(longline, 72, reply, sizeof reply, &ev);
+            CHECK(strcmp(reply, "error password too long\n") == 0);
+            CHECK(ev.n == 0);
+            expect_fresh();
     }
 
     /* An over-long line is discarded through its newline, so the next line is a fresh request. */
     static void test_overlong_discarded(void)
     {
-            char buf[128];
+            char buf[256];
             char reply[64];
             struct events ev;
 
             memset(buf, 'b', 100);
             buf[100] = '\n';
-            buf[101] = '\n';
-            send_request(buf, 102);
-            serve_one(req_r, rep_w, up_w);
+            memcpy(buf + 101, "probe ", 6);
+            memset(buf + 107, 'c', 100);
+            buf[207] = '\n';
+            buf[208] = '\n';
+            send_request(buf, 209);
+            serve();
             read_reply(reply, sizeof reply);
             CHECK(strcmp(reply, "error username too long\n") == 0);
             drain_events(&ev);
             CHECK(ev.n == 0);
 
-            serve_one(req_r, rep_w, up_w);
+            serve();
+            read_reply(reply, sizeof reply);
+            CHECK(strcmp(reply, "error password too long\n") == 0);
+            drain_events(&ev);
+            CHECK(ev.n == 0);
+
+            serve();
             read_reply(reply, sizeof reply);
             CHECK(strcmp(reply, "ok 43\n") == 0);
             drain_events(&ev);
-            check_typed(&ev, "");
+            check_typed(&ev, "", "wrongprobe");
     }
 
     static void test_fifos(void)

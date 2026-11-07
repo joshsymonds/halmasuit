@@ -10,7 +10,8 @@
 # option and runs the same way. The probe option loads uinput and defines
 # lab-probe.service, an on-demand root oneshot that nothing starts on its own.
 # With probe.earlyKeyboard, the uinput keyboard holder runs from stage 1 across
-# switch-root, and lab-probe uses it. Every option defaults off or empty,
+# switch-root. Then lab-probe-type, a root-only command on the rootfs PATH,
+# relays each request line to the holder. Every option defaults off or empty,
 # except probe.consumerUser, which defaults to greeter.
 #
 # Journal contract (frozen; consumed by tests/hw/timeline.py). Each entry is
@@ -62,6 +63,8 @@ let
   labVkmsCrc = pkgs.callPackage ./lab-vkms-crc.nix { };
 
   labKbd = pkgs.callPackage ./lab-probe-kbd.nix { };
+
+  labProbeType = pkgs.callPackage ./lab-probe-type.nix { };
 
   labProbe = ./lab_probe.py;
 
@@ -313,6 +316,11 @@ in
       # across the pivot, and the rootfs unit adopts it without starting anything.
       # The probe runs with --early-keyboard, so it writes through the holder's
       # FIFOs and never opens /dev/uinput.
+      #
+      # With probe.earlyKeyboard, lab-probe-type is on the rootfs PATH. It is
+      # root-only by its own euid check, not by a setuid bit or a sudo rule, and
+      # it relays one request line from stdin to the holder's request FIFO.
+      environment.systemPackages = lib.optional earlyKbd labProbeType;
       boot.kernelModules = lib.optional cfg.probe.enable "uinput";
       systemd.services.lab-probe = lib.mkIf cfg.probe.enable {
         serviceConfig = {
