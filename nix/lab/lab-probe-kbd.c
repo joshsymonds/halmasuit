@@ -3,11 +3,19 @@
  *
  * Creates the virtual keyboard "lab-probe keyboard" once and holds it for the
  * life of the boot. Each request line on the request FIFO makes it type the
- * fixed probe sequence, and each request gets one reply line on the reply FIFO.
+ * probe sequence, and each request gets one reply line on the reply FIFO.
  *
- *   request: <username>\n    0 to 32 bytes of a-z; an empty line means no user
- *   reply:   ok <n>\n        n is the number of key presses typed
+ *   request: <username>\n                 0 to 32 bytes of a-z; the fixed
+ *                                         password is typed
+ *            <username> <password>\n      one space separates the fields; the
+ *                                         username may be empty, the password
+ *                                         is 1 to 64 bytes of a-z and is typed
+ *                                         in place of the fixed password
+ *   reply:   ok <n>\n                     n is the number of key presses typed
  *            error <reason>\n
+ *
+ * The holder never echoes or logs request bytes, and wipes its request buffers
+ * after each request.
  *
  * /dev/uinput and both FIFOs are opened once and kept for the life of the
  * process. Paths are never reopened: after switch-root the holder's root is the
@@ -41,10 +49,11 @@
 
 #define REQUEST_DIR "/run/lab-probe-kbd"
 #define USERNAME_MAX 32
+#define PASSWORD_MAX 64
 #define CLEAR_PRESSES 32
 #define KEY_PACE_NS (20L * 1000000L)
 
-static const char PASSWORD[] = "wrongprobe";
+static const char FIXED_PASSWORD[] = "wrongprobe";
 static const char READY[] = "READY=1\n";
 
 static const int letter_codes[26] = {
@@ -52,6 +61,19 @@ static const int letter_codes[26] = {
 	KEY_J, KEY_K, KEY_L, KEY_M, KEY_N, KEY_O, KEY_P, KEY_Q, KEY_R,
 	KEY_S, KEY_T, KEY_U, KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z,
 };
+
+/*
+ * One request as read from the request FIFO. A zero password_len means the
+ * line named no password, and the fixed password is typed.
+ */
+struct request {
+	char username[USERNAME_MAX];
+	char password[PASSWORD_MAX];
+	size_t username_len;
+	size_t password_len;
+};
+
+enum request_field { USERNAME_FIELD, PASSWORD_FIELD, EXTRA_FIELD };
 
 static _Noreturn void fatal(const char *what, int err)
 {
@@ -133,10 +155,11 @@ static size_t type_text(int fd, const char *text, size_t len)
 
 /*
  * Types the probe: clear the field with BackSpace, then the username and Enter
- * when there is one, then the fixed password and Enter. Returns the number of
- * key presses typed.
+ * when there is one, then the password and Enter. The password is the one the
+ * request named, or the fixed password when it named none. Returns the number
+ * of key presses typed.
  */
-static size_t type_probe(int fd, const char *username, size_t len)
+static size_t type_probe(int fd, const struct request *req)
 {
 	size_t typed = 0;
 
@@ -144,12 +167,15 @@ static size_t type_probe(int fd, const char *username, size_t len)
 		tap(fd, KEY_BACKSPACE);
 		typed++;
 	}
-	if (len > 0) {
-		typed += type_text(fd, username, len);
+	if (req->username_len > 0) {
+		typed += type_text(fd, req->username, req->username_len);
 		tap(fd, KEY_ENTER);
 		typed++;
 	}
-	typed += type_text(fd, PASSWORD, strlen(PASSWORD));
+	if (req->password_len > 0)
+		typed += type_text(fd, req->password, req->password_len);
+	else
+		typed += type_text(fd, FIXED_PASSWORD, strlen(FIXED_PASSWORD));
 	tap(fd, KEY_ENTER);
 	typed++;
 	return typed;
@@ -225,15 +251,23 @@ static void open_request_fifos(const char *dir, int *request_fd, int *reply_fd)
 }
 
 /*
- * Reads one request line into username and returns NULL when it is valid, or
- * the reason it is rejected. A rejected line is consumed through its newline.
+ * Reads one request line into req and returns NULL when it is valid, or the
+ * fixed reason it is rejected. A rejected line is consumed through its newline.
+ * When a line has several faults, the reason is the first of these that applies:
+ * username too long, bad username, too many fields, password too long,
+ * bad password, missing password.
  */
-static const char *read_request(int fd, char username[USERNAME_MAX + 1], size_t *len)
+static const char *read_request(int fd, struct request *req)
 {
-	size_t n = 0;
-	bool bad = false;
-	bool overlong = false;
+	enum request_field field = USERNAME_FIELD;
+	bool user_long = false;
+	bool user_bad = false;
+	bool too_many = false;
+	bool pass_long = false;
+	bool pass_bad = false;
 
+	req->username_len = 0;
+	req->password_len = 0;
 	for (;;) {
 		char c;
 		ssize_t r = read(fd, &c, 1);
@@ -247,29 +281,57 @@ static const char *read_request(int fd, char username[USERNAME_MAX + 1], size_t 
 			fatal("request fifo closed", 0);
 		if (c == '\n')
 			break;
-		if (n == USERNAME_MAX) {
-			overlong = true;
+		if (c == ' ') {
+			if (field == USERNAME_FIELD) {
+				field = PASSWORD_FIELD;
+			} else {
+				too_many = true;
+				field = EXTRA_FIELD;
+			}
 			continue;
 		}
-		if (c < 'a' || c > 'z')
-			bad = true;
-		username[n++] = c;
+		switch (field) {
+		case USERNAME_FIELD:
+			if (req->username_len == USERNAME_MAX) {
+				user_long = true;
+				break;
+			}
+			if (c < 'a' || c > 'z')
+				user_bad = true;
+			req->username[req->username_len++] = c;
+			break;
+		case PASSWORD_FIELD:
+			if (req->password_len == PASSWORD_MAX) {
+				pass_long = true;
+				break;
+			}
+			if (c < 'a' || c > 'z')
+				pass_bad = true;
+			req->password[req->password_len++] = c;
+			break;
+		case EXTRA_FIELD:
+			break;
+		}
 	}
-	username[n] = '\0';
-	*len = n;
-	if (overlong)
+	if (user_long)
 		return "username too long";
-	if (bad)
+	if (user_bad)
 		return "bad username";
+	if (too_many)
+		return "too many fields";
+	if (pass_long)
+		return "password too long";
+	if (pass_bad)
+		return "bad password";
+	if (field == PASSWORD_FIELD && req->password_len == 0)
+		return "missing password";
 	return NULL;
 }
 
-static void serve_one(int request_fd, int reply_fd, int uinput_fd)
+static void serve_one(int request_fd, int reply_fd, int uinput_fd, struct request *req)
 {
-	char username[USERNAME_MAX + 1];
 	char reply[64];
-	size_t len = 0;
-	const char *reason = read_request(request_fd, username, &len);
+	const char *reason = read_request(request_fd, req);
 	int n;
 	int err;
 
@@ -277,7 +339,8 @@ static void serve_one(int request_fd, int reply_fd, int uinput_fd)
 		n = snprintf(reply, sizeof reply, "error %s\n", reason);
 	else
 		n = snprintf(reply, sizeof reply, "ok %zu\n",
-			     type_probe(uinput_fd, username, len));
+			     type_probe(uinput_fd, req));
+	explicit_bzero(req, sizeof *req);
 	err = write_all(reply_fd, reply, (size_t)n);
 	if (err != 0)
 		fatal("write reply", err);
@@ -321,6 +384,7 @@ static void notify_ready(void)
 
 int main(void)
 {
+	struct request req = { { 0 }, { 0 }, 0, 0 };
 	int uinput_fd;
 	int request_fd;
 	int reply_fd;
@@ -332,5 +396,5 @@ int main(void)
 	open_request_fifos(REQUEST_DIR, &request_fd, &reply_fd);
 	notify_ready();
 	for (;;)
-		serve_one(request_fd, reply_fd, uinput_fd);
+		serve_one(request_fd, reply_fd, uinput_fd, &req);
 }
