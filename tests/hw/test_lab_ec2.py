@@ -243,7 +243,13 @@ def stdin_log(command):
 
 def record_stdin(command, text):
     with (HERE / "stdin.jsonl").open("a") as calls:
-        calls.write(json.dumps({"command": command, "stdin": text}) + "\n")
+        calls.write(json.dumps({"command": command, "stdin": text, "boot": boot_number()}) + "\n")
+
+
+def liveness_checked():
+    """Whether the runner has run the greeter liveness check, which follows R1's journal reads."""
+    calls = (HERE / "ssh-calls.jsonl").read_text().splitlines()
+    return any(json.loads(call)[-1].startswith("test -d ") for call in calls)
 
 
 def set_password():
@@ -336,7 +342,7 @@ if remote.startswith("sudo -n tar "):
     source = Path(frames["source"])
     names = [raw.decode() for raw in sys.stdin.buffer.read().split(b"\0") if raw]
     sys.exit(archive_members(source, names, Recorder(source, frames["append"]), frames["mode"]))
-if CONFIG["login"]["boot1_journal"] == "fail-after-right" and boot_number() == 1 and len(stdin_log("lab-probe-type")) >= 2:
+if CONFIG["login"]["boot1_journal"] == "fail-after-r1" and boot_number() == 1 and liveness_checked():
     print("sudo: journalctl: read failed", file=sys.stderr)
     sys.exit(1)
 journal = CONFIG["journal"] if boot_number() == 1 else CONFIG["journal_after_reboot"]
@@ -601,7 +607,7 @@ class FakeTools:
                 "chpasswd": "ok",
                 "holder": "ok",
                 "greeter_probe": "alive",
-                "login_boots": [1],
+                "login_boots": [1, 2],
                 "wrong": [],
                 "right": [],
                 "boot1_journal": "ok",
@@ -1245,6 +1251,26 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(remotes.count("sudo -n lab-probe-type"), 2)
         self.assert_box_ended()
 
+    def test_right_password_is_typed_once_in_the_second_boot_after_the_reboot(self) -> None:
+        self.serve_login()
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 0, out)
+        (set_line,) = self.tools.stdins("chpasswd")
+        right = set_line[len(PROBE_USER) + 1 : -1]
+        typed = [call for call in self.tools.stdin_calls() if call["command"] == "lab-probe-type"]
+        self.assertEqual([call["boot"] for call in typed], [1, 2])
+        self.assertEqual(typed[1]["stdin"], f"{PROBE_USER} {right}\n")
+        commands = self.tools.remote_commands()
+        probes = [index for index, command in enumerate(commands) if command == "sudo -n lab-probe-type"]
+        reboot = commands.index(REBOOT_COMMAND)
+        self.assertEqual(len(probes), 2)
+        self.assertLess(probes[0], reboot)
+        self.assertLess(reboot, probes[1])
+        boot_id_reads = [index for index, command in enumerate(commands) if command == BOOT_ID_COMMAND]
+        self.assertTrue(any(reboot < index < probes[1] for index in boot_id_reads), commands)
+        self.assertIn("reboot after R1: boot boot-1 ended, boot boot-2 is up", self.run_log("ec2-login"))
+        self.assert_box_ended()
+
     def test_login_passes_and_ends_the_box(self) -> None:
         self.serve_login()
         code, out = self.run_runner("--login")
@@ -1305,21 +1331,20 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(
             [call["command"] for call in self.tools.stdin_calls()],
-            ["chpasswd", "lab-probe-type", "lab-probe-type", "lab-probe-type"],
+            ["chpasswd", "lab-probe-type", "lab-probe-type"],
         )
         (set_line,) = self.tools.stdins("chpasswd")
-        wrong_line, first_right_line, second_right_line = self.tools.stdins("lab-probe-type")
+        wrong_line, right_line = self.tools.stdins("lab-probe-type")
         right = set_line[len(PROBE_USER) + 1 : -1]
         self.assertNotEqual(wrong_line[len(PROBE_USER) + 1 : -1], right)
-        self.assertEqual(first_right_line, f"{PROBE_USER} {right}\n")
-        self.assertEqual(second_right_line, f"{PROBE_USER} {right}\n")
+        self.assertEqual(right_line, f"{PROBE_USER} {right}\n")
         commands = self.tools.remote_commands()
         probes = [index for index, command in enumerate(commands) if command == "sudo -n lab-probe-type"]
         reboot = commands.index(REBOOT_COMMAND)
-        self.assertEqual(len(probes), 3)
+        self.assertEqual(len(probes), 2)
         self.assertEqual(len(self.tools.reboot_calls()), 1)
-        self.assertLess(probes[1], reboot)
-        self.assertLess(reboot, probes[2])
+        self.assertLess(probes[0], reboot)
+        self.assertLess(reboot, probes[1])
         self.assertLess(reboot, commands.index(tar_command(DEFAULT_FRAMES_DIR)))
         boot_id_reads = [index for index, command in enumerate(commands) if command == BOOT_ID_COMMAND]
         self.assertLess(boot_id_reads[0], reboot)
@@ -1328,18 +1353,8 @@ class RunnerTest(unittest.TestCase):
         self.assertIn(b"session_opened", journal)
         self.assertNotIn(lab_ec2.PAM_MARKER.encode(), journal)
         log = self.run_log("ec2-login")
-        self.assertIn("same-boot wait ended with no login: boot boot-1 ended, boot boot-2 is up", log)
+        self.assertIn("reboot after R1: boot boot-1 ended, boot boot-2 is up", log)
         self.assertIn("PASS ec2-login", log)
-        self.assert_box_ended()
-
-    def test_same_boot_login_does_not_reboot(self) -> None:
-        self.serve_login()
-        code, out = self.run_runner("--login")
-        self.assertEqual(code, 0, out)
-        self.assertEqual(self.tools.reboot_calls(), [])
-        self.assertNotIn(BOOT_ID_COMMAND, self.tools.remote_commands())
-        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 2)
-        self.assertNotIn("same-boot wait ended", self.run_log("ec2-login"))
         self.assert_box_ended()
 
     def test_second_boot_login_writes_the_first_boot_journal(self) -> None:
@@ -1355,15 +1370,8 @@ class RunnerTest(unittest.TestCase):
         self.assertIn(REMOTE_COMMAND, commands[: commands.index(REBOOT_COMMAND)])
         self.assert_box_ended()
 
-    def test_same_boot_login_writes_no_first_boot_journal(self) -> None:
-        self.serve_login()
-        code, out = self.run_runner("--login")
-        self.assertEqual(code, 0, out)
-        self.assertFalse((self.run_dir("ec2-login") / "journal-boot1.json").exists())
-        self.assert_box_ended()
-
     def test_failing_first_boot_journal_pull_fails_the_run_before_the_reboot(self) -> None:
-        self.serve_login(boot1_journal="fail-after-right")
+        self.serve_login(boot1_journal="fail-after-r1")
         code, out = self.run_runner("--login")
         self.assertEqual(code, 1, out)
         log = self.run_log("ec2-login")
@@ -1378,11 +1386,11 @@ class RunnerTest(unittest.TestCase):
         code, out = self.run_runner("--login")
         self.assertEqual(code, 1, out)
         log = self.run_log("ec2-login")
-        self.assertIn("same-boot wait ended with no login: boot boot-1 ended, boot boot-2 is up", log)
+        self.assertIn("reboot after R1: boot boot-1 ended, boot boot-2 is up", log)
         self.assertIn("FAIL ec2-login: second boot: no login within 120 seconds", log)
-        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 3)
+        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 2)
         self.assertEqual(len(self.tools.reboot_calls()), 1)
-        self.assertGreaterEqual(self.clock.now, 2 * lab_ec2.LOGIN_WAIT_SECONDS)
+        self.assertGreaterEqual(self.clock.now, lab_ec2.LOGIN_WAIT_SECONDS)
         self.assert_box_ended()
 
     def test_no_new_boot_id_within_the_deadline_fails_the_run(self) -> None:
@@ -1395,7 +1403,7 @@ class RunnerTest(unittest.TestCase):
             self.run_log("ec2-login"),
         )
         self.assertEqual(len(self.tools.reboot_calls()), 1)
-        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 2)
+        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 1)
         self.assertGreaterEqual(self.clock.now, lab.BOOT_DEADLINE_SECONDS)
         self.assert_box_ended()
 
@@ -1408,7 +1416,7 @@ class RunnerTest(unittest.TestCase):
             "FAIL ec2-login: second boot: no halmasuit.service foreground_changed to greeter event",
             self.run_log("ec2-login"),
         )
-        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 2)
+        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 1)
         self.assertTrue((self.run_dir("ec2-login") / "journal.json").is_file())
         self.assert_box_ended()
 
@@ -1512,7 +1520,7 @@ class RunnerTest(unittest.TestCase):
         self.serve_login(login_boots=[2])
         code, out = self.run_runner("--login")
         self.assertEqual(code, 0, out)
-        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 3)
+        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 2)
         self.assertTrue((self.run_dir("ec2-login") / "journal-boot1.json").is_file())
         self.assert_passwords_stay_private(out)
         self.assert_box_ended()

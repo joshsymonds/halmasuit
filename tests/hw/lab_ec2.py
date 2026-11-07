@@ -15,20 +15,20 @@ Each output's greeter frame is copied to `<output>-greeter.png`. Each run writes
 directory under --state-root named `<stamp>-ec2-greeter`: run.log holds the ec2 calls with their
 results, the `ec2 up` output, and PASS or each `FAIL ec2-greeter: <message>` line.
 
-With --login, a run also logs labuser in at the greeter after the hold. It sets labuser's password
-to a fresh random one, types a wrong password through the lab's probe holder, and checks R1: the
-boot journal holds halmasuit's pam_unix authentication failure for labuser, and the greeter's
-process is alive 10 seconds later. It then types the right password and waits up to 120 seconds
-for the boot journal to hold session_opened and session_client_first_frame. If that same-boot wait
-ends without both events, the run pulls the first boot's journal into journal-boot1.json in the run
-directory, then reads the boot id, reboots the box over ssh, and waits up to 900 seconds for a
-different boot id. A failed pull fails the run with a `journal-boot1:` message and sends no reboot. In the new boot it holds the greeter as the first boot was held,
-types the right password once more, and waits up to 120 seconds for the same two events. Frames,
-the journal, and the checks then come from that second boot. A second boot that never comes, fails
-its hold, or shows no login fails the run with a `second boot:` message. The run directory is
-`<stamp>-ec2-login`, and its checks are the recorder's session span, the ec2-greeter profile, and
-the ec2-login profile; run.log holds PASS or each `FAIL ec2-login: <message>` line. The passwords
-are generated in memory and sent only on ssh's stdin, so no argv, run.log, or run file holds them.
+With --login, a run also logs labuser in at the greeter after the hold, in a boot after a reboot. It
+sets labuser's password to a fresh random one, types a wrong password through the lab's probe holder,
+and checks R1: the boot journal holds halmasuit's pam_unix authentication failure for labuser, and the
+greeter's process is alive 10 seconds later. The run then pulls the first boot's journal into
+journal-boot1.json in the run directory, reads the boot id, reboots the box over ssh, and waits up to
+900 seconds for a different boot id. A failed pull fails the run with a `journal-boot1:` message and
+sends no reboot. In the new boot it holds the greeter as the first boot was held, types the right
+password once, and waits up to 120 seconds for the boot journal to hold session_opened and
+session_client_first_frame. Frames, the journal, and the checks then come from that second boot. A
+second boot that never comes, fails its hold, or shows no login fails the run with a `second boot:`
+message. The run directory is `<stamp>-ec2-login`, and its checks are the recorder's session span,
+the ec2-greeter profile, and the ec2-login profile; run.log holds PASS or each `FAIL ec2-login:
+<message>` line. The passwords are generated in memory and sent only on ssh's stdin, so no argv,
+run.log, or run file holds them.
 
 A run refuses, launching nothing, while a halmasuit-lab box is already listed. Every box a run
 launches is ended before the run returns, on pass, fail, an exception, or SIGINT, SIGTERM, or
@@ -472,21 +472,16 @@ class Ec2Run:
             self.clock.sleep(lab.POLL_SECONDS)
 
     def _login(self, run: lab.RunLog, name: str) -> None:
-        """Logs labuser in once, or in a second boot when the same-boot wait ends without a login."""
+        """Types the wrong password, checks R1, reboots, and logs labuser in at the second boot's greeter."""
         wrong, right = _passwords()
         self._set_password(run, name, right)
         self._type_password(run, name, "the wrong password", wrong)
         self._check_r1(run, name)
-        self._type_password(run, name, "the right password", right)
-        found, _ = self._poll_journal(name, LOGIN_WAIT_SECONDS, _login_events)
-        if found is not None:
-            run.say("login: session_opened and session_client_first_frame in the boot journal")
-            return
         self._collect_first_boot_journal(run, name)
         previous = self._boot_id(run, name)
         self._reboot(run, name)
         current = self._await_new_boot(name, previous)
-        run.say(f"same-boot wait ended with no login: boot {previous} ended, boot {current} is up")
+        run.say(f"reboot after R1: boot {previous} ended, boot {current} is up")
         self._second_boot_login(run, name, right)
 
     def _set_password(self, run: lab.RunLog, name: str, password: str) -> None:
@@ -560,7 +555,7 @@ class Ec2Run:
             self.clock.sleep(lab.POLL_SECONDS)
 
     def _second_boot_login(self, run: lab.RunLog, name: str, right: str) -> None:
-        """Holds the rebooted box's greeter, types the right password once more, and waits for the login events."""
+        """Holds the rebooted box's greeter, types the right password, and waits for the login events."""
         reason = self._hold(name)
         if reason is not None:
             raise LabError(f"second boot: {reason}")
