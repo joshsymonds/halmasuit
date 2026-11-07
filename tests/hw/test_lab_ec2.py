@@ -336,6 +336,9 @@ if remote.startswith("sudo -n tar "):
     source = Path(frames["source"])
     names = [raw.decode() for raw in sys.stdin.buffer.read().split(b"\0") if raw]
     sys.exit(archive_members(source, names, Recorder(source, frames["append"]), frames["mode"]))
+if CONFIG["login"]["boot1_journal"] == "fail-after-right" and boot_number() == 1 and len(stdin_log("lab-probe-type")) >= 2:
+    print("sudo: journalctl: read failed", file=sys.stderr)
+    sys.exit(1)
 journal = CONFIG["journal"] if boot_number() == 1 else CONFIG["journal_after_reboot"]
 if journal is not None:
     sys.stdout.write(Path(journal).read_text())
@@ -601,6 +604,7 @@ class FakeTools:
                 "login_boots": [1],
                 "wrong": [],
                 "right": [],
+                "boot1_journal": "ok",
             },
         }
         install(self.ec2, EC2_FAKE)
@@ -1338,6 +1342,37 @@ class RunnerTest(unittest.TestCase):
         self.assertNotIn("same-boot wait ended", self.run_log("ec2-login"))
         self.assert_box_ended()
 
+    def test_second_boot_login_writes_the_first_boot_journal(self) -> None:
+        self.serve_login(login_boots=[2])
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 0, out)
+        first = (self.run_dir("ec2-login") / "journal-boot1.json").read_text(encoding="utf-8")
+        self.assertIn(lab_ec2.PAM_MARKER, first)
+        self.assertIn(f"user={PROBE_USER}", first)
+        self.assertNotIn("session_opened", first)
+        self.assertIn(b"session_opened", (self.run_dir("ec2-login") / "journal.json").read_bytes())
+        commands = self.tools.remote_commands()
+        self.assertIn(REMOTE_COMMAND, commands[: commands.index(REBOOT_COMMAND)])
+        self.assert_box_ended()
+
+    def test_same_boot_login_writes_no_first_boot_journal(self) -> None:
+        self.serve_login()
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 0, out)
+        self.assertFalse((self.run_dir("ec2-login") / "journal-boot1.json").exists())
+        self.assert_box_ended()
+
+    def test_failing_first_boot_journal_pull_fails_the_run_before_the_reboot(self) -> None:
+        self.serve_login(boot1_journal="fail-after-right")
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 1, out)
+        log = self.run_log("ec2-login")
+        self.assertIn("FAIL ec2-login: journal-boot1: ", log)
+        self.assertEqual(self.tools.reboot_calls(), [])
+        self.assertNotIn(BOOT_ID_COMMAND, self.tools.remote_commands())
+        self.assertFalse((self.run_dir("ec2-login") / "journal-boot1.json").exists())
+        self.assert_box_ended()
+
     def test_no_login_in_either_boot_fails_the_run(self) -> None:
         self.serve_login(right=[])
         code, out = self.run_runner("--login")
@@ -1478,6 +1513,7 @@ class RunnerTest(unittest.TestCase):
         code, out = self.run_runner("--login")
         self.assertEqual(code, 0, out)
         self.assertEqual(len(self.tools.stdins("lab-probe-type")), 3)
+        self.assertTrue((self.run_dir("ec2-login") / "journal-boot1.json").is_file())
         self.assert_passwords_stay_private(out)
         self.assert_box_ended()
 

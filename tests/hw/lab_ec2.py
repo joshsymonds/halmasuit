@@ -20,8 +20,9 @@ to a fresh random one, types a wrong password through the lab's probe holder, an
 boot journal holds halmasuit's pam_unix authentication failure for labuser, and the greeter's
 process is alive 10 seconds later. It then types the right password and waits up to 120 seconds
 for the boot journal to hold session_opened and session_client_first_frame. If that same-boot wait
-ends without both events, the run reads the boot id, reboots the box over ssh, and waits up to 900
-seconds for a different boot id. In the new boot it holds the greeter as the first boot was held,
+ends without both events, the run pulls the first boot's journal into journal-boot1.json in the run
+directory, then reads the boot id, reboots the box over ssh, and waits up to 900 seconds for a
+different boot id. A failed pull fails the run with a `journal-boot1:` message and sends no reboot. In the new boot it holds the greeter as the first boot was held,
 types the right password once more, and waits up to 120 seconds for the same two events. Frames,
 the journal, and the checks then come from that second boot. A second boot that never comes, fails
 its hold, or shows no login fails the run with a `second boot:` message. The run directory is
@@ -80,6 +81,7 @@ VIDEO_SUFFIX = ".nut"
 GREETER_SUFFIX = "-greeter.png"
 CONCAT_FRAMERATE = 1_000_000
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+FIRST_BOOT_JOURNAL_NAME = "journal-boot1.json"
 PROBE_USER = "labuser"
 PASSWORD_ALPHABET = string.ascii_lowercase
 PASSWORD_LENGTH = 32
@@ -480,6 +482,7 @@ class Ec2Run:
         if found is not None:
             run.say("login: session_opened and session_client_first_frame in the boot journal")
             return
+        self._collect_first_boot_journal(run, name)
         previous = self._boot_id(run, name)
         self._reboot(run, name)
         current = self._await_new_boot(name, previous)
@@ -574,6 +577,14 @@ class Ec2Run:
     def _collect_journal(self, run: lab.RunLog, name: str) -> None:
         text = self._journal(name, "collect the boot journal")
         (run.directory / timeline.JOURNAL_NAME).write_text(text, encoding="utf-8")
+
+    def _collect_first_boot_journal(self, run: lab.RunLog, name: str) -> None:
+        """Writes the first boot's journal as journal-boot1.json before the reboot; a failed pull raises, naming journal-boot1."""
+        try:
+            text = self._journal(name, "pull the first boot's journal")
+        except LabError as err:
+            raise LabError(f"journal-boot1: {err}") from err
+        (run.directory / FIRST_BOOT_JOURNAL_NAME).write_text(text, encoding="utf-8")
 
     def _collect_frames(self, run: lab.RunLog, name: str) -> None:
         """Copies the recorder index snapshot and the PNGs its lines name into frames/, or raises.
