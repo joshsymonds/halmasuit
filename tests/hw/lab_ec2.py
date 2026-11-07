@@ -40,7 +40,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import IO, Any
 
@@ -94,6 +94,29 @@ class _Interrupts:
         self.cleaning = True
         for signum in SIGNALS:
             signal.signal(signum, signal.SIG_IGN)
+
+
+class _RunLog(lab.RunLog):
+    """A RunLog whose say stops raising once the cleanup begins.
+
+    Before the cleanup a failed write raises as it does in lab.RunLog and ends the run; during the
+    cleanup the first failed write is kept as `failure`, so a lost log line never stops a box from
+    being ended.
+    """
+
+    def __init__(self, root: Path, stamp: str, name: str, emit: Callable[[str], None]) -> None:
+        super().__init__(root, stamp, name, emit)
+        self.cleaning = False
+        self.failure: OSError | None = None
+
+    def say(self, message: str) -> None:
+        try:
+            super().say(message)
+        except OSError as err:
+            if not self.cleaning:
+                raise
+            if self.failure is None:
+                self.failure = err
 
 
 class _Launch:
@@ -164,7 +187,7 @@ class Ec2Run:
         self.interrupts = interrupts
 
     def run(self) -> int:
-        run = lab.RunLog(self.state_root, self.clock.stamp(), PROFILE, print)
+        run = _RunLog(self.state_root, self.clock.stamp(), PROFILE, print)
         launch = _Launch()
         code = 1
         try:
@@ -176,20 +199,26 @@ class Ec2Run:
             run.say(f"FAIL {PROFILE}: {err}")
         finally:
             # A first signal can still land as the cleanup begins, before the cleaning flag is set;
-            # its handler raises here, and the cleanup goes on under the signal's exit code. Nothing
-            # but the code is set before _end, so no failing log write can skip the cleanup.
+            # its handler raises here, and the cleanup goes on under the signal's exit code. Only the
+            # code and the log's cleaning flag are set before _end, and from that flag on the log
+            # never raises, so a failed log write cannot skip the cleanup.
             late: int | None = None
             try:
                 self.interrupts.begin_cleanup()
             except _Signalled as received:
                 late = received.signum
                 code = 128 + late
+            run.cleaning = True
             problems = self._end(run, launch)
             if late is not None:
                 run.say(f"{signal.Signals(late).name} received as the cleanup began")
             for problem in problems:
                 run.say(f"FAIL {PROFILE}: {problem}")
             if problems and code == 0:
+                code = 1
+        if run.failure is not None:
+            print(f"run log write failed: {run.failure}", file=sys.stderr)
+            if code == 0:
                 code = 1
         return code
 
