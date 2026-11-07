@@ -15,6 +15,20 @@ Each output's greeter frame is copied to `<output>-greeter.png`. Each run writes
 directory under --state-root named `<stamp>-ec2-greeter`: run.log holds the ec2 calls with their
 results, the `ec2 up` output, and PASS or each `FAIL ec2-greeter: <message>` line.
 
+With --login, a run also logs labuser in at the greeter after the hold. It sets labuser's password
+to a fresh random one, types a wrong password through the lab's probe holder, and checks R1: the
+boot journal holds halmasuit's pam_unix authentication failure for labuser, and the greeter's
+process is alive 10 seconds later. It then types the right password and waits up to 120 seconds
+for the boot journal to hold session_opened and session_client_first_frame. If that same-boot wait
+ends without both events, the run reads the boot id, reboots the box over ssh, and waits up to 900
+seconds for a different boot id. In the new boot it holds the greeter as the first boot was held,
+types the right password once more, and waits up to 120 seconds for the same two events. Frames,
+the journal, and the checks then come from that second boot. A second boot that never comes, fails
+its hold, or shows no login fails the run with a `second boot:` message. The run directory is
+`<stamp>-ec2-login`, and its checks are the recorder's session span, the ec2-greeter profile, and
+the ec2-login profile; run.log holds PASS or each `FAIL ec2-login: <message>` line. The passwords
+are generated in memory and sent only on ssh's stdin, so no argv, run.log, or run file holds them.
+
 A run refuses, launching nothing, while a halmasuit-lab box is already listed. Every box a run
 launches is ended before the run returns, on pass, fail, an exception, or SIGINT, SIGTERM, or
 SIGHUP. The cleanup stops a still-running `ec2 up`, runs `ec2 down` on the named box (or, when
@@ -33,22 +47,25 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
+import string
 import subprocess
 import sys
 import tarfile
 import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, TypeVar
 
 import lab
 import timeline
 from lab import LabError
 
 PROFILE = "ec2-greeter"
+LOGIN_PROFILE = "ec2-login"
 CLASS = "halmasuit-lab"
 BOX_PREFIX = f"{CLASS}-"
 READY = re.compile(r"(halmasuit-lab-\S+) ready")
@@ -63,6 +80,13 @@ VIDEO_SUFFIX = ".nut"
 GREETER_SUFFIX = "-greeter.png"
 CONCAT_FRAMERATE = 1_000_000
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+PROBE_USER = "labuser"
+PASSWORD_ALPHABET = string.ascii_lowercase
+PASSWORD_LENGTH = 32
+PROBE_REPLY = re.compile(r"ok \d+")
+PAM_MARKER = lab._probe_marker(lab.HALMASUIT_SERVICE)
+LOGIN_WAIT_SECONDS = 120
+T = TypeVar("T")
 
 
 class _Signalled(Exception):
@@ -171,6 +195,7 @@ class Ec2Run:
         copy_timeout: int,
         ffmpeg: str,
         ffprobe: str,
+        login: bool,
         interrupts: _Interrupts,
     ) -> None:
         self.ec2 = ec2
@@ -184,10 +209,13 @@ class Ec2Run:
         self.copy_timeout = copy_timeout
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
+        self.login = login
+        self.profile = LOGIN_PROFILE if login else PROFILE
+        self.profiles = (PROFILE, LOGIN_PROFILE) if login else (PROFILE,)
         self.interrupts = interrupts
 
     def run(self) -> int:
-        run = _RunLog(self.state_root, self.clock.stamp(), PROFILE, print)
+        run = _RunLog(self.state_root, self.clock.stamp(), self.profile, print)
         launch = _Launch()
         code = 1
         try:
@@ -196,7 +224,7 @@ class Ec2Run:
             code = 128 + received.signum
             run.say(f"{signal.Signals(received.signum).name} received; ending the launched boxes")
         except LabError as err:
-            run.say(f"FAIL {PROFILE}: {err}")
+            run.say(f"FAIL {self.profile}: {err}")
         finally:
             # A first signal can still land as the cleanup begins, before the cleaning flag is set;
             # its handler raises here, and the cleanup goes on under the signal's exit code. Only the
@@ -213,7 +241,7 @@ class Ec2Run:
             if late is not None:
                 run.say(f"{signal.Signals(late).name} received as the cleanup began")
             for problem in problems:
-                run.say(f"FAIL {PROFILE}: {problem}")
+                run.say(f"FAIL {self.profile}: {problem}")
             if problems and code == 0:
                 code = 1
         if run.failure is not None:
@@ -230,6 +258,11 @@ class Ec2Run:
             raise LabError(f"refused: {', '.join(listed)} already listed; nothing launched")
         name = self._up(run, launch, head)
         reason = self._hold(name)
+        if reason is None and self.login:
+            try:
+                self._login(run, name)
+            except LabError as err:
+                reason = str(err)
         try:
             self._collect_frames(run, name)
         except LabError as err:
@@ -397,6 +430,147 @@ class Ec2Run:
             self.clock.sleep(lab.POLL_SECONDS)
         return None
 
+    def _ssh_input(self, name: str, remote: Sequence[str], text: str) -> lab.Result:
+        """Runs one remote command with text on its stdin; a failure to start or a timeout is a failed call."""
+        try:
+            done = subprocess.run(
+                self._ssh_argv(name, remote),
+                input=text,
+                capture_output=True,
+                text=True,
+                timeout=lab.REMOTE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return lab.Result(124, "", f"timed out after {lab.REMOTE_TIMEOUT_SECONDS} seconds")
+        except OSError as err:
+            return lab.Result(127, "", str(err))
+        return lab.Result(done.returncode, done.stdout, done.stderr)
+
+    def _poll_journal(
+        self, name: str, seconds: int, found: Callable[[list[dict[str, Any]]], T | None]
+    ) -> tuple[T | None, str]:
+        """Reads the boot journal every POLL_SECONDS on the clock until found returns a value, for up to seconds.
+
+        A failed read counts as not yet. Returns found's value, or None with the last read problem
+        once the time runs out.
+        """
+        problem = ""
+        started = self.clock.monotonic()
+        while True:
+            try:
+                value = found(lab._journal_records(self._journal(name, "read the boot journal")))
+            except LabError as err:
+                problem = str(err)
+            else:
+                if value is not None:
+                    return value, ""
+            if self.clock.monotonic() - started >= seconds:
+                return None, problem
+            self.clock.sleep(lab.POLL_SECONDS)
+
+    def _login(self, run: lab.RunLog, name: str) -> None:
+        """Logs labuser in once, or in a second boot when the same-boot wait ends without a login."""
+        wrong, right = _passwords()
+        self._set_password(run, name, right)
+        self._type_password(run, name, "the wrong password", wrong)
+        self._check_r1(run, name)
+        self._type_password(run, name, "the right password", right)
+        found, _ = self._poll_journal(name, LOGIN_WAIT_SECONDS, _login_events)
+        if found is not None:
+            run.say("login: session_opened and session_client_first_frame in the boot journal")
+            return
+        previous = self._boot_id(run, name)
+        self._reboot(run, name)
+        current = self._await_new_boot(name, previous)
+        run.say(f"same-boot wait ended with no login: boot {previous} ended, boot {current} is up")
+        self._second_boot_login(run, name, right)
+
+    def _set_password(self, run: lab.RunLog, name: str, password: str) -> None:
+        result = self._ssh_input(name, ("sudo", "-n", "chpasswd"), f"{PROBE_USER}:{password}\n")
+        self._record(run, "set the labuser password", result)
+        lab._ok(result, "set the labuser password")
+
+    def _type_password(self, run: lab.RunLog, name: str, what: str, password: str) -> None:
+        """Types labuser's password at the greeter through the probe holder, whose reply must be `ok <n>`."""
+        result = self._ssh_input(name, ("sudo", "-n", "lab-probe-type"), f"{PROBE_USER} {password}\n")
+        self._record(run, f"type {what}", result)
+        lab._ok(result, f"type {what}")
+        if not PROBE_REPLY.fullmatch(lab._last_line(result.stdout)):
+            raise LabError(f"type {what}: the holder did not reply `ok <n>`")
+
+    def _check_r1(self, run: lab.RunLog, name: str) -> None:
+        """R1: the boot journal holds the pam_unix failure for labuser, and the greeter lives after the settle."""
+        line, problem = self._poll_journal(name, lab.PROBE_WAIT_SECONDS, _pam_line)
+        if line is None:
+            detail = f"; last read problem: {problem}" if problem else ""
+            raise LabError(
+                f"R1: no line holding '{PAM_MARKER}' and user={PROBE_USER} in the boot journal within "
+                f"{lab.PROBE_WAIT_SECONDS} seconds{detail}"
+            )
+        run.say(f"R1 matched: {line}")
+        self.clock.sleep(lab.GREETER_SETTLE_SECONDS)
+        pid = _greeter_pid(lab._journal_records(self._journal(name, "read the boot journal")))
+        result = self._ssh(name, ("test", "-d", f"/proc/{pid}"))
+        self._record(run, "greeter liveness", result)
+        if result.returncode == 1:
+            run.say(f"R1 greeter pid {pid}: dead")
+            raise LabError(f"R1: greeter pid {pid} is dead")
+        if result.returncode != 0:
+            raise LabError(f"R1: could not check greeter pid {pid} (test -d rc {result.returncode})")
+        run.say(f"R1 greeter pid {pid}: alive")
+
+    def _boot_id(self, run: lab.RunLog, name: str) -> str:
+        result = self._ssh(name, ("cat", lab.BOOT_ID_FILE))
+        self._record(run, "read the boot id", result)
+        boot = lab._ok(result, "read the boot id").strip()
+        if not boot:
+            raise LabError("read the boot id printed no id")
+        return boot
+
+    def _reboot(self, run: lab.RunLog, name: str) -> None:
+        """Reboots the box over ssh; the connection may drop as it begins, so the result is logged, not required."""
+        result = self._ssh(name, ("sudo", "-n", "systemctl", "reboot"))
+        self._record(run, "reboot", result)
+
+    def _await_new_boot(self, name: str, previous: str) -> str:
+        """Reads the boot id every POLL_SECONDS on the clock until it differs from previous, and returns it.
+
+        A failed read counts as not yet. Once BOOT_DEADLINE_SECONDS pass, the last read problem is
+        part of the reason.
+        """
+        problem = ""
+        started = self.clock.monotonic()
+        while True:
+            result = self._ssh(name, ("cat", lab.BOOT_ID_FILE))
+            current = result.stdout.strip()
+            if result.returncode != 0:
+                detail = result.stderr.strip() or "no output"
+                problem = f"read the boot id failed (rc {result.returncode}): {detail}"
+            elif current and current != previous:
+                return current
+            if self.clock.monotonic() - started >= lab.BOOT_DEADLINE_SECONDS:
+                detail = f"; last read problem: {problem}" if problem else ""
+                raise LabError(
+                    f"second boot: no new boot id within {lab.BOOT_DEADLINE_SECONDS} seconds after the reboot{detail}"
+                )
+            self.clock.sleep(lab.POLL_SECONDS)
+
+    def _second_boot_login(self, run: lab.RunLog, name: str, right: str) -> None:
+        """Holds the rebooted box's greeter, types the right password once more, and waits for the login events."""
+        reason = self._hold(name)
+        if reason is not None:
+            raise LabError(f"second boot: {reason}")
+        self._type_password(run, name, "the right password in the second boot", right)
+        found, problem = self._poll_journal(name, LOGIN_WAIT_SECONDS, _login_events)
+        if found is None:
+            detail = f"; last read problem: {problem}" if problem else ""
+            raise LabError(
+                f"second boot: no login within {LOGIN_WAIT_SECONDS} seconds: no session_opened and "
+                f"session_client_first_frame in the boot journal{detail}"
+            )
+        run.say("login: session_opened and session_client_first_frame in the second boot's journal")
+
     def _collect_journal(self, run: lab.RunLog, name: str) -> None:
         text = self._journal(name, "collect the boot journal")
         (run.directory / timeline.JOURNAL_NAME).write_text(text, encoding="utf-8")
@@ -477,13 +651,15 @@ class Ec2Run:
         video_frames = self._encode(run, frames)
         self._greeter_pngs(run, document, frames)
         (run.directory / timeline.TIMELINE_NAME).write_text(json.dumps(document, indent=2) + "\n")
-        failures = timeline.recorder_failures(document, frames, video_frames)
-        failures += timeline.PROFILES[PROFILE](document)
+        recorder = timeline.login_recorder_failures if self.login else timeline.recorder_failures
+        failures = recorder(document, frames, video_frames)
+        for profile in self.profiles:
+            failures += timeline.PROFILES[profile](document)
         for failure in failures:
-            run.say(f"FAIL {PROFILE}: {failure}")
+            run.say(f"FAIL {self.profile}: {failure}")
         if failures:
             return 1
-        run.say(f"PASS {PROFILE}")
+        run.say(f"PASS {self.profile}")
         return 0
 
     def _recorder_index(self, run: lab.RunLog) -> list[dict[str, Any]]:
@@ -634,6 +810,58 @@ def _frame_names(snapshot: bytes) -> list[str]:
     return list(names)
 
 
+def _random_password() -> str:
+    return "".join(secrets.choice(PASSWORD_ALPHABET) for _ in range(PASSWORD_LENGTH))
+
+
+def _passwords() -> tuple[str, str]:
+    """A wrong and a right password, distinct, each drawn in memory."""
+    right = _random_password()
+    wrong = _random_password()
+    while wrong == right:
+        wrong = _random_password()
+    return wrong, right
+
+
+def _pam_line(records: list[dict[str, Any]]) -> str | None:
+    """The MESSAGE of the first entry holding the pam_unix failure for labuser, or None."""
+    for record in records:
+        message = record.get("MESSAGE")
+        if isinstance(message, str) and PAM_MARKER in message and f"user={PROBE_USER}" in message.split():
+            return message
+    return None
+
+
+def _greeter_pid(records: list[dict[str, Any]]) -> int:
+    """The pid of the first greeter_spawned event that carries an int pid, once no greeter death follows it."""
+    events = [event for event in map(lab._halmasuit_event, records) if event is not None]
+    spawned = next(
+        (
+            index
+            for index, event in enumerate(events)
+            if event.get("event") == "greeter_spawned" and type(event.get("pid")) is int
+        ),
+        None,
+    )
+    if spawned is None:
+        raise LabError("R1: no greeter_spawned event with an int pid in the boot journal")
+    pid = events[spawned]["pid"]
+    for event in events[spawned + 1 :]:
+        if event.get("event") in lab.GREETER_DEATH_EVENTS:
+            raise LabError(f"R1: {event['event']} follows greeter_spawned pid {pid}")
+    return pid
+
+
+def _login_events(records: list[dict[str, Any]]) -> frozenset[str] | None:
+    """The halmasuit event names in the boot journal, once it holds both login events; else None."""
+    names = {
+        event["event"]
+        for event in map(lab._halmasuit_event, records)
+        if event is not None and isinstance(event.get("event"), str)
+    }
+    return frozenset(names) if lab.LOGIN_EVENTS <= names else None
+
+
 def _ffconcat_quote(path: str) -> str:
     return "'" + path.replace("'", "'\\''") + "'"
 
@@ -689,6 +917,11 @@ def main(argv: Sequence[str] | None = None, *, clock: lab.Clock | None = None) -
     )
     parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg to encode each output's video")
     parser.add_argument("--ffprobe", default="ffprobe", help="ffprobe to count each video's frames")
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help="type a wrong then a right password at the greeter and check the login",
+    )
     options = parser.parse_args(argv)
     interrupts = _Interrupts()
     runner = Ec2Run(
@@ -703,6 +936,7 @@ def main(argv: Sequence[str] | None = None, *, clock: lab.Clock | None = None) -
         copy_timeout=options.copy_timeout,
         ffmpeg=options.ffmpeg,
         ffprobe=options.ffprobe,
+        login=options.login,
         interrupts=interrupts,
     )
     previous: dict[int, object] = {}
