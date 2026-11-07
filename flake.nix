@@ -887,6 +887,8 @@
           inherit nixpkgs;
           labModule = self.nixosModules.gnomon-lab;
         };
+        # lab-probe-type relay (J2): its checkPhase runs the fake-holder harness.
+        lab-probe-type = nixpkgs.legacyPackages.x86_64-linux.callPackage ./nix/lab/lab-probe-type.nix { };
         # NVIDIA-EGL env shape regression gate. Cannot replicate the
         # actual NVIDIA failure in CI (no single-GPU passthrough on
         # consumer Blackwell); asserts the UNIT shape — that
