@@ -19,7 +19,12 @@ With --login, a run also logs labuser in at the greeter after the hold. It sets 
 to a fresh random one, types a wrong password through the lab's probe holder, and checks R1: the
 boot journal holds halmasuit's pam_unix authentication failure for labuser, and the greeter's
 process is alive 10 seconds later. It then types the right password and waits up to 120 seconds
-for the boot journal to hold session_opened and session_client_first_frame. The run directory is
+for the boot journal to hold session_opened and session_client_first_frame. If that same-boot wait
+ends without both events, the run reads the boot id, reboots the box over ssh, and waits up to 900
+seconds for a different boot id. In the new boot it holds the greeter as the first boot was held,
+types the right password once more, and waits up to 120 seconds for the same two events. Frames,
+the journal, and the checks then come from that second boot. A second boot that never comes, fails
+its hold, or shows no login fails the run with a `second boot:` message. The run directory is
 `<stamp>-ec2-login`, and its checks are the recorder's session span, the ec2-greeter profile, and
 the ec2-login profile; run.log holds PASS or each `FAIL ec2-login: <message>` line. The passwords
 are generated in memory and sent only on ssh's stdin, so no argv, run.log, or run file holds them.
@@ -465,26 +470,34 @@ class Ec2Run:
             self.clock.sleep(lab.POLL_SECONDS)
 
     def _login(self, run: lab.RunLog, name: str) -> None:
-        """Sets labuser's password, types a wrong one and checks R1, then types the right one and waits."""
+        """Logs labuser in once, or in a second boot when the same-boot wait ends without a login."""
         wrong, right = _passwords()
         self._set_password(run, name, right)
-        self._type_password(run, name, "wrong", wrong)
+        self._type_password(run, name, "the wrong password", wrong)
         self._check_r1(run, name)
-        self._type_password(run, name, "right", right)
-        self._await_login(run, name)
+        self._type_password(run, name, "the right password", right)
+        found, _ = self._poll_journal(name, LOGIN_WAIT_SECONDS, _login_events)
+        if found is not None:
+            run.say("login: session_opened and session_client_first_frame in the boot journal")
+            return
+        previous = self._boot_id(run, name)
+        self._reboot(run, name)
+        current = self._await_new_boot(name, previous)
+        run.say(f"same-boot wait ended with no login: boot {previous} ended, boot {current} is up")
+        self._second_boot_login(run, name, right)
 
     def _set_password(self, run: lab.RunLog, name: str, password: str) -> None:
         result = self._ssh_input(name, ("sudo", "-n", "chpasswd"), f"{PROBE_USER}:{password}\n")
         self._record(run, "set the labuser password", result)
         lab._ok(result, "set the labuser password")
 
-    def _type_password(self, run: lab.RunLog, name: str, label: str, password: str) -> None:
+    def _type_password(self, run: lab.RunLog, name: str, what: str, password: str) -> None:
         """Types labuser's password at the greeter through the probe holder, whose reply must be `ok <n>`."""
         result = self._ssh_input(name, ("sudo", "-n", "lab-probe-type"), f"{PROBE_USER} {password}\n")
-        self._record(run, f"type the {label} password", result)
-        lab._ok(result, f"type the {label} password")
+        self._record(run, f"type {what}", result)
+        lab._ok(result, f"type {what}")
         if not PROBE_REPLY.fullmatch(lab._last_line(result.stdout)):
-            raise LabError(f"type the {label} password: the holder did not reply `ok <n>`")
+            raise LabError(f"type {what}: the holder did not reply `ok <n>`")
 
     def _check_r1(self, run: lab.RunLog, name: str) -> None:
         """R1: the boot journal holds the pam_unix failure for labuser, and the greeter lives after the settle."""
@@ -507,15 +520,56 @@ class Ec2Run:
             raise LabError(f"R1: could not check greeter pid {pid} (test -d rc {result.returncode})")
         run.say(f"R1 greeter pid {pid}: alive")
 
-    def _await_login(self, run: lab.RunLog, name: str) -> None:
+    def _boot_id(self, run: lab.RunLog, name: str) -> str:
+        result = self._ssh(name, ("cat", lab.BOOT_ID_FILE))
+        self._record(run, "read the boot id", result)
+        boot = lab._ok(result, "read the boot id").strip()
+        if not boot:
+            raise LabError("read the boot id printed no id")
+        return boot
+
+    def _reboot(self, run: lab.RunLog, name: str) -> None:
+        """Reboots the box over ssh; the connection may drop as it begins, so the result is logged, not required."""
+        result = self._ssh(name, ("sudo", "-n", "systemctl", "reboot"))
+        self._record(run, "reboot", result)
+
+    def _await_new_boot(self, name: str, previous: str) -> str:
+        """Reads the boot id every POLL_SECONDS on the clock until it differs from previous, and returns it.
+
+        A failed read counts as not yet. Once BOOT_DEADLINE_SECONDS pass, the last read problem is
+        part of the reason.
+        """
+        problem = ""
+        started = self.clock.monotonic()
+        while True:
+            result = self._ssh(name, ("cat", lab.BOOT_ID_FILE))
+            current = result.stdout.strip()
+            if result.returncode != 0:
+                detail = result.stderr.strip() or "no output"
+                problem = f"read the boot id failed (rc {result.returncode}): {detail}"
+            elif current and current != previous:
+                return current
+            if self.clock.monotonic() - started >= lab.BOOT_DEADLINE_SECONDS:
+                detail = f"; last read problem: {problem}" if problem else ""
+                raise LabError(
+                    f"second boot: no new boot id within {lab.BOOT_DEADLINE_SECONDS} seconds after the reboot{detail}"
+                )
+            self.clock.sleep(lab.POLL_SECONDS)
+
+    def _second_boot_login(self, run: lab.RunLog, name: str, right: str) -> None:
+        """Holds the rebooted box's greeter, types the right password once more, and waits for the login events."""
+        reason = self._hold(name)
+        if reason is not None:
+            raise LabError(f"second boot: {reason}")
+        self._type_password(run, name, "the right password in the second boot", right)
         found, problem = self._poll_journal(name, LOGIN_WAIT_SECONDS, _login_events)
         if found is None:
             detail = f"; last read problem: {problem}" if problem else ""
             raise LabError(
-                f"no login within {LOGIN_WAIT_SECONDS} seconds: no session_opened and "
+                f"second boot: no login within {LOGIN_WAIT_SECONDS} seconds: no session_opened and "
                 f"session_client_first_frame in the boot journal{detail}"
             )
-        run.say("login: session_opened and session_client_first_frame in the boot journal")
+        run.say("login: session_opened and session_client_first_frame in the second boot's journal")
 
     def _collect_journal(self, run: lab.RunLog, name: str) -> None:
         text = self._journal(name, "collect the boot journal")

@@ -37,6 +37,8 @@ STAMP = "20260101T000000Z"
 BOX = "halmasuit-lab-k3x"
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 REMOTE_COMMAND = "sudo -n journalctl -b 0 -o json --all --no-pager"
+REBOOT_COMMAND = "sudo -n systemctl reboot"
+BOOT_ID_COMMAND = f"cat {lab.BOOT_ID_FILE}"
 WAIT_SECONDS = 30
 OUTPUT = "DP-1"
 FRAME_COUNT = 64
@@ -250,6 +252,12 @@ def set_password():
     return sets[-1].split(":", 1)[1].rstrip("\n") if sets else None
 
 
+def boot_number():
+    """The boot the box is in: 1 until the fake reboots it."""
+    path = HERE / "boot-number"
+    return int(path.read_text()) if path.exists() else 1
+
+
 remote = sys.argv[-1]
 words = shlex.split(remote)
 if remote == "sudo -n chpasswd":
@@ -273,10 +281,28 @@ if remote == "sudo -n lab-probe-type":
         print("holder busy")
         sys.exit(0)
     _, typed = request.rstrip("\n").split(" ", 1)
-    lines = CONFIG["login"]["right"] if typed == set_password() else CONFIG["login"]["wrong"]
+    if typed != set_password():
+        lines = CONFIG["login"]["wrong"]
+    elif boot_number() in CONFIG["login"]["login_boots"]:
+        lines = CONFIG["login"]["right"]
+    else:
+        lines = []
     with (HERE / "login-journal.jsonl").open("a") as journal:
         journal.writelines(line + "\n" for line in lines)
     print(f"ok {len(stdin_log('lab-probe-type'))}")
+    sys.exit(0)
+if remote == "sudo -n systemctl reboot":
+    if CONFIG["reboot"] == "stuck":
+        sys.exit(0)
+    (HERE / "boot-number").write_text(str(boot_number() + 1))
+    (HERE / "login-journal.jsonl").unlink(missing_ok=True)
+    print("Connection to the box closed by remote host.", file=sys.stderr)
+    sys.exit(255)
+if words[:1] == ["cat"]:
+    if words[1:] != [CONFIG["boot_id_file"]]:
+        print(f"cat: {words[-1]}: Cannot open: No such file or directory", file=sys.stderr)
+        sys.exit(2)
+    print(f"boot-{boot_number()}")
     sys.exit(0)
 if words[:2] == ["test", "-d"]:
     probe = CONFIG["login"]["greeter_probe"]
@@ -310,8 +336,9 @@ if remote.startswith("sudo -n tar "):
     source = Path(frames["source"])
     names = [raw.decode() for raw in sys.stdin.buffer.read().split(b"\0") if raw]
     sys.exit(archive_members(source, names, Recorder(source, frames["append"]), frames["mode"]))
-if CONFIG["journal"] is not None:
-    sys.stdout.write(Path(CONFIG["journal"]).read_text())
+journal = CONFIG["journal"] if boot_number() == 1 else CONFIG["journal_after_reboot"]
+if journal is not None:
+    sys.stdout.write(Path(journal).read_text())
     login = HERE / "login-journal.jsonl"
     if login.exists():
         sys.stdout.write(login.read_text())
@@ -562,9 +589,19 @@ class FakeTools:
         self.frames_source = served
         self.ssh_config = {
             "fails": False,
+            "reboot": "ok",
+            "boot_id_file": lab.BOOT_ID_FILE,
             "journal": str(FIXTURE),
+            "journal_after_reboot": str(FIXTURE),
             "frames": {"dir": DEFAULT_FRAMES_DIR, "source": str(served), "mode": "serve", "append": None},
-            "login": {"chpasswd": "ok", "holder": "ok", "greeter_probe": "alive", "wrong": [], "right": []},
+            "login": {
+                "chpasswd": "ok",
+                "holder": "ok",
+                "greeter_probe": "alive",
+                "login_boots": [1],
+                "wrong": [],
+                "right": [],
+            },
         }
         install(self.ec2, EC2_FAKE)
         install(self.ssh, SSH_FAKE)
@@ -593,10 +630,12 @@ class FakeTools:
     def serve_journal(self, data: bytes | None) -> None:
         if data is None:
             self.ssh_config["journal"] = None
+            self.ssh_config["journal_after_reboot"] = None
         else:
             served = self.root / "served-journal.json"
             served.write_bytes(data)
             self.ssh_config["journal"] = str(served)
+            self.ssh_config["journal_after_reboot"] = str(served)
         self.save()
 
     def add_box(self, name: str) -> None:
@@ -623,6 +662,15 @@ class FakeTools:
 
     def stdin_calls(self) -> list[dict]:
         return read_jsonl(self.root / "stdin.jsonl")
+
+    def remote_commands(self) -> list[str]:
+        return [call[-1] for call in self.ssh_calls()]
+
+    def reboot_calls(self) -> list[str]:
+        return [command for command in self.remote_commands() if command == REBOOT_COMMAND]
+
+    def boot_id_reads(self) -> int:
+        return self.remote_commands().count(BOOT_ID_COMMAND)
 
     def stdins(self, command: str) -> list[str]:
         return [call["stdin"] for call in self.stdin_calls() if call["command"] == command]
@@ -1247,13 +1295,103 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(len(self.tools.stdins("lab-probe-type")), 1)
         self.assert_box_ended()
 
-    def test_no_login_within_the_wait_fails_the_run(self) -> None:
+    def test_second_boot_login_passes_and_ends_the_box(self) -> None:
+        self.serve_login(login_boots=[2])
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(
+            [call["command"] for call in self.tools.stdin_calls()],
+            ["chpasswd", "lab-probe-type", "lab-probe-type", "lab-probe-type"],
+        )
+        (set_line,) = self.tools.stdins("chpasswd")
+        wrong_line, first_right_line, second_right_line = self.tools.stdins("lab-probe-type")
+        right = set_line[len(PROBE_USER) + 1 : -1]
+        self.assertNotEqual(wrong_line[len(PROBE_USER) + 1 : -1], right)
+        self.assertEqual(first_right_line, f"{PROBE_USER} {right}\n")
+        self.assertEqual(second_right_line, f"{PROBE_USER} {right}\n")
+        commands = self.tools.remote_commands()
+        probes = [index for index, command in enumerate(commands) if command == "sudo -n lab-probe-type"]
+        reboot = commands.index(REBOOT_COMMAND)
+        self.assertEqual(len(probes), 3)
+        self.assertEqual(len(self.tools.reboot_calls()), 1)
+        self.assertLess(probes[1], reboot)
+        self.assertLess(reboot, probes[2])
+        self.assertLess(reboot, commands.index(tar_command(DEFAULT_FRAMES_DIR)))
+        boot_id_reads = [index for index, command in enumerate(commands) if command == BOOT_ID_COMMAND]
+        self.assertLess(boot_id_reads[0], reboot)
+        self.assertGreater(boot_id_reads[-1], reboot)
+        journal = (self.run_dir("ec2-login") / "journal.json").read_bytes()
+        self.assertIn(b"session_opened", journal)
+        self.assertNotIn(lab_ec2.PAM_MARKER.encode(), journal)
+        log = self.run_log("ec2-login")
+        self.assertIn("same-boot wait ended with no login: boot boot-1 ended, boot boot-2 is up", log)
+        self.assertIn("PASS ec2-login", log)
+        self.assert_box_ended()
+
+    def test_same_boot_login_does_not_reboot(self) -> None:
+        self.serve_login()
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.tools.reboot_calls(), [])
+        self.assertNotIn(BOOT_ID_COMMAND, self.tools.remote_commands())
+        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 2)
+        self.assertNotIn("same-boot wait ended", self.run_log("ec2-login"))
+        self.assert_box_ended()
+
+    def test_no_login_in_either_boot_fails_the_run(self) -> None:
         self.serve_login(right=[])
         code, out = self.run_runner("--login")
         self.assertEqual(code, 1, out)
-        self.assertIn("FAIL ec2-login: no login within 120 seconds", self.run_log("ec2-login"))
+        log = self.run_log("ec2-login")
+        self.assertIn("same-boot wait ended with no login: boot boot-1 ended, boot boot-2 is up", log)
+        self.assertIn("FAIL ec2-login: second boot: no login within 120 seconds", log)
+        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 3)
+        self.assertEqual(len(self.tools.reboot_calls()), 1)
+        self.assertGreaterEqual(self.clock.now, 2 * lab_ec2.LOGIN_WAIT_SECONDS)
+        self.assert_box_ended()
+
+    def test_no_new_boot_id_within_the_deadline_fails_the_run(self) -> None:
+        self.serve_login(login_boots=[2])
+        self.tools.set_ssh(reboot="stuck")
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            f"FAIL ec2-login: second boot: no new boot id within {lab.BOOT_DEADLINE_SECONDS} seconds after the reboot",
+            self.run_log("ec2-login"),
+        )
+        self.assertEqual(len(self.tools.reboot_calls()), 1)
         self.assertEqual(len(self.tools.stdins("lab-probe-type")), 2)
-        self.assertGreaterEqual(self.clock.now, lab_ec2.LOGIN_WAIT_SECONDS)
+        self.assertGreaterEqual(self.clock.now, lab.BOOT_DEADLINE_SECONDS)
+        self.assert_box_ended()
+
+    def test_second_boot_hold_failure_fails_the_run_naming_the_second_boot(self) -> None:
+        self.serve_login(login_boots=[2])
+        self.tools.set_ssh(journal_after_reboot=None)
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            "FAIL ec2-login: second boot: no halmasuit.service foreground_changed to greeter event",
+            self.run_log("ec2-login"),
+        )
+        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 2)
+        self.assertTrue((self.run_dir("ec2-login") / "journal.json").is_file())
+        self.assert_box_ended()
+
+    def test_sigterm_during_the_boot_id_wait_ends_the_box(self) -> None:
+        self.serve_login(login_boots=[2])
+        self.tools.set_ssh(reboot="stuck")
+        tools = self.tools
+
+        class SigtermDuringBootIdWait(FakeClock):
+            def sleep(self, seconds: float) -> None:
+                super().sleep(seconds)
+                if tools.boot_id_reads() >= 3:
+                    os.kill(os.getpid(), signal.SIGTERM)
+
+        self.clock = SigtermDuringBootIdWait()
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 128 + signal.SIGTERM, out)
+        self.assertIn("SIGTERM received", self.run_log("ec2-login"))
         self.assert_box_ended()
 
     def test_hold_failure_in_login_mode_types_nothing(self) -> None:
@@ -1314,10 +1452,7 @@ class RunnerTest(unittest.TestCase):
         )
         self.assert_box_ended()
 
-    def test_passwords_stay_out_of_argv_stdout_and_the_run_directory(self) -> None:
-        self.serve_login()
-        code, out = self.run_runner("--login")
-        self.assertEqual(code, 0, out)
+    def assert_passwords_stay_private(self, out: str) -> None:
         sent = self.tools.stdins("chpasswd") + self.tools.stdins("lab-probe-type")
         passwords = {word for text in sent for word in re.findall(r"[a-z]{32}", text)}
         self.assertEqual(len(passwords), 2)
@@ -1330,6 +1465,20 @@ class RunnerTest(unittest.TestCase):
             self.assertNotIn(password, out)
             for name, data in run_files.items():
                 self.assertNotIn(password.encode(), data, name)
+
+    def test_passwords_stay_out_of_argv_stdout_and_the_run_directory(self) -> None:
+        self.serve_login()
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 0, out)
+        self.assert_passwords_stay_private(out)
+        self.assert_box_ended()
+
+    def test_second_boot_passwords_stay_out_of_argv_stdout_and_the_run_directory(self) -> None:
+        self.serve_login(login_boots=[2])
+        code, out = self.run_runner("--login")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(self.tools.stdins("lab-probe-type")), 3)
+        self.assert_passwords_stay_private(out)
         self.assert_box_ended()
 
     def test_sigterm_while_lab_probe_type_hangs_ends_the_box(self) -> None:
