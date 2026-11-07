@@ -1559,6 +1559,7 @@ EC2_FIRST_FRAME_MONO_US = 1_600_000
 EC2_FRAME_STEP_US = 500_000
 EC2_GREETER_MONO_US = 2_996_000
 EC2_SESSION_MONO_US = 10_100_000
+EC2_SESSION_OPENED_MONO_US = 10_000_000
 RECORDER_OUTPUT = "DP-1"
 SECOND_OUTPUT = "DP-2"
 THIRD_OUTPUT = "DP-3"
@@ -1606,6 +1607,44 @@ def with_session_foreground(doc, mono):
         {"kind": "halmasuit", "mono_us": mono, "pid": 1184, "detail": "session", "payload": SESSION_PAYLOAD}
     )
     return doc
+
+
+def is_session_opened(event):
+    return event["kind"] == "halmasuit" and event["payload"] == SESSION_OPENED_PAYLOAD
+
+
+def is_session_first_frame(event):
+    return event["kind"] == "halmasuit" and event["payload"] == SESSION_FIRST_FRAME_PAYLOAD
+
+
+def with_session_opened(doc, mono=EC2_SESSION_OPENED_MONO_US):
+    doc["events"].append(
+        {
+            "kind": "halmasuit",
+            "mono_us": mono,
+            "pid": 1184,
+            "detail": "session_opened",
+            "payload": SESSION_OPENED_PAYLOAD,
+        }
+    )
+    return doc
+
+
+def with_session_first_frame(doc):
+    doc["events"].append(
+        {
+            "kind": "halmasuit",
+            "mono_us": EC2_SESSION_MONO_US + EC2_FRAME_STEP_US,
+            "pid": 1184,
+            "detail": "session_client_first_frame",
+            "payload": SESSION_FIRST_FRAME_PAYLOAD,
+        }
+    )
+    return doc
+
+
+def ec2_login_timeline():
+    return with_session_first_frame(with_session_opened(ec2_timeline()))
 
 
 def with_superseded(doc, frame_id, pid=1184):
@@ -1827,6 +1866,110 @@ class RecorderFailuresTest(unittest.TestCase):
         frames = ec2_lines() + ec2_lines(range(3), output=SECOND_OUTPUT)
         failures = timeline.recorder_failures(doc, frames, {RECORDER_OUTPUT: EC2_FRAME_COUNT, SECOND_OUTPUT: 3})
         self.assertEqual(failures, [])
+
+
+def span_failure(*outputs):
+    return (
+        f"recorder index does not span session_opened at {EC2_SESSION_OPENED_MONO_US} us "
+        f"on output(s): {', '.join(outputs)}"
+    )
+
+
+class EC2LoginProfileTest(unittest.TestCase):
+    def test_complete_login_run_passes(self):
+        self.assertEqual(timeline.PROFILES["ec2-login"](ec2_login_timeline()), [])
+
+    def test_session_events_are_required(self):
+        cases = {
+            "session_opened missing": (
+                drop_events(ec2_login_timeline(), is_session_opened),
+                ["no session_opened"],
+            ),
+            "session_client_first_frame missing": (
+                drop_events(ec2_login_timeline(), is_session_first_frame),
+                ["no session_client_first_frame"],
+            ),
+        }
+        for label, (doc, expected) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(timeline.PROFILES["ec2-login"](doc), expected)
+
+    def test_second_started_fails(self):
+        doc = ec2_login_timeline()
+        doc["events"].append(
+            {
+                "kind": "halmasuit",
+                "mono_us": 1_050_000,
+                "pid": 1184,
+                "detail": "started",
+                "payload": STARTED_PAYLOAD,
+            }
+        )
+        self.assertEqual(
+            timeline.PROFILES["ec2-login"](doc),
+            ["2 halmasuit started events; expected exactly one"],
+        )
+
+
+class LoginRecorderFailuresTest(unittest.TestCase):
+    def test_index_spanning_session_opened_on_every_output_passes(self):
+        frames = ec2_lines() + ec2_lines(output=SECOND_OUTPUT)
+        video = {RECORDER_OUTPUT: EC2_FRAME_COUNT, SECOND_OUTPUT: EC2_FRAME_COUNT}
+        failures = timeline.login_recorder_failures(ec2_login_timeline(), frames, video)
+        self.assertEqual(failures, [])
+
+    def test_output_wholly_before_session_opened_fails(self):
+        frames = ec2_lines() + ec2_lines(range(4), output=SECOND_OUTPUT)
+        video = {RECORDER_OUTPUT: EC2_FRAME_COUNT, SECOND_OUTPUT: 4}
+        failures = timeline.login_recorder_failures(ec2_login_timeline(), frames, video)
+        self.assertEqual(failures, [span_failure(SECOND_OUTPUT)])
+
+    def test_output_wholly_after_session_opened_fails(self):
+        frames = ec2_lines() + ec2_lines(range(20, 24), output=SECOND_OUTPUT)
+        video = {RECORDER_OUTPUT: EC2_FRAME_COUNT, SECOND_OUTPUT: 4}
+        failures = timeline.login_recorder_failures(ec2_login_timeline(), frames, video)
+        self.assertEqual(failures, [span_failure(SECOND_OUTPUT)])
+
+    def test_failure_names_every_output_that_does_not_span(self):
+        frames = (
+            ec2_lines()
+            + ec2_lines(range(20, 24), output=SECOND_OUTPUT)
+            + ec2_lines(range(4), output=THIRD_OUTPUT)
+        )
+        video = {RECORDER_OUTPUT: EC2_FRAME_COUNT, SECOND_OUTPUT: 4, THIRD_OUTPUT: 4}
+        failures = timeline.login_recorder_failures(ec2_login_timeline(), frames, video)
+        self.assertEqual(failures, [span_failure(SECOND_OUTPUT, THIRD_OUTPUT)])
+
+    def test_recorder_failures_are_included(self):
+        frames = ec2_lines() + ec2_lines(range(4), output=SECOND_OUTPUT)
+        video = {RECORDER_OUTPUT: EC2_FRAME_COUNT - 1, SECOND_OUTPUT: 4}
+        failures = timeline.login_recorder_failures(ec2_login_timeline(), frames, video)
+        self.assertEqual(
+            failures,
+            [
+                "video frame count differs from index: DP-1 has 63 video frame(s) for 64 index line(s)",
+                span_failure(SECOND_OUTPUT),
+            ],
+        )
+
+    def test_no_span_without_a_timed_session_opened(self):
+        frames = ec2_lines() + ec2_lines(range(4), output=SECOND_OUTPUT)
+        video = {RECORDER_OUTPUT: EC2_FRAME_COUNT, SECOND_OUTPUT: 4}
+        untimed = with_session_opened(drop_events(ec2_timeline(), is_session_opened), mono=None)
+        cases = {
+            "session_opened missing": drop_events(ec2_timeline(), is_session_opened),
+            "session_opened without a monotonic time": untimed,
+        }
+        for label, doc in cases.items():
+            with self.subTest(label):
+                self.assertEqual(timeline.login_recorder_failures(doc, frames, video), [])
+
+    def test_span_point_is_the_first_timed_session_opened(self):
+        doc = with_session_opened(ec2_login_timeline(), mono=20_000_000)
+        frames = ec2_lines() + ec2_lines(range(4), output=SECOND_OUTPUT)
+        video = {RECORDER_OUTPUT: EC2_FRAME_COUNT, SECOND_OUTPUT: 4}
+        failures = timeline.login_recorder_failures(doc, frames, video)
+        self.assertEqual(failures, [span_failure(SECOND_OUTPUT)])
 
 
 if __name__ == "__main__":

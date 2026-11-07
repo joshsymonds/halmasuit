@@ -101,6 +101,9 @@ is active; at least one active vkms sample follows the first `frame_rendered` fr
 P. A check that needs P, M, or that first frame is not evaluated when that anchor
 is missing: the check that defines the anchor reports it.
 
+Profile `ec2-login` checks an EC2 lab boot in which a person logs in at the greeter
+through halmasuit. It applies exactly the `attended-login` checks to the same run.
+
 Recorder index. `index.jsonl` is the frame recorder's index, one JSON object per
 presented frame and output, with `seq`, `output`, `mono_us`, `width`, `height`,
 `format`, and `dropped`. `read_recorder_index` returns its lines in file order and
@@ -117,6 +120,12 @@ Each output's video frame count equals its index lines, and each output has a fr
 in the greeter-foreground window. `greeter_frames` picks, per output, the latest index
 line in that window; that is the greeter PNG a run names. Seqs are shared by every
 output, so the absent-seq rule is over seqs, not per output.
+
+`login_recorder_failures` returns `recorder_failures` followed by the span check. S is
+the monotonic time of the first `session_opened` that has one. When S exists, each
+output must hold an index line at or before S and one at or after S; one message names
+S and every output that fails that. Without such a `session_opened` the span check is
+not evaluated.
 """
 
 from __future__ import annotations
@@ -846,6 +855,32 @@ def recorder_failures(
     return failures
 
 
+def login_recorder_failures(
+    timeline: Timeline, frames: list[dict[str, Any]], video_frames: Mapping[str, int]
+) -> list[str]:
+    failures = recorder_failures(timeline, frames, video_frames)
+    opened = next(
+        (
+            event["mono_us"]
+            for event in timed_halmasuit(timeline)
+            if payload_matches(event["payload"], "session_opened")
+        ),
+        None,
+    )
+    if opened is None:
+        return failures
+    unspanned: list[str] = []
+    for output in sorted({frame["output"] for frame in frames}):
+        monos = [frame["mono_us"] for frame in frames if frame["output"] == output]
+        if not min(monos) <= opened <= max(monos):
+            unspanned.append(output)
+    if unspanned:
+        failures.append(
+            f"recorder index does not span session_opened at {opened} us on output(s): {', '.join(unspanned)}"
+        )
+    return failures
+
+
 def bios_shader_greeter(timeline: Timeline) -> list[str]:
     events = timeline["events"]
     halmasuit = [event for event in events if event["kind"] == "halmasuit"]
@@ -946,6 +981,7 @@ PROFILES: dict[str, Profile] = {
     "baseline-greetd": baseline_greetd,
     "bios-shader-greeter": bios_shader_greeter,
     "ec2-greeter": ec2_greeter,
+    "ec2-login": attended_login,
     "production": production,
 }
 
